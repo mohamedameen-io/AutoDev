@@ -16,6 +16,7 @@ Flow:
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from adapters.inline import InlineAdapter
@@ -48,6 +49,29 @@ logger = get_logger(__name__)
 
 def _spec_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _try_read_plan_from_file(cwd: Path, text: str) -> str:
+    """Fallback: if the architect wrote the plan to a file instead of returning
+    it as text, read the file content.  Returns the file content if found,
+    otherwise returns the original text unchanged."""
+
+    # Common paths where the architect might write the plan.
+    candidates = [
+        cwd / ".autodev" / "plan.md",
+        cwd / ".swarm" / "plan.md",
+    ]
+    for p in candidates:
+        if p.exists():
+            content = p.read_text(encoding="utf-8").strip()
+            if content and "# Plan:" in content or "## Phase" in content:
+                logger.info(
+                    "plan_phase.read_plan_from_file",
+                    path=str(p),
+                    bytes=len(content),
+                )
+                return content
+    return text
 
 
 async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
@@ -102,7 +126,9 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
             target_agent="architect",
             action="document",
             acceptance=(
-                "Return a plan in the canonical autodev markdown format:\n"
+                "IMPORTANT: Return the ENTIRE plan as your text response. "
+                "Do NOT write it to a file. Do NOT use the Write or Task tool to create plan files. "
+                "Your response text must BE the plan, in this exact markdown format:\n"
                 "  # Plan: <title>\n"
                 "  ## Phase <n>: <title>\n"
                 "  ### Task <n.m>: <title>\n"
@@ -120,6 +146,9 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         architect_result = await _delegate(orch, "architect", architect_env)
 
         plan_md = architect_result.text
+        # Fallback: if architect wrote to a file instead of returning text,
+        # try reading the plan from known file locations.
+        plan_md = _try_read_plan_from_file(cwd, plan_md)
         plan: Plan
         try:
             plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
@@ -131,12 +160,18 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                         **architect_env.context,
                         "prior_attempt": plan_md[:2000],
                         "parse_error": str(exc),
-                        "hint": "Please use EXACTLY the canonical format.",
+                        "hint": "Please use EXACTLY the canonical format. "
+                        "Return the plan as your text response, do NOT write to files.",
                     }
                 }
             )
-            retry_result = await _delegate(orch, "architect", retry_env)
+            architect_spec = orch.registry.get("architect")
+            retry_max = (architect_spec.max_turns or 5) + 2 if architect_spec else 7
+            retry_result = await _delegate(
+                orch, "architect", retry_env, max_turns_override=retry_max
+            )
             plan_md = retry_result.text
+            plan_md = _try_read_plan_from_file(cwd, plan_md)
             plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
 
         if orch.cfg.tournaments.plan.enabled:
@@ -174,6 +209,8 @@ async def _delegate(
     orch: "Orchestrator",
     role: str,
     envelope: DelegationEnvelope,
+    *,
+    max_turns_override: int | None = None,
 ) -> AgentResult:
     """Build an :class:`AgentInvocation` from the envelope + registry and call adapter.
 
@@ -204,7 +241,7 @@ async def _delegate(
         cwd=orch.cwd,
         model=spec.model,
         allowed_tools=list(spec.tools) if spec.tools else None,
-        max_turns=1,
+        max_turns=max_turns_override or spec.max_turns or 1,
     )
 
     if isinstance(orch.adapter, InlineAdapter):
