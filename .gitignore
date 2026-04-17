@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+coverage.xml
+.hypothesis/
+
+# Type checkers
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# autodev runtime state
+.autodev/evidence/*.patch
+.autodev/evidence/*.diff
+.autodev/tournaments/*/a/
+.autodev/tournaments/*/b/
+.autodev/tournaments/*/ab/
+
+# Swarm files
+.swarm/
+
+# Local caches
+.cache/
+*.log
+
+# AI agent files
+.cursor/
+.claude/
+thoughts/
