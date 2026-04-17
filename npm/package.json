@@ -1,0 +1,56 @@
+{
+  "name": "autodev",
+  "version": "0.0.1",
+  "description": "Autonomous development engine — multi-agent orchestrator with tournament self-refinement, runs inside Claude Code, Cursor, and any LLM-assisted IDE",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "autodev": "./dist/cli/index.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mohamedameen/autodev.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "autonomous",
+    "autodev",
+    "claude-code",
+    "cursor",
+    "llm",
+    "multi-agent",
+    "orchestration",
+    "swarm"
+  ],
+  "files": [
+    "dist",
+    "wheel",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc && node scripts/bundle-wheel.js",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "execa": "^9.5.2",
+    "which": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/which": "^3.0.0",
+    "typescript": "^5.7.3"
+  }
+}
