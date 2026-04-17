@@ -1,0 +1,83 @@
+[
+  {
+    "pass": 1,
+    "winner": "AB",
+    "scores": {
+      "A": 3,
+      "B": 6,
+      "AB": 9
+    }
+  },
+  {
+    "pass": 2,
+    "winner": "A",
+    "scores": {
+      "A": 9,
+      "B": 3,
+      "AB": 6
+    }
+  },
+  {
+    "pass": 3,
+    "winner": "AB",
+    "scores": {
+      "A": 7,
+      "B": 3,
+      "AB": 8
+    }
+  },
+  {
+    "pass": 4,
+    "winner": "AB",
+    "scores": {
+      "A": 4,
+      "B": 5,
+      "AB": 9
+    }
+  },
+  {
+    "pass": 5,
+    "winner": "AB",
+    "scores": {
+      "A": 6,
+      "B": 3,
+      "AB": 9
+    }
+  },
+  {
+    "pass": 6,
+    "winner": "AB",
+    "scores": {
+      "A": 6,
+      "B": 4,
+      "AB": 8
+    }
+  },
+  {
+    "pass": 7,
+    "winner": "AB",
+    "scores": {
+      "A": 3,
+      "B": 6,
+      "AB": 9
+    }
+  },
+  {
+    "pass": 8,
+    "winner": "A",
+    "scores": {
+      "A": 9,
+      "B": 3,
+      "AB": 6
+    }
+  },
+  {
+    "pass": 9,
+    "winner": "A",
+    "scores": {
+      "A": 8,
+      "B": 5,
+      "AB": 5
+    }
+  }
+]
