@@ -6,7 +6,7 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-612_passing-success)](#development-setup)
+[![Tests](https://img.shields.io/badge/tests-733_passing-success)](#development-setup)
 [![LOC](https://img.shields.io/badge/source-11k_LOC-informational)](#)
 [![pydantic v2](https://img.shields.io/badge/pydantic-v2_strict-success)](https://docs.pydantic.dev/latest/)
 
@@ -417,14 +417,14 @@ The managed section is idempotent — running `init --inline` again updates with
 git clone https://github.com/mohamedameen/autodev
 cd autodev
 uv sync
-uv run pytest -v        # 612 tests
+uv run pytest -v        # 733 tests, 94% coverage
 ```
 
 ---
 
 ## Configuration
 
-`.autodev/config.json` is a versioned, strict pydantic schema. Model defaults are platform-aware — Claude Code uses model aliases (`opus`/`sonnet`/`haiku`) that resolve to the latest version, while Cursor uses explicit models with `auto` for intelligent selection and automatic fallback on rate limits.
+`.autodev/config.json` is a versioned, strict pydantic schema. Model defaults are platform-aware — Claude Code uses model aliases (`opus`/`sonnet`/`haiku`) that resolve to the latest version, while Cursor uses explicit models with `auto` for intelligent selection and automatic fallback on rate limits. Each agent also has a configurable `max_turns` — the number of turns the agent gets per invocation (tool-heavy roles like `developer` get more turns; text-only tournament roles get 1).
 
 ```jsonc
 {
@@ -432,20 +432,20 @@ uv run pytest -v        # 612 tests
   "platform": "auto",                               // "claude_code" | "cursor" | "inline" | "auto"
   "agents": {
     // Claude Code defaults (aliases resolve to latest):
-    "architect":         { "model": "opus"   },
-    "explorer":          { "model": "haiku"  },
-    "domain_expert":     { "model": "sonnet" },
-    "developer":         { "model": "sonnet" },
-    "reviewer":          { "model": "sonnet" },
-    "test_engineer":     { "model": "sonnet" },
-    "critic_t":          { "model": "sonnet" },
-    "architect_b":       { "model": "sonnet" },
-    "synthesizer":       { "model": "sonnet" },
-    "judge":             { "model": "sonnet" },
-    "critic_sounding_board": { "model": "sonnet" },
-    "critic_drift_verifier": { "model": "sonnet" },
-    "docs":              { "model": "sonnet" },
-    "designer":          { "model": "sonnet" }
+    "architect":         { "model": "opus",   "max_turns": 5  },
+    "explorer":          { "model": "haiku",  "max_turns": 3  },
+    "domain_expert":     { "model": "sonnet", "max_turns": 3  },
+    "developer":         { "model": "sonnet", "max_turns": 10 },
+    "reviewer":          { "model": "sonnet", "max_turns": 3  },
+    "test_engineer":     { "model": "sonnet", "max_turns": 5  },
+    "critic_t":          { "model": "sonnet", "max_turns": 1  },
+    "architect_b":       { "model": "sonnet", "max_turns": 5  },
+    "synthesizer":       { "model": "sonnet", "max_turns": 1  },
+    "judge":             { "model": "sonnet", "max_turns": 1  },
+    "critic_sounding_board": { "model": "sonnet", "max_turns": 3 },
+    "critic_drift_verifier": { "model": "sonnet", "max_turns": 3 },
+    "docs":              { "model": "sonnet", "max_turns": 3  },
+    "designer":          { "model": "sonnet", "max_turns": 3  }
     // Cursor defaults (with rate limit fallback):
     // "architect":         { "model": "opus"   },   // → auto on 429
     // "explorer":          { "model": "auto"  },   // auto-selects best model
@@ -583,7 +583,7 @@ cd autodev
 uv sync
 
 # Full test suite
-uv run pytest -v                                     # 612 passing
+uv run pytest -v                                     # 733 passing, 94% coverage
 
 # Property-based tests (Borda math)
 uv run pytest --hypothesis-show-statistics tests/test_tournament_borda_aggregation.py
@@ -602,11 +602,12 @@ uv run ruff check src/
 uv run mypy src/
 ```
 
-The test suite includes:
-- **Unit**: ledger atomicity, Borda aggregation, parse_ranking, plan manager under contention, knowledge ranking, adapter type round-trips
-- **Integration**: tiny-repo E2E with stubbed adapters for determinism
+The test suite includes (94% coverage, all source files ≥80%):
+- **Unit**: ledger atomicity, Borda aggregation, parse_ranking, plan manager under contention, knowledge ranking, adapter type round-trips, CLI commands, QA gates, config defaults, autologging
+- **Integration**: tiny-repo E2E with stubbed adapters for determinism, impl tournament full-flow with git worktrees
 - **Property**: Borda invariants via Hypothesis
 - **Replay**: tournament determinism against recorded reference fixtures
+- **Live**: opt-in smoke tests against real Claude Code / Cursor CLIs (`AUTODEV_LIVE=1`)
 
 ---
 
