@@ -19,7 +19,8 @@ escalated, mark it blocked, and stop the loop.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Literal, cast
 
 from adapters.inline import InlineAdapter
 from adapters.inline_types import DelegationPendingSignal
@@ -190,7 +191,7 @@ async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
             verdict, issues = _parse_review_verdict(review_result.text)
             review_ev = ReviewEvidence(
                 task_id=task.id,
-                verdict=verdict,
+                verdict=cast("Literal['APPROVED', 'NEEDS_CHANGES', 'REJECTED']", verdict),
                 issues=issues,
                 output_text=review_result.text,
             )
@@ -423,7 +424,7 @@ async def delegate(
             pending_task_id=envelope.task_id,
             pending_role=role,
             delegation_path=sig.delegation_path,
-            response_path=orch.adapter.response_path(envelope.task_id, role),  # type: ignore[union-attr]
+            response_path=orch.adapter.response_path(envelope.task_id, role),  # type: ignore[attr-defined]
             orchestrator_step=role,
             retry_count=retry_count,
             last_issues=last_issues or [],
@@ -546,7 +547,7 @@ async def _run_qa_gates(orch: "Orchestrator", task: "Task") -> str | None:
     cwd = orch.cwd
     language = detect_language(cwd)
 
-    gates: list[tuple[bool, object]] = [
+    gates: list[tuple[bool, Callable[[], Awaitable[GateResult]]]] = [
         (cfg.syntax_check, lambda: run_syntax_check(cwd, language)),
         (cfg.lint, lambda: run_lint(cwd, language)),
         (cfg.build_check, lambda: run_build_check(cwd, language)),
@@ -557,7 +558,7 @@ async def _run_qa_gates(orch: "Orchestrator", task: "Task") -> str | None:
     for enabled, gate_fn in gates:
         if not enabled:
             continue
-        result: GateResult = await gate_fn()  # type: ignore[misc]
+        result: GateResult = await gate_fn()
         if not result.passed:
             return result.details or "QA gate failed"
     return None

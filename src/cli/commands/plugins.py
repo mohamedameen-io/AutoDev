@@ -30,11 +30,11 @@ def plugins() -> None:
     for name, plugin in reg.qa_gates.items():
         table.add_row(name, "QA Gate", type(plugin).__module__)
 
-    for name, plugin in reg.judges.items():
-        table.add_row(name, "Judge Provider", type(plugin).__module__)
+    for name, jp in reg.judges.items():
+        table.add_row(name, "Judge Provider", type(jp).__module__)
 
-    for name, plugin in reg.agents.items():
-        table.add_row(name, "Agent Extension", type(plugin).__module__)
+    for name, ap in reg.agents.items():
+        table.add_row(name, "Agent Extension", type(ap).__module__)
 
     console.print(table)
     console.print(

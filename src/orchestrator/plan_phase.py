@@ -234,7 +234,7 @@ async def _delegate(
             pending_task_id=envelope.task_id,
             pending_role=role,
             delegation_path=sig.delegation_path,
-            response_path=orch.adapter.response_path(envelope.task_id, role),  # type: ignore[union-attr]
+            response_path=orch.adapter.response_path(envelope.task_id, role),  # type: ignore[attr-defined]
             orchestrator_step=step,
         )
         raise

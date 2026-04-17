@@ -53,6 +53,8 @@ dev = [
     "pytest-asyncio>=0.23",
     "hypothesis>=6.0",
     "pytest-cov>=4.1",
+    "mypy>=1.14",
+    "types-PyYAML>=6.0",
 ]
 
 [project.urls]
@@ -98,3 +100,9 @@ include = [
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["src"]
+filterwarnings = [
+    "ignore:coroutine 'create_subprocess_exec' was never awaited:RuntimeWarning",
+    "ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning",
+    "ignore:Exception ignored in.*create_subprocess_exec:pytest.PytestUnraisableExceptionWarning",
+    "ignore:unclosed event loop:ResourceWarning",
+]

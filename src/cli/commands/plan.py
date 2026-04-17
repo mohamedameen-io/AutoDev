@@ -10,6 +10,8 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from typing import Literal, cast
+
 from adapters.detect import get_adapter
 from agents import build_registry
 from config.loader import load_config
@@ -45,7 +47,7 @@ def plan(intent: str, platform: str | None) -> None:
 
     async def _run() -> None:
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
-        adapter = await get_adapter(platform_pref)
+        adapter = await get_adapter(cast("Literal['claude_code', 'cursor', 'inline', 'auto']", platform_pref))
         registry = build_registry(cfg)
         orch = Orchestrator(cwd=cwd, cfg=cfg, adapter=adapter, registry=registry)
         approved = await orch.plan(intent)
