@@ -56,7 +56,7 @@ async def test_build_check_python_no_files(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_build_check_rust_passes(tmp_path: Path) -> None:
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_build_check(tmp_path, language="rust")
     assert result.passed
     assert mock_exec.call_args.args[0] == "cargo"
@@ -65,7 +65,7 @@ async def test_build_check_rust_passes(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_build_check_rust_fails(tmp_path: Path) -> None:
     proc = _make_proc(1, stderr=b"error[E0308]: mismatched types")
-    with patch("asyncio.create_subprocess_exec", return_value=proc):
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
         result = await run_build_check(tmp_path, language="rust")
     assert not result.passed
     assert "E0308" in result.details
@@ -74,7 +74,7 @@ async def test_build_check_rust_fails(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_build_check_go_passes(tmp_path: Path) -> None:
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_build_check(tmp_path, language="go")
     assert result.passed
     assert mock_exec.call_args.args[0] == "go"
@@ -101,7 +101,7 @@ async def test_build_check_nodejs_with_build_script(tmp_path: Path) -> None:
     import json
     (tmp_path / "package.json").write_text(json.dumps({"scripts": {"build": "tsc"}}))
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_build_check(tmp_path, language="nodejs")
     assert result.passed
     assert "npm" in mock_exec.call_args.args[0]
@@ -112,7 +112,7 @@ async def test_build_check_nodejs_no_build_script(tmp_path: Path) -> None:
     import json
     (tmp_path / "package.json").write_text(json.dumps({"scripts": {}}))
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_build_check(tmp_path, language="nodejs")
     assert result.passed
     assert mock_exec.call_args.args[0] == "npx"

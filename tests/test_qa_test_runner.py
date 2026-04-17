@@ -35,7 +35,7 @@ async def test_run_tests_unknown_language(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_run_tests_python_passes(tmp_path: Path) -> None:
     proc = _make_proc(0, stdout=b"5 passed")
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_tests(tmp_path, language="python")
     assert result.passed
     assert mock_exec.call_args.args[0] == "pytest"
@@ -44,7 +44,7 @@ async def test_run_tests_python_passes(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_run_tests_python_fails(tmp_path: Path) -> None:
     proc = _make_proc(1, stdout=b"2 failed, 3 passed")
-    with patch("asyncio.create_subprocess_exec", return_value=proc):
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
         result = await run_tests(tmp_path, language="python")
     assert not result.passed
     assert "failed" in result.details
@@ -53,7 +53,7 @@ async def test_run_tests_python_fails(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_run_tests_nodejs(tmp_path: Path) -> None:
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_tests(tmp_path, language="nodejs")
     assert result.passed
     assert mock_exec.call_args.args[0] == "npm"
@@ -62,7 +62,7 @@ async def test_run_tests_nodejs(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_run_tests_rust(tmp_path: Path) -> None:
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_tests(tmp_path, language="rust")
     assert result.passed
     assert mock_exec.call_args.args[0] == "cargo"
@@ -71,7 +71,7 @@ async def test_run_tests_rust(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_run_tests_go(tmp_path: Path) -> None:
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_tests(tmp_path, language="go")
     assert result.passed
     assert mock_exec.call_args.args[0] == "go"

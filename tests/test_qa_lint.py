@@ -35,7 +35,7 @@ async def test_lint_no_language_detected(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_lint_python_passes(tmp_path: Path) -> None:
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_lint(tmp_path, language="python")
     assert result.passed
     mock_exec.assert_called_once()
@@ -45,7 +45,7 @@ async def test_lint_python_passes(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_lint_python_fails(tmp_path: Path) -> None:
     proc = _make_proc(1, stderr=b"E501 line too long")
-    with patch("asyncio.create_subprocess_exec", return_value=proc):
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
         result = await run_lint(tmp_path, language="python")
     assert not result.passed
     assert "E501" in result.details
@@ -73,7 +73,7 @@ async def test_lint_timeout(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_lint_nodejs(tmp_path: Path) -> None:
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_lint(tmp_path, language="nodejs")
     assert result.passed
     assert mock_exec.call_args.args[0] == "npx"
@@ -82,7 +82,7 @@ async def test_lint_nodejs(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_lint_rust(tmp_path: Path) -> None:
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_lint(tmp_path, language="rust")
     assert result.passed
     assert mock_exec.call_args.args[0] == "cargo"
@@ -91,7 +91,7 @@ async def test_lint_rust(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_lint_go(tmp_path: Path) -> None:
     proc = _make_proc(0)
-    with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_lint(tmp_path, language="go")
     assert result.passed
     assert mock_exec.call_args.args[0] == "golangci-lint"
