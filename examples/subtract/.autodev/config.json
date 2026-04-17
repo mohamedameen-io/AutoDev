@@ -1,0 +1,57 @@
+{
+  "schema_version": "1.0.0",
+  "platform": "auto",
+  "agents": {
+    "architect":            {"model": "sonnet"},
+    "explorer":             {"model": "haiku"},
+    "sme":                  {"model": "haiku"},
+    "coder":                {"model": "sonnet"},
+    "reviewer":             {"model": "haiku"},
+    "test_engineer":        {"model": "haiku"},
+    "critic":               {"model": "sonnet"},
+    "critic_sounding_board":{"model": "sonnet"},
+    "critic_drift_verifier":{"model": "haiku"},
+    "docs":                 {"model": "haiku"},
+    "designer":             {"model": "haiku", "disabled": true},
+    "critic_t":             {"model": "haiku"},
+    "author_b":             {"model": "haiku"},
+    "synthesizer":          {"model": "haiku"},
+    "judge":                {"model": "haiku"}
+  },
+  "tournaments": {
+    "plan": {
+      "enabled": false,
+      "num_judges": 1,
+      "convergence_k": 1,
+      "max_rounds": 2
+    },
+    "impl": {
+      "enabled": false,
+      "num_judges": 1,
+      "convergence_k": 1,
+      "max_rounds": 1
+    },
+    "max_parallel_subprocesses": 2,
+    "auto_disable_for_models": ["opus", "sonnet"]
+  },
+  "qa_gates": {
+    "syntax_check": true,
+    "lint": true,
+    "build_check": false,
+    "test_runner": true,
+    "secretscan": false,
+    "sast_scan": false,
+    "mutation_test": false
+  },
+  "qa_retry_limit": 2,
+  "guardrails": {
+    "max_tool_calls_per_task": 30,
+    "max_duration_s_per_task": 300,
+    "max_diff_bytes": 524288,
+    "cost_budget_usd_per_plan": null
+  },
+  "hive": {
+    "enabled": false,
+    "path": "~/.local/share/autodev/shared-learnings.jsonl"
+  }
+}
