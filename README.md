@@ -5,12 +5,12 @@
 **A deterministic, resumable, tournament-based orchestrator for LLM-driven software development.**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-612_passing-success)](#development-setup)
 [![LOC](https://img.shields.io/badge/source-11k_LOC-informational)](#)
 [![pydantic v2](https://img.shields.io/badge/pydantic-v2_strict-success)](https://docs.pydantic.dev/latest/)
 
-[Why AutoDev](#why-autodev) · [Design Principles](#design-principles) · [Architecture](docs/architecture.md) · [Tournaments](docs/tournaments.md) · [Quick Start](#quick-start)
+[Why AutoDev](#why-autodev) · [Design Principles](#design-principles) · [Architecture](docs/architecture.md) · [Tournaments](docs/design_documentation/tournaments.md) · [Quick Start](#quick-start)
 
 </div>
 
@@ -364,7 +364,7 @@ The always-on default is tuned for cost: 4 subprocess calls per round × max 3 r
 - **Borda aggregation with conservative tiebreak** — ties default to the incumbent. Prevents thrash on marginal improvements.
 - **Convergence criterion** — the incumbent must win `k` consecutive rounds. Prevents infinite refinement loops.
 
-See [`docs/tournaments.md`](docs/tournaments.md) for the full algorithm and proof sketches.
+See [`docs/design_documentation/tournaments.md`](docs/design_documentation/tournaments.md) for the full algorithm and proof sketches.
 
 ---
 
@@ -521,7 +521,7 @@ autodev execute --no-impl-tournament          # skip impl tournaments entirely
 
 Before `autodev execute`, the orchestrator prints a projected call count. You can abort before anything runs.
 
-See [`docs/cost.md`](docs/cost.md) for the full breakdown and tuning guide.
+See [`docs/design_documentation/cost.md`](docs/design_documentation/cost.md) for the full breakdown and tuning guide.
 
 ---
 
@@ -613,10 +613,10 @@ The test suite includes:
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — subsystems, FSM states, data flow
-- [`docs/tournaments.md`](docs/tournaments.md) — algorithm, convergence, configuration
-- [`docs/adapters.md`](docs/adapters.md) — platform adapter contract, inline mode, writing a new adapter
-- [`docs/agents.md`](docs/agents.md) — all 15 agent roles, prompts, tool maps
-- [`docs/cost.md`](docs/cost.md) — subscription cost model, tuning guide
+- [`docs/design_documentation/tournaments.md`](docs/design_documentation/tournaments.md) — algorithm, convergence, configuration
+- [`docs/design_documentation/adapters.md`](docs/design_documentation/adapters.md) — platform adapter contract, inline mode, writing a new adapter
+- [`docs/design_documentation/agents.md`](docs/design_documentation/agents.md) — all 15 agent roles, prompts, tool maps
+- [`docs/design_documentation/cost.md`](docs/design_documentation/cost.md) — subscription cost model, tuning guide
 
 ## Examples
 
@@ -634,4 +634,4 @@ AutoDev combines two threads of research:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GPL-3.0 — see [LICENSE](LICENSE).
