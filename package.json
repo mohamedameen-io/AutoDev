@@ -1,0 +1,23 @@
+{
+  "name": "autodev-repo",
+  "version": "0.0.1",
+  "private": true,
+  "description": "AutoDev monorepo root",
+  "scripts": {
+    "build:python": "pip wheel . --wheel-dir npm/wheel --no-deps",
+    "build:python:uv": "uv pip wheel . --dest npm/wheel",
+    "build:npm": "cd npm && npm install && npm run build",
+    "build:all": "npm run build:python:uv && npm run build:npm",
+    "test:python": "uv run pytest -v",
+    "lint:python": "uv run ruff check src/",
+    "typecheck:python": "uv run mypy src/",
+    "publish:python": "python -m build && twine upload dist/*.whl",
+    "publish:npm": "cd npm && npm publish",
+    "publish:all": "npm run build:all && npm run publish:python && npm run publish:npm",
+    "clean": "rm -rf dist/ build/ *.egg-info npm/dist npm/wheel"
+  },
+  "devDependencies": {
+    "build": "^1.1.0",
+    "twine": "^6.0.0"
+  }
+}
