@@ -1,17 +1,17 @@
-# AutoDev NPM
+# ai-autodev NPM
 
-Node.js wrapper for the [AutoDev](https://github.com/mohamedameen/autodev) Python package.
+Node.js wrapper for the [ai-autodev](https://github.com/mohamedameen/autodev) Python package.
 
 ## Installation
 
 ```bash
-npm install -g autodev
+npm install -g ai-autodev
 ```
 
 Or use it directly via `npx`:
 
 ```bash
-npx autodev --help
+npx ai-autodev --help
 ```
 
 ## Requirements
