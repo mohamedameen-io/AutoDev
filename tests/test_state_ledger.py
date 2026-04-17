@@ -238,3 +238,264 @@ async def test_read_entries_nonexistent_returns_empty(tmp_path: Path) -> None:
     out, entries = replay_ledger(tmp_path)
     assert out is None
     assert entries == []
+
+
+# ---------------------------------------------------------------------------
+# Extended coverage tests — _apply_op branches, _read_tail edge cases
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_replay_mark_blocked(tmp_path: Path) -> None:
+    """Append a mark_blocked op and verify task.status == 'blocked'."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="mark_blocked",
+            payload={"task_id": "1.1", "reason": "waiting for dep"},
+            session_id="s1",
+        )
+
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    task = out.phases[0].tasks[0]
+    assert task.status == "blocked"
+    assert task.blocked_reason == "waiting for dep"
+
+
+@pytest.mark.asyncio
+async def test_replay_mark_complete(tmp_path: Path) -> None:
+    """Append a mark_complete op and verify task.status == 'complete'."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="mark_complete",
+            payload={"task_id": "1.2"},
+            session_id="s1",
+        )
+
+    out, _ = replay_ledger(tmp_path)
+    assert out is not None
+    task = out.phases[0].tasks[1]
+    assert task.id == "1.2"
+    assert task.status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_replay_append_evidence(tmp_path: Path) -> None:
+    """Append an append_evidence op and verify task.evidence_bundle."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="append_evidence",
+            payload={"task_id": "1.1", "path": ".autodev/evidence/1.1-developer.json"},
+            session_id="s1",
+        )
+
+    out, _ = replay_ledger(tmp_path)
+    assert out is not None
+    task = out.phases[0].tasks[0]
+    assert task.evidence_bundle == ".autodev/evidence/1.1-developer.json"
+
+
+@pytest.mark.asyncio
+async def test_replay_unknown_op_raises(tmp_path: Path) -> None:
+    """An unknown op in the ledger should raise LedgerCorruptError.
+
+    The LedgerEntry schema enforces a Literal type on ``op``, so an
+    unrecognised op triggers a schema validation error during read_entries
+    (before _apply_op is even reached).
+    """
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+
+    # Manually forge a ledger line with an unknown op.
+    lp = ledger_path(tmp_path)
+    lines = lp.read_text().strip().splitlines()
+    last = json.loads(lines[-1])
+    forged: dict = {
+        "seq": last["seq"] + 1,
+        "timestamp": _iso(),
+        "session_id": "s1",
+        "op": "totally_unknown",
+        "payload": {},
+        "prev_hash": last["self_hash"],
+    }
+    forged["self_hash"] = compute_hash(forged)
+    with lp.open("a") as fh:
+        fh.write(json.dumps(forged, sort_keys=True) + "\n")
+
+    with pytest.raises(LedgerCorruptError, match="schema validation"):
+        replay_ledger(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_replay_update_task_with_all_metadata(tmp_path: Path) -> None:
+    """update_task_status with blocked_reason, retry_count, escalated, evidence_bundle."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="update_task_status",
+            payload={
+                "task_id": "1.1",
+                "status": "in_progress",
+                "blocked_reason": "api timeout",
+                "retry_count": 3,
+                "escalated": True,
+                "evidence_bundle": "/evidence/1.1.json",
+            },
+            session_id="s1",
+        )
+
+    out, _ = replay_ledger(tmp_path)
+    assert out is not None
+    task = out.phases[0].tasks[0]
+    assert task.status == "in_progress"
+    assert task.blocked_reason == "api timeout"
+    assert task.retry_count == 3
+    assert task.escalated is True
+    assert task.evidence_bundle == "/evidence/1.1.json"
+
+
+@pytest.mark.asyncio
+async def test_plan_tournament_complete_is_noop(tmp_path: Path) -> None:
+    """plan_tournament_complete should not mutate the plan."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="plan_tournament_complete",
+            payload={"tournament_id": "t1"},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    assert len(entries) == 2
+    # Plan should be exactly as initialized — tournament op did not mutate it.
+    assert out.plan_id == "p-test"
+    assert out.phases[0].tasks[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_impl_tournament_complete_is_noop(tmp_path: Path) -> None:
+    """impl_tournament_complete should not mutate the plan."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="impl_tournament_complete",
+            payload={"tournament_id": "t2"},
+            session_id="s1",
+        )
+
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    assert len(entries) == 2
+    assert out.phases[0].tasks[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_corrupt_last_line_raises(tmp_path: Path) -> None:
+    """Invalid JSON as the last line triggers LedgerCorruptError on next append."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+
+    # Corrupt the file by appending a complete but non-JSON line.
+    lp = ledger_path(tmp_path)
+    with lp.open("a") as fh:
+        fh.write("this is not json at all\n")
+
+    with pytest.raises(LedgerCorruptError, match="not valid JSON"):
+        async with plan_lock(tmp_path):
+            await append_entry(
+                tmp_path,
+                op="update_task_status",
+                payload={"task_id": "1.1", "status": "in_progress"},
+                session_id="s1",
+            )
+
+
+@pytest.mark.asyncio
+async def test_missing_seq_hash_fields_raises(tmp_path: Path) -> None:
+    """Valid JSON without seq/self_hash fields triggers LedgerCorruptError."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+
+    # Write valid JSON that lacks required fields as the last line.
+    lp = ledger_path(tmp_path)
+    with lp.open("a") as fh:
+        fh.write(json.dumps({"op": "noop", "payload": {}}) + "\n")
+
+    with pytest.raises(LedgerCorruptError, match="missing seq/self_hash"):
+        async with plan_lock(tmp_path):
+            await append_entry(
+                tmp_path,
+                op="update_task_status",
+                payload={"task_id": "1.1", "status": "in_progress"},
+                session_id="s1",
+            )

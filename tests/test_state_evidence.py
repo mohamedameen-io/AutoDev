@@ -149,3 +149,65 @@ async def test_write_patch_creates_file(tmp_path: Path) -> None:
     assert path.exists()
     assert path.name == "1.1.patch"
     assert "diff --git" in path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Extended coverage tests — edge cases for read/write/list
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_evidence_missing_file(tmp_path: Path) -> None:
+    """Reading evidence for a task that never had evidence returns None."""
+    result = await read_evidence(tmp_path, "nonexistent_task", "developer")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_read_evidence_invalid_json(tmp_path: Path) -> None:
+    """Garbage content in evidence file returns None."""
+    from state.paths import evidence_path
+
+    path = evidence_path(tmp_path, "bad", "developer")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{{not valid json!!", encoding="utf-8")
+
+    result = await read_evidence(tmp_path, "bad", "developer")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_read_evidence_invalid_schema(tmp_path: Path) -> None:
+    """Valid JSON but wrong schema returns None (pydantic validation fails)."""
+    import json
+    from state.paths import evidence_path
+
+    path = evidence_path(tmp_path, "schema_fail", "developer")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Valid JSON but missing required fields / wrong discriminator.
+    path.write_text(
+        json.dumps({"kind": "nonexistent_kind", "task_id": "x"}),
+        encoding="utf-8",
+    )
+
+    result = await read_evidence(tmp_path, "schema_fail", "developer")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_write_patch_creates_file_extended(tmp_path: Path) -> None:
+    """write_patch with arbitrary diff text creates the expected .patch file."""
+    diff_text = "--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
+    path = await write_patch(tmp_path, "2.1", diff_text)
+    assert path.exists()
+    assert path.name == "2.1.patch"
+    content = path.read_text(encoding="utf-8")
+    assert "--- a/foo.py" in content
+    assert "+new" in content
+
+
+@pytest.mark.asyncio
+async def test_list_evidence_empty_dir(tmp_path: Path) -> None:
+    """list_evidence when no evidence dir exists returns empty list."""
+    items = await list_evidence(tmp_path, "anything")
+    assert items == []
