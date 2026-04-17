@@ -21,7 +21,7 @@
 AutoDev is a **typed, crash-safe, auditable orchestration engine** that turns your existing Claude Code or Cursor subscription into a disciplined multi-agent development pipeline. It decomposes every feature request into a bounded finite state machine — *explore → plan → critique → code → review → test → merge* — and wraps the two highest-leverage decisions (the plan, and every individual diff) in a tournament-based self-refinement loop: a fresh critic identifies faults, a fresh author proposes a revision, a synthesizer merges the two, and N independent judges rank the variants via Borda count with a conservative tiebreak to the incumbent. Each role runs as a specialized agent with its own system prompt, model tier, and allow-listed tools — so **no model ever evaluates its own output**. The entire trajectory (delegations, tool calls, diffs, critiques, judge rankings, test results) is appended to a content-addressed JSONL ledger under `.autodev/`, making every run replayable, diffable, and auditable. If the process dies mid-task, `autodev resume` reconstructs state via ledger replay and continues at the exact FSM edge it left.
 
 ```bash
-pip install autodev    # or: npm install -g autodev
+pip install ai-autodev
 ```
 
 ---
@@ -182,7 +182,10 @@ Every decision is reconstructable from disk — why a judge ranked B above A, wh
 
 ```bash
 cd /your/project
-autodev init --inline       # detects .claude/ or .cursor/, writes auto-resume config
+autodev init --inline                     # renders agent files for both platforms, writes auto-resume config
+# or specify a platform explicitly:
+autodev init --inline --platform claude   # Claude Code only
+autodev init --inline --platform cursor   # Cursor only
 ```
 
 Then, in your agent (Claude Code or Cursor), describe what you want built:
@@ -393,16 +396,14 @@ See [`docs/design_documentation/tournaments.md`](docs/design_documentation/tourn
 
 ```bash
 # Install once, globally
-pip install autodev
-# or
-npm install -g autodev
+pip install ai-autodev
 
 # Opt in per project
 cd /your/project
 autodev init --inline
 ```
 
-The `--inline` flag writes a managed section to `.claude/CLAUDE.md` or `.cursor/rules/autodev.mdc` instructing your agent to:
+The `--inline` flag renders agent files for both platforms (`.claude/agents/<role>.md` and `.cursor/rules/<role>.mdc`) and writes a managed auto-resume section instructing your agent to:
 
 1. Watch `.autodev/delegations/` for work.
 2. Execute tasks using its own tools.

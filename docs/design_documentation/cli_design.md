@@ -433,7 +433,7 @@ The npm package (`npm/`) provides a Node.js wrapper that:
 flowchart LR
     USER["npx autodev plan '...'"] --> NPM["npm/src/cli/index.ts"]
     NPM --> VENV{"venv exists?"}
-    VENV -->|no| CREATE["python3 -m venv<br/>pip install autodev.whl"]
+    VENV -->|no| CREATE["python3 -m venv<br/>pip install ai_autodev.whl"]
     VENV -->|yes| EXEC["execFileSync(autodev, args)"]
     CREATE --> EXEC
     EXEC --> PY["Python autodev CLI"]
@@ -589,7 +589,7 @@ Environment variable: `AUTODEV_PLATFORM` can override platform detection (handle
 autodev = "cli:main"
 ```
 
-After `pip install autodev` (or `uv pip install -e .`), the `autodev` command is available on PATH.
+After `pip install ai-autodev` (or `uv pip install -e .`), the `autodev` command is available on PATH.
 
 ### 10.2 npm Distribution
 
@@ -601,7 +601,7 @@ After `pip install autodev` (or `uv pip install -e .`), the `autodev` command is
 }
 ```
 
-After `npm install autodev`, the npm wrapper is available. On first invocation, it creates `~/.config/autodev/venv/` and installs the bundled Python wheel.
+After `pip install ai-autodev`, the `autodev` command is available on PATH.
 
 ### 10.3 CLI Commands Summary
 
