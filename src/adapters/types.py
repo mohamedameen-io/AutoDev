@@ -65,6 +65,7 @@ class AgentSpec(BaseModel):
     prompt: str
     tools: list[str] = Field(default_factory=list)
     model: str | None = None
+    max_turns: int | None = None
 
 
 class StreamEvent(BaseModel):

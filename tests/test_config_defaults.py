@@ -69,6 +69,14 @@ def test_resolve_model_claude_developer() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_default_config_sets_max_turns_per_role() -> None:
+    cfg = default_config()
+    assert cfg.agents["architect"].max_turns == 5
+    assert cfg.agents["developer"].max_turns == 10
+    assert cfg.agents["judge"].max_turns == 1
+    assert cfg.agents["explorer"].max_turns == 3
+
+
 def test_default_config_cursor_platform() -> None:
     """default_config(platform='cursor') should use cursor-specific model resolution."""
     cfg = default_config(platform="cursor")

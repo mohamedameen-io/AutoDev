@@ -132,7 +132,7 @@ class _CoderRunner:
             cwd=worktree,
             model=developer_spec.model,
             allowed_tools=list(developer_spec.tools) if developer_spec.tools else None,
-            max_turns=1,
+            max_turns=developer_spec.max_turns or 1,
         )
         developer_result = await orch.adapter.execute(developer_inv)
 
@@ -172,7 +172,7 @@ class _CoderRunner:
             cwd=worktree,
             model=test_spec.model,
             allowed_tools=list(test_spec.tools) if test_spec.tools else None,
-            max_turns=1,
+            max_turns=test_spec.max_turns or 1,
         )
         test_result = await orch.adapter.execute(test_inv)
         passed, failed, total = _parse_test_counts(test_result.text)

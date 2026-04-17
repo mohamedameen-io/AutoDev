@@ -31,6 +31,7 @@ class AgentConfig(BaseModel):
 
     model: str | None = None
     disabled: bool = False
+    max_turns: int | None = None  # None = use role default
 
 
 class TournamentPhaseConfig(BaseModel):

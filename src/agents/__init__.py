@@ -154,6 +154,7 @@ def build_registry(cfg: AutodevConfig) -> dict[str, AgentSpec]:
             prompt=rendered,
             tools=tools,
             model=agent_cfg.model,
+            max_turns=agent_cfg.max_turns,
         )
 
     return registry

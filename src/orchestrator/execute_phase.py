@@ -398,7 +398,7 @@ async def delegate(
         cwd=orch.cwd,
         model=spec.model,
         allowed_tools=list(spec.tools) if spec.tools else None,
-        max_turns=1,
+        max_turns=spec.max_turns or 1,
     )
 
     # Inline adapter: check for existing response (resume shortcut) or inject

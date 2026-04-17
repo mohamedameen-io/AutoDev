@@ -98,6 +98,13 @@ def test_build_registry_missing_role_raises() -> None:
         build_registry(cfg)
 
 
+def test_registry_propagates_max_turns() -> None:
+    cfg = default_config()
+    registry = build_registry(cfg)
+    assert registry["architect"].max_turns == 5
+    assert registry["judge"].max_turns == 1
+
+
 def test_tournament_prompts_loaded_when_available() -> None:
     """Tournament roles pick up prompts from tournament.prompts."""
     importorskip_reason = None

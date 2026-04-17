@@ -9,7 +9,7 @@ import pytest
 
 from config.defaults import default_config
 from config.loader import expand_paths, load_config, save_config
-from config.schema import REQUIRED_AGENT_ROLES, AutodevConfig
+from config.schema import AgentConfig, REQUIRED_AGENT_ROLES, AutodevConfig
 from errors import ConfigError
 
 
@@ -77,6 +77,16 @@ def test_expand_paths_resolves_home() -> None:
     assert not str(expanded.hive.path).startswith("~")
     # Original config should be untouched.
     assert str(cfg.hive.path).startswith("~")
+
+
+def test_agent_config_accepts_max_turns() -> None:
+    cfg = AgentConfig(model="sonnet", max_turns=5)
+    assert cfg.max_turns == 5
+
+
+def test_agent_config_max_turns_default_none() -> None:
+    cfg = AgentConfig()
+    assert cfg.max_turns is None
 
 
 def test_unknown_top_level_field_rejected(tmp_path: Path) -> None:

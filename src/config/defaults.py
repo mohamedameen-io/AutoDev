@@ -32,6 +32,23 @@ _AGENT_MODEL_DEFAULTS: dict[str, str | None] = {
     "judge": None,
 }
 
+_AGENT_MAX_TURNS: dict[str, int] = {
+    "architect": 5,
+    "explorer": 3,
+    "domain_expert": 3,
+    "developer": 10,
+    "reviewer": 3,
+    "test_engineer": 5,
+    "critic_sounding_board": 3,
+    "critic_drift_verifier": 3,
+    "docs": 3,
+    "designer": 3,
+    "critic_t": 1,
+    "architect_b": 5,
+    "synthesizer": 1,
+    "judge": 1,
+}
+
 
 def resolve_model(model: str | None, role: str, platform: str) -> str:
     """Resolve model based on platform and role.
@@ -72,7 +89,10 @@ def resolve_model(model: str | None, role: str, platform: str) -> str:
 def default_config(platform: str = "auto") -> AutodevConfig:
     """Return the shipped default configuration."""
     agents = {
-        name: AgentConfig(model=resolve_model(model, name, platform))
+        name: AgentConfig(
+            model=resolve_model(model, name, platform),
+            max_turns=_AGENT_MAX_TURNS.get(name, 1),
+        )
         for name, model in _AGENT_MODEL_DEFAULTS.items()
     }
     return AutodevConfig(
