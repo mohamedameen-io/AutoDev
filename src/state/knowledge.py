@@ -582,8 +582,27 @@ class KnowledgeStore:
         if not merged:
             return ""
 
+        selected = merged[:cap]
+
+        # Increment applied_count for each selected swarm entry (read-modify-write).
+        swarm_ids = {e.id for e in selected if e.tier == "swarm"}
+        if swarm_ids:
+            try:
+                swarm_file = knowledge_path(self._cwd)
+                async with plan_lock(self._cwd):
+                    swarm_raw = await asyncio.to_thread(_read_jsonl, swarm_file)
+                    updated = False
+                    for d in swarm_raw:
+                        if d.get("id") in swarm_ids:
+                            d["applied_count"] = int(d.get("applied_count", 0)) + 1
+                            updated = True
+                    if updated:
+                        await asyncio.to_thread(_write_jsonl, swarm_file, swarm_raw)
+            except Exception:  # noqa: BLE001
+                self._log.warning("knowledge.inject.applied_count_update_failed")
+
         lines = ["Lessons learned from prior work:"]
-        for e in merged[:cap]:
+        for e in selected:
             lines.append(f"- [conf:{e.confidence:.2f}] {_one_line(e.text)}")
         return "\n".join(lines)
 

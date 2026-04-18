@@ -290,7 +290,12 @@ async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
                     )
             task = await orch.plan_manager.update_task_status(task.id, "tournamented")
 
-            # Step 7: complete.
+            # Step 7: extract and record lessons from agent outputs.
+            await _record_lessons(orch, task.id, developer_result.text, "developer")
+            await _record_lessons(orch, task.id, review_result.text, "reviewer")
+            await _record_lessons(orch, task.id, test_result.text, "test_engineer")
+
+            # Step 8: complete.
             task = await orch.plan_manager.update_task_status(
                 task.id,
                 "complete",
@@ -562,6 +567,44 @@ async def _run_qa_gates(orch: "Orchestrator", task: "Task") -> str | None:
         if not result.passed:
             return result.details or "QA gate failed"
     return None
+
+
+async def _record_lessons(
+    orch: "Orchestrator",
+    task_id: str,
+    output_text: str,
+    role: str,
+) -> None:
+    """Scan ``output_text`` for ``LESSON:`` prefixed lines and record each.
+
+    Extraction is lightweight: only lines that start with ``LESSON:``
+    (case-insensitive, after stripping whitespace) are recorded.  Each lesson
+    is recorded with confidence 0.7 and the agent's role as ``role_source``.
+
+    If ``orch.knowledge`` is None or recording raises, a WARNING is logged and
+    execution continues — knowledge errors must never block task completion.
+    """
+    if not output_text:
+        return
+    lessons: list[str] = []
+    for line in output_text.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("LESSON:"):
+            lesson_text = stripped[len("LESSON:"):].strip()
+            if lesson_text:
+                lessons.append(lesson_text)
+    if not lessons:
+        return
+    for lesson_text in lessons:
+        try:
+            await orch.knowledge.record(lesson_text, role, confidence=0.7)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.knowledge_record_failed",
+                task_id=task_id,
+                role=role,
+                err=str(exc),
+            )
 
 
 __all__ = [
