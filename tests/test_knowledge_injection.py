@@ -157,3 +157,46 @@ async def test_inject_limit_zero_returns_empty(
     store = KnowledgeStore(tmp_path, cfg=cfg, hive_path=hive_file)
     await _seed_swarm(store, how_many=2)
     assert await store.inject_block("developer", limit=0) == ""
+
+
+@pytest.mark.asyncio
+async def test_inject_block_increments_applied_count(
+    tmp_path: Path, hive_file: Path
+) -> None:
+    """inject_block must increment applied_count on each selected swarm entry."""
+    cfg = default_config()
+    cfg.hive.enabled = False
+    cfg.knowledge.max_inject_count = 2
+    store = KnowledgeStore(tmp_path, cfg=cfg, hive_path=hive_file)
+
+    # Record two disjoint lessons.
+    await store.record(
+        _DISJOINT_LESSONS[0],
+        role_source="developer",
+        confidence=0.8,
+    )
+    await store.record(
+        _DISJOINT_LESSONS[1],
+        role_source="developer",
+        confidence=0.7,
+    )
+
+    # Before injection, applied_count should be 0 for all entries.
+    entries_before = await store.read_all(tier="swarm")
+    assert all(e.applied_count == 0 for e in entries_before)
+
+    # Call inject_block — this should select and inject the top-2 entries.
+    block = await store.inject_block("developer")
+    assert "Lessons learned from prior work:" in block
+
+    # After injection, the selected entries should have applied_count == 1.
+    entries_after = await store.read_all(tier="swarm")
+    assert all(e.applied_count == 1 for e in entries_after), (
+        f"Expected applied_count=1 for all entries, got: "
+        f"{[(e.text[:20], e.applied_count) for e in entries_after]}"
+    )
+
+    # A second injection should increment to 2.
+    await store.inject_block("developer")
+    entries_after2 = await store.read_all(tier="swarm")
+    assert all(e.applied_count == 2 for e in entries_after2)
