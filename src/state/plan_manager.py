@@ -15,9 +15,9 @@ from errors import PlanConcurrentModificationError
 from autologging import get_logger
 from state.ledger import (
     LedgerEntry,
+    _apply_op,
     append_entry,
     read_entries,
-    replay_ledger,
     snapshot_plan,
 )
 from state.lockfile import plan_lock
@@ -90,8 +90,11 @@ class PlanManager:
                 base_plan = _apply_for_load(base_plan, later)
             return base_plan
 
-        # Full replay (no snapshot yet).
-        plan, _ = replay_ledger(self._cwd)
+        # Full replay (no snapshot yet) — reuse the already-read entries to
+        # avoid a second disk read inside replay_ledger().
+        plan: Plan | None = None
+        for entry in entries:
+            plan = _apply_op(plan, entry)
         return plan
 
     async def init_plan(self, plan: Plan) -> Plan:
@@ -358,6 +361,10 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
 
     if op == "plan_tournament_complete":
         # Audit-only breadcrumb (see ledger._apply_op). No plan mutation.
+        return plan
+
+    if op == "impl_tournament_complete":
+        # Audit-only breadcrumb. No plan state mutation.
         return plan
 
     return plan
