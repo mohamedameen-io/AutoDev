@@ -54,8 +54,12 @@ class CursorAdapter(PlatformAdapter):
         return cmd
 
     async def init_workspace(self, cwd: Path, agents: list[AgentSpec]) -> None:
+        # No-op for Phase 2: the Cursor CLI does not support a workspace
+        # configuration file equivalent to `.claude/agents/`. Agent constraints
+        # are expressed via `.cursor/rules/` MDC files, which must be authored
+        # manually for now.
         # TODO(phase-3): render `.cursor/rules/<name>.mdc` from AgentSpec via
-        # agents.render_cursor. No-op stub for Phase 2.
+        # agents.render_cursor to automate rule generation.
         logger.info(
             "cursor.init_workspace_stub",
             cwd=str(cwd),

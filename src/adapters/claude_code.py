@@ -54,8 +54,12 @@ class ClaudeCodeAdapter(PlatformAdapter):
         return cmd
 
     async def init_workspace(self, cwd: Path, agents: list[AgentSpec]) -> None:
+        # No-op: the claude CLI receives all agent instructions via the
+        # `--prompt` flag passed directly to the subprocess in `_build_command`.
+        # There is no workspace configuration file for `claude -p` to pick up,
+        # so nothing needs to be written here.
         # TODO(phase-3): render `.claude/agents/<name>.md` from AgentSpec via
-        # agents.render_claude. No-op stub for Phase 2.
+        # agents.render_claude to support persistent sub-agent configurations.
         logger.info(
             "claude_code.init_workspace_stub",
             cwd=str(cwd),

@@ -1,7 +1,27 @@
 """Shared fixtures for integration tests.
 
-All tests default to StubAdapter (no live LLM calls).
-Set AUTODEV_LIVE=1 to enable real ``claude -p`` calls.
+Test boundary
+-------------
+There are two tiers of integration tests in this package:
+
+**Stub-backed tests** (default)
+    Use :class:`~adapters.stub.StubAdapter` instead of a real LLM binary.
+    These run with no special environment variables and are safe to execute in
+    CI without network access or API credentials.  The vast majority of tests
+    in this package fall into this category.
+
+**Live tests**
+    Invoke the real ``claude -p`` subprocess (or equivalent) and make actual
+    LLM calls.  A test opts into live mode by requesting the :func:`live_mode`
+    fixture, which skips automatically unless the ``AUTODEV_LIVE=1`` environment
+    variable is set:
+
+    .. code-block:: shell
+
+        AUTODEV_LIVE=1 pytest tests/integration/ -v
+
+    Live tests are excluded from normal CI runs to avoid flakiness caused by
+    network conditions or model availability.
 """
 
 from __future__ import annotations

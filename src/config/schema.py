@@ -60,6 +60,10 @@ class QAGatesConfig(BaseModel):
     build_check: bool = True
     test_runner: bool = True
     secretscan: bool = True
+    # These two fields are NOT dispatched by _run_qa_gates. They are consumed
+    # exclusively by agent prompts (e.g. architect.md) to drive security-tier
+    # routing decisions at planning time. Dispatching them as actual gates is
+    # planned in ADR-008 (see line 104 of this file).
     sast_scan: bool = False
     mutation_test: bool = False
 
