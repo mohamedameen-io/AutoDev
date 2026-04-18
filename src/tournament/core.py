@@ -65,7 +65,17 @@ class ContentHandler(Protocol, Generic[T]):
     def render_for_synthesizer(self, task_prompt: str, x: T, y: T) -> str: ...
     def render_for_judge(
         self, task_prompt: str, v_a: T, v_b: T, v_ab: T, order_map: dict[int, str]
-    ) -> str: ...
+    ) -> str:
+        """Render judge prompt with proposals in the order dictated by order_map.
+
+        `order_map` maps 1-based display position to canonical label: e.g.
+        ``{1: "B", 2: "AB", 3: "A"}`` means proposal 1 shown to the judge is
+        variant B, proposal 2 is AB, and proposal 3 is A. Implementations must
+        present proposals in this shuffled order so judges cannot infer identity
+        from position, and must use the same map to inverse-translate
+        judge-emitted position numbers back to canonical labels after judging.
+        """
+        ...
     def parse_revision(self, revision_text: str, original: T) -> T: ...
     def parse_synthesis(self, synth_text: str, a: T, b: T) -> T: ...
     def render_as_markdown(self, t: T) -> str: ...
@@ -103,34 +113,37 @@ def parse_ranking(text: str, valid_labels: str = "123") -> list[str] | None:
     """Parse the last RANKING: line into a list of valid characters.
 
     Returns a list like `["1","3","2"]` on success or `None` on failure.
-    A RANKING with fewer than 2 digits is rejected (treated as parse failure).
+    A RANKING with fewer valid digits than `len(valid_labels)` is rejected
+    (treated as parse failure) to avoid giving the omitted candidate a
+    systematic 0-point disadvantage in Borda aggregation.
     """
     for line in reversed(text.split("\n")):
         line = line.strip().strip("*").strip().lstrip("#").strip()
         if line.upper().startswith("RANKING:"):
             raw = line.split(":", 1)[1].strip()
             items = [c for c in raw if c in valid_labels]
-            if len(items) >= 2:
+            if len(items) >= len(valid_labels):
                 return items
     return None
 
 
 def randomize_for_judge(
     v_a: T, v_b: T, v_ab: T, rng: random.Random
-) -> tuple[list[T], dict[int, str]]:
-    """Shuffle (A, B, AB) into a random display order.
+) -> dict[int, str]:
+    """Shuffle (A, B, AB) into a random display order and return the order map.
 
-    Returns `(shuffled_proposals, order_map)` where `order_map[pos_index]` maps
-    a 1-based display index back to the canonical label ("A" | "B" | "AB").
+    Returns `order_map` where `order_map[pos_index]` maps a 1-based display
+    index back to the canonical label ("A" | "B" | "AB"). Callers use this to
+    pass a consistent order to :meth:`ContentHandler.render_for_judge` and to
+    inverse-map judge-emitted position numbers back to canonical labels after
+    judging.
     """
     versions = [("A", v_a), ("B", v_b), ("AB", v_ab)]
     rng.shuffle(versions)
     order: dict[int, str] = {}
-    proposals: list[T] = []
-    for i, (label, content) in enumerate(versions, 1):
+    for i, (label, _content) in enumerate(versions, 1):
         order[i] = label
-        proposals.append(content)
-    return proposals, order
+    return order
 
 
 def aggregate_rankings(
@@ -335,7 +348,7 @@ class Tournament(Generic[T]):
         orders: list[dict[int, str]] = []
         coros = []
         for _ in range(self.cfg.num_judges):
-            _, order = randomize_for_judge(v_a, v_b, v_ab, self.rng)
+            order = randomize_for_judge(v_a, v_b, v_ab, self.rng)
             orders.append(order)
             user = self.handler.render_for_judge(task_prompt, v_a, v_b, v_ab, order)
             coros.append(self._guarded_judge(user, model))

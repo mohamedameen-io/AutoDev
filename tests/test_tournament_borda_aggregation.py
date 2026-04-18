@@ -8,7 +8,7 @@ given = hypothesis.given
 settings = hypothesis.settings
 st = hypothesis.strategies
 
-from tournament import aggregate_rankings
+from tournament import aggregate_rankings, parse_ranking
 
 
 # ── Basic cases ───────────────────────────────────────────────────────────
@@ -68,6 +68,33 @@ def test_empty_rankings_fallback_to_tiebreak() -> None:
     assert scores == {"A": 0, "B": 0, "AB": 0}
     assert valid == 0
     assert winner == "A"
+
+
+# ── parse_ranking guard ───────────────────────────────────────────────────
+
+def test_parse_ranking_incomplete_returns_none() -> None:
+    """A 2-element ranking when 3 labels are expected must return None.
+
+    Without this guard the omitted candidate receives 0 Borda points — a
+    systematic disadvantage that biases aggregation against it.
+    """
+    text = "Some analysis\nRANKING: 1 3"  # only 2 of 3 positions filled
+    result = parse_ranking(text, valid_labels="123")
+    assert result is None
+
+
+def test_parse_ranking_complete_three_labels_accepted() -> None:
+    """A complete 3-element ranking must be accepted normally."""
+    text = "Analysis\nRANKING: 2 1 3"
+    result = parse_ranking(text, valid_labels="123")
+    assert result == ["2", "1", "3"]
+
+
+def test_parse_ranking_single_element_returns_none() -> None:
+    """A 1-element ranking when 3 labels are expected must also return None."""
+    text = "RANKING: 2"
+    result = parse_ranking(text, valid_labels="123")
+    assert result is None
 
 
 # ── Tiebreak behaviour ────────────────────────────────────────────────────
