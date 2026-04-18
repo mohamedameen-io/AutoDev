@@ -37,7 +37,6 @@ def test_version_works() -> None:
     result = runner.invoke(cli, ["--version"])
     assert result.exit_code == 0
     assert __version__ in result.output
-    assert "0.0.1" in result.output
 
 
 def test_doctor_in_empty_dir(tmp_path: Path) -> None:
