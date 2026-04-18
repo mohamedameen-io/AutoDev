@@ -19,7 +19,6 @@ Always-on defaults (set by the orchestrator, not here): ``num_judges=1``,
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import random
 import time
@@ -36,13 +35,10 @@ from tournament.core import (
     TournamentConfig,
     WinnerLabel,
     aggregate_rankings,
-    randomize_for_judge,
-    parse_ranking,
 )
 from tournament.prompts import (
     ARCHITECT_B_SYSTEM,
     CRITIC_SYSTEM,
-    JUDGE_SYSTEM,
     SYNTHESIZER_SYSTEM,
 )
 
@@ -437,22 +433,21 @@ class ImplTournament(Tournament[ImplBundle]):
     ) -> tuple[WinnerLabel, ImplBundle, PassResult]:
         """CRITIC -> ARCHITECT_B (realize B) -> SYNTHESIZER (realize AB) -> JUDGES."""
         assert isinstance(self.handler, ImplContentHandler)
-        handler: ImplContentHandler = self.handler  # for mypy
 
-        hash_before = handler.hash(incumbent)
+        hash_before = self.handler.hash(incumbent)
         t0 = time.time()
         model = self.cfg.model
 
-        version_a_md = handler.render_as_markdown(incumbent)
+        version_a_md = self.handler.render_as_markdown(incumbent)
 
         # 1. Critic on A.
-        critic_user = handler.render_for_critic(incumbent, task_prompt)
+        critic_user = self.handler.render_for_critic(incumbent, task_prompt)
         critic_text = await self.client.call(
             system=CRITIC_SYSTEM, user=critic_user, role="critic_t", model=model
         )
 
         # 2. Architect_B proposes direction text; realize B in its own worktree.
-        architect_b_user = handler.render_for_architect_b(
+        architect_b_user = self.handler.render_for_architect_b(
             task_prompt, incumbent, critic_text
         )
         revision_direction = await self.client.call(
@@ -472,7 +467,7 @@ class ImplTournament(Tournament[ImplBundle]):
             v_x, v_y = incumbent, v_b
         else:
             v_x, v_y = v_b, incumbent
-        synth_user = handler.render_for_synthesizer(task_prompt, v_x, v_y)
+        synth_user = self.handler.render_for_synthesizer(task_prompt, v_x, v_y)
         synth_direction = await self.client.call(
             system=SYNTHESIZER_SYSTEM,
             user=synth_user,
@@ -486,8 +481,8 @@ class ImplTournament(Tournament[ImplBundle]):
         )
 
         # 4. N parallel judges with randomized presentation.
-        rankings, judge_details = await self._run_judges_impl(
-            task_prompt, incumbent, v_b, v_ab, model, handler
+        rankings, judge_details = await self._run_judges(
+            task_prompt, incumbent, v_b, v_ab, model
         )
 
         # 5. Borda aggregation with conservative tiebreak to A.
@@ -496,8 +491,8 @@ class ImplTournament(Tournament[ImplBundle]):
             rankings, labels=["A", "B", "AB"], tiebreak_winner=tiebreak
         )
 
-        version_b_md = handler.render_as_markdown(v_b)
-        version_ab_md = handler.render_as_markdown(v_ab)
+        version_b_md = self.handler.render_as_markdown(v_b)
+        version_ab_md = self.handler.render_as_markdown(v_ab)
         elapsed = time.time() - t0
         winners_map: dict[str, ImplBundle] = {
             "A": incumbent,
@@ -505,7 +500,7 @@ class ImplTournament(Tournament[ImplBundle]):
             "AB": v_ab,
         }
         chosen = winners_map[winner]
-        hash_after = handler.hash(chosen)
+        hash_after = self.handler.hash(chosen)
 
         result = PassResult(
             pass_num=pass_num,
@@ -588,66 +583,6 @@ class ImplTournament(Tournament[ImplBundle]):
         if realized.variant_label != variant_label:
             realized = replace(realized, variant_label=variant_label)  # type: ignore[arg-type]
         return realized
-
-    async def _run_judges_impl(
-        self,
-        task_prompt: str,
-        v_a: ImplBundle,
-        v_b: ImplBundle,
-        v_ab: ImplBundle,
-        model: str | None,
-        handler: ImplContentHandler,
-    ) -> tuple[list[list[str] | None], list[dict[str, Any]]]:
-        """Spawn N judges concurrently with ImplBundle-aware rendering."""
-        orders: list[dict[int, str]] = []
-        coros = []
-        for _ in range(self.cfg.num_judges):
-            _, order = randomize_for_judge(v_a, v_b, v_ab, self.rng)
-            orders.append(order)
-            user = handler.render_for_judge(task_prompt, v_a, v_b, v_ab, order)
-            coros.append(self._guarded_judge_impl(user, model))
-
-        responses = await asyncio.gather(*coros, return_exceptions=True)
-
-        rankings: list[list[str] | None] = []
-        judge_details: list[dict[str, Any]] = []
-        for resp, order in zip(responses, orders):
-            if isinstance(resp, BaseException):
-                rankings.append(None)
-                judge_details.append(
-                    {
-                        "error": str(resp),
-                        "order": {str(k): v for k, v in order.items()},
-                    }
-                )
-                continue
-            raw_ranking = parse_ranking(resp, "123")
-            if raw_ranking is None:
-                rankings.append(None)
-                judge_details.append(
-                    {
-                        "ranking": None,
-                        "order": {str(k): v for k, v in order.items()},
-                        "raw_response": resp,
-                    }
-                )
-            else:
-                mapped = [order.get(int(r), r) for r in raw_ranking]
-                rankings.append(mapped)
-                judge_details.append(
-                    {
-                        "ranking": mapped,
-                        "order": {str(k): v for k, v in order.items()},
-                        "raw_response": resp,
-                    }
-                )
-        return rankings, judge_details
-
-    async def _guarded_judge_impl(self, user: str, model: str | None) -> str:
-        async with self._sem:
-            return await self.client.call(
-                system=JUDGE_SYSTEM, user=user, role="judge", model=model
-            )
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
