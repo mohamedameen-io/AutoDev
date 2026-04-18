@@ -50,6 +50,7 @@ class AgentResult(BaseModel):
     files_changed: list[Path] = Field(default_factory=list)
     diff: str | None = None
     duration_s: float
+    cost_usd: float = 0.0
     error: str | None = None
     raw_stdout: str = ""
     raw_stderr: str = ""

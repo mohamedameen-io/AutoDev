@@ -45,6 +45,7 @@
   },
   "qa_retry_limit": 2,
   "guardrails": {
+    "max_invocations_per_task": 30,
     "max_tool_calls_per_task": 30,
     "max_duration_s_per_task": 300,
     "max_diff_bytes": 524288,

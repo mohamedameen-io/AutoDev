@@ -71,6 +71,11 @@ class QAGatesConfig(BaseModel):
 class GuardrailsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Upper bound on agent round-trips per task (enforced in pre_invocation).
+    max_invocations_per_task: int = 60
+    # Upper bound on cumulative tool calls per task. Requires stream-json
+    # parsing (Phase 3 functionality) to be fully enforced; currently
+    # tool_calls are populated only when stream-json is used.
     max_tool_calls_per_task: int = 60
     max_duration_s_per_task: int = 900
     max_diff_bytes: int = 5_242_880

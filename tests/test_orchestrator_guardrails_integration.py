@@ -79,6 +79,7 @@ async def test_tool_call_cap_blocks_task(tmp_path: Path) -> None:
     """Tight tool-call cap causes task to be marked blocked."""
     # Cap of 1 tool call total — coder returns 2 tool calls → cap exceeded.
     guardrails = GuardrailsConfig(
+        max_invocations_per_task=60,
         max_tool_calls_per_task=1,
         max_duration_s_per_task=900,
         max_diff_bytes=5_242_880,
@@ -100,6 +101,7 @@ async def test_tool_call_cap_blocks_task(tmp_path: Path) -> None:
 async def test_diff_size_cap_blocks_task(tmp_path: Path) -> None:
     """Tight diff-size cap causes task to be marked blocked."""
     guardrails = GuardrailsConfig(
+        max_invocations_per_task=60,
         max_tool_calls_per_task=60,
         max_duration_s_per_task=900,
         max_diff_bytes=5,  # 5 bytes — any real diff exceeds this
@@ -119,14 +121,15 @@ async def test_diff_size_cap_blocks_task(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_invocation_cap_blocks_task(tmp_path: Path) -> None:
-    """Tight invocation cap (max_tool_calls_per_task=1) blocks after 1 round-trip."""
+    """Tight invocation cap (max_invocations_per_task=1) blocks after 1 round-trip."""
     guardrails = GuardrailsConfig(
-        max_tool_calls_per_task=1,
+        max_invocations_per_task=1,
+        max_tool_calls_per_task=60,
         max_duration_s_per_task=900,
         max_diff_bytes=5_242_880,
     )
-    # Coder succeeds but reviewer triggers a second invocation (same role).
-    # With cap=1, the second pre_invocation raises.
+    # Coder succeeds but reviewer triggers a second invocation.
+    # With max_invocations_per_task=1, the second pre_invocation raises.
     coder_result = ok("wrote code")
     reviewer_result = ok("APPROVED\n- clean")
     adapter = StubAdapter({"developer": coder_result, "reviewer": reviewer_result})
@@ -157,6 +160,7 @@ async def test_guardrail_enforcer_attached_to_orchestrator(tmp_path: Path) -> No
 async def test_loop_detector_blocks_task_on_repeated_output(tmp_path: Path) -> None:
     """Repeated identical coder output triggers loop detection → task blocked."""
     guardrails = GuardrailsConfig(
+        max_invocations_per_task=60,
         max_tool_calls_per_task=60,
         max_duration_s_per_task=900,
         max_diff_bytes=5_242_880,
