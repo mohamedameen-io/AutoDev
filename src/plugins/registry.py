@@ -74,14 +74,18 @@ class QAGatePlugin(Protocol):
 
 @runtime_checkable
 class JudgeProviderPlugin(Protocol):
-    """A custom tournament judge that returns a ranking of version ids.
+    """A custom tournament judge that returns a ranking of version indices.
 
-    The return value is a list of version-id strings ordered best-to-worst.
+    The return value is a permutation of ``[0, 1, ..., len(versions)-1]``
+    ordered best-to-worst. Index 0 refers to the first element of ``versions``,
+    index 1 to the second, etc. For the standard three-way tournament call
+    ``rank(task, [v_a, v_b, v_ab])``, a valid return is e.g. ``[2, 0, 1]``
+    meaning ``v_ab`` is best, ``v_a`` is second, and ``v_b`` is worst.
     """
 
     name: str
 
-    async def rank(self, task: str, versions: list[Any]) -> list[str]:
+    async def rank(self, task: str, versions: list[Any]) -> list[int]:
         ...
 
 

@@ -192,6 +192,7 @@ class Tournament(Generic[T]):
         cfg: TournamentConfig,
         artifact_dir: Path,
         rng: random.Random | None = None,
+        judge_plugins: list[Any] | None = None,
     ) -> None:
         self.handler = handler
         self.client = client
@@ -201,6 +202,8 @@ class Tournament(Generic[T]):
         self.store = TournamentArtifactStore(artifact_dir)
         self.log = get_logger(component="tournament", artifact_dir=str(artifact_dir))
         self._sem = asyncio.Semaphore(max(1, cfg.max_parallel_subprocesses))
+        # Optional list of JudgeProviderPlugin instances to supplement LLM judges.
+        self._judge_plugins: list[Any] = judge_plugins or []
 
     async def run(self, task_prompt: str, initial: T) -> tuple[T, list[PassResult]]:
         """Run passes 1..max_rounds, converge when streak >= convergence_k.
@@ -344,7 +347,14 @@ class Tournament(Generic[T]):
         v_ab: T,
         model: str | None,
     ) -> tuple[list[list[str] | None], list[dict[str, Any]]]:
-        """Spawn N judges concurrently (capped by semaphore), parse rankings."""
+        """Spawn N judges concurrently (capped by semaphore), parse rankings.
+
+        After LLM judges complete, also invokes any registered
+        :class:`~plugins.registry.JudgeProviderPlugin` instances.  Each plugin
+        returns a permutation of ``[0, 1, 2]`` (best-to-worst indices into
+        ``[v_a, v_b, v_ab]``), which is validated then mapped to canonical
+        labels (0→"A", 1→"B", 2→"AB") before being added to the Borda tally.
+        """
         orders: list[dict[int, str]] = []
         coros = []
         for _ in range(self.cfg.num_judges):
@@ -384,6 +394,60 @@ class Tournament(Generic[T]):
                         "raw_response": resp,
                     }
                 )
+
+        # Invoke JudgeProviderPlugin instances and merge into Borda tally.
+        _index_to_label: dict[int, str] = {0: "A", 1: "B", 2: "AB"}
+        _valid_permutation = {0, 1, 2}
+        versions = [v_a, v_b, v_ab]
+        for plugin in self._judge_plugins:
+            try:
+                raw_indices = await plugin.rank(task_prompt, versions)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(
+                    "tournament.plugin_judge_error",
+                    plugin=getattr(plugin, "name", repr(plugin)),
+                    error=str(exc),
+                )
+                rankings.append(None)
+                judge_details.append(
+                    {
+                        "plugin": getattr(plugin, "name", repr(plugin)),
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            # Validate: must be a permutation of [0, 1, 2].
+            if (
+                not isinstance(raw_indices, list)
+                or len(raw_indices) != 3
+                or set(raw_indices) != _valid_permutation
+            ):
+                self.log.warning(
+                    "tournament.plugin_judge_invalid",
+                    plugin=getattr(plugin, "name", repr(plugin)),
+                    raw=raw_indices,
+                )
+                rankings.append(None)
+                judge_details.append(
+                    {
+                        "plugin": getattr(plugin, "name", repr(plugin)),
+                        "ranking": None,
+                        "raw": raw_indices,
+                        "error": "invalid permutation",
+                    }
+                )
+                continue
+
+            mapped = [_index_to_label[i] for i in raw_indices]
+            rankings.append(mapped)
+            judge_details.append(
+                {
+                    "plugin": getattr(plugin, "name", repr(plugin)),
+                    "ranking": mapped,
+                }
+            )
+
         return rankings, judge_details
 
     async def _guarded_judge(self, user: str, model: str | None) -> str:

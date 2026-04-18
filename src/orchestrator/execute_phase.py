@@ -548,6 +548,8 @@ def _parse_test_counts(text: str) -> tuple[int, int, int]:
 
 async def _run_qa_gates(orch: "Orchestrator", task: "Task") -> str | None:
     """Run enabled QA gates. Returns the first failure detail string, or None if all pass."""
+    from plugins.registry import QAContext
+
     cfg = orch.cfg.qa_gates
     cwd = orch.cwd
     language = detect_language(cwd)
@@ -566,6 +568,24 @@ async def _run_qa_gates(orch: "Orchestrator", task: "Task") -> str | None:
         result: GateResult = await gate_fn()
         if not result.passed:
             return result.details or "QA gate failed"
+
+    # Run plugin QA gates after all built-in gates pass.
+    if hasattr(orch, "plugin_registry") and orch.plugin_registry is not None:
+        ctx = QAContext(cwd=cwd, task_id=task.id)
+        for plugin in orch.plugin_registry.qa_gates.values():
+            try:
+                plugin_result = await plugin.run(ctx)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.plugin_gate_error",
+                    task_id=task.id,
+                    plugin=plugin.name,
+                    error=str(exc),
+                )
+                continue
+            if not plugin_result.passed:
+                return plugin_result.details or f"plugin gate '{plugin.name}' failed"
+
     return None
 
 

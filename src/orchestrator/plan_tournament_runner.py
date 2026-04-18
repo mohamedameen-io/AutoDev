@@ -115,11 +115,17 @@ async def run_plan_tournament(orch: "Orchestrator", initial_md: str, spec: str) 
         max_parallel_subprocesses=orch.cfg.tournaments.max_parallel_subprocesses,
     )
 
+    judge_plugins = (
+        list(orch.plugin_registry.judges.values())
+        if orch.plugin_registry is not None
+        else []
+    )
     tournament = Tournament(
         handler=PlanContentHandler(),
         client=client,
         cfg=tcfg,
         artifact_dir=artifact_dir,
+        judge_plugins=judge_plugins,
     )
 
     logger.info(
