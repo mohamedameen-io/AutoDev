@@ -417,6 +417,7 @@ class ImplTournament(Tournament[ImplBundle]):
         *,
         coder_runner: CoderRunner,
         worktree_manager: Any,  # WorktreeManager — typed Any to avoid cycle
+        judge_plugins: list[Any] | None = None,
     ) -> None:
         super().__init__(
             handler=handler,
@@ -424,6 +425,7 @@ class ImplTournament(Tournament[ImplBundle]):
             cfg=cfg,
             artifact_dir=artifact_dir,
             rng=rng,
+            judge_plugins=judge_plugins,
         )
         self._coder_runner = coder_runner
         self._worktrees = worktree_manager
@@ -598,7 +600,14 @@ class ImplTournament(Tournament[ImplBundle]):
         model: str | None,
         handler: ImplContentHandler,
     ) -> tuple[list[list[str] | None], list[dict[str, Any]]]:
-        """Spawn N judges concurrently with ImplBundle-aware rendering."""
+        """Spawn N judges concurrently with ImplBundle-aware rendering.
+
+        After LLM judges complete, also invokes any registered
+        :class:`~plugins.registry.JudgeProviderPlugin` instances.  Each plugin
+        returns a permutation of ``[0, 1, 2]`` (best-to-worst indices into
+        ``[v_a, v_b, v_ab]``), which is validated then mapped to canonical
+        labels (0→"A", 1→"B", 2→"AB") before being added to the Borda tally.
+        """
         orders: list[dict[int, str]] = []
         coros = []
         for _ in range(self.cfg.num_judges):
@@ -641,6 +650,59 @@ class ImplTournament(Tournament[ImplBundle]):
                         "raw_response": resp,
                     }
                 )
+
+        # Invoke JudgeProviderPlugin instances and merge into Borda tally.
+        _index_to_label: dict[int, str] = {0: "A", 1: "B", 2: "AB"}
+        _valid_permutation = {0, 1, 2}
+        versions = [v_a, v_b, v_ab]
+        for plugin in self._judge_plugins:
+            try:
+                raw_indices = await plugin.rank(task_prompt, versions)
+            except Exception as exc:  # noqa: BLE001
+                self._impl_log.warning(
+                    "impl_tournament.plugin_judge_error",
+                    plugin=getattr(plugin, "name", repr(plugin)),
+                    error=str(exc),
+                )
+                rankings.append(None)
+                judge_details.append(
+                    {
+                        "plugin": getattr(plugin, "name", repr(plugin)),
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            if (
+                not isinstance(raw_indices, list)
+                or len(raw_indices) != 3
+                or set(raw_indices) != _valid_permutation
+            ):
+                self._impl_log.warning(
+                    "impl_tournament.plugin_judge_invalid",
+                    plugin=getattr(plugin, "name", repr(plugin)),
+                    raw=raw_indices,
+                )
+                rankings.append(None)
+                judge_details.append(
+                    {
+                        "plugin": getattr(plugin, "name", repr(plugin)),
+                        "ranking": None,
+                        "raw": raw_indices,
+                        "error": "invalid permutation",
+                    }
+                )
+                continue
+
+            mapped = [_index_to_label[i] for i in raw_indices]
+            rankings.append(mapped)
+            judge_details.append(
+                {
+                    "plugin": getattr(plugin, "name", repr(plugin)),
+                    "ranking": mapped,
+                }
+            )
+
         return rankings, judge_details
 
     async def _guarded_judge_impl(self, user: str, model: str | None) -> str:

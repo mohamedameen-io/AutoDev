@@ -23,6 +23,7 @@ from adapters.types import AgentSpec
 from config.schema import AutodevConfig
 from guardrails import GuardrailEnforcer, LoopDetector
 from autologging import get_logger
+from plugins.registry import PluginRegistry
 from state.knowledge import KnowledgeStore
 from state.plan_manager import PlanManager
 from state.schemas import Plan, Task
@@ -44,6 +45,7 @@ class Orchestrator:
         *,
         disable_impl_tournament: bool = False,
         lock_timeout_s: float = 30.0,
+        plugin_registry: PluginRegistry | None = None,
     ) -> None:
         self._cwd = Path(cwd)
         self._cfg = cfg
@@ -58,6 +60,55 @@ class Orchestrator:
         self._log = get_logger(component="orchestrator", session_id=self._session_id)
         self.guardrails = GuardrailEnforcer(cfg.guardrails)
         self.loop_detector = LoopDetector()
+        self.plugin_registry: PluginRegistry | None = plugin_registry
+
+        # Wire AgentExtensionPlugins: merge their specs into the agent registry.
+        if plugin_registry is not None:
+            for plugin in plugin_registry.agents.values():
+                try:
+                    spec = plugin.get_spec()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "orchestrator.plugin_agent_spec_error",
+                        plugin=plugin.name,
+                        error=str(exc),
+                    )
+                    continue
+                if spec is None:
+                    continue
+                # ``spec`` is duck-typed as AgentSpec-compatible.
+                # If it's already an AgentSpec, use it directly; otherwise
+                # try to treat it as a dict or object with the needed attrs.
+                if isinstance(spec, AgentSpec):
+                    self._registry[spec.name] = spec
+                elif isinstance(spec, dict):
+                    try:
+                        agent_spec = AgentSpec(**spec)
+                        self._registry[agent_spec.name] = agent_spec
+                    except Exception as exc2:  # noqa: BLE001
+                        logger.warning(
+                            "orchestrator.plugin_agent_spec_invalid",
+                            plugin=plugin.name,
+                            error=str(exc2),
+                        )
+                else:
+                    # Duck-typed object: try to build AgentSpec from its attributes.
+                    try:
+                        agent_spec = AgentSpec(
+                            name=spec.name,
+                            description=getattr(spec, "description", ""),
+                            prompt=getattr(spec, "prompt", ""),
+                            tools=list(getattr(spec, "tools", [])),
+                            model=getattr(spec, "model", None),
+                            max_turns=getattr(spec, "max_turns", None),
+                        )
+                        self._registry[agent_spec.name] = agent_spec
+                    except Exception as exc3:  # noqa: BLE001
+                        logger.warning(
+                            "orchestrator.plugin_agent_spec_invalid",
+                            plugin=plugin.name,
+                            error=str(exc3),
+                        )
 
     # --- Accessors (kept public for plan_phase/execute_phase modules) ---
 

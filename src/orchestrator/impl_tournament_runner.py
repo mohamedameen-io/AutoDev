@@ -247,6 +247,11 @@ async def run_impl_tournament(
     wt_mgr = WorktreeManager(main_repo=orch.cwd, tournament_dir=worktree_dir)
     coder_runner = _CoderRunner(orch)
 
+    judge_plugins = (
+        list(orch.plugin_registry.judges.values())
+        if orch.plugin_registry is not None
+        else []
+    )
     tournament = ImplTournament(
         handler=ImplContentHandler(),
         client=client,
@@ -254,6 +259,7 @@ async def run_impl_tournament(
         artifact_dir=artifact_dir,
         coder_runner=coder_runner,
         worktree_manager=wt_mgr,
+        judge_plugins=judge_plugins,
     )
 
     logger.info(
