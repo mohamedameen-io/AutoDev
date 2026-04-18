@@ -1,17 +1,20 @@
 """Per-task guardrail enforcement.
 
 The enforcer wraps :func:`orchestrator.execute_phase.delegate` calls
-with three cap checks:
+with four cap checks:
 
 1. **Duration cap** (``max_duration_s_per_task``) — how long the orchestrator
    has spent on a task since :meth:`GuardrailEnforcer.start_task` was called.
-2. **Invocation cap** (``max_tool_calls_per_task`` reused as an upper bound on
-   number of agent round-trips) — a proxy safety net for tasks that hammer
+2. **Invocation cap** (``max_invocations_per_task``) — upper bound on the
+   number of agent round-trips; a proxy safety net for tasks that hammer
    the adapter.
 3. **Tool-call cap** (``max_tool_calls_per_task``) — cumulative tool-call
-   count across all invocations for the task.
+   count across all invocations for the task (requires stream-json parsing;
+   Phase 3 functionality, not yet enforced).
 4. **Diff-size cap** (``max_diff_bytes``) — cumulative size of diffs returned
    by the adapter, in UTF-8 bytes.
+5. **Plan cost cap** (``cost_budget_usd_per_plan``) — cumulative USD cost
+   across all tasks in the plan; accumulated from ``AgentResult.cost_usd``.
 
 On breach, the enforcer raises :class:`errors.GuardrailExceededError`.
 The execute-phase loop catches that, marks the task ``blocked`` with a
@@ -77,6 +80,7 @@ class GuardrailEnforcer:
     def __init__(self, cfg: GuardrailsConfig) -> None:
         self.cfg = cfg
         self._metrics: dict[str, TaskMetrics] = {}
+        self.plan_cost_usd: float = 0.0
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -108,11 +112,11 @@ class GuardrailEnforcer:
             )
 
         # Invocation cap is a proxy for "too many round-trips even if each
-        # round-trip uses zero tool calls". Use the same cap as tool-calls.
-        if m.invocation_count >= self.cfg.max_tool_calls_per_task:
+        # round-trip uses zero tool calls".
+        if m.invocation_count >= self.cfg.max_invocations_per_task:
             raise GuardrailExceededError(
                 f"task {task_id}: invocation cap "
-                f"{self.cfg.max_tool_calls_per_task} exceeded"
+                f"{self.cfg.max_invocations_per_task} exceeded"
             )
 
     def post_invocation(self, task_id: str, result: AgentResult) -> None:
@@ -139,6 +143,17 @@ class GuardrailEnforcer:
                     f"{self.cfg.max_diff_bytes} bytes exceeded "
                     f"(hit {m.total_diff_bytes})"
                 )
+
+        self.plan_cost_usd += result.cost_usd
+        if (
+            self.cfg.cost_budget_usd_per_plan is not None
+            and self.plan_cost_usd > self.cfg.cost_budget_usd_per_plan
+        ):
+            raise GuardrailExceededError(
+                f"task {task_id}: plan cost budget "
+                f"${self.cfg.cost_budget_usd_per_plan:.4f} USD exceeded "
+                f"(accumulated ${self.plan_cost_usd:.4f} USD)"
+            )
 
     # --- introspection -----------------------------------------------------
 

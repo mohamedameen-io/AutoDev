@@ -144,6 +144,9 @@ def doctor() -> None:
             guardrails_table.add_column("Cap", no_wrap=True)
             guardrails_table.add_column("Value", no_wrap=True)
             guardrails_table.add_row(
+                "max_invocations_per_task", str(gr.max_invocations_per_task)
+            )
+            guardrails_table.add_row(
                 "max_tool_calls_per_task", str(gr.max_tool_calls_per_task)
             )
             guardrails_table.add_row(

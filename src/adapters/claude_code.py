@@ -143,21 +143,32 @@ class ClaudeCodeAdapter(PlatformAdapter):
         text = str(parsed.get("result", ""))
         is_error = bool(parsed.get("is_error", False))
 
+        cost_usd: float = 0.0
+        if "total_cost_usd" in parsed:
+            cost_usd = float(parsed["total_cost_usd"])
+        else:
+            logger.warning(
+                "claude_code.missing_total_cost_usd",
+                role=inv.role,
+            )
+
         files_after = _git_porcelain_set(inv.cwd)
         files_changed = _diff_files(files_before, files_after)
         diff = _git_diff(inv.cwd) if files_changed else None
 
-        return AgentResult(
+        result = AgentResult(
             success=not is_error,
             text=text,
             tool_calls=[],  # TODO(phase-3+): parse from stream-json if needed
             files_changed=[Path(p) for p in files_changed],
             diff=diff,
             duration_s=duration,
+            cost_usd=cost_usd,
             error=None if not is_error else str(parsed.get("error", "is_error=true")),
             raw_stdout=stdout,
             raw_stderr=stderr,
         )
+        return result
 
     async def healthcheck(self) -> tuple[bool, str]:
         try:

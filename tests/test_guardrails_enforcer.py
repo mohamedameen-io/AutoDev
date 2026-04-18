@@ -14,6 +14,7 @@ from guardrails.enforcer import GuardrailEnforcer
 
 def _cfg(**kwargs) -> GuardrailsConfig:
     defaults = {
+        "max_invocations_per_task": 10,
         "max_tool_calls_per_task": 10,
         "max_duration_s_per_task": 60,
         "max_diff_bytes": 1024,
@@ -64,7 +65,7 @@ def test_post_invocation_untracked_is_lenient() -> None:
 
 
 def test_tool_call_cap_exceeded() -> None:
-    enf = GuardrailEnforcer(_cfg(max_tool_calls_per_task=3))
+    enf = GuardrailEnforcer(_cfg(max_tool_calls_per_task=3, max_invocations_per_task=10))
     enf.start_task("t1")
     enf.pre_invocation("t1", _inv())
     enf.post_invocation("t1", _result(tool_calls=2))
@@ -74,7 +75,7 @@ def test_tool_call_cap_exceeded() -> None:
 
 
 def test_invocation_cap_exceeded() -> None:
-    enf = GuardrailEnforcer(_cfg(max_tool_calls_per_task=2))
+    enf = GuardrailEnforcer(_cfg(max_invocations_per_task=2, max_tool_calls_per_task=100))
     enf.start_task("t1")
     # Exhaust invocation count without tool calls.
     for _ in range(2):
@@ -129,3 +130,16 @@ def test_start_task_resets_metrics() -> None:
     snap = enf.metrics_snapshot("t1")
     assert snap["tool_call_count"] == 0
     assert snap["invocation_count"] == 0
+
+
+def test_cost_budget_exceeded() -> None:
+    enf = GuardrailEnforcer(_cfg(cost_budget_usd_per_plan=0.10))
+    enf.start_task("t1")
+    result = AgentResult(
+        success=True,
+        text="done",
+        duration_s=0.01,
+        cost_usd=0.11,
+    )
+    with pytest.raises(GuardrailExceededError, match="plan cost budget"):
+        enf.post_invocation("t1", result)
