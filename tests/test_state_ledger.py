@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import json
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,11 @@ from state.ledger import (
 from state.lockfile import plan_lock
 from state.paths import ledger_path
 from state.schemas import Phase, Plan, Task
+
+hypothesis = pytest.importorskip("hypothesis")
+given = hypothesis.given
+settings = hypothesis.settings
+st = hypothesis.strategies
 
 
 def _iso() -> str:
@@ -150,6 +156,41 @@ async def test_concurrent_appends_serialized_under_lock(tmp_path: Path) -> None:
     # Chain intact.
     for i in range(1, len(entries)):
         assert entries[i].prev_hash == entries[i - 1].self_hash
+
+
+@given(st.integers(min_value=1, max_value=30))
+@settings(max_examples=20, deadline=None)
+def test_hash_chain_property_holds_across_many_appends(num_updates: int) -> None:
+    """Property-style guard: seq monotonicity and prev_hash links always hold."""
+
+    async def _run(tmp_path: Path) -> None:
+        plan = _mk_plan()
+        async with plan_lock(tmp_path):
+            await append_entry(
+                tmp_path,
+                op="init_plan",
+                payload={"plan": plan.model_dump(mode="json")},
+                session_id="s1",
+            )
+
+        statuses = ["in_progress", "coded", "reviewed", "complete"]
+        for i in range(num_updates):
+            async with plan_lock(tmp_path):
+                await append_entry(
+                    tmp_path,
+                    op="update_task_status",
+                    payload={"task_id": "1.1", "status": statuses[i % len(statuses)]},
+                    session_id=f"w{i}",
+                )
+
+        entries = read_entries(tmp_path)
+        assert len(entries) == num_updates + 1
+        assert [e.seq for e in entries] == list(range(1, num_updates + 2))
+        for i in range(1, len(entries)):
+            assert entries[i].prev_hash == entries[i - 1].self_hash
+
+    with tempfile.TemporaryDirectory() as td:
+        asyncio.run(_run(Path(td)))
 
 
 @pytest.mark.asyncio

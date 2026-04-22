@@ -164,18 +164,23 @@ def _read_last_entry_head(path: Path) -> tuple[int, str]:
 def _atomic_append(path: Path, line: str) -> None:
     """Append ``line`` durably.
 
-    Strategy: copy-existing-contents-to-tmp, append, then ``os.replace``.
-    This is resilient to the process being killed mid-write: either the
-    whole new file is visible or nothing changed.
+    Strategy: clone-existing-contents-to-tmp (reflink when available, else
+    copy), append, then ``os.replace``. This preserves the same crash-safety
+    guarantees while avoiding a full read on filesystems that support reflinks.
     """
     parent = path.parent
     parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_bytes() if path.exists() else b""
-    # tempfile in same dir to keep the replace atomic across filesystems.
+    # Tempfile in same dir to keep replace atomic across filesystems.
     fd, tmp_path = tempfile.mkstemp(prefix=".ledger.", suffix=".tmp", dir=str(parent))
     try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(existing)
+        os.close(fd)
+        tmp = Path(tmp_path)
+
+        if path.exists():
+            if not _clone_file(path, tmp):
+                tmp.write_bytes(path.read_bytes())
+
+        with tmp.open("ab") as fh:
             fh.write(line.encode("utf-8"))
             fh.flush()
             os.fsync(fh.fileno())
@@ -188,6 +193,40 @@ def _atomic_append(path: Path, line: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _clone_file(src: Path, dst: Path) -> bool:
+    """Best-effort reflink clone ``src`` -> ``dst``.
+
+    Returns ``True`` when the filesystem/runtime supports an O(1)-style clone
+    (APFS clonefile on macOS or FICLONE ioctl on Linux); returns ``False`` for
+    unsupported filesystems/platforms so callers can fall back to byte-copy.
+    """
+    clonefile = getattr(os, "clonefile", None)
+    if clonefile is not None:
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        try:
+            clonefile(str(src), str(dst))
+            return True
+        except OSError:
+            pass
+
+    try:
+        import fcntl
+    except ImportError:
+        return False
+
+    # Linux FICLONE ioctl: clone src inode into dst (copy-on-write where supported).
+    ficlone = 0x40049409
+    try:
+        with src.open("rb") as src_fh, dst.open("wb") as dst_fh:
+            fcntl.ioctl(dst_fh.fileno(), ficlone, src_fh.fileno())
+        return True
+    except OSError:
+        return False
 
 
 def read_entries(cwd: Path) -> list[LedgerEntry]:
