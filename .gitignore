@@ -61,3 +61,7 @@ Thumbs.db
 .claude/
 thoughts/
 .serena/
+autoreason_results
+
+# Environment variables
+.env
