@@ -40,9 +40,9 @@ class TestParseRanking:
         # Only 1 digit found in the ranking line → treated as parse failure.
         assert parse_ranking("RANKING: 1") is None
 
-    def test_two_digits_accepted(self) -> None:
-        # autoreason accepts >= 2 digits as a valid ranking.
-        assert parse_ranking("RANKING: 1, 2") == ["1", "2"]
+    def test_two_digits_rejected_with_three_labels(self) -> None:
+        # Incomplete ranking (2 of 3 candidates) is rejected to prevent Borda bias.
+        assert parse_ranking("RANKING: 1, 2") is None
 
     def test_custom_valid_labels_for_5way(self) -> None:
         # 5-way judge uses A..E; the function supports custom label sets.
@@ -58,7 +58,8 @@ class TestParseRanking:
 
     def test_ignores_non_label_digits(self) -> None:
         # In "123" valid-labels mode, a "4" or "5" gets filtered out.
-        assert parse_ranking("RANKING: 1, 5, 2") == ["1", "2"]
+        # After filtering, only 2 valid labels remain (incomplete) → rejected.
+        assert parse_ranking("RANKING: 1, 5, 2") is None
 
     def test_multiline_ranking_scan_is_reversed(self) -> None:
         # Two RANKING lines — reverse scan finds the last one that starts
