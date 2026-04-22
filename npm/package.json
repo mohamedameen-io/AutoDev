@@ -1,6 +1,6 @@
 {
   "name": "ai-autodev",
-  "version": "0.0.1",
+  "version": "0.1.1",
   "description": "Autonomous development engine — multi-agent orchestrator with tournament self-refinement, runs inside Claude Code, Cursor, and any LLM-assisted IDE",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

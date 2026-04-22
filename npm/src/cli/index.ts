@@ -38,7 +38,7 @@ function ensureVenv(): void {
 
 function installWheel(): void {
   const wheels = [
-    join(WHEEL_DIR, "ai_autodev-0.1.0-py3-none-any.whl"),
+    join(WHEEL_DIR, "ai_autodev-0.1.1-py3-none-any.whl"),
     join(WHEEL_DIR, "ai_autodev-py3-none-any.whl"),
   ];
 
