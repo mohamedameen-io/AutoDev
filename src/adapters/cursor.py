@@ -38,10 +38,30 @@ class CursorAdapter(PlatformAdapter):
     def _build_command(self, binary: str, inv: AgentInvocation) -> list[str]:
         # Primary `cursor` form: `cursor agent "<prompt>" --print --output-format json`.
         # Fallback `cursor-agent`: same flags, just a different entry binary.
+        # `--force` trusts the working directory non-interactively (equivalent to
+        # `-f`); without it, recent Cursor Agent versions abort with a
+        # "Workspace Trust Required" prompt that can't be answered from a
+        # non-TTY subprocess. We intentionally avoid `--yolo`, which would also
+        # auto-approve tool calls.
         if binary.endswith("cursor-agent"):
-            cmd: list[str] = [binary, inv.prompt, "--print", "--output-format", "json"]
+            cmd: list[str] = [
+                binary,
+                inv.prompt,
+                "--print",
+                "--output-format",
+                "json",
+                "--force",
+            ]
         else:
-            cmd = [binary, "agent", inv.prompt, "--print", "--output-format", "json"]
+            cmd = [
+                binary,
+                "agent",
+                inv.prompt,
+                "--print",
+                "--output-format",
+                "json",
+                "--force",
+            ]
         if inv.model:
             cmd += ["--model", inv.model]
         if inv.allowed_tools:
