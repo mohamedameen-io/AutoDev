@@ -257,3 +257,22 @@ async def test_execute_non_git_repo_no_diff_tracking(tmp_path: Path) -> None:
         result = await adapter.execute(inv)
     assert result.files_changed == []
     assert result.diff is None
+
+
+@pytest.mark.asyncio
+async def test_execute_returns_empty_tool_calls_phase2(tmp_path: Path) -> None:
+    """Framing test: output-format json exposes no individual tool events.
+
+    If this starts failing, the adapter likely switched to stream-json parsing
+    and the max_tool_calls_per_task guardrail semantics should be revisited.
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="developer", prompt="p", cwd=tmp_path)
+    fake = _fake_proc(stdout=_good_claude_blob("ok"), returncode=0)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is True
+    assert result.tool_calls == []
