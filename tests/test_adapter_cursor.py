@@ -65,6 +65,9 @@ async def test_execute_cursor_primary_binary(tmp_path: Path) -> None:
     call = spawn.call_args_list[0]
     assert call.args[0] == "cursor"
     assert "agent" in call.args  # `cursor agent <prompt>` form
+    # Workspace Trust bypass: recent Cursor Agent versions refuse to run in
+    # an untrusted directory unless `--force` (or `-f`/`--yolo`) is passed.
+    assert "--force" in call.args
 
 
 @pytest.mark.asyncio
@@ -87,6 +90,8 @@ async def test_execute_falls_back_to_cursor_agent(tmp_path: Path) -> None:
     assert second.args[0] == "cursor-agent"
     # cursor-agent form skips the "agent" subcommand.
     assert "agent" not in second.args[:2]
+    # Workspace Trust bypass must be present on the fallback form too.
+    assert "--force" in second.args
 
 
 @pytest.mark.asyncio
