@@ -11,6 +11,7 @@ from adapters.inline_config import (
     _CLAUDE_SECTION_END,
     _CLAUDE_SECTION_START,
     render_claude_resume_config,
+    render_claude_slash_command,
     render_cursor_resume_config,
     update_claude_md,
 )
@@ -179,3 +180,64 @@ def test_init_workspace_preserves_existing_claude_md_user_content(
     assert "This is my custom CLAUDE.md content." in result
     assert _CLAUDE_SECTION_START in result
     assert "autodev resume" in result
+
+
+# ---------------------------------------------------------------------------
+# 11. render_claude_resume_config includes the kickoff rule
+# ---------------------------------------------------------------------------
+
+
+def test_render_claude_resume_config_includes_kickoff_rule() -> None:
+    result = render_claude_resume_config()
+    assert "autodev plan" in result
+    assert "describes a feature" in result
+    assert "do NOT" in result
+    assert "implement it directly" in result
+
+
+# ---------------------------------------------------------------------------
+# 12. render_claude_resume_config still includes the resume instruction
+# ---------------------------------------------------------------------------
+
+
+def test_render_claude_resume_config_still_has_resume_instruction() -> None:
+    result = render_claude_resume_config()
+    assert "autodev resume" in result
+    assert ".autodev/delegations/" in result
+
+
+# ---------------------------------------------------------------------------
+# 13. render_claude_resume_config has exactly one managed-section delimiter pair
+# ---------------------------------------------------------------------------
+
+
+def test_render_claude_resume_config_single_managed_section() -> None:
+    result = render_claude_resume_config()
+    assert result.count(_CLAUDE_SECTION_START) == 1
+    assert result.count(_CLAUDE_SECTION_END) == 1
+
+
+# ---------------------------------------------------------------------------
+# 14. render_claude_slash_command begins with YAML frontmatter
+# ---------------------------------------------------------------------------
+
+
+def test_render_claude_slash_command_has_frontmatter() -> None:
+    result = render_claude_slash_command()
+    assert result.startswith("---\n")
+    assert "description:" in result
+    assert "allowed-tools:" in result
+    assert "argument-hint:" in result
+
+
+# ---------------------------------------------------------------------------
+# 15. render_claude_slash_command body documents the --review flag
+# ---------------------------------------------------------------------------
+
+
+def test_render_claude_slash_command_documents_review_flag() -> None:
+    result = render_claude_slash_command()
+    assert "--review" in result
+    assert "$ARGUMENTS" in result
+    assert "autodev plan" in result
+    assert "autodev execute" in result
