@@ -40,6 +40,11 @@ _TRANSIENT_SUBSTRINGS = (
     "timed out",
     "connection",
     "503",
+    # Subprocess process-death patterns (see Tier 1A in claude_code.py).
+    # NOTE: these are matched lowercase via _classify_error.
+    "claude exited",
+    "empty stderr",
+    "broken pipe",
 )
 
 

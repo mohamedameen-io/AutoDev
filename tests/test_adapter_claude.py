@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -124,6 +125,83 @@ async def test_execute_nonzero_exit(tmp_path: Path) -> None:
     assert result.error is not None
     assert "auth failed" in result.error
     assert result.raw_stderr == "auth failed"
+
+
+@pytest.mark.asyncio
+async def test_execute_nonzero_exit_empty_streams_uses_sentinel(
+    tmp_path: Path,
+) -> None:
+    """Both stdout and stderr empty → error uses 'empty stderr' sentinel.
+
+    This is the silent-death case from the unity bug; the sentinel allows the
+    tournament-layer transient classifier to retry.
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path)
+    fake = _fake_proc(stdout="", stderr="", returncode=1)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.error == "claude exited 1 with empty stderr"
+
+
+@pytest.mark.asyncio
+async def test_execute_nonzero_exit_only_stdout_includes_stdout(
+    tmp_path: Path,
+) -> None:
+    """Empty stderr but stdout has content → error message includes stdout tail.
+
+    `claude -p --output-format json` sometimes writes its JSON error to stdout
+    while exiting non-zero with empty stderr.
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path)
+    fake = _fake_proc(stdout='{"error":"oops"}', stderr="", returncode=1)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.error is not None
+    assert "stdout" in result.error
+    assert "oops" in result.error
+
+
+@pytest.mark.asyncio
+async def test_execute_nonzero_exit_writes_debug_dump(tmp_path: Path) -> None:
+    """A non-zero exit writes a sectioned dump to ``.autodev/debug/``."""
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(
+        role="architect_b",
+        prompt="THE_PROMPT_BODY",
+        cwd=tmp_path,
+        max_turns=1,
+    )
+    fake = _fake_proc(
+        stdout="THE_STDOUT", stderr="THE_STDERR", returncode=1
+    )
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    debug_root = tmp_path / ".autodev" / "debug"
+    assert debug_root.exists()
+    files = list(debug_root.iterdir())
+    assert len(files) == 1, f"expected 1 dump file, got {files!r}"
+    dump = files[0]
+    assert re.match(r"^architect_b-\d{13}\.txt$", dump.name), dump.name
+    body = dump.read_text(encoding="utf-8")
+    assert "THE_PROMPT_BODY" in body
+    assert "THE_STDOUT" in body
+    assert "THE_STDERR" in body
+    assert "role: architect_b" in body
+    assert "returncode: 1" in body
 
 
 @pytest.mark.asyncio

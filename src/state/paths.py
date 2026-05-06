@@ -20,6 +20,7 @@ REJECTED_LESSONS_FILE: str = "rejected_lessons.jsonl"
 EVIDENCE_DIR: str = "evidence"
 TOURNAMENTS_DIR: str = "tournaments"
 SESSIONS_DIR: str = "sessions"
+DEBUG_DIR: str = "debug"
 LOCK_FILE: str = ".lock"
 
 
@@ -85,6 +86,11 @@ def tournaments_dir(cwd: Path) -> Path:
     return autodev_root(cwd) / TOURNAMENTS_DIR
 
 
+def debug_dir(cwd: Path) -> Path:
+    """Return ``.autodev/debug/`` (created on demand by callers)."""
+    return autodev_root(cwd) / DEBUG_DIR
+
+
 def sessions_dir(cwd: Path) -> Path:
     return autodev_root(cwd) / SESSIONS_DIR
 
@@ -133,6 +139,7 @@ def inline_state_path(cwd: Path) -> Path:
 __all__ = [
     "AUTODEV_DIR",
     "CONFIG_FILE",
+    "DEBUG_DIR",
     "DELEGATIONS_DIR",
     "EVIDENCE_DIR",
     "INLINE_STATE_FILE",
@@ -147,6 +154,7 @@ __all__ = [
     "TOURNAMENTS_DIR",
     "autodev_root",
     "config_path",
+    "debug_dir",
     "delegation_path",
     "delegations_dir",
     "ensure_autodev_dir",

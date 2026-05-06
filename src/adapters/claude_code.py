@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import time
 from contextlib import suppress
@@ -13,6 +14,7 @@ from adapters.base import PlatformAdapter
 from adapters.git_utils import _diff_files, _git_diff, _git_porcelain_set
 from adapters.types import AgentInvocation, AgentResult, AgentSpec
 from autologging import get_logger
+from state.paths import debug_dir
 
 logger = get_logger(__name__)
 
@@ -118,11 +120,26 @@ class ClaudeCodeAdapter(PlatformAdapter):
         returncode = proc.returncode if proc.returncode is not None else -1
 
         if returncode != 0:
+            err_tail = stderr.strip()[:500]
+            out_tail = stdout.strip()[:500]
+            if not err_tail and not out_tail:
+                msg = f"claude exited {returncode} with empty stderr"
+            elif err_tail:
+                msg = f"claude exited {returncode}: {err_tail}"
+            else:
+                msg = f"claude exited {returncode} (stdout): {out_tail}"
+            self._dump_failure_transcript(
+                inv=inv,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=returncode,
+                duration=duration,
+            )
             return AgentResult(
                 success=False,
                 text="",
                 duration_s=duration,
-                error=f"claude exited {returncode}: {stderr.strip()[:500]}",
+                error=msg,
                 raw_stdout=stdout,
                 raw_stderr=stderr,
             )
@@ -173,6 +190,55 @@ class ClaudeCodeAdapter(PlatformAdapter):
             raw_stderr=stderr,
         )
         return result
+
+    def _dump_failure_transcript(
+        self,
+        *,
+        inv: AgentInvocation,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+        duration: float,
+    ) -> None:
+        """Best-effort: dump full subprocess context to ``.autodev/debug/``.
+
+        Filename: ``{role}-{unix_ts_ms}.txt`` — Windows-safe (no ``:``),
+        pass-num-orderable, role-grouped on ``ls``. On any OSError (permission,
+        readonly fs, etc.) we log a warning and swallow — never let a debug-dump
+        failure mask the original subprocess error.
+        """
+        try:
+            target_dir = debug_dir(inv.cwd)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            ts_ms = int(time.time() * 1000)
+            target = target_dir / f"{inv.role}-{ts_ms}.txt"
+            iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            allowed_tools_repr = (
+                ",".join(inv.allowed_tools) if inv.allowed_tools else ""
+            )
+            sections = (
+                "== meta ==\n"
+                f"role: {inv.role}\n"
+                f"model: {inv.model or ''}\n"
+                f"max_turns: {inv.max_turns}\n"
+                f"allowed_tools: {allowed_tools_repr}\n"
+                f"returncode: {returncode}\n"
+                f"duration_s: {duration:.3f}\n"
+                f"timestamp: {iso}\n"
+                "\n== prompt ==\n"
+                f"{inv.prompt}\n"
+                "\n== stdout ==\n"
+                f"{stdout}\n"
+                "\n== stderr ==\n"
+                f"{stderr}\n"
+            )
+            target.write_text(sections, encoding="utf-8")
+        except OSError as exc:
+            logger.warning(
+                "claude_code.debug_dump_failed",
+                role=inv.role,
+                err=str(exc),
+            )
 
     async def healthcheck(self) -> tuple[bool, str]:
         try:

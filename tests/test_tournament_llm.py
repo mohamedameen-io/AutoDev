@@ -144,6 +144,48 @@ async def test_retries_on_transient_result_success_false(
 
 
 @pytest.mark.asyncio
+async def test_retries_on_empty_stderr_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 'empty stderr' sentinel from Tier 1A is treated as transient."""
+    _patch_no_sleep(monkeypatch)
+
+    adapter = StubAdapter(
+        [
+            _Result(
+                success=False,
+                text="",
+                error="claude exited 1 with empty stderr",
+            ),
+            _Result(text="OK"),
+        ]
+    )
+    client = AdapterLLMClient(adapter, cwd=tmp_path, max_attempts=5)
+    out = await client.call(system="s", user="u", role="architect_b")
+    assert out == "OK"
+    assert len(adapter.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_retries_on_claude_exited_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any 'claude exited' prefix from the adapter is treated as transient."""
+    _patch_no_sleep(monkeypatch)
+
+    adapter = StubAdapter(
+        [
+            _Result(success=False, text="", error="claude exited 1: some text"),
+            _Result(text="OK"),
+        ]
+    )
+    client = AdapterLLMClient(adapter, cwd=tmp_path, max_attempts=5)
+    out = await client.call(system="s", user="u", role="architect_b")
+    assert out == "OK"
+    assert len(adapter.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_exhausts_retries_raises_transient(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
