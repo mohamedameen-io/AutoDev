@@ -60,5 +60,8 @@ jobs:
       - name: Build NPM package
         run: cd npm && npm ci && npm run build
 
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+
       - name: Publish to npm
         run: cd npm && npm publish --provenance --access public
