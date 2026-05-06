@@ -5,7 +5,7 @@
   "description": "AutoDev monorepo root",
   "scripts": {
     "build:python": "pip wheel . --wheel-dir npm/wheel --no-deps",
-    "build:python:uv": "uv pip wheel . --dest npm/wheel",
+    "build:python:uv": "uv build --wheel --out-dir npm/wheel",
     "build:npm": "cd npm && npm install && npm run build",
     "build:all": "npm run build:python:uv && npm run build:npm",
     "test:python": "uv run pytest -v",

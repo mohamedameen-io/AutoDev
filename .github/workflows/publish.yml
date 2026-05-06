@@ -22,7 +22,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Build wheel
-        run: uv pip wheel . --dest dist --no-deps
+        run: uv build --wheel --out-dir dist
 
       - name: Publish to PyPI
         env:
@@ -46,7 +46,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Build Python wheel
-        run: uv pip wheel . --dest npm/wheel --no-deps
+        run: uv build --wheel --out-dir npm/wheel
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
