@@ -85,12 +85,13 @@ def init(platform: str, force: bool, inline: bool) -> None:
 
     autodev_dir.mkdir(parents=True, exist_ok=True)
 
+    platform_normalized = platform.lower()
+
     # Build config, overriding platform if the user asked for a specific one.
     cfg = default_config()
     if inline:
         cfg.platform = "inline"
     else:
-        platform_normalized = platform.lower()
         if platform_normalized == "claude":
             cfg.platform = "claude_code"
         elif platform_normalized == "cursor":
@@ -109,6 +110,15 @@ def init(platform: str, force: bool, inline: bool) -> None:
     specs = build_registry(cfg)
     claude_paths = render_claude_agents(specs, cwd)
     cursor_paths = render_cursor_rules(specs, cwd)
+
+    slash_path: Path | None = None
+    if platform_normalized != "cursor":
+        from adapters.inline_config import render_claude_slash_command
+
+        commands_dir = cwd / ".claude" / "commands"
+        commands_dir.mkdir(parents=True, exist_ok=True)
+        slash_path = commands_dir / "autodev.md"
+        slash_path.write_text(render_claude_slash_command(), encoding="utf-8")
 
     # For inline mode, also initialise the inline workspace.
     if inline:
@@ -129,6 +139,8 @@ def init(platform: str, force: bool, inline: bool) -> None:
         table.add_row(str(p.relative_to(cwd)), "Claude Code agent")
     for p in cursor_paths:
         table.add_row(str(p.relative_to(cwd)), "Cursor rule")
+    if slash_path is not None:
+        table.add_row(str(slash_path.relative_to(cwd)), "slash command (/autodev)")
     console.print(table)
     console.print(
         f"[green]autodev initialized.[/green] Platform: [bold]{cfg.platform}[/bold]."
