@@ -291,3 +291,73 @@ async def test_plan_phase_tournament_disabled_flag_skips_tournament(
     # No ledger entry either.
     ledger = await orch.plan_manager.read_ledger()
     assert all(e.op != "plan_tournament_complete" for e in ledger)
+
+
+class _TournamentFailingAdapter(PlanTournamentStubAdapter):
+    """Returns valid plan_md for architect, but fails the tournament's first call.
+
+    Used to verify Tier 2E: plan-phase fallback when ``run_plan_tournament``
+    raises ``TournamentError``. The first ``critic_t`` call returns
+    ``success=False`` with a non-transient error; the AdapterLLMClient layer
+    promotes this to ``TournamentError``, which the plan_phase try/except
+    must catch.
+    """
+
+    name = "plan-tournament-failing-stub"
+
+    async def execute(self, inv: "AgentInvocation") -> "AgentResult":
+        self.calls.append(inv)
+        self._n[inv.role] = self._n.get(inv.role, 0) + 1
+
+        if inv.role == "explorer":
+            return _ok("explorer findings")
+        if inv.role == "domain_expert":
+            return _ok("domain_expert findings")
+        if inv.role == "architect":
+            return _ok(INITIAL_PLAN_MD)
+        if inv.role == "critic_t":
+            # Non-transient failure → AdapterLLMClient raises TournamentError.
+            return AgentResult(
+                success=False,
+                text="",
+                duration_s=0.01,
+                error="permission denied: simulated non-transient failure",
+            )
+        return _ok(f"[{inv.role}] default-ok")
+
+
+@pytest.mark.asyncio
+async def test_plan_phase_continues_when_tournament_raises(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Tier 2E: a TournamentError mid-tournament must not abort the plan phase.
+
+    The tournament's first ``critic_t`` call fails with a non-transient error,
+    propagating ``TournamentError`` through ``run_plan_tournament``. The plan
+    phase's try/except should catch it, log ``plan_phase.tournament_failed``,
+    and continue with the unrefined plan markdown.
+    """
+    adapter = _TournamentFailingAdapter()
+    orch = _make_orch(tmp_path, adapter)
+
+    plan = await orch.plan("Add foo(x)")
+
+    # init_plan completed with the ORIGINAL (un-refined) plan markdown.
+    assert isinstance(plan, Plan)
+    # Title must NOT have the "(refined)" suffix the tournament would have
+    # introduced — this proves we fell back to the architect's plan_md.
+    assert "(refined)" not in plan.metadata.get("title", "")
+
+    # init_plan was called → ledger has an init_plan entry.
+    ledger = await orch.plan_manager.read_ledger()
+    init_ops = [e.op for e in ledger if e.op == "init_plan"]
+    assert len(init_ops) == 1, "init_plan should have been called exactly once"
+
+    # No plan_tournament_complete ledger entry — the tournament failed early.
+    assert all(e.op != "plan_tournament_complete" for e in ledger)
+
+    # The fallback warning must have been emitted via structlog (writes to stdout).
+    out = capsys.readouterr().out
+    assert "plan_phase.tournament_failed" in out, (
+        f"expected 'plan_phase.tournament_failed' in stdout; got: {out[-2000:]}"
+    )

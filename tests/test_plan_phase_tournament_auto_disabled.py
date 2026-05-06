@@ -118,7 +118,9 @@ async def test_run_plan_tournament_returns_initial_when_auto_disabled(
         tmp_path, adapter, judge_model="opus", auto_disable=["opus"]
     )
 
-    result = await run_plan_tournament(orch, CANONICAL_PLAN_MD, "add noop()")
+    result = await run_plan_tournament(
+        orch, CANONICAL_PLAN_MD, "add noop()", spec_hash="0123456789abcdef"
+    )
     assert result == CANONICAL_PLAN_MD
 
     assert adapter.count("critic_t") == 0

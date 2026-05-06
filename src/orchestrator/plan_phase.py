@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from adapters.inline import InlineAdapter
 from adapters.inline_types import DelegationPendingSignal
 from adapters.types import AgentInvocation, AgentResult
-from errors import AutodevError
+from errors import AutodevError, TournamentError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
 from orchestrator.inline_state import write_suspend_state
@@ -175,7 +175,13 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
             plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
 
         if orch.cfg.tournaments.plan.enabled:
-            refined_md = await run_plan_tournament(orch, plan_md, intent)
+            try:
+                refined_md = await run_plan_tournament(
+                    orch, plan_md, intent, spec_hash
+                )
+            except TournamentError as exc:
+                logger.warning("plan_phase.tournament_failed", err=str(exc))
+                refined_md = plan_md
             if refined_md and refined_md != plan_md:
                 try:
                     plan = parse_plan_markdown(refined_md, spec_hash=spec_hash)

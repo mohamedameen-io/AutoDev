@@ -106,6 +106,24 @@ class PassResult(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
+@dataclass
+class ResumeState:
+    """Resume metadata recovered from a tournament's on-disk artifacts.
+
+    Returned by :meth:`tournament.state.TournamentArtifactStore.read_resume_state`.
+    The caller (:meth:`Tournament.run`) decides whether to:
+        - short-circuit (``completed=True``) and return ``final_md`` directly, or
+        - continue the loop from ``starting_pass_num`` with the recovered
+          ``incumbent_md`` and trailing-A-wins ``streak``.
+    """
+
+    starting_pass_num: int  # next pass to run (1-indexed)
+    incumbent_md: str  # the markdown to use as A
+    streak: int  # trailing A-wins for convergence accounting
+    completed: bool  # if True, tournament already converged → caller short-circuits
+    final_md: str | None  # populated iff completed
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
@@ -211,8 +229,62 @@ class Tournament(Generic[T]):
         Writes initial_a, per-pass artifacts, incumbent_after_NN for each
         non-A win, and final_output + history.json at exit. Returns the final
         incumbent and the full pass history.
+
+        Resume semantics (Tier 2D):
+            - If on-disk artifacts indicate a completed tournament
+              (``final_output.md`` present), return the final markdown without
+              any LLM calls.
+            - If on-disk artifacts indicate partial progress, resume from the
+              next unfinished pass with the recovered incumbent + streak.
+            - If the on-disk ``initial_a.md`` hash doesn't match the current
+              ``initial`` argument, log a warning and start fresh.
         """
-        self.store.write_initial(self.handler.render_as_markdown(initial))
+        resume = self.store.read_resume_state()
+        if resume is not None and resume.completed:
+            self.log.info(
+                "tournament_resumed_completed",
+                final_bytes=len(resume.final_md or ""),
+            )
+            history_raw = self.store.read_history() or []
+            history_loaded: list[PassResult] = []
+            for entry in history_raw:
+                try:
+                    history_loaded.append(PassResult.model_validate(entry))
+                except Exception:  # noqa: BLE001
+                    # If a stale/malformed history entry is present, skip it.
+                    pass
+            final_text = resume.final_md or ""
+            return self.handler.parse_revision(final_text, initial), history_loaded
+
+        # If a fresh-but-mismatched initial is detected, fall back to a fresh
+        # start. Otherwise keep the resume context.
+        if resume is not None:
+            on_disk_initial = self.store.read_initial()
+            if on_disk_initial is not None:
+                on_disk_t = self.handler.parse_revision(on_disk_initial, initial)
+                if self.handler.hash(on_disk_t) != self.handler.hash(initial):
+                    self.log.warning(
+                        "tournament_resume_initial_mismatch",
+                        action="starting_fresh",
+                    )
+                    resume = None
+
+        if resume is None:
+            self.store.write_initial(self.handler.render_as_markdown(initial))
+            incumbent: T = initial
+            streak = 0
+            start_pass = 1
+        else:
+            # Skip write_initial — the on-disk file is already authoritative.
+            incumbent = self.handler.parse_revision(resume.incumbent_md, initial)
+            streak = resume.streak
+            start_pass = resume.starting_pass_num
+            self.log.info(
+                "tournament_resumed",
+                from_pass=start_pass,
+                streak=streak,
+            )
+
         self.log.info(
             "tournament_start",
             max_rounds=self.cfg.max_rounds,
@@ -220,11 +292,20 @@ class Tournament(Generic[T]):
             num_judges=self.cfg.num_judges,
         )
 
-        incumbent: T = initial
         history: list[PassResult] = []
-        streak = 0
 
-        for pass_num in range(1, self.cfg.max_rounds + 1):
+        # If we resumed with an A-win streak already meeting convergence,
+        # short-circuit before the loop body. (Equivalent to the "already
+        # completed" path but reached via partial state rather than
+        # ``final_output.md``.)
+        if streak >= self.cfg.convergence_k:
+            self.log.info("converged", pass_num=start_pass - 1, streak=streak)
+            self.store.write_final(
+                self.handler.render_as_markdown(incumbent), history
+            )
+            return incumbent, history
+
+        for pass_num in range(start_pass, self.cfg.max_rounds + 1):
             winner, new_incumbent, result = await self.run_pass(
                 task_prompt, incumbent, pass_num
             )
@@ -462,6 +543,7 @@ __all__ = [
     "ContentHandler",
     "LLMClient",
     "PassResult",
+    "ResumeState",
     "Tournament",
     "TournamentConfig",
     "TournamentError",

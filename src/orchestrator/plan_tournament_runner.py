@@ -18,7 +18,7 @@ Responsibilities:
 
 from __future__ import annotations
 
-import uuid
+import random
 from typing import TYPE_CHECKING
 
 from adapters import InlineAdapter
@@ -76,8 +76,20 @@ def _is_auto_disabled(model: str | None, auto_disable: list[str]) -> bool:
     return any(marker.lower() in low for marker in auto_disable)
 
 
-async def run_plan_tournament(orch: "Orchestrator", initial_md: str, spec: str) -> str:
+async def run_plan_tournament(
+    orch: "Orchestrator", initial_md: str, spec: str, spec_hash: str
+) -> str:
     """Run the plan tournament and return the refined plan markdown.
+
+    Args:
+        orch: Orchestrator instance carrying adapter / config / plugin registry.
+        initial_md: Draft plan markdown produced by the architect role.
+        spec: Original user intent (used as the tournament ``task_prompt``).
+        spec_hash: Stable 16-hex-char digest of the user spec. Used to derive
+            a deterministic ``tournament_id`` (so reruns on the same spec land
+            in the same artifact dir and can resume) and to seed the
+            tournament RNG (so judge presentation order and synthesizer X/Y
+            ordering are reproducible across runs).
 
     Behavior:
         - If any relevant role resolves to an auto-disabled model, returns
@@ -102,7 +114,7 @@ async def run_plan_tournament(orch: "Orchestrator", initial_md: str, spec: str) 
         "Tournament runners must use subprocess adapters, not InlineAdapter"
     )
 
-    tournament_id = f"plan-{uuid.uuid4().hex[:8]}"
+    tournament_id = f"plan-{spec_hash[:8]}"
     artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
 
     client = AdapterLLMClient(orch.adapter, cwd=orch.cwd)
@@ -120,11 +132,13 @@ async def run_plan_tournament(orch: "Orchestrator", initial_md: str, spec: str) 
         if orch.plugin_registry is not None
         else []
     )
+    rng = random.Random(int(spec_hash, 16))
     tournament = Tournament(
         handler=PlanContentHandler(),
         client=client,
         cfg=tcfg,
         artifact_dir=artifact_dir,
+        rng=rng,
         judge_plugins=judge_plugins,
     )
 
