@@ -3,6 +3,7 @@
 from tournament.core import (
     ContentHandler,
     LLMClient,
+    PartialPassState,
     PassResult,
     Tournament,
     TournamentConfig,
@@ -36,6 +37,7 @@ __all__ = [
     "ImplContentHandler",
     "ImplTournament",
     "LLMClient",
+    "PartialPassState",
     "PassResult",
     "PlanContentHandler",
     "StubLLMClient",

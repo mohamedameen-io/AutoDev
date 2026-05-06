@@ -5,16 +5,23 @@ Layout::
     <artifact_dir>/
       initial_a.md
       incumbent_after_NN.md     (one per non-A winning pass)
-      final_output.md
+      final_output.md           (sole "tournament complete" marker)
       history.json
       pass_NN/
-        version_a.md
-        critic.md
-        version_b.md
-        version_ab.md
-        result.json
+        version_a.md            (written after CRITIC starts)
+        critic.md               (written after CRITIC completes)
+        version_b.md            (written after ARCHITECT_B completes)
+        version_ab.md           (written after SYNTHESIZER completes)
+        synth_meta.json         (X/Y assignment recorded when SYNTHESIZER completes)
+        judges/
+          <i>_order.json        (shuffle order, written before judge i runs)
+          <i>_response.json     (raw + parsed ranking, written after judge i lands)
+        result.json             (sole "pass complete" marker; written after Borda)
 
-All writes are atomic (tmp file in the same directory, then `os.replace`).
+Each individual file is written atomically via a same-directory tempfile +
+``os.replace``. ``result.json`` is the sole pass-completion marker — its
+absence indicates a partial pass that ``read_resume_state`` may surface as
+``PartialPassState`` for resume.
 """
 
 from __future__ import annotations
@@ -24,13 +31,15 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from tournament.core import PassResult, ResumeState
+    from tournament.core import PartialPassState, PassResult, ResumeState
 
 
 _PASS_DIR_RE = re.compile(r"^pass_(\d+)$")
+_JUDGE_ORDER_RE = re.compile(r"^(\d+)_order\.json$")
+_JUDGE_RESPONSE_RE = re.compile(r"^(\d+)_response\.json$")
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -90,23 +99,76 @@ class TournamentArtifactStore:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def write_pass(
-        self,
-        pass_num: int,
-        version_a_md: str,
-        critic_md: str,
-        version_b_md: str,
-        version_ab_md: str,
-        result: "PassResult",
-    ) -> Path:
-        """Write all artifacts for a single pass atomically."""
+    def judges_dir(self, pass_num: int) -> Path:
+        d = self.pass_dir(pass_num) / "judges"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    # ── per-role writers (Tier 3) ──
+    def write_version_a(self, pass_num: int, version_a_md: str) -> Path:
+        """Write pass_NN/version_a.md."""
+        path = self.pass_dir(pass_num) / "version_a.md"
+        _atomic_write_text(path, version_a_md)
+        return path
+
+    def write_critic(self, pass_num: int, critic_md: str) -> Path:
+        """Write pass_NN/critic.md."""
+        path = self.pass_dir(pass_num) / "critic.md"
+        _atomic_write_text(path, critic_md)
+        return path
+
+    def write_version_b(self, pass_num: int, version_b_md: str) -> Path:
+        """Write pass_NN/version_b.md."""
+        path = self.pass_dir(pass_num) / "version_b.md"
+        _atomic_write_text(path, version_b_md)
+        return path
+
+    def write_synthesis(
+        self, pass_num: int, version_ab_md: str, synth_meta: dict[str, str]
+    ) -> tuple[Path, Path]:
+        """Write pass_NN/version_ab.md and pass_NN/synth_meta.json (atomic per file).
+
+        ``synth_meta`` must contain ``x_label`` and ``y_label`` (each ``"A"`` or
+        ``"B"``).
+        """
         pdir = self.pass_dir(pass_num)
-        _atomic_write_text(pdir / "version_a.md", version_a_md)
-        _atomic_write_text(pdir / "critic.md", critic_md)
-        _atomic_write_text(pdir / "version_b.md", version_b_md)
-        _atomic_write_text(pdir / "version_ab.md", version_ab_md)
-        _atomic_write_json(pdir / "result.json", result.model_dump(mode="json"))
-        return pdir
+        ab_path = pdir / "version_ab.md"
+        meta_path = pdir / "synth_meta.json"
+        _atomic_write_text(ab_path, version_ab_md)
+        _atomic_write_json(meta_path, synth_meta)
+        return ab_path, meta_path
+
+    def write_judge_order(
+        self, pass_num: int, judge_index: int, order: dict[int, str]
+    ) -> Path:
+        """Write pass_NN/judges/<i>_order.json before judge i runs.
+
+        JSON requires string keys, so the int slot keys (1/2/3) are stringified
+        on write and converted back on read.
+        """
+        path = self.judges_dir(pass_num) / f"{judge_index}_order.json"
+        # Stringify keys for JSON compatibility.
+        serialisable = {str(k): v for k, v in order.items()}
+        _atomic_write_json(path, serialisable)
+        return path
+
+    def write_judge_response(
+        self, pass_num: int, judge_index: int, response: dict[str, Any]
+    ) -> Path:
+        """Write pass_NN/judges/<i>_response.json after judge i lands.
+
+        ``response`` shape: ``{"raw": str, "ranking": list[str] | None,
+        "error": str | None}``.
+        """
+        path = self.judges_dir(pass_num) / f"{judge_index}_response.json"
+        _atomic_write_json(path, response)
+        return path
+
+    def write_pass_result(self, pass_num: int, result: "PassResult") -> Path:
+        """Write pass_NN/result.json — the sole pass-complete marker."""
+        path = self.pass_dir(pass_num) / "result.json"
+        _atomic_write_json(path, result.model_dump(mode="json"))
+        return path
 
     # ── readers (Tier 2D resume support) ──
     def read_initial(self) -> str | None:
@@ -151,6 +213,9 @@ class TournamentArtifactStore:
                   ``pass_N/version_b.md`` (B) or ``pass_N/version_ab.md`` (AB)
                   if the incumbent_after file is missing (rare crash window).
             7. ``streak`` = trailing A-wins at pass ``N`` (counting back).
+            8. Tier 3: probe ``pass_<N+1>/`` for partial state; if any per-role
+               artifact is present (and ``result.json`` is absent), attach a
+               ``PartialPassState`` to ``ResumeState.partial``.
         """
         # Import locally to avoid module-load circular import; core imports
         # state under TYPE_CHECKING only, but state's runtime needs the dataclass.
@@ -184,7 +249,7 @@ class TournamentArtifactStore:
             pass_num = int(m.group(1))
             result_path = child / "result.json"
             if not result_path.exists():
-                continue  # partial dir → ignore
+                continue  # partial dir → ignore for completed-pass tally
             try:
                 data = json.loads(result_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
@@ -194,7 +259,24 @@ class TournamentArtifactStore:
             pass_results[pass_num] = data
 
         if not pass_results:
-            return None
+            # No completed passes. But maybe pass_01 has partial state from a
+            # crash mid-pass-1? Probe pass_01 for partial state too.
+            partial = _read_partial_pass_state(
+                self.artifact_dir / "pass_01"
+            )
+            if partial is None:
+                return None
+            initial_text = self.read_initial()
+            if initial_text is None:
+                return None
+            return ResumeState(
+                starting_pass_num=1,
+                incumbent_md=initial_text,
+                streak=0,
+                completed=False,
+                final_md=None,
+                partial=partial,
+            )
 
         sorted_nums = sorted(pass_results.keys())
         n = sorted_nums[-1]
@@ -254,13 +336,129 @@ class TournamentArtifactStore:
             else:
                 break
 
+        starting_pass_num = n + 1
+        partial = _read_partial_pass_state(
+            self.artifact_dir / f"pass_{starting_pass_num:02d}"
+        )
+
         return ResumeState(
-            starting_pass_num=n + 1,
+            starting_pass_num=starting_pass_num,
             incumbent_md=incumbent_md,
             streak=streak,
             completed=False,
             final_md=None,
+            partial=partial,
         )
+
+
+def _read_partial_pass_state(pass_dir: Path) -> "PartialPassState | None":
+    """Inspect ``pass_dir`` for partial per-role artifacts.
+
+    Returns:
+        ``None`` if:
+            - the dir doesn't exist,
+            - ``result.json`` exists (pass is complete, not partial), or
+            - no per-role artifacts are present.
+        Otherwise, a populated ``PartialPassState``.
+    """
+    from tournament.core import PartialPassState
+
+    if not pass_dir.exists() or not pass_dir.is_dir():
+        return None
+
+    # Pass complete → not partial.
+    if (pass_dir / "result.json").exists():
+        return None
+
+    def _read_text(name: str) -> str | None:
+        p = pass_dir / name
+        if not p.exists():
+            return None
+        try:
+            return p.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def _read_json(name: str) -> dict | None:
+        p = pass_dir / name
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    version_a_md = _read_text("version_a.md")
+    critic_md = _read_text("critic.md")
+    version_b_md = _read_text("version_b.md")
+    version_ab_md = _read_text("version_ab.md")
+    synth_meta_raw = _read_json("synth_meta.json")
+    synth_meta: dict[str, str] | None
+    if synth_meta_raw is None:
+        synth_meta = None
+    else:
+        # Ensure values are strings (PartialPassState expects dict[str, str]).
+        synth_meta = {str(k): str(v) for k, v in synth_meta_raw.items()}
+
+    judge_orders: dict[int, dict[int, str]] = {}
+    judge_responses: dict[int, dict[str, Any]] = {}
+    judges_subdir = pass_dir / "judges"
+    if judges_subdir.exists() and judges_subdir.is_dir():
+        for child in judges_subdir.iterdir():
+            if not child.is_file():
+                continue
+            m_order = _JUDGE_ORDER_RE.match(child.name)
+            m_response = _JUDGE_RESPONSE_RE.match(child.name)
+            if m_order is not None:
+                idx = int(m_order.group(1))
+                try:
+                    raw = json.loads(child.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                # Convert string keys back to int (slot indices).
+                try:
+                    parsed = {int(k): v for k, v in raw.items()}
+                except (TypeError, ValueError):
+                    continue
+                judge_orders[idx] = parsed
+            elif m_response is not None:
+                idx = int(m_response.group(1))
+                try:
+                    raw = json.loads(child.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                judge_responses[idx] = raw
+
+    # If absolutely nothing on disk → no partial state.
+    if (
+        version_a_md is None
+        and critic_md is None
+        and version_b_md is None
+        and version_ab_md is None
+        and synth_meta is None
+        and not judge_orders
+        and not judge_responses
+    ):
+        return None
+
+    pass_num = int(pass_dir.name.removeprefix("pass_"))
+    return PartialPassState(
+        pass_num=pass_num,
+        version_a_md=version_a_md,
+        critic_md=critic_md,
+        version_b_md=version_b_md,
+        version_ab_md=version_ab_md,
+        synth_meta=synth_meta,
+        judge_orders=judge_orders,
+        judge_responses=judge_responses,
+    )
 
 
 __all__ = ["TournamentArtifactStore"]

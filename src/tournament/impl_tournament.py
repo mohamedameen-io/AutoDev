@@ -30,6 +30,7 @@ from errors import TournamentError
 from autologging import get_logger
 from tournament.core import (
     LLMClient,
+    PartialPassState,
     PassResult,
     Tournament,
     TournamentConfig,
@@ -431,10 +432,23 @@ class ImplTournament(Tournament[ImplBundle]):
         )
 
     async def run_pass(
-        self, task_prompt: str, incumbent: ImplBundle, pass_num: int
+        self,
+        task_prompt: str,
+        incumbent: ImplBundle,
+        pass_num: int,
+        partial: PartialPassState | None = None,
     ) -> tuple[WinnerLabel, ImplBundle, PassResult]:
-        """CRITIC -> ARCHITECT_B (realize B) -> SYNTHESIZER (realize AB) -> JUDGES."""
+        """CRITIC -> ARCHITECT_B (realize B) -> SYNTHESIZER (realize AB) -> JUDGES.
+
+        Tier 3 note: ``partial`` is accepted for signature compatibility with
+        the base class but not honored. Implementation-tournament passes
+        materialize variants via ephemeral git worktrees, which can't be
+        partially recovered from on-disk markdown alone. Per-pass artifacts
+        are still written via the new per-role API at end-of-pass.
+        """
         assert isinstance(self.handler, ImplContentHandler)
+        # `partial` ignored — see docstring.
+        del partial
 
         hash_before = self.handler.hash(incumbent)
         t0 = time.time()
@@ -467,8 +481,10 @@ class ImplTournament(Tournament[ImplBundle]):
         # 3. Synthesizer over (A, B) — randomized X/Y for positional fairness.
         if self.rng.random() < 0.5:
             v_x, v_y = incumbent, v_b
+            synth_meta = {"x_label": "A", "y_label": "B"}
         else:
             v_x, v_y = v_b, incumbent
+            synth_meta = {"x_label": "B", "y_label": "A"}
         synth_user = self.handler.render_for_synthesizer(task_prompt, v_x, v_y)
         synth_direction = await self.client.call(
             system=SYNTHESIZER_SYSTEM,
@@ -484,7 +500,13 @@ class ImplTournament(Tournament[ImplBundle]):
 
         # 4. N parallel judges with randomized presentation.
         rankings, judge_details = await self._run_judges(
-            task_prompt, incumbent, v_b, v_ab, model
+            task_prompt,
+            incumbent,
+            v_b,
+            v_ab,
+            model,
+            pass_num=pass_num,
+            partial_judges=(None, None),
         )
 
         # 5. Borda aggregation with conservative tiebreak to A.
@@ -516,14 +538,13 @@ class ImplTournament(Tournament[ImplBundle]):
             meta={"timestamp": time.time(), "phase": "impl"},
         )
 
-        self.store.write_pass(
-            pass_num=pass_num,
-            version_a_md=version_a_md,
-            critic_md=critic_text,
-            version_b_md=version_b_md,
-            version_ab_md=version_ab_md,
-            result=result,
-        )
+        # Tier 3 API: per-role writes (no checkpointing on impl side, all
+        # written end-of-pass to preserve all-or-nothing semantics).
+        self.store.write_version_a(pass_num, version_a_md)
+        self.store.write_critic(pass_num, critic_text)
+        self.store.write_version_b(pass_num, version_b_md)
+        self.store.write_synthesis(pass_num, version_ab_md, synth_meta)
+        self.store.write_pass_result(pass_num, result)
 
         self._impl_log.info(
             "impl_pass_complete",

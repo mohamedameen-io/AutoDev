@@ -533,3 +533,126 @@ def test_pass_result_is_pydantic() -> None:
     assert "meta" in dumped
     r2 = PassResult.model_validate(dumped)
     assert r2.pass_num == 1
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_timing_writes_artifacts_incrementally(tmp_path: Path) -> None:
+    """Tier 3: per-role artifacts are written as each role completes, not in a
+    single end-of-pass batch.
+
+    Asserts the timing by snapshotting the contents of ``pass_01/`` at the
+    *entry* of each LLM call. Because every per-role write happens BEFORE the
+    next role's LLM call, the snapshot taken when role ``R`` is invoked
+    reflects all writes performed by all roles that completed before ``R``.
+    """
+
+    class _SnapshotClient(StubLLMClient):
+        def __init__(
+            self,
+            *args,
+            snapshot_dir: Path,
+            **kwargs,
+        ) -> None:
+            super().__init__(*args, **kwargs)
+            self.snapshots: list[dict] = []
+            self._snapshot_dir = snapshot_dir
+
+        async def call(
+            self,
+            *,
+            system: str,
+            user: str,
+            role: str,
+            model: str | None = None,
+        ) -> str:
+            # Snapshot BEFORE the LLM call. Reflects on-disk state at this
+            # role's entry point.
+            files: set[str] = set()
+            if self._snapshot_dir.exists():
+                for p in self._snapshot_dir.rglob("*"):
+                    if p.is_file():
+                        files.add(p.relative_to(self._snapshot_dir).as_posix())
+            n_for_role = self._role_counts.get(role, 0) + 1
+            self.snapshots.append({"role": role, "n": n_for_role, "files": files})
+            return await super().call(
+                system=system, user=user, role=role, model=model
+            )
+
+    cfg = TournamentConfig(num_judges=3, convergence_k=1, max_rounds=1)
+    artifact = tmp_path / "tournaments" / "checkpoint-timing"
+    pass1_dir = artifact / "pass_01"
+
+    client = _SnapshotClient(
+        fn=_favor_label_factory("A", _prefix_map()),
+        snapshot_dir=pass1_dir,
+    )
+    t = Tournament(
+        handler=_handler(),
+        client=client,
+        cfg=cfg,
+        artifact_dir=artifact,
+        rng=random.Random(42),
+    )
+    await t.run("Task.", "MARK_A_ONLY_INITIAL")
+
+    # ── Sequence checks: the first three calls are CRITIC → ARCHITECT_B →
+    # SYNTHESIZER, in that strict order. ────────────────────────────────────
+    assert len(client.snapshots) == 6  # critic + arch_b + synth + 3 judges
+    assert client.snapshots[0]["role"] == "critic_t"
+    assert client.snapshots[1]["role"] == "architect_b"
+    assert client.snapshots[2]["role"] == "synthesizer"
+    assert {s["role"] for s in client.snapshots[3:6]} == {"judge"}
+
+    # ── Snapshot 0 (CRITIC entry): version_a.md was written before this LLM
+    # call; nothing else exists yet. ─────────────────────────────────────────
+    s0 = client.snapshots[0]["files"]
+    assert "version_a.md" in s0
+    assert "critic.md" not in s0
+    assert "version_b.md" not in s0
+    assert "version_ab.md" not in s0
+    assert "synth_meta.json" not in s0
+    # No judges files yet either.
+    assert not any(f.startswith("judges/") for f in s0)
+
+    # ── Snapshot 1 (ARCHITECT_B entry): critic.md is now on disk; version_b
+    # is not yet written. ────────────────────────────────────────────────────
+    s1 = client.snapshots[1]["files"]
+    assert "version_a.md" in s1
+    assert "critic.md" in s1
+    assert "version_b.md" not in s1
+    assert "version_ab.md" not in s1
+    assert "synth_meta.json" not in s1
+
+    # ── Snapshot 2 (SYNTHESIZER entry): version_b.md is on disk; synth
+    # outputs are not yet written. ───────────────────────────────────────────
+    s2 = client.snapshots[2]["files"]
+    assert "version_a.md" in s2
+    assert "critic.md" in s2
+    assert "version_b.md" in s2
+    assert "version_ab.md" not in s2
+    assert "synth_meta.json" not in s2
+
+    # ── Snapshots 3..5 (the 3 judges, parallel): set-level assertions only,
+    # since asyncio.gather may interleave their entries. Every judge sees the
+    # full SYNTHESIZER output on disk before its own LLM call fires. ─────────
+    for s in client.snapshots[3:6]:
+        files = s["files"]
+        assert "version_a.md" in files
+        assert "critic.md" in files
+        assert "version_b.md" in files
+        assert "version_ab.md" in files
+        assert "synth_meta.json" in files
+        # No result.json is written until after ALL judges complete + Borda.
+        assert "result.json" not in files
+
+    # ── Post-run state: every per-judge order + response file lands, and
+    # result.json is the final artifact written for the pass. ───────────────
+    assert (pass1_dir / "version_a.md").exists()
+    assert (pass1_dir / "critic.md").exists()
+    assert (pass1_dir / "version_b.md").exists()
+    assert (pass1_dir / "version_ab.md").exists()
+    assert (pass1_dir / "synth_meta.json").exists()
+    for i in range(3):
+        assert (pass1_dir / "judges" / f"{i}_order.json").exists()
+        assert (pass1_dir / "judges" / f"{i}_response.json").exists()
+    assert (pass1_dir / "result.json").exists()
