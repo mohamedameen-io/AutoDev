@@ -281,6 +281,83 @@ async def test_execute_subtype_none_on_subprocess_failure(tmp_path: Path) -> Non
     assert result.subtype is None
 
 
+# ── Fix 4 completion: rc!=0 with JSON-in-stdout still surfaces subtype ──
+
+
+@pytest.mark.asyncio
+async def test_execute_rc1_with_error_max_turns_json_extracts_subtype(
+    tmp_path: Path,
+) -> None:
+    """Realistic deterministic-failure shape: claude exits rc=1 BUT writes a
+    complete result JSON to stdout with ``subtype="error_max_turns"``. The
+    adapter must surface that subtype so the tournament retry layer's
+    deterministic short-circuit can fire (Fix 4 completion).
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=1)
+    blob = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error_max_turns",
+            "is_error": True,
+            "duration_ms": 100,
+            "num_turns": 2,
+            "result": "",
+            "stop_reason": "tool_use",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "total_cost_usd": 0.0,
+            "errors": ["Reached maximum number of turns (1)"],
+        }
+    )
+    fake = _fake_proc(stdout=blob, stderr="", returncode=1)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.subtype == "error_max_turns"
+    assert result.error is not None
+    assert result.error.startswith("claude exited 1")
+
+
+@pytest.mark.asyncio
+async def test_execute_rc1_with_unparseable_stdout_subtype_is_none(
+    tmp_path: Path,
+) -> None:
+    """rc=1 + non-JSON stdout falls through gracefully: subtype stays None and
+    the existing transient-substring classifier path applies."""
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=1)
+    fake = _fake_proc(stdout="not json at all", stderr="boom", returncode=1)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.subtype is None
+
+
+@pytest.mark.asyncio
+async def test_execute_rc1_with_empty_stdout_subtype_is_none(
+    tmp_path: Path,
+) -> None:
+    """rc=1 + empty stdout/stderr (genuine subprocess death sentinel) keeps
+    subtype=None so the transient-substring classifier still retries."""
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=1)
+    fake = _fake_proc(stdout="", stderr="", returncode=1)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.subtype is None
+    assert result.error == "claude exited 1 with empty stderr"
+
+
 @pytest.mark.asyncio
 async def test_execute_binary_not_found(tmp_path: Path) -> None:
     adapter = ClaudeCodeAdapter(binary="nonexistent-claude-binary-xyz")

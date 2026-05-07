@@ -133,6 +133,27 @@ class ClaudeCodeAdapter(PlatformAdapter):
                 msg = f"claude exited {returncode}: {err_tail}"
             else:
                 msg = f"claude exited {returncode} (stdout): {out_tail}"
+
+            # Fix 4 completion: deterministic-subtype failures (e.g.
+            # ``error_max_turns``, ``error_max_tokens``,
+            # ``error_during_execution``) sometimes exit rc=1 yet write a
+            # complete result JSON to stdout. Extract ``subtype``
+            # opportunistically so the tournament retry layer's
+            # ``_DETERMINISTIC_SUBTYPES`` short-circuit fires and the call
+            # is not retried. Falls through to ``None`` on empty / malformed
+            # / non-dict stdout — preserving the genuine-subprocess-death
+            # path (which DOES want to retry via the transient-substring
+            # classifier).
+            subtype_val: str | None = None
+            try:
+                parsed_failure = json.loads(stdout)
+                if isinstance(parsed_failure, dict):
+                    st = parsed_failure.get("subtype")
+                    if st:
+                        subtype_val = str(st)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
             self._dump_failure_transcript(
                 inv=inv,
                 stdout=stdout,
@@ -147,6 +168,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
                 error=msg,
                 raw_stdout=stdout,
                 raw_stderr=stderr,
+                subtype=subtype_val,
             )
 
         try:
