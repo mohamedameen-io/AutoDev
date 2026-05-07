@@ -96,6 +96,73 @@ def test_parse_plan_markdown_without_description_uses_title() -> None:
     assert t.acceptance == []
 
 
+# --- COMPLEXITY: capture tests ---------------------------------------------
+
+
+CANONICAL_PLAN_MD_WITH_COMPLEXITY = f"{CANONICAL_PLAN_MD}\nCOMPLEXITY: medium\n"
+
+
+def test_parse_plan_markdown_captures_complexity_medium() -> None:
+    plan = parse_plan_markdown(CANONICAL_PLAN_MD_WITH_COMPLEXITY)
+    assert plan.complexity == "medium"
+
+
+def test_parse_plan_markdown_captures_complexity_simple() -> None:
+    md = f"{CANONICAL_PLAN_MD}\nCOMPLEXITY: simple\n"
+    plan = parse_plan_markdown(md)
+    assert plan.complexity == "simple"
+
+
+def test_parse_plan_markdown_captures_complexity_complex() -> None:
+    md = f"{CANONICAL_PLAN_MD}\nCOMPLEXITY: complex\n"
+    plan = parse_plan_markdown(md)
+    assert plan.complexity == "complex"
+
+
+def test_parse_plan_markdown_no_complexity_line_returns_none() -> None:
+    """Legacy plans without a COMPLEXITY: line gracefully default to None."""
+    plan = parse_plan_markdown(CANONICAL_PLAN_MD)
+    assert plan.complexity is None
+
+
+def test_parse_plan_markdown_complexity_case_insensitive() -> None:
+    """COMPLEXITY: header and value match case-insensitively but normalize to lowercase."""
+    md_upper = f"{CANONICAL_PLAN_MD}\nCOMPLEXITY: MEDIUM\n"
+    plan_upper = parse_plan_markdown(md_upper)
+    assert plan_upper.complexity == "medium"
+
+    md_lower = f"{CANONICAL_PLAN_MD}\ncomplexity: simple\n"
+    plan_lower = parse_plan_markdown(md_lower)
+    assert plan_lower.complexity == "simple"
+
+
+def test_parse_plan_markdown_complexity_invalid_value_treated_as_missing() -> None:
+    """Unknown bucket like ``foo`` doesn't match the regex; complexity stays None."""
+    md = f"{CANONICAL_PLAN_MD}\nCOMPLEXITY: foo\n"
+    plan = parse_plan_markdown(md)
+    assert plan.complexity is None
+
+
+def test_parse_plan_markdown_strips_complexity_from_body() -> None:
+    """The COMPLEXITY: line must not leak into any phase/task title or description."""
+    plan = parse_plan_markdown(CANONICAL_PLAN_MD_WITH_COMPLEXITY)
+    for phase in plan.phases:
+        assert "COMPLEXITY:" not in phase.title
+        assert "COMPLEXITY:" not in phase.description
+        for task in phase.tasks:
+            assert "COMPLEXITY:" not in task.title
+            assert "COMPLEXITY:" not in task.description
+
+
+def test_parse_plan_markdown_complexity_at_end_of_file_with_trailing_newline() -> None:
+    """COMPLEXITY: as the last line — surrounded by newlines — parses cleanly."""
+    md = f"{CANONICAL_PLAN_MD}\n\nCOMPLEXITY: complex\n"
+    plan = parse_plan_markdown(md)
+    assert plan.complexity == "complex"
+    # Body should still parse normally.
+    assert len(plan.phases) == 2
+
+
 # --- Full-flow tests using StubAdapter -------------------------------------
 
 

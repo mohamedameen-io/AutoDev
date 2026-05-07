@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as _dt
 import re
 import uuid
+from typing import Literal, cast
 
 from errors import AutodevError
 from state.schemas import AcceptanceCriterion, Phase, Plan, Task
@@ -39,6 +40,10 @@ _RE_DESC = re.compile(r"^\s*-\s*Description\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _RE_ACCEPT_HEADER = re.compile(r"^\s*-\s*Acceptance\s*:?\s*$", re.IGNORECASE)
 _RE_ACCEPT_ITEM = re.compile(r"^\s*-\s*\[\s*[ xX]?\s*\]\s*(.+?)\s*$")
 _RE_DEPENDS = re.compile(r"^\s*-\s*Depends(?:_on|On)?\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_RE_COMPLEXITY = re.compile(
+    r"^COMPLEXITY:\s*(simple|medium|complex)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def _iso_now() -> str:
@@ -53,6 +58,22 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
     """
     if not md or not md.strip():
         raise PlanParseError("empty plan markdown")
+
+    # Capture and strip the trailing ``COMPLEXITY: <bucket>`` directive emitted
+    # by the architect. Done before the line-loop so the body parser never sees
+    # the directive line. Legacy plans without this line gracefully resolve to
+    # ``complexity = None`` (consumers fall back to user-global effort).
+    m_complexity = _RE_COMPLEXITY.search(md)
+    complexity: Literal["simple", "medium", "complex"] | None = None
+    if m_complexity is not None:
+        # The regex constrains the captured group to {simple, medium, complex}
+        # (case-insensitive); ``.lower()`` normalizes it to one of the three
+        # literals. ``cast`` tells mypy the runtime guarantee.
+        complexity = cast(
+            Literal["simple", "medium", "complex"],
+            m_complexity.group(1).lower(),
+        )
+        md = _RE_COMPLEXITY.sub("", md, count=1)
 
     title_match = _RE_PLAN_TITLE.search(md)
     if title_match is None:
@@ -176,6 +197,7 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
         spec_hash=spec_hash,
         phases=phases,
         metadata={"title": plan_title},
+        complexity=complexity,
         created_at=now,
         updated_at=now,
     )
