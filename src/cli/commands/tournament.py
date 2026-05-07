@@ -223,56 +223,70 @@ def _render_history_table(console: Console, history: list) -> None:
 # ---------------------------------------------------------------------------
 
 
-@click.command("tournament")
-@click.option(
-    "--phase",
-    type=click.Choice(["plan", "impl"], case_sensitive=False),
-    required=True,
-    help="Which tournament variant to run.",
-)
-@click.option(
-    "--input",
-    "input_path",
-    type=click.Path(exists=False, dir_okay=False, path_type=Path),
-    default=None,
-    help="Input file (required for --phase=plan; optional diff file for --phase=impl).",
-)
-@click.option("--dry-run", is_flag=True, help="Skip LLM calls; use canned responses.")
-@click.option(
-    "--max-rounds",
-    type=int,
-    default=None,
-    help="Override tournaments.*.max_rounds for this run.",
-)
-@click.option(
-    "--input-diff",
-    "input_diff",
-    type=click.Path(exists=False, dir_okay=False, path_type=Path),
-    default=None,
-    help="Unified diff file for --phase=impl (alternative to --input).",
-)
-@click.option(
-    "--task-desc",
-    "task_desc",
-    type=str,
-    default=None,
-    help="Task description for --phase=impl.",
-)
-@click.option(
-    "--task-id",
-    "task_id",
-    type=str,
-    default="cli-impl",
-    help="Task ID for --phase=impl (default: cli-impl).",
-)
-@click.option(
-    "--files",
-    "files_changed",
-    type=str,
-    default=None,
-    help="Comma-separated list of changed files for --phase=impl.",
-)
-def tournament(
+def _run_command_options(fn):
+    """Apply the existing ``run`` options. Used by both the legacy flat-flag
+    invocation and the explicit ``tournament run`` subcommand so the two
+    paths share the same option surface (and option order).
+    """
+    fn = click.option(
+        "--files",
+        "files_changed",
+        type=str,
+        default=None,
+        help="Comma-separated list of changed files for --phase=impl.",
+    )(fn)
+    fn = click.option(
+        "--task-id",
+        "task_id",
+        type=str,
+        default="cli-impl",
+        help="Task ID for --phase=impl (default: cli-impl).",
+    )(fn)
+    fn = click.option(
+        "--task-desc",
+        "task_desc",
+        type=str,
+        default=None,
+        help="Task description for --phase=impl.",
+    )(fn)
+    fn = click.option(
+        "--input-diff",
+        "input_diff",
+        type=click.Path(exists=False, dir_okay=False, path_type=Path),
+        default=None,
+        help="Unified diff file for --phase=impl (alternative to --input).",
+    )(fn)
+    fn = click.option(
+        "--max-rounds",
+        type=int,
+        default=None,
+        help="Override tournaments.*.max_rounds for this run.",
+    )(fn)
+    fn = click.option(
+        "--dry-run",
+        is_flag=True,
+        help="Skip LLM calls; use canned responses.",
+    )(fn)
+    fn = click.option(
+        "--input",
+        "input_path",
+        type=click.Path(exists=False, dir_okay=False, path_type=Path),
+        default=None,
+        help=(
+            "Input file (required for --phase=plan; optional diff file for "
+            "--phase=impl)."
+        ),
+    )(fn)
+    fn = click.option(
+        "--phase",
+        type=click.Choice(["plan", "impl"], case_sensitive=False),
+        required=True,
+        help="Which tournament variant to run.",
+    )(fn)
+    return fn
+
+
+def _dispatch_run(
     phase: str,
     input_path: Path | None,
     dry_run: bool,
@@ -282,7 +296,12 @@ def tournament(
     task_id: str,
     files_changed: str | None,
 ) -> None:
-    """Run a plan or implementation tournament against a file."""
+    """Shared body for both the legacy flat-flag invocation and ``tournament run``.
+
+    Extracted so the same logic services
+    ``autodev tournament --phase=plan ...`` (preserved for backward compat)
+    AND the new ``autodev tournament run --phase=plan ...`` form.
+    """
     console = Console()
     phase_lower = phase.lower()
 
@@ -349,6 +368,185 @@ def tournament(
     except AutodevError as exc:
         console.print(f"[red]autodev tournament failed:[/red] {exc}")
         sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# v0.6.0: Click group + subcommands ('run' and 'promote'), with backward
+# compatibility for the legacy flat-flag form ``tournament --phase=plan ...``.
+# ---------------------------------------------------------------------------
+
+
+_LEGACY_KNOWN_FLAGS = {
+    "--phase",
+    "--input",
+    "--input-diff",
+    "--dry-run",
+    "--max-rounds",
+    "--task-desc",
+    "--task-id",
+    "--files",
+    "-h",
+    "--help",
+}
+
+
+class _TournamentGroup(click.Group):
+    """Custom group that forwards bare ``tournament --phase=...`` invocations
+    to the ``run`` subcommand, preserving backward compatibility with the
+    pre-v0.6.0 flat-flag CLI surface.
+
+    Click groups normally consume the first positional arg as the
+    subcommand name. We override :meth:`resolve_command` to inject ``run``
+    when the first arg looks like a flag-form invocation.
+    """
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        # Insert 'run' before the args if the first arg is one of the
+        # legacy flat flags (rather than a known subcommand). This keeps
+        # the legacy form ``tournament --phase=plan ...`` working while
+        # still accepting ``tournament run ...`` and ``tournament promote ...``.
+        if args:
+            first = args[0]
+            # Strip any '=value' suffix to compare against the flag name.
+            first_flag = first.split("=", 1)[0]
+            known_subs = set(self.commands.keys())
+            if first_flag in _LEGACY_KNOWN_FLAGS and first_flag not in known_subs:
+                args = ["run", *args]
+        return super().parse_args(ctx, args)
+
+
+@click.group(
+    "tournament",
+    cls=_TournamentGroup,
+    invoke_without_command=False,
+)
+def tournament() -> None:
+    """Run, salvage, and inspect plan/impl self-refinement tournaments.
+
+    Subcommands:
+
+      \b
+      run      Run a plan or implementation tournament against a file (the
+               legacy flat-flag form ``tournament --phase=plan ...`` still
+               works as a synonym).
+      promote  Salvage an incumbent from a previously-run tournament's
+               on-disk artifacts and write it to the local plan.json.
+    """
+
+
+@tournament.command("run")
+@_run_command_options
+def run_subcommand(
+    phase: str,
+    input_path: Path | None,
+    dry_run: bool,
+    max_rounds: int | None,
+    input_diff: Path | None,
+    task_desc: str | None,
+    task_id: str,
+    files_changed: str | None,
+) -> None:
+    """Run a plan or implementation tournament against a file."""
+    _dispatch_run(
+        phase=phase,
+        input_path=input_path,
+        dry_run=dry_run,
+        max_rounds=max_rounds,
+        input_diff=input_diff,
+        task_desc=task_desc,
+        task_id=task_id,
+        files_changed=files_changed,
+    )
+
+
+@tournament.command("promote")
+@click.option(
+    "--tournament-id",
+    "tournament_id",
+    required=True,
+    type=str,
+    help="Tournament directory name under .autodev/tournaments/ (e.g. plan-b536bfe8).",
+)
+@click.option(
+    "--pass",
+    "pass_num",
+    type=int,
+    default=None,
+    help="Promote a specific pass; defaults to the latest incumbent.",
+)
+def promote_subcommand(tournament_id: str, pass_num: int | None) -> None:
+    """Salvage a tournament's incumbent into the local plan.json.
+
+    Reads ``.autodev/tournaments/<tournament-id>/incumbent_after_NN.md``
+    (latest by default, or the explicit pass number from ``--pass``),
+    parses it as a Plan, and writes it to ``.autodev/plan.json`` via the
+    PlanManager. This is the manual fallback for the automatic
+    on-tournament-error recovery in ``run_plan_phase``.
+    """
+    from orchestrator.plan_parser import parse_plan_markdown
+    from state.plan_manager import PlanManager
+    from tournament.state import TournamentArtifactStore
+
+    console = Console()
+    cwd = Path.cwd()
+    artifact_dir = autodev_root(cwd) / "tournaments" / tournament_id
+    if not artifact_dir.exists():
+        console.print(
+            f"[red]autodev tournament promote:[/red] "
+            f"tournament dir not found: {artifact_dir}"
+        )
+        sys.exit(2)
+
+    store = TournamentArtifactStore(artifact_dir)
+    if pass_num is not None:
+        recovered = store.read_incumbent_at(pass_num)
+        if recovered is None:
+            console.print(
+                f"[red]autodev tournament promote:[/red] "
+                f"no incumbent_after_{pass_num:02d}.md in {artifact_dir}"
+            )
+            sys.exit(2)
+        used_pass: int | None = pass_num
+    else:
+        recovered = store.latest_incumbent_md()
+        used_pass = store.latest_incumbent_pass_num()
+        if recovered is None:
+            console.print(
+                f"[red]autodev tournament promote:[/red] "
+                f"no incumbent files (or initial_a.md) in {artifact_dir}"
+            )
+            sys.exit(2)
+
+    # Parse the recovered markdown using a deterministic stub spec_hash.
+    # (Plan-tournament salvage runs are by definition orphaned from their
+    # original spec; the spec_hash here is a placeholder that lets the Plan
+    # validator pass without forcing the user to re-derive the original hash.)
+    spec_hash_stub = f"salvage-{tournament_id}"[:16].ljust(16, "0")
+    try:
+        plan = parse_plan_markdown(recovered, spec_hash=spec_hash_stub)
+    except Exception as exc:  # noqa: BLE001
+        console.print(
+            f"[red]autodev tournament promote:[/red] "
+            f"failed to parse recovered markdown: {exc}"
+        )
+        sys.exit(2)
+
+    async def _persist() -> None:
+        pm = PlanManager(cwd, session_id="cli-tournament-promote")
+        await pm.init_plan(plan)
+
+    try:
+        asyncio.run(_persist())
+    except AutodevError as exc:
+        console.print(f"[red]autodev tournament promote failed:[/red] {exc}")
+        sys.exit(2)
+
+    pass_label = used_pass if used_pass is not None else "(initial)"
+    console.print(
+        f"[green]Promoted incumbent[/green] from "
+        f"[cyan]{tournament_id}[/cyan] pass={pass_label} "
+        f"({len(recovered)} bytes) to .autodev/plan.json"
+    )
 
 
 async def _run_plan_tournament_cli(
@@ -421,6 +619,7 @@ async def _run_plan_tournament_cli(
         max_parallel_subprocesses=cfg.tournaments.max_parallel_subprocesses,
         score_stability_window=plan_cfg.score_stability_window,
         score_stability_max_delta=plan_cfg.score_stability_max_delta,
+        winner_stability_window=plan_cfg.winner_stability_window,
     )
 
     console.print(
@@ -529,6 +728,7 @@ async def _run_impl_tournament_cli(
         max_parallel_subprocesses=cfg.tournaments.max_parallel_subprocesses,
         score_stability_window=impl_cfg.score_stability_window,
         score_stability_max_delta=impl_cfg.score_stability_max_delta,
+        winner_stability_window=impl_cfg.winner_stability_window,
     )
 
     console.print(
