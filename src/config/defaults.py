@@ -131,6 +131,7 @@ def default_config(platform: str = "auto") -> AutodevConfig:
         ),
         qa_gates=QAGatesConfig(),
         qa_retry_limit=3,
+        user_complexity="medium",
         guardrails=GuardrailsConfig(),
         hive=HiveConfig(
             enabled=True,

@@ -36,6 +36,13 @@ class AgentInvocation(BaseModel):
     timeout_s: int = 600
     allowed_tools: list[str] | None = None
     max_turns: int = 1
+    # Per-invocation Claude Code ``--effort`` hint. Plain ``str`` (not
+    # ``Literal``) because the adapter accepts any value for forward-compat
+    # with new effort levels Claude Code may add. The ``Literal`` validation
+    # lives at the config layer (see :class:`config.schema.AgentConfig`).
+    # ``None`` = the adapter omits the ``--effort`` flag and inherits the
+    # user-global default in ``~/.claude/settings.json``.
+    effort: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

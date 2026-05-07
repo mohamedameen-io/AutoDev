@@ -134,3 +134,30 @@ def test_extra_fields_rejected() -> None:
             cwd=Path("/x"),
             unexpected_field="oops",  # type: ignore[call-arg]
         )
+
+
+# ---------------------------------------------------------------------------
+# AgentInvocation.effort — Claude Code per-invocation test-time-compute hint
+# ---------------------------------------------------------------------------
+
+
+def test_agent_invocation_effort_default_none(tmp_path: Path) -> None:
+    """Without an explicit ``effort=``, the field is ``None`` — adapters
+    that translate this to a CLI flag (e.g. ``claude_code``) skip ``--effort``
+    and inherit the user-global setting.
+    """
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path)
+    assert inv.effort is None
+
+
+def test_agent_invocation_accepts_effort_string(tmp_path: Path) -> None:
+    """The adapter accepts arbitrary effort strings (``Literal`` validation
+    lives at the config layer only — see :class:`config.schema.AgentConfig`).
+    Forward-compat with new effort levels Claude Code may add.
+    """
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, effort="xhigh")
+    assert inv.effort == "xhigh"
+    # Round-trip through JSON to confirm the field persists.
+    dumped = inv.model_dump(mode="json")
+    reloaded = AgentInvocation.model_validate(dumped)
+    assert reloaded.effort == "xhigh"

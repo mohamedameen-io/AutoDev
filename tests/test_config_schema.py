@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from config.defaults import default_config
 from config.loader import expand_paths, load_config, save_config
@@ -97,3 +98,68 @@ def test_unknown_top_level_field_rejected(tmp_path: Path) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+# ---------------------------------------------------------------------------
+# AgentConfig.effort — per-role test-time-compute override
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "level",
+    ["low", "medium", "high", "xhigh", "max", None],
+)
+def test_agent_config_accepts_effort_levels(level: str | None) -> None:
+    cfg = AgentConfig(effort=level)
+    assert cfg.effort == level
+    # Round-trip through JSON to confirm the field persists.
+    dumped = cfg.model_dump(mode="json")
+    reloaded = AgentConfig.model_validate(dumped)
+    assert reloaded.effort == level
+
+
+def test_agent_config_rejects_invalid_effort() -> None:
+    with pytest.raises(ValidationError):
+        AgentConfig(effort="insane")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# AutodevConfig.user_complexity — top-level user-declared complexity bucket
+# ---------------------------------------------------------------------------
+
+
+def test_autodev_config_user_complexity_default_medium() -> None:
+    """A minimal valid config that doesn't set user_complexity defaults to
+    ``"medium"`` — ensures pre-existing on-disk configs validate without
+    migration.
+    """
+    cfg = default_config()
+    data = cfg.model_dump(mode="json")
+    # Drop the user_complexity field so we test the actual default.
+    data.pop("user_complexity", None)
+    reloaded = AutodevConfig.model_validate(data)
+    assert reloaded.user_complexity == "medium"
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high", "max"])
+def test_autodev_config_user_complexity_accepts_levels(level: str) -> None:
+    cfg = default_config()
+    data = cfg.model_dump(mode="json")
+    data["user_complexity"] = level
+    reloaded = AutodevConfig.model_validate(data)
+    assert reloaded.user_complexity == level
+    # Round-trip again to confirm it persists.
+    redumped = reloaded.model_dump(mode="json")
+    rereloaded = AutodevConfig.model_validate(redumped)
+    assert rereloaded.user_complexity == level
+
+
+def test_autodev_config_rejects_invalid_user_complexity() -> None:
+    """``"complex"`` is valid for ``Plan.complexity`` but NOT for
+    ``AutodevConfig.user_complexity`` — they are distinct enums.
+    """
+    cfg = default_config()
+    data = cfg.model_dump(mode="json")
+    data["user_complexity"] = "complex"
+    with pytest.raises(ValidationError):
+        AutodevConfig.model_validate(data)

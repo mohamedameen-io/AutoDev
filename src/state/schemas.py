@@ -88,6 +88,14 @@ class Plan(BaseModel):
     spec_hash: str
     phases: list[Phase]
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Architect-emitted plan-complexity bucket parsed from the trailing
+    # ``COMPLEXITY: simple|medium|complex`` line of the plan markdown.
+    # ``None`` for legacy plans (no COMPLEXITY: line) or when the architect
+    # hasn't emitted it yet — the effort resolver gracefully falls back to
+    # the user-global Claude Code default for non-architect roles in that
+    # case. Distinct enum from ``AutodevConfig.user_complexity`` which uses
+    # {low, medium, high, max}.
+    complexity: Literal["simple", "medium", "complex"] | None = None
     created_at: str
     updated_at: str
     content_hash: str = ""  # CAS hash, recomputed on save by the ledger

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from errors import PlanConcurrentModificationError
 from state.plan_manager import PlanManager, current_plan_path, read_plan_json
@@ -420,3 +421,67 @@ async def test_load_fast_path_applies_post_snapshot_entries(tmp_path: Path) -> N
     assert t1.evidence_bundle == "/ev/1.1.json"
     assert t2.status == "blocked"
     assert t2.blocked_reason == "dep missing"
+
+
+# ---------------------------------------------------------------------------
+# Plan.complexity — architect-emitted plan-complexity bucket
+# ---------------------------------------------------------------------------
+
+
+def test_plan_complexity_default_none() -> None:
+    """A freshly-constructed Plan has ``complexity = None`` by default —
+    the parser sets this only when an architect emits ``COMPLEXITY: <bucket>``.
+    Legacy plans (no COMPLEXITY: line) keep the field as ``None`` and the
+    effort resolver falls back to the user-global default downstream.
+    """
+    plan = _mk_plan()
+    assert plan.complexity is None
+
+
+def test_plan_complexity_round_trip_through_json() -> None:
+    """Round-trip ``complexity="complex"`` through ``model_dump(mode="json")``
+    and ``model_validate`` — the field must persist across serialization.
+    """
+    plan = Plan(
+        plan_id="p-rt",
+        spec_hash="cafebabe",
+        phases=[
+            Phase(
+                id="1",
+                title="Setup",
+                tasks=[
+                    Task(id="1.1", phase_id="1", title="task a", description="do a"),
+                ],
+            ),
+        ],
+        created_at=_iso(),
+        updated_at=_iso(),
+        complexity="complex",
+    )
+    dumped = plan.model_dump(mode="json")
+    reloaded = Plan.model_validate(dumped)
+    assert reloaded.complexity == "complex"
+    assert reloaded == plan
+
+
+def test_plan_complexity_rejects_invalid() -> None:
+    """``"moderate"`` is not in the {simple, medium, complex} enum and must
+    fail validation — guards against architect output drift.
+    """
+    with pytest.raises(ValidationError):
+        Plan(
+            plan_id="p-bad",
+            spec_hash="cafebabe",
+            phases=[
+                Phase(
+                    id="1",
+                    title="Setup",
+                    tasks=[
+                        Task(id="1.1", phase_id="1", title="t", description="d"),
+                    ],
+                ),
+            ],
+            created_at=_iso(),
+            updated_at=_iso(),
+            complexity="moderate",  # type: ignore[arg-type]
+        )

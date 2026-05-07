@@ -145,3 +145,16 @@ def test_default_impl_tournament_max_rounds_unchanged() -> None:
     cfg = default_config()
     assert cfg.tournaments.impl.convergence_k == 1
     assert cfg.tournaments.impl.max_rounds == 3
+
+
+# ---------------------------------------------------------------------------
+# default_config: user_complexity (test-time-compute bucket)
+# ---------------------------------------------------------------------------
+
+
+def test_default_user_complexity_is_medium() -> None:
+    """``default_config()`` ships ``user_complexity="medium"`` — the
+    middle-bucket default that AutoDev uses when the user has not flagged
+    a different complexity tier on the CLI or in their config.
+    """
+    assert default_config().user_complexity == "medium"

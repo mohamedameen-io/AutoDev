@@ -32,6 +32,12 @@ class AgentConfig(BaseModel):
     model: str | None = None
     disabled: bool = False
     max_turns: int | None = None  # None = use role default
+    # Per-role override for Claude Code's ``--effort`` test-time-compute
+    # flag. ``None`` = inherit (let the orchestrator's effort resolver
+    # derive a value from plan + user complexity, or fall back to the
+    # user-global default in ``~/.claude/settings.json``). Validated at the
+    # config layer; the adapter accepts any string for forward-compat.
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
 
 
 class TournamentPhaseConfig(BaseModel):
@@ -150,6 +156,13 @@ class AutodevConfig(BaseModel):
     tournaments: TournamentsConfig
     qa_gates: QAGatesConfig = Field(default_factory=QAGatesConfig)
     qa_retry_limit: int = 3
+    # User-declared task-complexity bucket. Drives the architect's effort
+    # floor (``xhigh`` for {low, medium, high}, ``max`` for ``max``) and is
+    # combined with the parsed ``Plan.complexity`` to derive per-role effort
+    # for downstream agents. Defaults to ``"medium"`` so existing on-disk
+    # configs validate without migration. Distinct from ``Plan.complexity``
+    # which uses {simple, medium, complex}.
+    user_complexity: Literal["low", "medium", "high", "max"] = "medium"
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
     hive: HiveConfig
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
