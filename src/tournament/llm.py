@@ -22,7 +22,6 @@ from tenacity import (
     RetryError,
     retry,
     retry_if_exception_type,
-    stop_after_attempt,
     wait_exponential,
 )
 
@@ -30,14 +29,14 @@ from errors import AdapterError, TournamentError
 from autologging import get_logger
 
 
+# Substrings whose corresponding failures are normal-cost transients —
+# fast to retry, so we use the default ``max_attempts`` budget (typically 5).
 _TRANSIENT_SUBSTRINGS = (
     "rate",
     "429",
     "overloaded",
     "529",
     "too many requests",
-    "timeout",
-    "timed out",
     "connection",
     "503",
     # Subprocess process-death patterns (see Tier 1A in claude_code.py).
@@ -45,6 +44,16 @@ _TRANSIENT_SUBSTRINGS = (
     "claude exited",
     "empty stderr",
     "broken pipe",
+)
+
+
+# Substrings whose corresponding failures are EXPENSIVE transients — the
+# retry itself takes hundreds of seconds, so we cap them at
+# ``max_attempts_expensive`` (typically 3) to bound total wall-clock burn.
+# Without this cap a 600s timeout retried 5x = ~50 min silent loss (QNX bug).
+_EXPENSIVE_TRANSIENT_SUBSTRINGS = (
+    "timeout",
+    "timed out",
 )
 
 
@@ -63,6 +72,16 @@ _DETERMINISTIC_SUBTYPES = frozenset(
 
 class TransientError(AdapterError):
     """Retryable adapter failure (rate limit / transient network / overload)."""
+
+
+class ExpensiveTransientError(TransientError):
+    """Retryable but expensive failure (e.g. subprocess timeout).
+
+    Subclassed from :class:`TransientError` so existing
+    ``retry_if_exception_type(TransientError)`` predicates still match, but
+    the retry loop's stop predicate inspects the concrete class to apply a
+    smaller attempt budget (``max_attempts_expensive``).
+    """
 
 
 @runtime_checkable
@@ -154,19 +173,34 @@ def _classify_error(
     exc: BaseException | None = None,
     *,
     subtype: str | None = None,
-) -> bool:
-    """Return True if the error text indicates a transient failure.
+) -> type[TransientError] | None:
+    """Return the transient class for a given error string, or ``None``.
+
+    Returns:
+        - :class:`ExpensiveTransientError` if the message matches a substring
+          in ``_EXPENSIVE_TRANSIENT_SUBSTRINGS`` (currently: timeout-related).
+        - :class:`TransientError` for normal transients in
+          ``_TRANSIENT_SUBSTRINGS`` (rate limits, 429/529, connection, etc.).
+        - ``None`` for non-transient or empty failures.
 
     Deterministic CLI failure subtypes (``subtype in _DETERMINISTIC_SUBTYPES``
-    — e.g. ``error_max_turns``) take precedence and force ``False`` regardless
+    — e.g. ``error_max_turns``) take precedence and force ``None`` regardless
     of the error string. This prevents the retry loop from burning attempts on
-    a failure that is guaranteed to repeat (Fix 4).
+    a failure that is guaranteed to repeat (Fix 4 — must keep working across
+    BOTH transient classes after the v0.5.4 split).
     """
     if subtype is not None and subtype in _DETERMINISTIC_SUBTYPES:
-        return False
+        return None
     text = (err or "") + " " + (str(exc) if exc else "")
     low = text.lower()
-    return any(sub in low for sub in _TRANSIENT_SUBSTRINGS)
+    # Expensive transients are a strict subset of "should retry" but with a
+    # smaller budget; check them first so a literal "timeout" message is
+    # routed to the cap.
+    if any(sub in low for sub in _EXPENSIVE_TRANSIENT_SUBSTRINGS):
+        return ExpensiveTransientError
+    if any(sub in low for sub in _TRANSIENT_SUBSTRINGS):
+        return TransientError
+    return None
 
 
 class AdapterLLMClient:
@@ -203,17 +237,21 @@ class AdapterLLMClient:
         *,
         timeout_s: int = 600,
         max_attempts: int = 5,
+        max_attempts_expensive: int = 3,
         role_max_turns: dict[str, int] | None = None,
         role_allowed_tools: dict[str, list[str] | None] | None = None,
         role_effort: dict[str, str] | None = None,
+        role_timeout_s: dict[str, int] | None = None,
     ) -> None:
         self._adapter = adapter
         self._cwd = cwd
         self._timeout_s = timeout_s
         self._max_attempts = max_attempts
+        self._max_attempts_expensive = max_attempts_expensive
         self._role_max_turns = role_max_turns
         self._role_allowed_tools = role_allowed_tools
         self._role_effort = role_effort
+        self._role_timeout_s = role_timeout_s
         self._log = get_logger(component="tournament.llm")
 
     def _resolve_max_turns(self, role: str) -> int:
@@ -245,6 +283,18 @@ class AdapterLLMClient:
             return None
         return self._role_effort.get(role)
 
+    def _resolve_timeout_s(self, role: str) -> int:
+        """Return the per-role timeout in seconds, or the client default.
+
+        Roles absent from the ``role_timeout_s`` map fall back to
+        ``self._timeout_s`` (the AdapterLLMClient ctor default, typically 600s).
+        Used so complex-plan architects/synthesizers can run longer without
+        affecting cheap roles like the judge.
+        """
+        if self._role_timeout_s is not None and role in self._role_timeout_s:
+            return self._role_timeout_s[role]
+        return self._timeout_s
+
     async def call(
         self,
         *,
@@ -253,7 +303,16 @@ class AdapterLLMClient:
         role: str,
         model: str | None = None,
     ) -> str:
-        """Invoke the adapter with tenacity-backed retries on transient errors."""
+        """Invoke the adapter with tenacity-backed retries on transient errors.
+
+        Two retry budgets are dispatched based on classification:
+            - ``max_attempts`` for normal transients (cheap to retry).
+            - ``max_attempts_expensive`` for :class:`ExpensiveTransientError`
+              (e.g. timeouts — capped to bound silent wall-clock burn).
+
+        The dispatch is implemented via a custom ``stop`` callable that
+        consults the failing exception's class on each attempt.
+        """
 
         inv = _build_invocation(
             role=role,
@@ -261,14 +320,34 @@ class AdapterLLMClient:
             user=user,
             cwd=self._cwd,
             model=model,
-            timeout_s=self._timeout_s,
+            timeout_s=self._resolve_timeout_s(role),
             max_turns=self._resolve_max_turns(role),
             allowed_tools=self._resolve_allowed_tools(role),
             effort=self._resolve_effort(role),
         )
 
+        max_attempts = self._max_attempts
+        max_attempts_expensive = self._max_attempts_expensive
+
+        def _stop_dispatch(retry_state: Any) -> bool:
+            """Stop policy: cap expensive transients sooner than normal ones.
+
+            ``retry_state.attempt_number`` is 1-based. We stop AFTER the
+            attempt-number reaches the relevant cap.
+            """
+            attempt = retry_state.attempt_number
+            outcome = retry_state.outcome
+            # If outcome is None or did not fail, defer to the larger budget
+            # (tenacity won't actually call this on success — kept defensive).
+            if outcome is None or not outcome.failed:
+                return attempt >= max_attempts
+            exc = outcome.exception()
+            if isinstance(exc, ExpensiveTransientError):
+                return attempt >= max_attempts_expensive
+            return attempt >= max_attempts
+
         @retry(
-            stop=stop_after_attempt(self._max_attempts),
+            stop=_stop_dispatch,
             wait=wait_exponential(multiplier=2, min=2, max=60),
             retry=retry_if_exception_type(TransientError),
             reraise=True,
@@ -279,9 +358,15 @@ class AdapterLLMClient:
             except TransientError:
                 raise
             except BaseException as exc:  # noqa: BLE001
-                if _classify_error(None, exc):
-                    self._log.info("transient_exception", role=role, err=str(exc))
-                    raise TransientError(str(exc)) from exc
+                cls = _classify_error(None, exc)
+                if cls is not None:
+                    self._log.info(
+                        "transient_exception",
+                        role=role,
+                        err=str(exc),
+                        cls=cls.__name__,
+                    )
+                    raise cls(str(exc)) from exc
                 raise TournamentError(
                     f"adapter.execute raised for role={role}: {exc}"
                 ) from exc
@@ -301,9 +386,15 @@ class AdapterLLMClient:
                     raise TournamentError(
                         f"non-retryable subtype={subtype} for role={role}: {error}"
                     )
-                if _classify_error(error, subtype=subtype):
-                    self._log.info("transient_result", role=role, err=error)
-                    raise TransientError(error or "transient adapter failure")
+                cls = _classify_error(error, subtype=subtype)
+                if cls is not None:
+                    self._log.info(
+                        "transient_result",
+                        role=role,
+                        err=error,
+                        cls=cls.__name__,
+                    )
+                    raise cls(error or "transient adapter failure")
                 raise TournamentError(
                     f"adapter returned success=False for role={role}: {error}"
                 )
@@ -368,6 +459,7 @@ class StubLLMClient:
 __all__ = [
     "AdapterLike",
     "AdapterLLMClient",
+    "ExpensiveTransientError",
     "StubLLMClient",
     "TransientError",
 ]

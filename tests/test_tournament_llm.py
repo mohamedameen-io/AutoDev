@@ -10,10 +10,11 @@ import pytest
 from errors import TournamentError
 from tournament.llm import (
     AdapterLLMClient,
+    ExpensiveTransientError,
     StubLLMClient,
     TransientError,
 )
-from tournament.llm import _build_invocation  # type: ignore
+from tournament.llm import _build_invocation, _classify_error  # type: ignore
 
 
 # ── StubAdapter (fakes Phase-2's PlatformAdapter) ─────────────────────────
@@ -458,6 +459,154 @@ async def test_timeout_error_is_transient_and_retries(
     client = AdapterLLMClient(adapter, cwd=tmp_path, max_attempts=3)
     out = await client.call(system="s", user="u", role="judge")
     assert out == "OK"
+
+
+# ── v0.5.4 Part 1B: Expensive-transient retry cap ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_call_caps_expensive_transient_at_3_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout error retries at most ``max_attempts_expensive=3`` times.
+
+    Without the cap, a 600s timeout retried 5x would burn ~50 minutes silently.
+    """
+    _patch_no_sleep(monkeypatch)
+
+    adapter = StubAdapter(
+        [
+            _Result(success=False, text="", error="timeout after 600s")
+            for _ in range(10)
+        ]
+    )
+    client = AdapterLLMClient(
+        adapter, cwd=tmp_path, max_attempts=5, max_attempts_expensive=3
+    )
+    with pytest.raises((ExpensiveTransientError, TransientError)):
+        await client.call(system="s", user="u", role="judge")
+    assert len(adapter.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_call_normal_transient_uses_default_5_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rate-limit (normal transient) still retries up to ``max_attempts=5``."""
+    _patch_no_sleep(monkeypatch)
+
+    adapter = StubAdapter(
+        [
+            _Result(success=False, text="", error="rate limit hit (429)")
+            for _ in range(10)
+        ]
+    )
+    client = AdapterLLMClient(
+        adapter, cwd=tmp_path, max_attempts=5, max_attempts_expensive=3
+    )
+    with pytest.raises(TransientError):
+        await client.call(system="s", user="u", role="judge")
+    assert len(adapter.calls) == 5
+
+
+def test_classify_error_categorises_expensive_vs_normal() -> None:
+    """``_classify_error`` returns the correct exception class per substring."""
+    # Expensive transient substrings → ExpensiveTransientError
+    for msg in (
+        "timeout after 600s",
+        "request timed out",
+        "TIMEOUT",
+        "Timed Out",
+    ):
+        cls = _classify_error(msg)
+        assert cls is ExpensiveTransientError, f"{msg!r} should be expensive"
+
+    # Normal transient substrings → TransientError (not ExpensiveTransientError)
+    for msg in (
+        "429 too many requests",
+        "model overloaded (529)",
+        "rate limit",
+        "503 service unavailable",
+        "claude exited 1",
+        "empty stderr",
+        "broken pipe",
+        "connection reset",
+    ):
+        cls = _classify_error(msg)
+        assert cls is TransientError, f"{msg!r} should be normal transient"
+
+    # Non-transient → None
+    for msg in (
+        "permission denied: not logged in",
+        "invalid prompt schema",
+        "auth failure",
+        "",
+    ):
+        cls = _classify_error(msg)
+        assert cls is None, f"{msg!r} should not classify as transient"
+
+
+def test_deterministic_subtype_unchanged_by_class_split() -> None:
+    """Regression: the deterministic-subtype short-circuit still wins over
+    BOTH transient classes (Fix 4 must keep working)."""
+    # error_max_turns + timeout substring → still NOT transient
+    assert (
+        _classify_error("timeout after 600s", subtype="error_max_turns") is None
+    )
+    # error_max_turns + rate substring → still NOT transient
+    assert _classify_error("rate limit", subtype="error_max_turns") is None
+    # error_during_execution + claude exited → still NOT transient
+    assert (
+        _classify_error("claude exited 1", subtype="error_during_execution")
+        is None
+    )
+    # error_max_tokens + 429 → still NOT transient
+    assert _classify_error("429 too many", subtype="error_max_tokens") is None
+
+
+# ── v0.5.4 Part 1C: Per-role timeout_s ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_role_timeout_s_overrides_inv_timeout(tmp_path: Path) -> None:
+    """``role_timeout_s`` mapping is honored on the built invocation."""
+    adapter = StubAdapter([_Result(text="A"), _Result(text="B")])
+    client = AdapterLLMClient(
+        adapter,
+        cwd=tmp_path,
+        timeout_s=600,  # client default
+        role_timeout_s={"architect_b": 1200, "judge": 300},
+    )
+    await client.call(system="s", user="u", role="architect_b")
+    await client.call(system="s", user="u", role="judge")
+
+    assert adapter.calls[0].role == "architect_b"
+    assert adapter.calls[0].timeout_s == 1200
+    assert adapter.calls[1].role == "judge"
+    assert adapter.calls[1].timeout_s == 300
+
+
+@pytest.mark.asyncio
+async def test_role_timeout_s_unknown_role_uses_default(tmp_path: Path) -> None:
+    """A role not in ``role_timeout_s`` falls back to the client default."""
+    adapter = StubAdapter([_Result(text="A")])
+    client = AdapterLLMClient(
+        adapter,
+        cwd=tmp_path,
+        timeout_s=600,
+        role_timeout_s={"architect_b": 1200},
+    )
+    await client.call(system="s", user="u", role="judge")
+    assert adapter.calls[0].timeout_s == 600
+
+
+@pytest.mark.asyncio
+async def test_no_role_timeout_dict_keeps_default(tmp_path: Path) -> None:
+    """Without ``role_timeout_s``, the existing default flows through."""
+    adapter = StubAdapter([_Result(text="A")])
+    client = AdapterLLMClient(adapter, cwd=tmp_path, timeout_s=600)
+    await client.call(system="s", user="u", role="critic_t")
+    assert adapter.calls[0].timeout_s == 600
 
 
 # ── StubLLMClient mode tests ──────────────────────────────────────────────
