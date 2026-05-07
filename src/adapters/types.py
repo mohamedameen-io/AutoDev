@@ -54,6 +54,14 @@ class AgentResult(BaseModel):
     error: str | None = None
     raw_stdout: str = ""
     raw_stderr: str = ""
+    # CLI-reported result subtype (mirrors Claude Code's ``subtype`` field —
+    # ``"success"``, ``"error_max_turns"``, ``"error_during_execution"``,
+    # ``"error_max_tokens"``, etc.). Populated by adapters that parse
+    # structured CLI JSON output. ``None`` for adapters that don't surface a
+    # subtype (e.g. genuine subprocess failures with no parsable stdout).
+    # Used by the tournament retry layer to short-circuit deterministic
+    # failures (see :data:`tournament.llm._DETERMINISTIC_SUBTYPES`).
+    subtype: str | None = None
 
 
 class AgentSpec(BaseModel):

@@ -163,6 +163,12 @@ class ClaudeCodeAdapter(PlatformAdapter):
 
         text = str(parsed.get("result", ""))
         is_error = bool(parsed.get("is_error", False))
+        # Surface the CLI's ``subtype`` field on the result so the tournament
+        # retry layer can short-circuit deterministic failures (e.g.
+        # ``error_max_turns``). Empty / missing → None.
+        subtype_val = parsed.get("subtype") or None
+        if subtype_val is not None:
+            subtype_val = str(subtype_val)
 
         cost_usd: float = 0.0
         if "total_cost_usd" in parsed:
@@ -188,6 +194,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
             error=None if not is_error else str(parsed.get("error", "is_error=true")),
             raw_stdout=stdout,
             raw_stderr=stderr,
+            subtype=subtype_val,
         )
         return result
 

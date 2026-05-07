@@ -219,6 +219,68 @@ async def test_execute_is_error_true(tmp_path: Path) -> None:
     assert result.error == "rate_limited"
 
 
+# ── Fix 4: subtype propagation ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_execute_extracts_subtype_success(tmp_path: Path) -> None:
+    """Successful response carries ``subtype="success"`` on the AgentResult."""
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=1)
+    fake = _fake_proc(stdout=_good_claude_blob("OK"), returncode=0)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is True
+    assert result.subtype == "success"
+
+
+@pytest.mark.asyncio
+async def test_execute_extracts_subtype_error_max_turns(tmp_path: Path) -> None:
+    """``error_max_turns`` (returncode=0, is_error=true) propagates ``subtype``."""
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=1)
+    blob = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error_max_turns",
+            "is_error": True,
+            "duration_ms": 100,
+            "num_turns": 2,
+            "result": "",
+            "stop_reason": "tool_use",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "total_cost_usd": 0.0,
+            "errors": ["Reached maximum number of turns (1)"],
+        }
+    )
+    fake = _fake_proc(stdout=blob, returncode=0)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.subtype == "error_max_turns"
+
+
+@pytest.mark.asyncio
+async def test_execute_subtype_none_on_subprocess_failure(tmp_path: Path) -> None:
+    """Non-zero exit (genuine subprocess death) leaves ``subtype=None``."""
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=1)
+    fake = _fake_proc(stdout="", stderr="boom", returncode=1)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.subtype is None
+
+
 @pytest.mark.asyncio
 async def test_execute_binary_not_found(tmp_path: Path) -> None:
     adapter = ClaudeCodeAdapter(binary="nonexistent-claude-binary-xyz")
