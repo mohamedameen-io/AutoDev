@@ -235,6 +235,68 @@ def test_read_partial_pass_state_with_judges_subset(tmp_path: Path) -> None:
     assert all(isinstance(k, int) for k in state.judge_orders[2])
 
 
+# ── latest_incumbent_md / latest_incumbent_pass_num / read_incumbent_at ────
+
+
+def test_latest_incumbent_md_returns_highest_pass(tmp_path: Path) -> None:
+    """``latest_incumbent_md`` returns the contents of the highest-numbered file."""
+    store = TournamentArtifactStore(tmp_path)
+    store.write_initial("INITIAL")
+    store.write_incumbent_after(1, "PASS_1_BODY")
+    store.write_incumbent_after(3, "PASS_3_BODY")
+    store.write_incumbent_after(5, "PASS_5_BODY")
+    store.write_incumbent_after(2, "PASS_2_BODY")
+    assert store.latest_incumbent_md() == "PASS_5_BODY"
+
+
+def test_latest_incumbent_md_falls_back_to_initial(tmp_path: Path) -> None:
+    """When no incumbent_after_*.md exists, fall back to ``initial_a.md``."""
+    store = TournamentArtifactStore(tmp_path)
+    store.write_initial("ONLY_INITIAL")
+    assert store.latest_incumbent_md() == "ONLY_INITIAL"
+
+
+def test_latest_incumbent_md_returns_none_on_empty_dir(tmp_path: Path) -> None:
+    """When neither incumbent_after files NOR initial_a.md exists, return None."""
+    store = TournamentArtifactStore(tmp_path)
+    assert store.latest_incumbent_md() is None
+
+
+def test_latest_incumbent_pass_num_returns_highest(tmp_path: Path) -> None:
+    """``latest_incumbent_pass_num`` returns the highest pass integer."""
+    store = TournamentArtifactStore(tmp_path)
+    store.write_incumbent_after(2, "p2")
+    store.write_incumbent_after(7, "p7")
+    store.write_incumbent_after(4, "p4")
+    assert store.latest_incumbent_pass_num() == 7
+
+
+def test_latest_incumbent_pass_num_returns_none_on_empty_dir(
+    tmp_path: Path,
+) -> None:
+    """No fallback to 0 — return None when no incumbent files exist."""
+    store = TournamentArtifactStore(tmp_path)
+    # Even with initial_a.md present, pass_num returns None.
+    store.write_initial("INITIAL")
+    assert store.latest_incumbent_pass_num() is None
+
+
+def test_read_incumbent_at_specific_pass(tmp_path: Path) -> None:
+    """``read_incumbent_at(pass_num)`` returns the pass-specific markdown."""
+    store = TournamentArtifactStore(tmp_path)
+    store.write_incumbent_after(3, "PASS_3_BODY")
+    store.write_incumbent_after(5, "PASS_5_BODY")
+    assert store.read_incumbent_at(3) == "PASS_3_BODY"
+    assert store.read_incumbent_at(5) == "PASS_5_BODY"
+
+
+def test_read_incumbent_at_missing_pass_returns_none(tmp_path: Path) -> None:
+    """``read_incumbent_at(pass_num)`` returns None for missing pass."""
+    store = TournamentArtifactStore(tmp_path)
+    store.write_incumbent_after(3, "PASS_3_BODY")
+    assert store.read_incumbent_at(99) is None
+
+
 def test_read_partial_pass_state_full_pass_minus_result(tmp_path: Path) -> None:
     """All per-role files present (no ``result.json``) → fully populated state."""
     pass_dir = tmp_path / "pass_05"

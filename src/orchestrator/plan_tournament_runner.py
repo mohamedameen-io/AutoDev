@@ -48,6 +48,16 @@ logger = get_logger(__name__)
 _TOURNAMENT_ROLES: tuple[str, ...] = ("critic_t", "architect_b", "synthesizer", "judge")
 
 
+def _plan_tournament_id(spec_hash: str) -> str:
+    """Derive the deterministic plan-tournament id from a spec hash.
+
+    Centralised so :mod:`orchestrator.plan_phase` (which reads the salvage
+    artifacts on a tournament failure) and the runner itself can never drift
+    in their notion of "where this tournament lives on disk."
+    """
+    return f"plan-{spec_hash[:8]}"
+
+
 def _build_role_overrides(
     orch: "Orchestrator",
     plan_complexity: str | None,
@@ -173,7 +183,7 @@ async def run_plan_tournament(
         "Tournament runners must use subprocess adapters, not InlineAdapter"
     )
 
-    tournament_id = f"plan-{spec_hash[:8]}"
+    tournament_id = _plan_tournament_id(spec_hash)
     artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
 
     # Extract the architect's COMPLEXITY: classification directly from the
@@ -203,6 +213,7 @@ async def run_plan_tournament(
         max_parallel_subprocesses=orch.cfg.tournaments.max_parallel_subprocesses,
         score_stability_window=cfg.score_stability_window,
         score_stability_max_delta=cfg.score_stability_max_delta,
+        winner_stability_window=cfg.winner_stability_window,
     )
 
     judge_plugins = (
@@ -256,4 +267,4 @@ async def run_plan_tournament(
     return final_md
 
 
-__all__ = ["run_plan_tournament"]
+__all__ = ["_plan_tournament_id", "run_plan_tournament"]

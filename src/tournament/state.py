@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 _PASS_DIR_RE = re.compile(r"^pass_(\d+)$")
 _JUDGE_ORDER_RE = re.compile(r"^(\d+)_order\.json$")
 _JUDGE_RESPONSE_RE = re.compile(r"^(\d+)_response\.json$")
+_INCUMBENT_AFTER_RE = re.compile(r"^incumbent_after_(\d+)\.md$")
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -190,6 +191,71 @@ class TournamentArtifactStore:
         if not isinstance(data, list):
             return None
         return data
+
+    # ── salvage helpers (v0.6.0) ──
+    def _scan_incumbent_pass_nums(self) -> list[int]:
+        """Return sorted ascending list of pass nums with an
+        ``incumbent_after_NN.md`` file on disk.
+
+        Returns an empty list if ``self.artifact_dir`` is missing or holds no
+        matching files.
+        """
+        if not self.artifact_dir.exists():
+            return []
+        nums: list[int] = []
+        for child in self.artifact_dir.glob("incumbent_after_*.md"):
+            m = _INCUMBENT_AFTER_RE.match(child.name)
+            if m is None:
+                continue
+            try:
+                nums.append(int(m.group(1)))
+            except ValueError:
+                continue
+        return sorted(nums)
+
+    def latest_incumbent_md(self) -> str | None:
+        """Return the markdown of the highest-numbered ``incumbent_after_NN.md``.
+
+        Salvage-path helper for v0.6.0 (Issue 2): when a tournament fails
+        mid-loop, the orchestrator can recover the most-recent incumbent that
+        was persisted to disk rather than dropping all refinement.
+
+        Falls back to :meth:`read_initial` if no ``incumbent_after_*.md``
+        files are present. Returns ``None`` only when neither a numbered
+        incumbent NOR ``initial_a.md`` is on disk.
+        """
+        nums = self._scan_incumbent_pass_nums()
+        if nums:
+            top = nums[-1]
+            path = self.artifact_dir / f"incumbent_after_{top:02d}.md"
+            try:
+                return path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None
+        return self.read_initial()
+
+    def latest_incumbent_pass_num(self) -> int | None:
+        """Return the highest pass-num with an ``incumbent_after_NN.md`` file.
+
+        Unlike :meth:`latest_incumbent_md` this does NOT fall back to
+        ``initial_a.md`` — the initial markdown predates pass 1, so there is
+        no meaningful integer to return. Returns ``None`` when no
+        ``incumbent_after_*.md`` files exist.
+        """
+        nums = self._scan_incumbent_pass_nums()
+        return nums[-1] if nums else None
+
+    def read_incumbent_at(self, pass_num: int) -> str | None:
+        """Return the markdown of ``incumbent_after_<pass_num>.md`` or None.
+
+        Used by the ``autodev tournament promote`` CLI subcommand to salvage
+        a specific pass's incumbent rather than the most recent one.
+        """
+        path = self.artifact_dir / f"incumbent_after_{pass_num:02d}.md"
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
 
     def read_resume_state(self) -> "ResumeState | None":
         """Infer resume state from on-disk artifacts.
