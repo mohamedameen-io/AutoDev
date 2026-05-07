@@ -582,6 +582,17 @@ async def _run_plan_tournament_cli(
     plan_cfg = cfg.tournaments.plan
     effective_max_rounds = max_rounds_override or plan_cfg.max_rounds
 
+    # v0.7.0 / Issue 5C: mirror plan_tournament_runner — when the architect
+    # classifies the plan as ``complex`` and the override is set, escalate
+    # ``num_judges`` for this run.
+    plan_complexity_cli = extract_complexity(markdown)
+    effective_num_judges = plan_cfg.num_judges
+    if (
+        plan_complexity_cli == "complex"
+        and plan_cfg.complex_plan_num_judges_override is not None
+    ):
+        effective_num_judges = plan_cfg.complex_plan_num_judges_override
+
     tournament_id = f"plan-{uuid.uuid4().hex[:8]}"
     artifact_dir = autodev_root(cwd) / "tournaments" / tournament_id
 
@@ -612,7 +623,7 @@ async def _run_plan_tournament_cli(
         model = judge_cfg.model if judge_cfg else None
 
     tcfg = TournamentConfig(
-        num_judges=plan_cfg.num_judges,
+        num_judges=effective_num_judges,
         convergence_k=plan_cfg.convergence_k,
         max_rounds=effective_max_rounds,
         model=model,
@@ -626,7 +637,7 @@ async def _run_plan_tournament_cli(
     console.print(
         f"[bold cyan]autodev tournament --phase=plan[/bold cyan] "
         f"id={tournament_id} rounds<= {effective_max_rounds} "
-        f"judges={plan_cfg.num_judges} k={plan_cfg.convergence_k} "
+        f"judges={effective_num_judges} k={plan_cfg.convergence_k} "
         f"{'[dry-run]' if dry_run else ''}"
     )
     console.print(f"[dim]Input:[/dim] {input_path}")

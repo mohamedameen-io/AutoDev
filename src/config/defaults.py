@@ -126,6 +126,11 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 # count, demote it to the next-best Borda winner so the
                 # tournament can't be hijacked by ever-growing merges.
                 max_plan_lines_growth_ratio=1.5,
+                # v0.7.0 / Issue 5C: escalate to a 7-judge ensemble when
+                # the architect classifies the plan as "complex" (autoreason:
+                # 7 judges → ~3× faster convergence than 3). Medium / simple
+                # plans stay at the cheaper default of 5 judges above.
+                complex_plan_num_judges_override=7,
             ),
             impl=TournamentPhaseConfig(
                 enabled=True,
@@ -145,6 +150,10 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 # Impl tournaments operate on diff bundles, not line-counted
                 # plan markdown — leave the line-ratio knob disabled.
                 max_plan_lines_growth_ratio=None,
+                # v0.7.0 / Issue 5C: impl tournaments don't extract
+                # complexity from a plan markdown, so the override stays
+                # ``None``. Field is plumbed through for schema symmetry.
+                complex_plan_num_judges_override=None,
             ),
             max_parallel_subprocesses=3,
             auto_disable_for_models=["opus"],

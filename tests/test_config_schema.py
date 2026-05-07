@@ -163,3 +163,50 @@ def test_autodev_config_rejects_invalid_user_complexity() -> None:
     data["user_complexity"] = "complex"
     with pytest.raises(ValidationError):
         AutodevConfig.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# v0.7.0 — TournamentPhaseConfig.complex_plan_num_judges_override (Issue 5C)
+# ---------------------------------------------------------------------------
+
+
+def test_tournament_phase_config_complex_plan_num_judges_override_round_trip() -> None:
+    """The v0.7.0 ``complex_plan_num_judges_override`` field round-trips
+    through ``model_dump`` + ``model_validate`` cleanly. Default is ``None``.
+    """
+    from config.schema import TournamentPhaseConfig
+
+    base = TournamentPhaseConfig(
+        enabled=True,
+        num_judges=5,
+        convergence_k=2,
+        max_rounds=15,
+    )
+    assert base.complex_plan_num_judges_override is None
+
+    with_override = TournamentPhaseConfig(
+        enabled=True,
+        num_judges=5,
+        convergence_k=2,
+        max_rounds=15,
+        complex_plan_num_judges_override=7,
+    )
+    assert with_override.complex_plan_num_judges_override == 7
+    reloaded = TournamentPhaseConfig.model_validate(with_override.model_dump())
+    assert reloaded.complex_plan_num_judges_override == 7
+
+
+def test_tournament_phase_config_complex_plan_num_judges_override_accepts_none() -> None:
+    """Explicit ``None`` round-trips and signals 'feature off'."""
+    from config.schema import TournamentPhaseConfig
+
+    cfg = TournamentPhaseConfig(
+        enabled=True,
+        num_judges=5,
+        convergence_k=2,
+        max_rounds=15,
+        complex_plan_num_judges_override=None,
+    )
+    assert cfg.complex_plan_num_judges_override is None
+    reloaded = TournamentPhaseConfig.model_validate(cfg.model_dump())
+    assert reloaded.complex_plan_num_judges_override is None

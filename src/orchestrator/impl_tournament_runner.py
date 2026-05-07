@@ -329,6 +329,16 @@ async def run_impl_tournament(
         role_timeout_s=role_timeout_s,
     )
 
+    # v0.7.0 / Issue 5C: ``complex_plan_num_judges_override`` is a plan-only
+    # knob — impl complexity isn't extracted from a plan markdown — but the
+    # field is read here for symmetry so the impl runner stays parallel to
+    # the plan runner. ``num_judges`` is always ``cfg.num_judges`` for impl;
+    # we don't escalate based on the parsed Plan's complexity here because
+    # the impl tournament's role mix is structurally different (single-judge
+    # by convention, with worktree variants doing the heavy lifting).
+    _impl_complex_override_unused = cfg.complex_plan_num_judges_override
+    del _impl_complex_override_unused
+
     tcfg = TournamentConfig(
         num_judges=cfg.num_judges,
         convergence_k=cfg.convergence_k,

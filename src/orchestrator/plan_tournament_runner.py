@@ -193,6 +193,25 @@ async def run_plan_tournament(
     # the markdown is the source-of-truth path during the plan tournament.
     plan_complexity = extract_complexity(initial_md)
 
+    # v0.7.0 / Issue 5C: complexity-aware judge ensemble. When the architect
+    # classifies the plan as ``complex`` AND the operator has opted in by
+    # setting ``cfg.complex_plan_num_judges_override``, escalate the judge
+    # panel for this run. Adopts autoreason's "7 judges → ~3× faster
+    # convergence" finding, gated to complex plans so the cost (~40% more
+    # judge calls) doesn't apply to medium / simple work.
+    effective_num_judges = cfg.num_judges
+    if (
+        plan_complexity == "complex"
+        and cfg.complex_plan_num_judges_override is not None
+    ):
+        effective_num_judges = cfg.complex_plan_num_judges_override
+        logger.info(
+            "plan_tournament.judge_ensemble_escalated",
+            complexity=plan_complexity,
+            default_num_judges=cfg.num_judges,
+            override_num_judges=effective_num_judges,
+        )
+
     role_max_turns, role_allowed_tools, role_timeout_s, role_effort = (
         _build_role_overrides(orch, plan_complexity)
     )
@@ -206,7 +225,7 @@ async def run_plan_tournament(
     )
 
     tcfg = TournamentConfig(
-        num_judges=cfg.num_judges,
+        num_judges=effective_num_judges,
         convergence_k=cfg.convergence_k,
         max_rounds=cfg.max_rounds,
         model=model,

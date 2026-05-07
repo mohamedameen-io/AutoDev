@@ -68,6 +68,17 @@ class TournamentPhaseConfig(BaseModel):
     # Impl tournaments leave this ``None`` because impl artifacts aren't
     # line-counted plan markdown.
     max_plan_lines_growth_ratio: float | None = None
+    # Optional escalation knob for the judge ensemble on complex plans
+    # (v0.7.0 / Issue 5C). When the architect's ``COMPLEXITY:`` directive
+    # resolves to ``"complex"`` and this field is non-None, the plan
+    # tournament substitutes ``num_judges`` with this value for that run.
+    # Adopts autoreason's "7 judges → ~3× faster convergence" finding —
+    # opt-in cost (~40% more judge calls per complex plan) gated on a
+    # complexity classification the architect already emits. Defaults to
+    # ``None`` so legacy configs validate; the plan-tournament default
+    # ships with ``7``. Impl tournaments leave this ``None`` because impl
+    # complexity isn't extracted from a plan markdown.
+    complex_plan_num_judges_override: int | None = None
 
 
 class TournamentsConfig(BaseModel):

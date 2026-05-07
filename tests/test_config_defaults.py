@@ -277,3 +277,26 @@ def test_tournament_phase_config_max_plan_lines_growth_ratio_round_trip() -> Non
     assert with_ratio.max_plan_lines_growth_ratio == 1.5
     reloaded = TournamentPhaseConfig.model_validate(with_ratio.model_dump())
     assert reloaded.max_plan_lines_growth_ratio == 1.5
+
+
+# ---------------------------------------------------------------------------
+# default_config: v0.7.0 — complex_plan_num_judges_override (Issue 5C)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_default_complex_plan_num_judges_override_is_7() -> None:
+    """Plan ships ``complex_plan_num_judges_override=7`` so that complex
+    plans escalate to a 7-judge ensemble (autoreason: 7 judges = ~3× faster
+    convergence). Medium/simple plans stay at the cheaper default of 5.
+    """
+    cfg = default_config()
+    assert cfg.tournaments.plan.complex_plan_num_judges_override == 7
+
+
+def test_impl_default_complex_plan_num_judges_override_is_none() -> None:
+    """Impl tournaments don't extract complexity from a plan markdown — the
+    override is always ``None`` for impl. The field is plumbed through for
+    schema symmetry, not for behavior.
+    """
+    cfg = default_config()
+    assert cfg.tournaments.impl.complex_plan_num_judges_override is None
