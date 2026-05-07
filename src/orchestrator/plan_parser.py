@@ -50,6 +50,27 @@ def _iso_now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
+def extract_complexity(md: str) -> Literal["simple", "medium", "complex"] | None:
+    """Return the architect's ``COMPLEXITY:`` classification or ``None``.
+
+    Light-weight alternative to :func:`parse_plan_markdown` for callers that
+    only need the complexity bucket — specifically the plan-tournament runner,
+    which runs *before* the parsed Plan is persisted to ``plan_manager`` and
+    therefore can't reach the value via ``plan_manager.load()``. Reading
+    directly from the architect's markdown sidesteps that ordering problem.
+
+    Returns ``None`` for legacy plans without the line; callers fall back to
+    the user-global effort default.
+    """
+    m = _RE_COMPLEXITY.search(md)
+    if m is None:
+        return None
+    return cast(
+        Literal["simple", "medium", "complex"],
+        m.group(1).lower(),
+    )
+
+
 def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
     """Parse architect markdown into a :class:`Plan`.
 

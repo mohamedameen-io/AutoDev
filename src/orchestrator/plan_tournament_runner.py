@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from adapters import InlineAdapter
 from autologging import get_logger
+from orchestrator.plan_parser import extract_complexity
 from state.paths import autodev_root
 from tournament import (
     AdapterLLMClient,
@@ -46,32 +47,27 @@ logger = get_logger(__name__)
 _TOURNAMENT_ROLES: tuple[str, ...] = ("critic_t", "architect_b", "synthesizer", "judge")
 
 
-async def _build_role_overrides(
+def _build_role_overrides(
     orch: "Orchestrator",
+    plan_complexity: str | None,
 ) -> tuple[dict[str, int], dict[str, list[str] | None], dict[str, str]]:
     """Build per-role ``max_turns``, ``allowed_tools``, and ``effort`` maps.
 
-    Reads each tournament role's :class:`~adapters.types.AgentSpec` from
-    ``orch.registry`` and produces the dicts consumed by
-    :class:`~tournament.llm.AdapterLLMClient`. Roles missing from the registry
-    are simply omitted (the client falls back to its defaults).
+    ``plan_complexity`` is supplied by the caller — at plan-tournament time the
+    parsed Plan has not yet been persisted to ``plan_manager`` (that happens
+    *after* the tournament refines the markdown), so reading via
+    ``plan_manager.load()`` would always return None. :func:`run_plan_tournament`
+    extracts the value directly from the architect's markdown via
+    :func:`orchestrator.plan_parser.extract_complexity`.
 
-    ``role_effort`` is computed via
-    :func:`tournament.effort.resolve_role_effort` keyed on the parsed plan
-    complexity (architect classification) and ``cfg.user_complexity``.
+    Reads each tournament role's :class:`~adapters.types.AgentSpec` from
+    ``orch.registry``. Roles missing from the registry are simply omitted (the
+    client falls back to its defaults). ``role_effort`` is computed via
+    :func:`tournament.effort.resolve_role_effort`.
     """
     role_max_turns: dict[str, int] = {}
     role_allowed_tools: dict[str, list[str] | None] = {}
     role_effort: dict[str, str] = {}
-
-    plan_complexity: str | None = None
-    if orch.plan_manager is not None:
-        try:
-            existing_plan = await orch.plan_manager.load()
-        except Exception:  # noqa: BLE001
-            existing_plan = None
-        if existing_plan is not None:
-            plan_complexity = existing_plan.complexity
 
     for role in _TOURNAMENT_ROLES:
         spec = orch.registry.get(role)
@@ -162,8 +158,15 @@ async def run_plan_tournament(
     tournament_id = f"plan-{spec_hash[:8]}"
     artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
 
-    role_max_turns, role_allowed_tools, role_effort = (
-        await _build_role_overrides(orch)
+    # Extract the architect's COMPLEXITY: classification directly from the
+    # markdown the tournament is about to refine. The parsed Plan isn't
+    # persisted to plan_manager until AFTER this function returns, so
+    # plan_manager.load() would still yield None at this point — reading from
+    # the markdown is the source-of-truth path during the plan tournament.
+    plan_complexity = extract_complexity(initial_md)
+
+    role_max_turns, role_allowed_tools, role_effort = _build_role_overrides(
+        orch, plan_complexity
     )
     client = AdapterLLMClient(
         orch.adapter,

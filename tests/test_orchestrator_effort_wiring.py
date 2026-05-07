@@ -89,15 +89,12 @@ def _seed_plan(orch: Orchestrator, complexity: str | None) -> Plan:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_plan_tournament_role_effort_complex_plan(tmp_path: Path) -> None:
-    """With Plan.complexity='complex', architect_b/synthesizer get xhigh,
+def test_plan_tournament_role_effort_complex_plan(tmp_path: Path) -> None:
+    """With plan_complexity='complex', architect_b/synthesizer get xhigh,
     judge/critic_t get medium (per EFFORT_MATRIX)."""
     orch = _make_orch_for_wiring(tmp_path)
-    plan = _seed_plan(orch, "complex")
-    await orch.plan_manager.init_plan(plan)
 
-    rmt, rat, role_effort = await _build_role_overrides(orch)
+    rmt, rat, role_effort = _build_role_overrides(orch, "complex")
 
     assert role_effort["architect_b"] == "xhigh"
     assert role_effort["synthesizer"] == "xhigh"
@@ -105,14 +102,11 @@ async def test_plan_tournament_role_effort_complex_plan(tmp_path: Path) -> None:
     assert role_effort["critic_t"] == "medium"
 
 
-@pytest.mark.asyncio
-async def test_plan_tournament_role_effort_medium_plan(tmp_path: Path) -> None:
-    """With Plan.complexity='medium', authors get high, evaluators get medium."""
+def test_plan_tournament_role_effort_medium_plan(tmp_path: Path) -> None:
+    """With plan_complexity='medium', authors get high, evaluators get medium."""
     orch = _make_orch_for_wiring(tmp_path)
-    plan = _seed_plan(orch, "medium")
-    await orch.plan_manager.init_plan(plan)
 
-    _, _, role_effort = await _build_role_overrides(orch)
+    _, _, role_effort = _build_role_overrides(orch, "medium")
 
     assert role_effort["architect_b"] == "high"
     assert role_effort["synthesizer"] == "high"
@@ -120,14 +114,11 @@ async def test_plan_tournament_role_effort_medium_plan(tmp_path: Path) -> None:
     assert role_effort["critic_t"] == "medium"
 
 
-@pytest.mark.asyncio
-async def test_plan_tournament_role_effort_simple_plan(tmp_path: Path) -> None:
-    """With Plan.complexity='simple', authors get medium, evaluators get low."""
+def test_plan_tournament_role_effort_simple_plan(tmp_path: Path) -> None:
+    """With plan_complexity='simple', authors get medium, evaluators get low."""
     orch = _make_orch_for_wiring(tmp_path)
-    plan = _seed_plan(orch, "simple")
-    await orch.plan_manager.init_plan(plan)
 
-    _, _, role_effort = await _build_role_overrides(orch)
+    _, _, role_effort = _build_role_overrides(orch, "simple")
 
     assert role_effort["architect_b"] == "medium"
     assert role_effort["synthesizer"] == "medium"
@@ -135,36 +126,72 @@ async def test_plan_tournament_role_effort_simple_plan(tmp_path: Path) -> None:
     assert role_effort["critic_t"] == "low"
 
 
-@pytest.mark.asyncio
-async def test_plan_tournament_role_effort_no_plan_yields_empty(
+def test_plan_tournament_role_effort_no_complexity_yields_empty(
     tmp_path: Path,
 ) -> None:
-    """Without a plan, no roles resolve to a non-None effort (architect not in tournament)."""
+    """Without a plan_complexity, no tournament roles resolve to a non-None
+    effort (architect runs at the floor outside the tournament)."""
     orch = _make_orch_for_wiring(tmp_path)
-    # Don't seed any plan.
 
-    _, _, role_effort = await _build_role_overrides(orch)
+    _, _, role_effort = _build_role_overrides(orch, None)
 
-    # All four tournament roles fall through to None (no plan_complexity, no
-    # explicit override) so role_effort stays empty.
+    # All four tournament roles fall through to None.
     assert role_effort == {}
 
 
-@pytest.mark.asyncio
-async def test_plan_tournament_role_effort_explicit_override_wins(
+def test_plan_tournament_role_effort_explicit_override_wins(
     tmp_path: Path,
 ) -> None:
     """``cfg.agents['judge'].effort='low'`` overrides the matrix value."""
     orch = _make_orch_for_wiring(tmp_path, judge_effort_override="low")
-    plan = _seed_plan(orch, "complex")  # would yield medium for evaluator
-    await orch.plan_manager.init_plan(plan)
 
-    _, _, role_effort = await _build_role_overrides(orch)
+    _, _, role_effort = _build_role_overrides(orch, "complex")
 
     # judge override wins; architect_b/synthesizer remain at xhigh.
     assert role_effort["judge"] == "low"
     assert role_effort["architect_b"] == "xhigh"
     assert role_effort["critic_t"] == "medium"  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# Regression test: run_plan_tournament must extract complexity from initial_md
+# (not from plan_manager — plan isn't persisted yet at tournament time).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_plan_tournament_extracts_complexity_from_initial_md(
+    tmp_path: Path,
+) -> None:
+    """``run_plan_tournament`` must pull plan_complexity out of its ``initial_md``
+    argument because at the moment it runs, ``plan_manager.load()`` would still
+    return None — the parsed Plan is only persisted AFTER the tournament.
+
+    Verifies the wiring by building an AdapterLLMClient via the helper-extraction
+    path and asserting role_effort reflects the COMPLEXITY: classification.
+    """
+    from orchestrator.plan_parser import extract_complexity
+
+    initial_md = (
+        "# Plan: foo\n"
+        "## Phase 1: bar\n"
+        "### Task 1.1: baz\n"
+        "  - Description: do\n"
+        "\n"
+        "COMPLEXITY: complex\n"
+    )
+
+    # Sanity: extract_complexity returns the classification.
+    assert extract_complexity(initial_md) == "complex"
+
+    # Sanity: a markdown without the line returns None.
+    assert extract_complexity("# Plan: foo\n## Phase 1: bar\n### Task 1.1: baz\n  - Description: do\n") is None
+
+    # Wire-up: the helper, given the extracted complexity, returns the right matrix.
+    orch = _make_orch_for_wiring(tmp_path)
+    _, _, role_effort = _build_role_overrides(orch, extract_complexity(initial_md))
+    assert role_effort["architect_b"] == "xhigh"  # complex → author tier → xhigh
+    assert role_effort["judge"] == "medium"        # complex → evaluator tier → medium
 
 
 # ---------------------------------------------------------------------------

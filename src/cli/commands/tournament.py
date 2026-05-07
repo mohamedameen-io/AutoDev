@@ -37,6 +37,7 @@ from config.defaults import default_config
 from config.loader import load_config
 from config.schema import AutodevConfig
 from errors import AutodevError
+from orchestrator.plan_parser import extract_complexity
 from state.paths import autodev_root, config_path
 from tournament import (
     AdapterLLMClient,
@@ -57,6 +58,7 @@ _TOURNAMENT_ROLES_FOR_CLI: tuple[str, ...] = (
 
 def _cli_role_overrides(
     cfg: AutodevConfig,
+    markdown: str | None = None,
 ) -> tuple[dict[str, int], dict[str, list[str] | None], dict[str, str]]:
     """Build tournament-role overrides from an AutodevConfig (no registry).
 
@@ -64,16 +66,21 @@ def _cli_role_overrides(
     ``impl_tournament_runner``. Used by the standalone CLI which has access
     to ``cfg`` but does not build a full ``Orchestrator`` registry.
 
-    Returns ``(role_max_turns, role_allowed_tools, role_effort)``. The CLI
-    standalone path doesn't have a parsed plan, so ``plan_complexity`` is
-    ``None`` — only explicit per-role ``agent_cfg.effort`` overrides take
-    effect (architect doesn't run in standalone tournament mode).
+    When ``markdown`` is supplied (typically the loaded ``--input`` plan),
+    the architect's ``COMPLEXITY:`` line is extracted from it and used to
+    derive per-role effort via the matrix. Without markdown (or with markdown
+    that lacks the directive), only explicit per-role ``agent_cfg.effort``
+    overrides take effect — non-architect roles fall through to None.
+
+    Returns ``(role_max_turns, role_allowed_tools, role_effort)``.
     """
     role_max_turns: dict[str, int] = {}
     role_allowed_tools: dict[str, list[str] | None] = {}
     role_effort: dict[str, str] = {}
 
-    plan_complexity: str | None = None  # CLI tournament has no plan
+    plan_complexity: str | None = (
+        extract_complexity(markdown) if markdown is not None else None
+    )
 
     for role in _TOURNAMENT_ROLES_FOR_CLI:
         agent_cfg = cfg.agents.get(role)
@@ -378,7 +385,10 @@ async def _run_plan_tournament_cli(
         from adapters.detect import get_adapter
 
         adapter = await get_adapter(cfg.platform)
-        rmt, rat, ref = _cli_role_overrides(cfg)
+        # Pass the loaded plan markdown so _cli_role_overrides can extract
+        # the architect's COMPLEXITY: classification and resolve per-role
+        # effort accordingly.
+        rmt, rat, ref = _cli_role_overrides(cfg, markdown)
         client = AdapterLLMClient(
             adapter,
             cwd=cwd,
