@@ -17,13 +17,49 @@ incumbent. Richer per-section picking is Phase 7 territory.
 from __future__ import annotations
 
 import hashlib
+import re
 
+from autologging import get_logger
 from tournament.prompts import (
     ARCHITECT_B_PROMPT,
     CRITIC_PROMPT,
     JUDGE_RANK_3_PROMPT,
     SYNTHESIZER_PROMPT,
 )
+
+
+logger = get_logger(__name__)
+
+
+_PREAMBLE_HEADING = re.compile(r"^#\s+", flags=re.MULTILINE)
+
+
+def _strip_preamble(text: str) -> str:
+    """Slice ``text`` from the first ``# `` heading.
+
+    Tournament authors (``architect_b``, ``synthesizer``) sometimes prepend
+    commentary like "Here is the revised plan…" before the actual plan. That
+    commentary must not contaminate the next pass's incumbent.
+
+    Behavior:
+        - leading whitespace is stripped first;
+        - if the result starts with ``#``, return as-is;
+        - otherwise scan for the first ``^# `` heading (single hash + ws) and
+          slice from there;
+        - if no such heading exists, return the stripped text and log
+          ``preamble_strip_failed`` so the artifact surfaces the gap.
+    """
+    stripped = text.lstrip()
+    if not stripped or stripped.startswith("#"):
+        return stripped.rstrip()
+    match = _PREAMBLE_HEADING.search(stripped)
+    if match is None:
+        logger.warning(
+            "preamble_strip_failed",
+            head_preview=stripped[:120],
+        )
+        return stripped.rstrip()
+    return stripped[match.start() :].rstrip()
 
 
 class PlanContentHandler:
@@ -91,15 +127,19 @@ class PlanContentHandler:
     def parse_revision(self, revision_text: str, original: str) -> str:
         """Extract the new plan markdown from author_b's response.
 
-        The prompt asks for a full rewritten plan. We trim leading / trailing
-        whitespace only; any richer section-level parsing lives in Phase 7's
-        structured ``ImplBundle`` handler.
+        Strips leading/trailing whitespace and any preamble before the first
+        ``# `` heading. See :func:`_strip_preamble`.
         """
-        return revision_text.strip()
+        return _strip_preamble(revision_text)
 
     def parse_synthesis(self, synth_text: str, a: str, b: str) -> str:
-        """Extract the synthesized plan markdown from the synthesizer response."""
-        return synth_text.strip()
+        """Extract the synthesized plan markdown from the synthesizer response.
+
+        Strips leading/trailing whitespace and any preamble (e.g.
+        "Looking at both versions, X is...") before the first ``# `` heading.
+        See :func:`_strip_preamble`.
+        """
+        return _strip_preamble(synth_text)
 
     # ── Serialization ──────────────────────────────────────────────────────
 

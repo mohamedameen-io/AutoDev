@@ -57,7 +57,10 @@ PROBLEMS FOUND:
 
 Revise the proposal to address these problems.
 For each change, state which problem it fixes.
-Do not make changes that aren't motivated by an identified problem."""
+Do not make changes that aren't motivated by an identified problem.
+
+OUTPUT FORMAT — STRICT:
+Your output MUST begin with the markdown heading `# Plan:` (or whatever H1 the existing plan uses). Do not write any preamble, commentary, or summary text before the heading. The first non-whitespace character of your output must be `#`."""
 
 SYNTHESIZER_PROMPT = """ORIGINAL TASK:
 ---
@@ -77,7 +80,10 @@ VERSION Y:
 ---
 
 Produce a synthesis that keeps the strongest elements from both.
-Pick the best version of each section and make them cohere."""
+Pick the best version of each section and make them cohere.
+
+OUTPUT FORMAT — STRICT:
+Your output MUST begin with the markdown heading `# Plan:` (or whatever H1 the existing plan uses). Do not write any preamble, commentary, or summary text before the heading. The first non-whitespace character of your output must be `#`."""
 
 JUDGE_RANK_3_PROMPT = """ORIGINAL TASK:
 ---

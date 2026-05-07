@@ -156,6 +156,65 @@ def test_parse_synthesis_strips_whitespace() -> None:
     assert h.parse_synthesis("\n\n# merged\n", a="a", b="b") == "# merged"
 
 
+# ── Preamble stripping (Fix 5) ────────────────────────────────────────────
+
+
+def test_parse_synthesis_strips_preamble() -> None:
+    """Synthesizer commentary before the first H1 must be stripped."""
+    h = PlanContentHandler()
+    text = (
+        "Looking at both versions, X is the stronger base on nearly every "
+        "technical dimension.\n\n# Plan: foo\n## Phase 1\n"
+    )
+    assert h.parse_synthesis(text, a="a", b="b") == "# Plan: foo\n## Phase 1"
+
+
+def test_parse_synthesis_no_preamble_passthrough() -> None:
+    """Inputs that already start with the heading are unchanged (modulo strip)."""
+    h = PlanContentHandler()
+    text = "# Plan: foo\n## Phase 1\n"
+    assert h.parse_synthesis(text, a="a", b="b") == "# Plan: foo\n## Phase 1"
+
+
+def test_parse_synthesis_no_h1_logs_and_passes_through(capsys) -> None:
+    """When no ``# `` heading exists, fall back to stripped text and log a warning.
+
+    Autologging routes through ``structlog.PrintLoggerFactory`` to stdout, so
+    ``capsys`` is the right capture mechanism (not pytest's ``caplog`` which
+    only sees stdlib-routed logs).
+    """
+    h = PlanContentHandler()
+    text = "Looking at both versions, neither contains a heading."
+    result = h.parse_synthesis(text, a="a", b="b")
+    assert result == text
+    captured = capsys.readouterr()
+    assert "preamble_strip_failed" in (captured.out + captured.err)
+
+
+def test_parse_revision_strips_preamble() -> None:
+    """Architect_b commentary before the first H1 must also be stripped."""
+    h = PlanContentHandler()
+    text = (
+        "Here is the revised plan with the requested fixes:\n\n"
+        "# Plan: bar\n## Phase A\n"
+    )
+    assert h.parse_revision(text, original="ignored") == "# Plan: bar\n## Phase A"
+
+
+def test_parse_synthesis_h2_only_passthrough() -> None:
+    """An H2-only document (no ``# `` heading) is returned as-is.
+
+    The regex ``^#\\s+`` requires a single ``#`` followed by whitespace, so it
+    does NOT match ``## Phase 1`` (the second char is ``#``, not whitespace).
+    H2-only docs therefore fall through to the warning-and-passthrough path.
+    """
+    h = PlanContentHandler()
+    text = "Some preamble.\n\n## Phase 1\n## Phase 2"
+    result = h.parse_synthesis(text, a="a", b="b")
+    # No H1 heading means we cannot identify a clean slice point — pass through.
+    assert result == text
+
+
 # ── Identity ──────────────────────────────────────────────────────────────
 
 
