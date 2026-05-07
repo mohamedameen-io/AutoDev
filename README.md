@@ -6,7 +6,7 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-733_passing-success)](#development-setup)
+[![Tests](https://img.shields.io/badge/tests-819_passing-success)](#development-setup)
 [![LOC](https://img.shields.io/badge/source-11k_LOC-informational)](#)
 [![pydantic v2](https://img.shields.io/badge/pydantic-v2_strict-success)](https://docs.pydantic.dev/latest/)
 
@@ -26,6 +26,25 @@ pip install ai-autodev
 
 ---
 
+## What's new
+
+Highlights of changes since the last 0.1.x release:
+
+**Tournament durability (v0.2.0 → v0.3.x)**
+- `autodev resume` now reconstructs an in-flight tournament from on-disk artifacts and tolerates partial pass directories.
+- Per-role checkpointing within a pass — critic, architect_b, synthesizer, and each judge persist their output before the next role's LLM call. A crash mid-pass replays the completed roles instead of restarting from scratch.
+- Silent `claude -p` exits (empty stderr, broken pipe, ECONNRESET) are reclassified as transient and retried with exponential backoff.
+- Every adapter failure dumps a structured transcript to `.autodev/debug/{role}-{ts}.txt` with prompt, stdout, stderr, and meta — failure forensics without re-running.
+
+**Tournament convergence and cost-control (current dev branch, post-v0.3.0)**
+- **Hash-aware streak** — when the chosen variant is byte-identical to the incumbent (synthesizer regurgitated unchanged content), the streak advances even if the Borda label is `B`/`AB`. Closes the "AB wins forever but content is stable" deadlock observed in real plan runs.
+- **Score-stability runaway detector** — opt-in `score_stability_window` / `score_stability_max_delta` knobs on `TournamentPhaseConfig` terminate a stalled tournament when the per-pass scores stop moving, instead of burning all `max_rounds`.
+- **Per-role `max_turns` and tool restriction in tournaments** — `AdapterLLMClient` now honors `cfg.agents[role].max_turns` and the role tool map. Sonnet's `error_max_turns` failures from tool detours go away; tournament roles are restricted to a read-only sentinel.
+- **Deterministic-failure short-circuit** — `error_max_turns`, `error_max_tokens`, and `error_during_execution` subtypes from `claude -p` are no longer retried as transient; the tournament fails fast instead of burning 5× exponential-backoff attempts on the same prompt.
+- **Synthesizer / architect_b preamble stripping** — `parse_synthesis` and `parse_revision` slice from the first `# ` heading so commentary like "Looking at both versions..." cannot leak into the next pass's incumbent.
+
+---
+
 ## Why experienced developers should use this
 
 If you have shipped production code with a single-agent AI tool, you have hit all of these failure modes. AutoDev is designed around the assumption that each is a structural property of the single-agent model, not a prompt-engineering problem.
@@ -34,7 +53,7 @@ If you have shipped production code with a single-agent AI tool, you have hit al
 
 - **Non-determinism in the model, determinism in the pipeline.** The orchestrator is a pure Python FSM. Every state transition is a ledger append with a SHA-256 content hash chained to the previous entry. Same inputs + same recorded adapter outputs → byte-identical final state. This is what makes replay-based debugging and tournament regression testing tractable.
 
-- **Crash-safety is a contract, not a hope.** The plan ledger uses `filelock` (with `thread_local=False` so asyncio tasks serialize correctly), atomic `tmp → rename` writes, and CAS hash chaining. Corrupted or partial writes are detected on replay; `autodev doctor` will refuse to proceed against a torn ledger.
+- **Crash-safety is a contract, not a hope.** The plan ledger uses `filelock` (with `thread_local=False` so asyncio tasks serialize correctly), atomic `tmp → rename` writes, and CAS hash chaining. Corrupted or partial writes are detected on replay; `autodev doctor` will refuse to proceed against a torn ledger. **Tournaments are also crash-safe mid-pass**: each of `critic_t`, `architect_b`, `synthesizer`, and the N judges checkpoints its output before the next role's subprocess is spawned, so `autodev resume` re-runs only the unfinished roles within the in-flight pass.
 
 - **Typed contracts at every boundary.** Every data structure crossing a process or async boundary — delegations, agent responses, evidence bundles, plan snapshots, tournament pass results — is validated by **pydantic v2 with `extra="forbid"`**. No silent coercion. No "it worked on my laptop" schema drift between runs.
 
@@ -332,24 +351,28 @@ flowchart TD
     C --> D["synthesizer<br/>Merge X,Y → AB"]
     D --> E["N judges<br/>Rank A,B,AB"]
     E --> F["Borda aggregation"]
-    F --> G{winner == A?}
+    F --> G{"effective_winner == A?<br/>(winner==A OR<br/>hash unchanged)"}
     G -->|Yes| H["streak++"]
     G -->|No| I["streak = 0<br/>incumbent = winner"]
     H --> J{streak ≥ k?}
     J -->|Yes| K["CONVERGED"]
-    J -->|No| L["Next pass"]
-    I --> L
+    J -->|No| M{scores stable<br/>over window?}
+    I --> M
+    M -->|Yes| N["RUNAWAY<br/>(early termination)"]
+    M -->|No| L["Next pass"]
     L --> B
 
     style A fill:#e3f2fd
     style K fill:#c8e6c9
+    style N fill:#ffcdd2
     style J fill:#fff9c4
     style G fill:#ffecb3
+    style M fill:#fff9c4
 ```
 
 ### Plan tournament
 
-`num_judges=3, convergence_k=2, max_rounds=15` by default. Converges when the incumbent wins two passes in a row.
+`num_judges=3, convergence_k=2, max_rounds=15` by default. Converges when the incumbent wins two passes in a row — counting either an explicit `A` win *or* a hash-equal "no change" pass where the synthesizer produced byte-identical output. Optional `score_stability_window` / `score_stability_max_delta` provide an early-exit safety net on stalled runs.
 
 ### Implementation tournament (always-on)
 
@@ -365,7 +388,9 @@ The always-on default is tuned for cost: 4 subprocess calls per round × max 3 r
 
 - **Fresh context per role** — no in-context contamination. The critic cannot see the author's rationale; the judge cannot see the critic's critique; labels are randomized before judges see variants.
 - **Borda aggregation with conservative tiebreak** — ties default to the incumbent. Prevents thrash on marginal improvements.
-- **Convergence criterion** — the incumbent must win `k` consecutive rounds. Prevents infinite refinement loops.
+- **Convergence criterion** — the incumbent must win `k` consecutive rounds *or* the chosen variant must be byte-identical to the incumbent (the synthesizer producing no real change counts toward the streak). Prevents infinite refinement loops.
+- **Optional runaway detector** — `score_stability_window` / `score_stability_max_delta` terminate the tournament when per-pass Borda scores stop moving by more than a threshold, even before `max_rounds`.
+- **Resumable mid-pass** — every role's output is checkpointed to disk before the next role's LLM call. A crash leaves a complete-as-of-the-last-finished-role partial state on disk; `autodev resume` re-runs only the unfinished roles.
 
 See [`docs/design_documentation/tournaments.md`](docs/design_documentation/tournaments.md) for the full algorithm and proof sketches.
 
@@ -418,7 +443,7 @@ The managed section is idempotent — running `init --inline` again updates with
 git clone https://github.com/mohamedameen/autodev
 cd autodev
 uv sync
-uv run pytest -v        # 733 tests, 94% coverage
+uv run pytest -v        # 819 tests, 92% coverage
 ```
 
 ---
@@ -454,8 +479,21 @@ uv run pytest -v        # 733 tests, 94% coverage
     // etc.
   },
   "tournaments": {
-    "plan": { "enabled": true, "num_judges": 3, "convergence_k": 2, "max_rounds": 15 },
-    "impl": { "enabled": true, "num_judges": 1, "convergence_k": 1, "max_rounds": 3  },
+    "plan": {
+      "enabled": true, "num_judges": 3, "convergence_k": 2, "max_rounds": 15,
+      // Optional runaway detector — terminate early when scores stop moving.
+      // Both null = feature off (default). When set, the engine compares
+      // |Δscore| across A/B/AB between the first and last pass in the trailing
+      // window; if total ≤ max_delta, it logs `tournament.runaway_detected`
+      // and breaks out instead of burning the remaining rounds.
+      "score_stability_window": null,
+      "score_stability_max_delta": null
+    },
+    "impl": {
+      "enabled": true, "num_judges": 1, "convergence_k": 1, "max_rounds": 3,
+      "score_stability_window": null,
+      "score_stability_max_delta": null
+    },
     "max_parallel_subprocesses": 3,
     "auto_disable_for_models": ["opus"]             // gains plateau at high-tier models that can reliably self-evaluate
   },
@@ -584,7 +622,7 @@ cd autodev
 uv sync
 
 # Full test suite
-uv run pytest -v                                     # 733 passing, 94% coverage
+uv run pytest -v                                     # 819 passing, 92% coverage
 
 # Property-based tests (Borda math)
 uv run pytest --hypothesis-show-statistics tests/test_tournament_borda_aggregation.py
@@ -603,7 +641,7 @@ uv run ruff check src/
 uv run mypy src/
 ```
 
-The test suite includes (94% coverage, all source files ≥80%):
+The test suite includes (92% coverage, all core source files ≥80%):
 - **Unit**: ledger atomicity, Borda aggregation, parse_ranking, plan manager under contention, knowledge ranking, adapter type round-trips, CLI commands, QA gates, config defaults, autologging
 - **Integration**: tiny-repo E2E with stubbed adapters for determinism, impl tournament full-flow with git worktrees
 - **Property**: Borda invariants via Hypothesis
