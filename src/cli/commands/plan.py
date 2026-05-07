@@ -28,7 +28,16 @@ from state.paths import config_path
     default=None,
     help="Override platform selection (else use config + auto-detect).",
 )
-def plan(intent: str, platform: str | None) -> None:
+@click.option(
+    "--complexity",
+    type=click.Choice(["low", "medium", "high", "max"]),
+    default=None,
+    help=(
+        "Override task complexity for this run (else use config). Drives the "
+        "architect's effort floor (xhigh for {low,medium,high}, max for max)."
+    ),
+)
+def plan(intent: str, platform: str | None, complexity: str | None) -> None:
     """Run PLAN phase: explore, research, draft, gate, persist."""
     console = Console()
     cwd = Path.cwd()
@@ -44,6 +53,9 @@ def plan(intent: str, platform: str | None) -> None:
     except AutodevError as exc:
         console.print(f"[red]autodev plan: config error[/red]: {exc}")
         sys.exit(1)
+
+    if complexity is not None:
+        cfg = cfg.model_copy(update={"user_complexity": complexity})
 
     async def _run() -> None:
         platform_pref = platform or cfg.platform  # type: ignore[assignment]

@@ -242,3 +242,106 @@ def test_render_plan_summary_empty_files_shows_dash() -> None:
 
     rendered = output.getvalue()
     assert "-" in rendered
+
+
+# ---------------------------------------------------------------------------
+# --complexity flag tests
+# ---------------------------------------------------------------------------
+
+
+def _write_config_with_complexity(cwd: Path, user_complexity: str) -> None:
+    """Write a config.json with a specific user_complexity value."""
+    cfg = default_config()
+    cfg.user_complexity = user_complexity  # type: ignore[assignment]
+    autodev_dir = cwd / ".autodev"
+    autodev_dir.mkdir(parents=True, exist_ok=True)
+    save_config(cfg, autodev_dir / "config.json")
+
+
+def test_plan_complexity_flag_overrides_config(tmp_path: Path) -> None:
+    """--complexity CLI flag overrides cfg.user_complexity for this run."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config_with_complexity(cwd, user_complexity="low")
+
+        mock_plan = _make_plan()
+        captured: dict[str, object] = {}
+
+        with (
+            patch("cli.commands.plan.get_adapter") as mock_get_adapter,
+            patch("cli.commands.plan.Orchestrator") as mock_orch_cls,
+        ):
+            mock_adapter = MagicMock()
+            mock_get_adapter.return_value = mock_adapter
+
+            def _capture(*args, **kwargs):  # type: ignore[no-untyped-def]
+                captured["cfg"] = kwargs.get("cfg")
+                mock_orch = MagicMock()
+                mock_orch.plan = AsyncMock(return_value=mock_plan)
+                return mock_orch
+
+            mock_orch_cls.side_effect = _capture
+
+            result = runner.invoke(
+                cli,
+                ["plan", "build a widget", "--complexity", "max"],
+                catch_exceptions=False,
+            )
+
+    assert result.exit_code == 0, result.output
+    cfg = captured["cfg"]
+    assert cfg is not None
+    assert cfg.user_complexity == "max"  # type: ignore[union-attr]
+
+
+def test_plan_complexity_flag_omitted_uses_config_value(tmp_path: Path) -> None:
+    """When --complexity is omitted, cfg.user_complexity from config is preserved."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config_with_complexity(cwd, user_complexity="high")
+
+        mock_plan = _make_plan()
+        captured: dict[str, object] = {}
+
+        with (
+            patch("cli.commands.plan.get_adapter") as mock_get_adapter,
+            patch("cli.commands.plan.Orchestrator") as mock_orch_cls,
+        ):
+            mock_adapter = MagicMock()
+            mock_get_adapter.return_value = mock_adapter
+
+            def _capture(*args, **kwargs):  # type: ignore[no-untyped-def]
+                captured["cfg"] = kwargs.get("cfg")
+                mock_orch = MagicMock()
+                mock_orch.plan = AsyncMock(return_value=mock_plan)
+                return mock_orch
+
+            mock_orch_cls.side_effect = _capture
+
+            result = runner.invoke(
+                cli, ["plan", "build a widget"], catch_exceptions=False
+            )
+
+    assert result.exit_code == 0, result.output
+    cfg = captured["cfg"]
+    assert cfg is not None
+    assert cfg.user_complexity == "high"  # type: ignore[union-attr]
+
+
+def test_plan_complexity_flag_invalid_value_rejected(tmp_path: Path) -> None:
+    """Invalid --complexity value is rejected by Click's Choice validator."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config_with_complexity(cwd, user_complexity="medium")
+
+        result = runner.invoke(
+            cli, ["plan", "build a widget", "--complexity", "garbage"]
+        )
+
+    assert result.exit_code != 0
+    # Click Choice errors mention "Invalid value" and the offending value.
+    assert "Invalid value" in result.output or "invalid choice" in result.output.lower()
+    assert "garbage" in result.output
