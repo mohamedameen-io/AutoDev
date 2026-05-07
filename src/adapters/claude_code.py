@@ -50,6 +50,11 @@ class ClaudeCodeAdapter(PlatformAdapter):
             cmd += ["--model", inv.model]
         if inv.max_turns and inv.max_turns > 0:
             cmd += ["--max-turns", str(inv.max_turns)]
+        # ``--effort {low,medium,high,xhigh,max}`` controls test-time compute.
+        # ``None`` or empty string → flag omitted, the CLI inherits the
+        # user-global default from ``~/.claude/settings.json``.
+        if inv.effort:
+            cmd += ["--effort", inv.effort]
         if inv.allowed_tools:
             cmd += ["--allowed-tools", ",".join(inv.allowed_tools)]
         # NOTE: We deliberately do NOT pass `--continue`; every call is fresh.

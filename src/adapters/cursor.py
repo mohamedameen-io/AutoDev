@@ -105,7 +105,11 @@ class CursorAdapter(PlatformAdapter):
 
         for model in models_to_try:
             for binary in self.binaries:
-                # Create new invocation with this model
+                # Create new invocation with this model. Preserve every
+                # field on the original invocation — including ``effort`` —
+                # so the model-fallback retry path doesn't silently drop
+                # adapter hints. Cursor's CLI ignores ``--effort`` (claude-
+                # specific flag) so the value is plumbed through but unused.
                 inv_with_model = AgentInvocation(
                     role=inv.role,
                     prompt=inv.prompt,
@@ -113,6 +117,8 @@ class CursorAdapter(PlatformAdapter):
                     cwd=inv.cwd,
                     allowed_tools=inv.allowed_tools,
                     timeout_s=inv.timeout_s,
+                    max_turns=inv.max_turns,
+                    effort=inv.effort,
                 )
                 cmd = self._build_command(binary, inv_with_model)
                 logger.info(

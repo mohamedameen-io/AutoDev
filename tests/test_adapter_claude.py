@@ -337,6 +337,55 @@ def test_build_command_omits_optional_flags(tmp_path: Path) -> None:
     assert "--max-turns" not in cmd
     assert "--model" not in cmd
     assert "--allowed-tools" not in cmd
+    assert "--effort" not in cmd
+
+
+def test_build_command_includes_effort_when_set(tmp_path: Path) -> None:
+    """``inv.effort`` is forwarded as ``--effort <value>`` between
+    ``--max-turns`` and ``--allowed-tools``.
+
+    Asserts the full triplet flag-ordering invariant the Claude CLI parses
+    cleanly: max-turns → effort → allowed-tools.
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(
+        role="r",
+        prompt="p",
+        cwd=tmp_path,
+        max_turns=1,
+        effort="xhigh",
+        allowed_tools=["Read"],
+    )
+    cmd = adapter._build_command(inv)
+    assert "--effort" in cmd
+    eff_idx = cmd.index("--effort")
+    assert cmd[eff_idx + 1] == "xhigh"
+    # --effort must appear AFTER --max-turns and BEFORE --allowed-tools.
+    mt_idx = cmd.index("--max-turns")
+    at_idx = cmd.index("--allowed-tools")
+    assert mt_idx < eff_idx < at_idx
+
+
+def test_build_command_omits_effort_when_none(tmp_path: Path) -> None:
+    """``effort=None`` (the default) → ``--effort`` is NOT in cmd."""
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=1)
+    cmd = adapter._build_command(inv)
+    assert "--effort" not in cmd
+
+
+def test_build_command_omits_effort_when_empty_string(tmp_path: Path) -> None:
+    """``effort=""`` is falsy and the ``if inv.effort:`` guard suppresses it."""
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(
+        role="r",
+        prompt="p",
+        cwd=tmp_path,
+        max_turns=1,
+        effort="",
+    )
+    cmd = adapter._build_command(inv)
+    assert "--effort" not in cmd
 
 
 @pytest.mark.asyncio

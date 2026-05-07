@@ -92,6 +92,7 @@ class _Invocation:
     timeout_s: int = 600
     allowed_tools: list[str] | None = None
     max_turns: int = 1
+    effort: str | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -104,6 +105,7 @@ def _build_invocation(
     timeout_s: int,
     max_turns: int = 1,
     allowed_tools: list[str] | None = None,
+    effort: str | None = None,
 ) -> Any:
     """Build a Phase-2 AgentInvocation if available, else a duck-typed shim.
 
@@ -114,6 +116,10 @@ def _build_invocation(
     ``max_turns`` and ``allowed_tools`` default to text-only-role conventions
     (1 turn, no tool restriction). :class:`AdapterLLMClient` overrides them
     per-role from the ``role_max_turns`` / ``role_allowed_tools`` maps.
+
+    ``effort`` (Claude Code ``--effort``) defaults to ``None`` (inherit
+    user-global). :class:`AdapterLLMClient` resolves it per-role from the
+    ``role_effort`` map.
     """
     prompt = f"{system}\n\n{user}"
     try:
@@ -127,6 +133,7 @@ def _build_invocation(
             timeout_s=timeout_s,
             allowed_tools=allowed_tools,
             max_turns=max_turns,
+            effort=effort,
         )
     except Exception:
         # Fallback: the adapter in use may accept any object with the same fields.
@@ -138,6 +145,7 @@ def _build_invocation(
             timeout_s=timeout_s,
             allowed_tools=allowed_tools,
             max_turns=max_turns,
+            effort=effort,
         )
 
 
@@ -197,6 +205,7 @@ class AdapterLLMClient:
         max_attempts: int = 5,
         role_max_turns: dict[str, int] | None = None,
         role_allowed_tools: dict[str, list[str] | None] | None = None,
+        role_effort: dict[str, str] | None = None,
     ) -> None:
         self._adapter = adapter
         self._cwd = cwd
@@ -204,6 +213,7 @@ class AdapterLLMClient:
         self._max_attempts = max_attempts
         self._role_max_turns = role_max_turns
         self._role_allowed_tools = role_allowed_tools
+        self._role_effort = role_effort
         self._log = get_logger(component="tournament.llm")
 
     def _resolve_max_turns(self, role: str) -> int:
@@ -224,6 +234,17 @@ class AdapterLLMClient:
             return ["Read"]
         return configured
 
+    def _resolve_effort(self, role: str) -> str | None:
+        """Return the per-role ``--effort`` hint, or ``None`` to inherit.
+
+        Roles absent from the ``role_effort`` map (or the map being ``None``)
+        return ``None`` — the adapter omits the flag and the Claude CLI
+        inherits the user-global default in ``~/.claude/settings.json``.
+        """
+        if self._role_effort is None:
+            return None
+        return self._role_effort.get(role)
+
     async def call(
         self,
         *,
@@ -243,6 +264,7 @@ class AdapterLLMClient:
             timeout_s=self._timeout_s,
             max_turns=self._resolve_max_turns(role),
             allowed_tools=self._resolve_allowed_tools(role),
+            effort=self._resolve_effort(role),
         )
 
         @retry(

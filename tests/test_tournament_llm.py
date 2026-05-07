@@ -77,6 +77,8 @@ async def test_invocation_uses_phase2_type_when_available() -> None:
     assert inv.max_turns == 1
     # Default: no tool restriction → flag omitted by adapter.
     assert inv.allowed_tools is None
+    # Default: no effort hint → adapter inherits user-global default.
+    assert inv.effort is None
 
 
 # ── Fix 2 + Fix 3: per-role max_turns and allowed_tools ───────────────────
@@ -159,6 +161,50 @@ async def test_invocation_no_role_dicts_keeps_defaults(tmp_path: Path) -> None:
     await client.call(system="s", user="u", role="critic_t")
     assert adapter.calls[0].max_turns == 1
     assert adapter.calls[0].allowed_tools is None
+    assert adapter.calls[0].effort is None
+
+
+# ── Step 3: per-role effort plumbing ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_invocation_uses_role_effort(tmp_path: Path) -> None:
+    """``role_effort`` mapping is honored per-call (mirrors role_max_turns)."""
+    adapter = StubAdapter([_Result(text="A"), _Result(text="B")])
+    client = AdapterLLMClient(
+        adapter,
+        cwd=tmp_path,
+        role_effort={"architect_b": "high", "critic_t": "medium"},
+    )
+    await client.call(system="s", user="u", role="architect_b")
+    await client.call(system="s", user="u", role="critic_t")
+
+    assert adapter.calls[0].role == "architect_b"
+    assert adapter.calls[0].effort == "high"
+    assert adapter.calls[1].role == "critic_t"
+    assert adapter.calls[1].effort == "medium"
+
+
+@pytest.mark.asyncio
+async def test_invocation_unknown_role_effort_returns_none(tmp_path: Path) -> None:
+    """A role not in ``role_effort`` falls back to ``effort=None``."""
+    adapter = StubAdapter([_Result(text="A")])
+    client = AdapterLLMClient(
+        adapter,
+        cwd=tmp_path,
+        role_effort={"architect_b": "high"},
+    )
+    await client.call(system="s", user="u", role="judge")
+    assert adapter.calls[0].effort is None
+
+
+@pytest.mark.asyncio
+async def test_invocation_no_role_effort_dict(tmp_path: Path) -> None:
+    """``role_effort=None`` (the default) → ``effort=None`` on every call."""
+    adapter = StubAdapter([_Result(text="A")])
+    client = AdapterLLMClient(adapter, cwd=tmp_path)
+    await client.call(system="s", user="u", role="architect_b")
+    assert adapter.calls[0].effort is None
 
 
 # ── Happy path ────────────────────────────────────────────────────────────
