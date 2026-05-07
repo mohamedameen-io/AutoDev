@@ -103,12 +103,41 @@ class ClaudeCodeAdapter(PlatformAdapter):
                     proc.kill()
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(proc.wait(), timeout=5)
+                # Drain whatever the subprocess buffered before kill so the
+                # dump captures the partial transcript (mirrors the rc!=0
+                # path added in v0.5.2). Best-effort: a hung process whose
+                # streams never resolve will TimeoutError out at 2.0s.
+                stdout_b = b""
+                stderr_b = b""
+                with suppress(Exception):
+                    stdout_b, stderr_b = await asyncio.wait_for(
+                        proc.communicate(), timeout=2.0
+                    )
                 duration = time.monotonic() - start
+                stdout = (
+                    stdout_b.decode("utf-8", errors="replace")
+                    if stdout_b
+                    else ""
+                )
+                stderr = (
+                    stderr_b.decode("utf-8", errors="replace")
+                    if stderr_b
+                    else ""
+                )
+                self._dump_failure_transcript(
+                    inv=inv,
+                    stdout=stdout,
+                    stderr=stderr,
+                    returncode=-1,  # sentinel: timeout
+                    duration=duration,
+                )
                 return AgentResult(
                     success=False,
                     text="",
                     duration_s=duration,
                     error=f"timeout after {inv.timeout_s}s",
+                    raw_stdout=stdout,
+                    raw_stderr=stderr,
                 )
         except FileNotFoundError as exc:
             duration = time.monotonic() - start

@@ -109,6 +109,68 @@ async def test_execute_timeout(tmp_path: Path) -> None:
     assert result.success is False
     assert result.error is not None
     assert "timeout" in result.error.lower()
+    # v0.5.3: post-kill drain populates raw_* with whatever the subprocess
+    # buffered (empty for the test fixture's hung process). They are no
+    # longer ``None`` — they default to ``""`` after the dump path runs.
+    assert result.raw_stdout == ""
+    assert result.raw_stderr == ""
+
+
+@pytest.mark.asyncio
+async def test_execute_timeout_writes_debug_dump(tmp_path: Path) -> None:
+    """A timeout-killed subprocess writes a sectioned dump to ``.autodev/debug/``.
+
+    Mirrors :func:`test_execute_nonzero_exit_writes_debug_dump` for the rc=-1
+    sentinel timeout branch (v0.5.3 — the v0.5.2 dump pattern extended to
+    timeout failures so 600s-timeout architect_b runs leave forensic
+    artifacts).
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(
+        role="architect_b",
+        prompt="THE_PROMPT_BODY",
+        cwd=tmp_path,
+        max_turns=1,
+        timeout_s=1,
+    )
+    # Custom fake: first ``communicate()`` hangs (triggers TimeoutError on
+    # the outer ``wait_for``); second ``communicate()`` (the post-kill
+    # drain) returns immediately with empty bytes. This avoids the 2.0s
+    # real-time wait the unmodified ``hang=True`` fixture would impose on
+    # the drain step.
+    fake = AsyncMock()
+    fake.returncode = None
+    call_count = {"n": 0}
+
+    async def _communicate(*_a, **_kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            await asyncio.sleep(3600)  # outer wait_for cancels this
+        return (b"", b"")
+
+    fake.communicate = _communicate
+    fake.wait = AsyncMock(return_value=-1)
+    fake.kill = lambda: None
+
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.error is not None
+    assert "timeout" in result.error.lower()
+    debug_root = tmp_path / ".autodev" / "debug"
+    assert debug_root.exists()
+    files = list(debug_root.iterdir())
+    assert len(files) == 1, f"expected 1 dump file, got {files!r}"
+    dump = files[0]
+    assert re.match(r"^architect_b-\d{13}\.txt$", dump.name), dump.name
+    body = dump.read_text(encoding="utf-8")
+    assert "== meta ==" in body
+    assert "role: architect_b" in body
+    assert "returncode: -1" in body
+    assert "THE_PROMPT_BODY" in body
 
 
 @pytest.mark.asyncio
