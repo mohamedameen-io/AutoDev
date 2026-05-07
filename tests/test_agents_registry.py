@@ -121,3 +121,50 @@ def test_tournament_prompts_loaded_when_available() -> None:
     assert specs["architect_b"].prompt == tp.ARCHITECT_B_SYSTEM
     assert specs["synthesizer"].prompt == tp.SYNTHESIZER_SYSTEM
     assert specs["judge"].prompt == tp.JUDGE_SYSTEM
+
+
+# ── v0.5.4 Part 3: Architect prompt EXECUTION ENVIRONMENT CONSTRAINTS ─────
+
+
+def test_architect_prompt_contains_execution_env_constraints() -> None:
+    """The architect's rendered prompt must include the new
+    ``EXECUTION ENVIRONMENT CONSTRAINTS`` section and document the
+    ``[MANUAL]`` task-title convention for non-agent-runnable phases."""
+    specs = build_registry(default_config())
+    architect_prompt = specs["architect"].prompt
+
+    # Section header present.
+    assert "## EXECUTION ENVIRONMENT CONSTRAINTS" in architect_prompt, (
+        "architect prompt is missing the EXECUTION ENVIRONMENT CONSTRAINTS section"
+    )
+
+    # The [MANUAL] convention must be documented.
+    assert "[MANUAL]" in architect_prompt, (
+        "architect prompt must mention the [MANUAL] convention"
+    )
+
+
+def test_architect_prompt_complexity_section_remains_last() -> None:
+    """``OUTPUT REQUIREMENT — PLAN COMPLEXITY`` must remain the LAST section.
+
+    The new ``EXECUTION ENVIRONMENT CONSTRAINTS`` section is inserted
+    immediately above it, but the COMPLEXITY directive is consumed by the
+    parser and must be the final section so its position is unambiguous.
+    """
+    specs = build_registry(default_config())
+    architect_prompt = specs["architect"].prompt
+
+    constraints_idx = architect_prompt.find("## EXECUTION ENVIRONMENT CONSTRAINTS")
+    complexity_idx = architect_prompt.find("## OUTPUT REQUIREMENT — PLAN COMPLEXITY")
+
+    assert constraints_idx > 0, "constraints section missing"
+    assert complexity_idx > 0, "complexity section missing"
+    assert constraints_idx < complexity_idx, (
+        "constraints must appear BEFORE the complexity output requirement"
+    )
+
+    # No `## ` heading should appear after the complexity section header.
+    tail = architect_prompt[complexity_idx + len("## OUTPUT REQUIREMENT — PLAN COMPLEXITY") :]
+    assert "\n## " not in tail, (
+        "OUTPUT REQUIREMENT — PLAN COMPLEXITY must remain the final section"
+    )

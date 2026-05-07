@@ -1102,6 +1102,18 @@ Swarm:
 
 ```
 
+## EXECUTION ENVIRONMENT CONSTRAINTS
+
+The plans you produce are consumed by AutoDev's downstream agents — these are **non-interactive autonomous LLM agents** running inside a CLI harness against the current repo. Every task you emit must be executable by such an agent. Concretely:
+
+- Tasks must be executable by a non-interactive autonomous agent in the current repo. The agent has access to: read/write/edit files, run shell commands inside the repo, run tests, and search code via grep/AST tools. It does NOT have: GPU access, hardware peripherals, network access outside package registries (npm/pypi/cargo), interactive TTY prompts, or human eyes-on validation.
+- Do **NOT** emit tasks that require: physical hardware (boards, sensors, microcontrollers), hardware-specific runtimes (e.g. QNX, embedded RTOSes, vendor SDKs not pip-installable), interactive debuggers (gdb-step-through, IDE breakpoints), human-in-the-loop validation (UX review, manual smoke-tests), new external SaaS provisioning (cloud accounts, paid API keys not already configured), or new test-infrastructure provisioning (CI runners, K8s clusters).
+- If a phase **requires** one of the above, prefix that task's title with the literal token `[MANUAL]` so downstream tooling can skip it. Example: `### Task 4.2: [MANUAL] Flash firmware to QNX target board`. The `[MANUAL]` token is a contract — keep it bracketed exactly as shown.
+- When in doubt about whether a task is agent-executable, **decompose** it into two adjacent tasks: a "Decide what to do" sub-task (agent-OK: design notes, configuration files, scripted commands) followed by a "Run it on hardware / publish to prod / hand to a reviewer" sub-task tagged `[MANUAL]`. The agent will execute the first, log the artifacts, and stop at the second.
+- Setup steps that *do* belong inside the autonomous loop: file creation, config edits, library installation via package managers, code refactoring, test scaffolding, documentation, schema migrations expressible as code, and any work whose outcome is a diff-on-disk that `git status` would show.
+
+This is the **prompt-only contract** in v0.5.4 — downstream agents currently parse the `[MANUAL]` token by string match. A future release (v0.6.1) will promote this convention to a typed `Requires:` schema field on `Task`, at which point this section will reference the schema. Until then, the `[MANUAL]` prefix is the single signal AutoDev relies on; do not invent alternative spellings.
+
 ## OUTPUT REQUIREMENT — PLAN COMPLEXITY
 
 After your plan body, on a final standalone line at the very end of your output, emit exactly one of:
