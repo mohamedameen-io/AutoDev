@@ -45,6 +45,27 @@ logger = get_logger(__name__)
 _TOURNAMENT_ROLES: tuple[str, ...] = ("critic_t", "architect_b", "synthesizer", "judge")
 
 
+def _build_role_overrides(
+    orch: "Orchestrator",
+) -> tuple[dict[str, int], dict[str, list[str] | None]]:
+    """Build per-role ``max_turns`` and ``allowed_tools`` maps from the registry.
+
+    Reads each tournament role's :class:`~adapters.types.AgentSpec` from
+    ``orch.registry`` and produces the dicts consumed by
+    :class:`~tournament.llm.AdapterLLMClient`. Roles missing from the registry
+    are simply omitted (the client falls back to its defaults).
+    """
+    role_max_turns: dict[str, int] = {}
+    role_allowed_tools: dict[str, list[str] | None] = {}
+    for role in _TOURNAMENT_ROLES:
+        spec = orch.registry.get(role)
+        if spec is None:
+            continue
+        role_max_turns[role] = spec.max_turns or 1
+        role_allowed_tools[role] = list(spec.tools) if spec.tools else []
+    return role_max_turns, role_allowed_tools
+
+
 def _resolve_tournament_model(orch: "Orchestrator") -> str | None:
     """Return the judge model (or ``None`` if unresolved).
 
@@ -117,7 +138,13 @@ async def run_plan_tournament(
     tournament_id = f"plan-{spec_hash[:8]}"
     artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
 
-    client = AdapterLLMClient(orch.adapter, cwd=orch.cwd)
+    role_max_turns, role_allowed_tools = _build_role_overrides(orch)
+    client = AdapterLLMClient(
+        orch.adapter,
+        cwd=orch.cwd,
+        role_max_turns=role_max_turns,
+        role_allowed_tools=role_allowed_tools,
+    )
 
     tcfg = TournamentConfig(
         num_judges=cfg.num_judges,
@@ -125,6 +152,8 @@ async def run_plan_tournament(
         max_rounds=cfg.max_rounds,
         model=model,
         max_parallel_subprocesses=orch.cfg.tournaments.max_parallel_subprocesses,
+        score_stability_window=cfg.score_stability_window,
+        score_stability_max_delta=cfg.score_stability_max_delta,
     )
 
     judge_plugins = (

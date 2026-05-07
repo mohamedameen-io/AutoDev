@@ -48,6 +48,19 @@ _TRANSIENT_SUBSTRINGS = (
 )
 
 
+# Subtypes that the CLI reports for deterministic failures — retrying with the
+# same prompt cannot help. When :class:`AgentResult.subtype` matches one of
+# these, ``_classify_error`` short-circuits transient classification and the
+# call is wrapped in a :class:`TournamentError` immediately.
+_DETERMINISTIC_SUBTYPES = frozenset(
+    {
+        "error_max_turns",
+        "error_max_tokens",
+        "error_during_execution",
+    }
+)
+
+
 class TransientError(AdapterError):
     """Retryable adapter failure (rate limit / transient network / overload)."""
 
@@ -89,12 +102,18 @@ def _build_invocation(
     cwd: Path,
     model: str | None,
     timeout_s: int,
+    max_turns: int = 1,
+    allowed_tools: list[str] | None = None,
 ) -> Any:
     """Build a Phase-2 AgentInvocation if available, else a duck-typed shim.
 
     The original implementation used separate system + user messages. Subscription
     CLIs accept a single prompt; we concatenate with a blank line between
     sections to preserve the semantic boundary.
+
+    ``max_turns`` and ``allowed_tools`` default to text-only-role conventions
+    (1 turn, no tool restriction). :class:`AdapterLLMClient` overrides them
+    per-role from the ``role_max_turns`` / ``role_allowed_tools`` maps.
     """
     prompt = f"{system}\n\n{user}"
     try:
@@ -106,8 +125,8 @@ def _build_invocation(
             cwd=cwd,
             model=model,
             timeout_s=timeout_s,
-            allowed_tools=[],  # text-only roles
-            max_turns=1,
+            allowed_tools=allowed_tools,
+            max_turns=max_turns,
         )
     except Exception:
         # Fallback: the adapter in use may accept any object with the same fields.
@@ -117,13 +136,26 @@ def _build_invocation(
             cwd=cwd,
             model=model,
             timeout_s=timeout_s,
-            allowed_tools=[],
-            max_turns=1,
+            allowed_tools=allowed_tools,
+            max_turns=max_turns,
         )
 
 
-def _classify_error(err: str | None, exc: BaseException | None = None) -> bool:
-    """Return True if the error text indicates a transient failure."""
+def _classify_error(
+    err: str | None,
+    exc: BaseException | None = None,
+    *,
+    subtype: str | None = None,
+) -> bool:
+    """Return True if the error text indicates a transient failure.
+
+    Deterministic CLI failure subtypes (``subtype in _DETERMINISTIC_SUBTYPES``
+    — e.g. ``error_max_turns``) take precedence and force ``False`` regardless
+    of the error string. This prevents the retry loop from burning attempts on
+    a failure that is guaranteed to repeat (Fix 4).
+    """
+    if subtype is not None and subtype in _DETERMINISTIC_SUBTYPES:
+        return False
     text = (err or "") + " " + (str(exc) if exc else "")
     low = text.lower()
     return any(sub in low for sub in _TRANSIENT_SUBSTRINGS)
@@ -134,8 +166,26 @@ class AdapterLLMClient:
 
     Usage::
 
-        client = AdapterLLMClient(adapter, cwd=repo_root)
+        client = AdapterLLMClient(
+            adapter,
+            cwd=repo_root,
+            role_max_turns={"architect_b": 5},
+            role_allowed_tools={"architect_b": []},
+        )
         text = await client.call(system="...", user="...", role="critic_t")
+
+    Per-role overrides:
+        ``role_max_turns`` and ``role_allowed_tools`` are optional dicts keyed
+        by tournament role name (``critic_t`` / ``architect_b`` / ``synthesizer``
+        / ``judge``). When a role appears in the map, its value is used to
+        construct the :class:`~adapters.types.AgentInvocation` for that call.
+        Roles not in the map fall back to defaults (``max_turns=1``,
+        ``allowed_tools=None``) — the pre-Fix-2/3 behavior.
+
+        Empty list (``[]``) in ``role_allowed_tools`` is normalized to
+        ``["Read"]``: the Claude CLI's variadic ``--allowed-tools`` flag is
+        skipped on falsy values, which would silently allow all tools.
+        ``Read`` is a benign read-only sentinel for text-only roles.
     """
 
     def __init__(
@@ -145,12 +195,34 @@ class AdapterLLMClient:
         *,
         timeout_s: int = 600,
         max_attempts: int = 5,
+        role_max_turns: dict[str, int] | None = None,
+        role_allowed_tools: dict[str, list[str] | None] | None = None,
     ) -> None:
         self._adapter = adapter
         self._cwd = cwd
         self._timeout_s = timeout_s
         self._max_attempts = max_attempts
+        self._role_max_turns = role_max_turns
+        self._role_allowed_tools = role_allowed_tools
         self._log = get_logger(component="tournament.llm")
+
+    def _resolve_max_turns(self, role: str) -> int:
+        if self._role_max_turns is None:
+            return 1
+        return self._role_max_turns.get(role, 1)
+
+    def _resolve_allowed_tools(self, role: str) -> list[str] | None:
+        if self._role_allowed_tools is None:
+            return None
+        if role not in self._role_allowed_tools:
+            return None
+        configured = self._role_allowed_tools[role]
+        # Empty list = "no tools" intent. The Claude CLI's variadic
+        # --allowed-tools flag is omitted on falsy values, so we substitute a
+        # benign read-only sentinel that actually restricts the toolset.
+        if configured is not None and len(configured) == 0:
+            return ["Read"]
+        return configured
 
     async def call(
         self,
@@ -169,6 +241,8 @@ class AdapterLLMClient:
             cwd=self._cwd,
             model=model,
             timeout_s=self._timeout_s,
+            max_turns=self._resolve_max_turns(role),
+            allowed_tools=self._resolve_allowed_tools(role),
         )
 
         @retry(
@@ -193,8 +267,19 @@ class AdapterLLMClient:
             success = getattr(result, "success", True)
             error = getattr(result, "error", None)
             text = getattr(result, "text", None)
+            subtype = getattr(result, "subtype", None)
             if not success:
-                if _classify_error(error):
+                if subtype in _DETERMINISTIC_SUBTYPES:
+                    self._log.warning(
+                        "deterministic_subtype",
+                        role=role,
+                        subtype=subtype,
+                        err=error,
+                    )
+                    raise TournamentError(
+                        f"non-retryable subtype={subtype} for role={role}: {error}"
+                    )
+                if _classify_error(error, subtype=subtype):
                     self._log.info("transient_result", role=role, err=error)
                     raise TransientError(error or "transient adapter failure")
                 raise TournamentError(

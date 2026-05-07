@@ -77,6 +77,25 @@ def _is_auto_disabled(model: str | None, auto_disable: list[str]) -> bool:
     return any(marker.lower() in low for marker in auto_disable)
 
 
+def _build_tournament_role_overrides(
+    orch: "Orchestrator",
+) -> tuple[dict[str, int], dict[str, list[str] | None]]:
+    """Build per-role overrides for the tournament's :class:`AdapterLLMClient`.
+
+    Mirrors :func:`plan_tournament_runner._build_role_overrides`. Roles that
+    aren't in the registry are omitted; the client then uses its defaults.
+    """
+    role_max_turns: dict[str, int] = {}
+    role_allowed_tools: dict[str, list[str] | None] = {}
+    for role in _TOURNAMENT_ROLES:
+        spec = orch.registry.get(role)
+        if spec is None:
+            continue
+        role_max_turns[role] = spec.max_turns or 1
+        role_allowed_tools[role] = list(spec.tools) if spec.tools else []
+    return role_max_turns, role_allowed_tools
+
+
 class _CoderRunner:
     """Concrete :class:`~tournament.CoderRunner` implementation.
 
@@ -234,7 +253,13 @@ async def run_impl_tournament(
     artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
     worktree_dir = artifact_dir / "worktrees"
 
-    client = AdapterLLMClient(orch.adapter, cwd=orch.cwd)
+    role_max_turns, role_allowed_tools = _build_tournament_role_overrides(orch)
+    client = AdapterLLMClient(
+        orch.adapter,
+        cwd=orch.cwd,
+        role_max_turns=role_max_turns,
+        role_allowed_tools=role_allowed_tools,
+    )
 
     tcfg = TournamentConfig(
         num_judges=cfg.num_judges,
@@ -242,6 +267,8 @@ async def run_impl_tournament(
         max_rounds=cfg.max_rounds,
         model=model,
         max_parallel_subprocesses=orch.cfg.tournaments.max_parallel_subprocesses,
+        score_stability_window=cfg.score_stability_window,
+        score_stability_max_delta=cfg.score_stability_max_delta,
     )
 
     wt_mgr = WorktreeManager(main_repo=orch.cwd, tournament_dir=worktree_dir)

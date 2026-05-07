@@ -24,11 +24,13 @@ class _Result:
         success: bool = True,
         text: str = "OK",
         error: str | None = None,
+        subtype: str | None = None,
     ) -> None:
         self.success = success
         self.text = text
         self.error = error
         self.duration_s = 0.01
+        self.subtype = subtype
 
 
 class StubAdapter:
@@ -53,7 +55,12 @@ class StubAdapter:
 @pytest.mark.asyncio
 async def test_invocation_uses_phase2_type_when_available() -> None:
     """_build_invocation should return an AgentInvocation pydantic model
-    when src.adapters.types is importable."""
+    when src.adapters.types is importable.
+
+    With no per-role overrides, the defaults are ``max_turns=1`` and
+    ``allowed_tools=None`` (i.e. flag omitted upstream — preserves original
+    "all tools available" behavior for callers that don't opt in).
+    """
     inv = _build_invocation(
         role="critic_t",
         system="SYS",
@@ -62,15 +69,96 @@ async def test_invocation_uses_phase2_type_when_available() -> None:
         model=None,
         timeout_s=600,
     )
-    # Phase 2 scaffolding exists for types.py; we should get the real class.
     assert hasattr(inv, "role")
     assert hasattr(inv, "prompt")
     assert inv.role == "critic_t"
     assert inv.prompt == "SYS\n\nUSER"
     assert inv.timeout_s == 600
     assert inv.max_turns == 1
-    # Text-only roles get no allowed_tools.
-    assert inv.allowed_tools == []
+    # Default: no tool restriction → flag omitted by adapter.
+    assert inv.allowed_tools is None
+
+
+# ── Fix 2 + Fix 3: per-role max_turns and allowed_tools ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_invocation_uses_role_max_turns(tmp_path: Path) -> None:
+    """``role_max_turns`` mapping is honored per-call."""
+    adapter = StubAdapter([_Result(text="A"), _Result(text="B")])
+    client = AdapterLLMClient(
+        adapter,
+        cwd=tmp_path,
+        role_max_turns={"architect_b": 5, "critic_t": 1},
+    )
+    await client.call(system="s", user="u", role="architect_b")
+    await client.call(system="s", user="u", role="critic_t")
+
+    assert adapter.calls[0].role == "architect_b"
+    assert adapter.calls[0].max_turns == 5
+    assert adapter.calls[1].role == "critic_t"
+    assert adapter.calls[1].max_turns == 1
+
+
+@pytest.mark.asyncio
+async def test_invocation_uses_role_allowed_tools_empty_list(
+    tmp_path: Path,
+) -> None:
+    """An empty list in the role map is normalized to ``["Read"]``.
+
+    The Claude CLI's ``--allowed-tools`` flag is variadic and is omitted by
+    the adapter when ``allowed_tools`` is falsy — which would silently leave
+    all tools available. We pick a single read-only sentinel instead.
+    """
+    adapter = StubAdapter([_Result(text="A")])
+    client = AdapterLLMClient(
+        adapter,
+        cwd=tmp_path,
+        role_allowed_tools={"architect_b": []},
+    )
+    await client.call(system="s", user="u", role="architect_b")
+    assert adapter.calls[0].allowed_tools == ["Read"]
+
+
+@pytest.mark.asyncio
+async def test_invocation_uses_role_allowed_tools_nonempty(
+    tmp_path: Path,
+) -> None:
+    """A non-empty list passes through unchanged."""
+    adapter = StubAdapter([_Result(text="A")])
+    client = AdapterLLMClient(
+        adapter,
+        cwd=tmp_path,
+        role_allowed_tools={"architect_b": ["Read", "Grep"]},
+    )
+    await client.call(system="s", user="u", role="architect_b")
+    assert adapter.calls[0].allowed_tools == ["Read", "Grep"]
+
+
+@pytest.mark.asyncio
+async def test_invocation_unknown_role_uses_defaults(tmp_path: Path) -> None:
+    """A role not in either map falls back to ``max_turns=1`` and no tools."""
+    adapter = StubAdapter([_Result(text="A")])
+    client = AdapterLLMClient(
+        adapter,
+        cwd=tmp_path,
+        role_max_turns={"architect_b": 5},
+        role_allowed_tools={"architect_b": ["Read"]},
+    )
+    await client.call(system="s", user="u", role="judge")
+    assert adapter.calls[0].max_turns == 1
+    assert adapter.calls[0].allowed_tools is None
+
+
+@pytest.mark.asyncio
+async def test_invocation_no_role_dicts_keeps_defaults(tmp_path: Path) -> None:
+    """Without role dicts, ``AdapterLLMClient`` behaves exactly as before
+    Fix 2/3 — preserving back-compat with existing callers."""
+    adapter = StubAdapter([_Result(text="A")])
+    client = AdapterLLMClient(adapter, cwd=tmp_path)
+    await client.call(system="s", user="u", role="critic_t")
+    assert adapter.calls[0].max_turns == 1
+    assert adapter.calls[0].allowed_tools is None
 
 
 # ── Happy path ────────────────────────────────────────────────────────────
@@ -170,7 +258,11 @@ async def test_retries_on_empty_stderr_exit(
 async def test_retries_on_claude_exited_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Any 'claude exited' prefix from the adapter is treated as transient."""
+    """Any 'claude exited' prefix from the adapter is treated as transient.
+
+    No ``subtype`` is provided (genuine subprocess death without parsable
+    JSON output), so this falls through to the substring classifier.
+    """
     _patch_no_sleep(monkeypatch)
 
     adapter = StubAdapter(
@@ -183,6 +275,66 @@ async def test_retries_on_claude_exited_prefix(
     out = await client.call(system="s", user="u", role="architect_b")
     assert out == "OK"
     assert len(adapter.calls) == 2
+
+
+# ── Fix 4: deterministic-subtype short-circuit (no retry) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_error_max_turns_does_not_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``subtype="error_max_turns"`` is deterministic — fail fast, no retry."""
+    _patch_no_sleep(monkeypatch)
+
+    adapter = StubAdapter(
+        [
+            _Result(
+                success=False,
+                text="",
+                error="error_max_turns hit",
+                subtype="error_max_turns",
+            ),
+        ]
+    )
+    client = AdapterLLMClient(adapter, cwd=tmp_path, max_attempts=5)
+    with pytest.raises(TournamentError):
+        await client.call(system="s", user="u", role="architect_b")
+    # No retries — exactly one adapter call.
+    assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_subtype_overrides_transient_substring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even if the error string contains 'claude exited', a deterministic
+    subtype short-circuits the retry loop."""
+    _patch_no_sleep(monkeypatch)
+
+    adapter = StubAdapter(
+        [
+            _Result(
+                success=False,
+                text="",
+                error="claude exited 1: error_max_turns",
+                subtype="error_max_turns",
+            ),
+        ]
+    )
+    client = AdapterLLMClient(adapter, cwd=tmp_path, max_attempts=5)
+    with pytest.raises(TournamentError):
+        await client.call(system="s", user="u", role="architect_b")
+    assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_subtype_success_keeps_happy_path(tmp_path: Path) -> None:
+    """``subtype="success"`` on a successful response is a no-op."""
+    adapter = StubAdapter([_Result(text="HELLO", subtype="success")])
+    client = AdapterLLMClient(adapter, cwd=tmp_path)
+    out = await client.call(system="s", user="u", role="critic_t")
+    assert out == "HELLO"
 
 
 @pytest.mark.asyncio

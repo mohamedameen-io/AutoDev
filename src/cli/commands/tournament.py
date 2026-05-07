@@ -32,8 +32,10 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from agents import resolve_claude_tools
 from config.defaults import default_config
 from config.loader import load_config
+from config.schema import AutodevConfig
 from errors import AutodevError
 from state.paths import autodev_root, config_path
 from tournament import (
@@ -42,6 +44,35 @@ from tournament import (
     Tournament,
     TournamentConfig,
 )
+
+
+_TOURNAMENT_ROLES_FOR_CLI: tuple[str, ...] = (
+    "critic_t",
+    "architect_b",
+    "synthesizer",
+    "judge",
+)
+
+
+def _cli_role_overrides(
+    cfg: AutodevConfig,
+) -> tuple[dict[str, int], dict[str, list[str] | None]]:
+    """Build tournament-role overrides from an AutodevConfig (no registry).
+
+    Mirrors the orchestrator helpers in ``plan_tournament_runner`` /
+    ``impl_tournament_runner``. Used by the standalone CLI which has access
+    to ``cfg`` but does not build a full ``Orchestrator`` registry.
+    """
+    role_max_turns: dict[str, int] = {}
+    role_allowed_tools: dict[str, list[str] | None] = {}
+    for role in _TOURNAMENT_ROLES_FOR_CLI:
+        agent_cfg = cfg.agents.get(role)
+        if agent_cfg is None:
+            continue
+        role_max_turns[role] = agent_cfg.max_turns or 1
+        tools = resolve_claude_tools(role)
+        role_allowed_tools[role] = list(tools) if tools else []
+    return role_max_turns, role_allowed_tools
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +363,13 @@ async def _run_plan_tournament_cli(
         from adapters.detect import get_adapter
 
         adapter = await get_adapter(cfg.platform)
-        client = AdapterLLMClient(adapter, cwd=cwd)
+        rmt, rat = _cli_role_overrides(cfg)
+        client = AdapterLLMClient(
+            adapter,
+            cwd=cwd,
+            role_max_turns=rmt,
+            role_allowed_tools=rat,
+        )
         judge_cfg = cfg.agents.get("judge")
         model = judge_cfg.model if judge_cfg else None
 
@@ -342,6 +379,8 @@ async def _run_plan_tournament_cli(
         max_rounds=effective_max_rounds,
         model=model,
         max_parallel_subprocesses=cfg.tournaments.max_parallel_subprocesses,
+        score_stability_window=plan_cfg.score_stability_window,
+        score_stability_max_delta=plan_cfg.score_stability_max_delta,
     )
 
     console.print(
@@ -430,7 +469,13 @@ async def _run_impl_tournament_cli(
         from adapters.detect import get_adapter
 
         adapter = await get_adapter(cfg.platform)
-        client = AdapterLLMClient(adapter, cwd=cwd)
+        rmt, rat = _cli_role_overrides(cfg)
+        client = AdapterLLMClient(
+            adapter,
+            cwd=cwd,
+            role_max_turns=rmt,
+            role_allowed_tools=rat,
+        )
         judge_cfg = cfg.agents.get("judge")
         model = judge_cfg.model if judge_cfg else None
 
@@ -440,6 +485,8 @@ async def _run_impl_tournament_cli(
         max_rounds=effective_max_rounds,
         model=model,
         max_parallel_subprocesses=cfg.tournaments.max_parallel_subprocesses,
+        score_stability_window=impl_cfg.score_stability_window,
+        score_stability_max_delta=impl_cfg.score_stability_max_delta,
     )
 
     console.print(
