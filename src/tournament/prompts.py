@@ -100,7 +100,17 @@ Three proposals have been produced independently. Evaluate how well each accompl
 
 For each proposal, state what it gets right and what it gets wrong.
 
-Consider not only correctness and completeness but also whether the level of detail is appropriate. Penalize unnecessary bloat — proposals that pad with redundant annotations, restate the same issue in multiple sections, or expand verbosity without adding new substance are not better than concise proposals that cover the same ground. When two proposals are functionally equivalent, prefer the shorter one.
+Consider not only correctness and completeness but also whether the level of detail is appropriate.
+
+MANDATORY LENGTH PENALTY: If a proposal is more than 1.3× the length of the
+shortest proposal AND adds NO new substantive content (i.e. the extra lines
+are restatements, redundant sub-sections, or expanded annotations of the
+same ideas), it MUST be ranked LAST. When two proposals cover the same
+ground, the shorter one ranks higher — concise plans execute better.
+
+Worked example: Proposal 1 is 200 lines covering 12 phases; Proposal 2 is
+350 lines covering the same 12 phases plus restated rationale. Correct
+ranking: 1, 3, 2 (proposal 1 wins on length given equivalent coverage).
 
 Then rank all three from best to worst:
 

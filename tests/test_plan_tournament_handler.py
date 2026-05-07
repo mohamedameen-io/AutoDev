@@ -241,14 +241,15 @@ def test_handler_conforms_to_content_handler_protocol() -> None:
 def test_judge_prompt_contains_length_awareness_directive() -> None:
     """Judge ranking must explicitly weigh detail-vs-bloat.
 
-    Step 4 of the anti-runaway plan adds a length-aware clause to
+    Step 4 of the anti-runaway plan added a length-aware clause to
     JUDGE_RANK_3_PROMPT so judges don't reflexively prefer the longer
-    proposal when functional equivalence holds. The sentinel phrase
-    'Penalize unnecessary bloat' is the load-bearing directive — its
-    presence is what shifts unanimous 0-3 votes toward 1-2/2-1, letting
-    the tiebreak fire and the tournament converge.
+    proposal when functional equivalence holds. v0.6.2 strengthened the
+    directive to active-voice MANDATORY phrasing with a 1.3× threshold —
+    the v0.4.0 passive language ("Penalize unnecessary bloat") was empirically
+    insufficient (judges in the QNX run kept voting AB on 400-line plans).
+    The MANDATORY phrase is the load-bearing sentinel under v0.6.2.
     """
-    assert "Penalize unnecessary bloat" in JUDGE_RANK_3_PROMPT
+    assert "MANDATORY LENGTH PENALTY" in JUDGE_RANK_3_PROMPT
 
 
 def test_synthesizer_prompt_allows_noop() -> None:
