@@ -270,6 +270,156 @@ async def test_status_reports_counts(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_phase_skips_tasks_with_requires(tmp_path: Path) -> None:
+    """A task whose ``requires`` is non-empty must be marked ``skipped`` —
+    the developer adapter must NEVER be invoked for it — and surrounding
+    tasks must execute normally.
+    """
+    # Custom plan: task 1.1 marked as hardware-required; task 1.2 is normal.
+    cfg = default_config()
+    cfg.tournaments.plan.enabled = False
+    cfg.tournaments.impl.enabled = False
+    registry = build_registry(cfg)
+
+    adapter = StubAdapter(
+        {
+            "developer": _coder_ok_with_diff(),
+            "reviewer": _reviewer("APPROVED"),
+            "test_engineer": _test_engineer_ok(),
+        }
+    )
+    orch = Orchestrator(
+        cwd=tmp_path,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id="sess-requires-skip",
+    )
+    plan = Plan(
+        plan_id="p-requires",
+        spec_hash="d",
+        phases=[
+            Phase(
+                id="1",
+                title="Work",
+                tasks=[
+                    Task(
+                        id="1.1",
+                        phase_id="1",
+                        title="Flash firmware",
+                        description="Hardware step",
+                        files=["firmware.bin"],
+                        acceptance=[
+                            AcceptanceCriterion(
+                                id="ac-1", description="device boots"
+                            ),
+                        ],
+                        requires=["hardware"],
+                    ),
+                    Task(
+                        id="1.2",
+                        phase_id="1",
+                        title="Add subtract",
+                        description="Implement subtract(a, b)",
+                        files=["math.py"],
+                        acceptance=[
+                            AcceptanceCriterion(
+                                id="ac-1", description="tests pass"
+                            ),
+                        ],
+                    ),
+                ],
+            )
+        ],
+        created_at=_iso(),
+        updated_at=_iso(),
+    )
+    await orch.plan_manager.init_plan(plan)
+
+    tasks = await orch.execute()
+
+    # Both tasks are reported as processed.
+    assert len(tasks) == 2
+    by_id = {t.id: t for t in tasks}
+
+    # Task 1.1 — skipped, never reached the developer.
+    skipped = by_id["1.1"]
+    assert skipped.status == "skipped"
+    assert skipped.blocked_reason is not None
+    assert "hardware" in skipped.blocked_reason
+    assert "requires=" in skipped.blocked_reason
+
+    # Task 1.2 — completed normally.
+    done = by_id["1.2"]
+    assert done.status == "complete"
+
+    # The developer adapter ran exactly once (for 1.2 only).
+    assert adapter.count("developer") == 1
+    assert adapter.count("reviewer") == 1
+    assert adapter.count("test_engineer") == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_phase_skips_specific_task_with_requires(tmp_path: Path) -> None:
+    """When ``task_id`` targets a requires-marked task directly, it is still
+    skipped (not executed) — the explicit-target path must respect the field.
+    """
+    cfg = default_config()
+    cfg.tournaments.plan.enabled = False
+    cfg.tournaments.impl.enabled = False
+    registry = build_registry(cfg)
+
+    adapter = StubAdapter(
+        {
+            "developer": _coder_ok_with_diff(),
+            "reviewer": _reviewer("APPROVED"),
+            "test_engineer": _test_engineer_ok(),
+        }
+    )
+    orch = Orchestrator(
+        cwd=tmp_path,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id="sess-requires-target",
+    )
+    plan = Plan(
+        plan_id="p-requires-target",
+        spec_hash="d",
+        phases=[
+            Phase(
+                id="1",
+                title="Work",
+                tasks=[
+                    Task(
+                        id="1.1",
+                        phase_id="1",
+                        title="Hand off to operator",
+                        description="Manual step",
+                        files=[],
+                        acceptance=[],
+                        requires=["human"],
+                    ),
+                ],
+            )
+        ],
+        created_at=_iso(),
+        updated_at=_iso(),
+    )
+    await orch.plan_manager.init_plan(plan)
+
+    tasks = await orch.execute(task_id="1.1")
+
+    assert len(tasks) == 1
+    assert tasks[0].status == "skipped"
+    assert "human" in (tasks[0].blocked_reason or "")
+    # No agent of any kind was invoked.
+    assert adapter.count("developer") == 0
+    assert adapter.count("reviewer") == 0
+    assert adapter.count("test_engineer") == 0
+
+
+@pytest.mark.asyncio
 async def test_resume_picks_up_pending_tasks(tmp_path: Path) -> None:
     adapter = StubAdapter(
         {

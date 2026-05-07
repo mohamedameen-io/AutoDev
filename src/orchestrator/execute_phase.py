@@ -92,6 +92,27 @@ async def run_execute_phase(
 async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
     """Run the developer -> reviewer -> tests loop for one task. Returns the final task."""
     retry_limit = orch.cfg.qa_retry_limit
+
+    # Step 0: short-circuit non-agent-executable tasks (v0.6.1).
+    # Tasks with a non-empty ``requires`` list are skipped programmatically —
+    # the orchestrator never invokes any adapter for them. Mirrors the
+    # ``status in ('complete', 'skipped')`` short-circuit in
+    # :func:`run_execute_phase` for tasks that are already terminal, but
+    # catches the *first-time* skip path before any FSM transition.
+    if task.requires:
+        blocked_reason = f"requires={list(task.requires)}"
+        skipped_task = await orch.plan_manager.update_task_status(
+            task.id,
+            "skipped",
+            meta={"blocked_reason": blocked_reason},
+        )
+        logger.info(
+            "execute_phase.skip_requires",
+            task_id=task.id,
+            requires=list(task.requires),
+        )
+        return skipped_task
+
     task = await orch.plan_manager.update_task_status(task.id, "in_progress")
 
     orch.guardrails.start_task(task.id)
