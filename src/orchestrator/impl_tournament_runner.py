@@ -40,6 +40,7 @@ from tournament import (
     TournamentConfig,
 )
 from tournament.effort import resolve_role_effort
+from tournament.timeouts import resolve_role_timeout_s
 
 
 if TYPE_CHECKING:
@@ -80,19 +81,27 @@ def _is_auto_disabled(model: str | None, auto_disable: list[str]) -> bool:
 
 async def _build_tournament_role_overrides(
     orch: "Orchestrator",
-) -> tuple[dict[str, int], dict[str, list[str] | None], dict[str, str]]:
+) -> tuple[
+    dict[str, int],
+    dict[str, list[str] | None],
+    dict[str, int],
+    dict[str, str],
+]:
     """Build per-role overrides for the tournament's :class:`AdapterLLMClient`.
 
     Mirrors :func:`plan_tournament_runner._build_role_overrides`. Roles that
     aren't in the registry are omitted; the client then uses its defaults.
 
-    Returns a 3-tuple ``(role_max_turns, role_allowed_tools, role_effort)``.
-    The third dict is populated from
-    :func:`tournament.effort.resolve_role_effort` keyed on the parsed plan
-    complexity (architect classification) and ``cfg.user_complexity``.
+    Returns a 4-tuple
+    ``(role_max_turns, role_allowed_tools, role_timeout_s, role_effort)``.
+    The third dict (``role_timeout_s``) was added in v0.5.4 and is populated
+    from :func:`tournament.timeouts.resolve_role_timeout_s` keyed on the
+    parsed plan complexity. The fourth (``role_effort``) is populated from
+    :func:`tournament.effort.resolve_role_effort`.
     """
     role_max_turns: dict[str, int] = {}
     role_allowed_tools: dict[str, list[str] | None] = {}
+    role_timeout_s: dict[str, int] = {}
     role_effort: dict[str, str] = {}
 
     plan_complexity: str | None = None
@@ -110,6 +119,9 @@ async def _build_tournament_role_overrides(
             continue
         role_max_turns[role] = spec.max_turns or 1
         role_allowed_tools[role] = list(spec.tools) if spec.tools else []
+        timeout_s = resolve_role_timeout_s(role, plan_complexity)
+        if timeout_s is not None:
+            role_timeout_s[role] = timeout_s
         effort = resolve_role_effort(
             role,
             orch.cfg.agents.get(role),
@@ -118,7 +130,7 @@ async def _build_tournament_role_overrides(
         )
         if effort is not None:
             role_effort[role] = effort
-    return role_max_turns, role_allowed_tools, role_effort
+    return role_max_turns, role_allowed_tools, role_timeout_s, role_effort
 
 
 class _CoderRunner:
@@ -305,7 +317,7 @@ async def run_impl_tournament(
     artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
     worktree_dir = artifact_dir / "worktrees"
 
-    role_max_turns, role_allowed_tools, role_effort = (
+    role_max_turns, role_allowed_tools, role_timeout_s, role_effort = (
         await _build_tournament_role_overrides(orch)
     )
     client = AdapterLLMClient(
@@ -314,6 +326,7 @@ async def run_impl_tournament(
         role_max_turns=role_max_turns,
         role_allowed_tools=role_allowed_tools,
         role_effort=role_effort,
+        role_timeout_s=role_timeout_s,
     )
 
     tcfg = TournamentConfig(

@@ -94,7 +94,7 @@ def test_plan_tournament_role_effort_complex_plan(tmp_path: Path) -> None:
     judge/critic_t get medium (per EFFORT_MATRIX)."""
     orch = _make_orch_for_wiring(tmp_path)
 
-    rmt, rat, role_effort = _build_role_overrides(orch, "complex")
+    rmt, rat, _rts, role_effort = _build_role_overrides(orch, "complex")
 
     assert role_effort["architect_b"] == "xhigh"
     assert role_effort["synthesizer"] == "xhigh"
@@ -106,7 +106,7 @@ def test_plan_tournament_role_effort_medium_plan(tmp_path: Path) -> None:
     """With plan_complexity='medium', authors get high, evaluators get medium."""
     orch = _make_orch_for_wiring(tmp_path)
 
-    _, _, role_effort = _build_role_overrides(orch, "medium")
+    _, _, _rts, role_effort = _build_role_overrides(orch, "medium")
 
     assert role_effort["architect_b"] == "high"
     assert role_effort["synthesizer"] == "high"
@@ -118,7 +118,7 @@ def test_plan_tournament_role_effort_simple_plan(tmp_path: Path) -> None:
     """With plan_complexity='simple', authors get medium, evaluators get low."""
     orch = _make_orch_for_wiring(tmp_path)
 
-    _, _, role_effort = _build_role_overrides(orch, "simple")
+    _, _, _rts, role_effort = _build_role_overrides(orch, "simple")
 
     assert role_effort["architect_b"] == "medium"
     assert role_effort["synthesizer"] == "medium"
@@ -133,7 +133,7 @@ def test_plan_tournament_role_effort_no_complexity_yields_empty(
     effort (architect runs at the floor outside the tournament)."""
     orch = _make_orch_for_wiring(tmp_path)
 
-    _, _, role_effort = _build_role_overrides(orch, None)
+    _, _, _rts, role_effort = _build_role_overrides(orch, None)
 
     # All four tournament roles fall through to None.
     assert role_effort == {}
@@ -145,7 +145,7 @@ def test_plan_tournament_role_effort_explicit_override_wins(
     """``cfg.agents['judge'].effort='low'`` overrides the matrix value."""
     orch = _make_orch_for_wiring(tmp_path, judge_effort_override="low")
 
-    _, _, role_effort = _build_role_overrides(orch, "complex")
+    _, _, _rts, role_effort = _build_role_overrides(orch, "complex")
 
     # judge override wins; architect_b/synthesizer remain at xhigh.
     assert role_effort["judge"] == "low"
@@ -189,9 +189,64 @@ async def test_run_plan_tournament_extracts_complexity_from_initial_md(
 
     # Wire-up: the helper, given the extracted complexity, returns the right matrix.
     orch = _make_orch_for_wiring(tmp_path)
-    _, _, role_effort = _build_role_overrides(orch, extract_complexity(initial_md))
+    _, _, _, role_effort = _build_role_overrides(orch, extract_complexity(initial_md))
     assert role_effort["architect_b"] == "xhigh"  # complex → author tier → xhigh
     assert role_effort["judge"] == "medium"        # complex → evaluator tier → medium
+
+
+# ---------------------------------------------------------------------------
+# v0.5.4 Part 1C: Per-role timeout_s wiring
+# ---------------------------------------------------------------------------
+
+
+def test_role_timeout_s_resolved_for_complex_plan(tmp_path: Path) -> None:
+    """With plan_complexity='complex', architect_b gets 1200s (the QNX fix),
+    synthesizer gets 900s, critic_t gets 600s, judge stays at 300s."""
+    orch = _make_orch_for_wiring(tmp_path)
+
+    _, _, role_timeout_s, _ = _build_role_overrides(orch, "complex")
+
+    assert role_timeout_s["architect_b"] == 1200
+    assert role_timeout_s["synthesizer"] == 900
+    assert role_timeout_s["critic_t"] == 600
+    assert role_timeout_s["judge"] == 300
+
+
+def test_role_timeout_s_resolved_for_medium_plan(tmp_path: Path) -> None:
+    """With plan_complexity='medium', architect_b stays at 600s (no escalation)."""
+    orch = _make_orch_for_wiring(tmp_path)
+
+    _, _, role_timeout_s, _ = _build_role_overrides(orch, "medium")
+
+    assert role_timeout_s["architect_b"] == 600
+    assert role_timeout_s["synthesizer"] == 600
+    assert role_timeout_s["critic_t"] == 300
+    assert role_timeout_s["judge"] == 300
+
+
+def test_role_timeout_s_no_complexity_yields_empty(tmp_path: Path) -> None:
+    """Without a plan_complexity, no tournament roles resolve to a timeout."""
+    orch = _make_orch_for_wiring(tmp_path)
+
+    _, _, role_timeout_s, _ = _build_role_overrides(orch, None)
+
+    # All four tournament roles fall through to None → omitted from dict.
+    assert role_timeout_s == {}
+
+
+@pytest.mark.asyncio
+async def test_impl_tournament_role_timeout_s_complex_plan(tmp_path: Path) -> None:
+    """Same shape as plan tournament: complex plan → table values."""
+    orch = _make_orch_for_wiring(tmp_path)
+    plan = _seed_plan(orch, "complex")
+    await orch.plan_manager.init_plan(plan)
+
+    _, _, role_timeout_s, _ = await _build_tournament_role_overrides(orch)
+
+    assert role_timeout_s["architect_b"] == 1200
+    assert role_timeout_s["synthesizer"] == 900
+    assert role_timeout_s["critic_t"] == 600
+    assert role_timeout_s["judge"] == 300
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +261,7 @@ async def test_impl_tournament_role_effort_complex_plan(tmp_path: Path) -> None:
     plan = _seed_plan(orch, "complex")
     await orch.plan_manager.init_plan(plan)
 
-    _, _, role_effort = await _build_tournament_role_overrides(orch)
+    _, _, _rts, role_effort = await _build_tournament_role_overrides(orch)
 
     assert role_effort["architect_b"] == "xhigh"
     assert role_effort["synthesizer"] == "xhigh"
@@ -223,7 +278,7 @@ async def test_impl_tournament_role_effort_explicit_override_wins(
     plan = _seed_plan(orch, "medium")
     await orch.plan_manager.init_plan(plan)
 
-    _, _, role_effort = await _build_tournament_role_overrides(orch)
+    _, _, _rts, role_effort = await _build_tournament_role_overrides(orch)
 
     assert role_effort["judge"] == "low"
     assert role_effort["architect_b"] == "high"
@@ -237,7 +292,7 @@ async def test_impl_tournament_role_effort_explicit_override_wins(
 def test_cli_role_overrides_no_plan_returns_empty_effort() -> None:
     """Without a plan and without per-role overrides, role_effort is empty."""
     cfg = default_config()
-    rmt, rat, role_effort = _cli_role_overrides(cfg)
+    rmt, rat, _rts, role_effort = _cli_role_overrides(cfg)
     # Sanity: max_turns and tools still populated from cfg.
     assert "judge" in rmt
     assert "judge" in rat
@@ -250,7 +305,7 @@ def test_cli_role_overrides_includes_role_effort_with_explicit_config() -> None:
     cfg = default_config()
     cfg.agents["judge"].effort = "low"  # type: ignore[assignment]
 
-    _, _, role_effort = _cli_role_overrides(cfg)
+    _, _, _rts, role_effort = _cli_role_overrides(cfg)
     assert role_effort == {"judge": "low"}
 
 
@@ -261,7 +316,7 @@ def test_cli_role_overrides_explicit_overrides_for_multiple_roles() -> None:
     cfg.agents["architect_b"].effort = "max"  # type: ignore[assignment]
     cfg.agents["critic_t"].effort = "low"  # type: ignore[assignment]
 
-    _, _, role_effort = _cli_role_overrides(cfg)
+    _, _, _rts, role_effort = _cli_role_overrides(cfg)
     assert role_effort == {
         "judge": "low",
         "architect_b": "max",

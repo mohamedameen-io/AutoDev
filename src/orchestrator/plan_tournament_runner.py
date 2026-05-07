@@ -32,6 +32,7 @@ from tournament import (
     TournamentConfig,
 )
 from tournament.effort import resolve_role_effort
+from tournament.timeouts import resolve_role_timeout_s
 
 
 if TYPE_CHECKING:
@@ -50,8 +51,13 @@ _TOURNAMENT_ROLES: tuple[str, ...] = ("critic_t", "architect_b", "synthesizer", 
 def _build_role_overrides(
     orch: "Orchestrator",
     plan_complexity: str | None,
-) -> tuple[dict[str, int], dict[str, list[str] | None], dict[str, str]]:
-    """Build per-role ``max_turns``, ``allowed_tools``, and ``effort`` maps.
+) -> tuple[
+    dict[str, int],
+    dict[str, list[str] | None],
+    dict[str, int],
+    dict[str, str],
+]:
+    """Build per-role ``max_turns``, ``allowed_tools``, ``timeout_s`` and ``effort`` maps.
 
     ``plan_complexity`` is supplied by the caller — at plan-tournament time the
     parsed Plan has not yet been persisted to ``plan_manager`` (that happens
@@ -63,10 +69,19 @@ def _build_role_overrides(
     Reads each tournament role's :class:`~adapters.types.AgentSpec` from
     ``orch.registry``. Roles missing from the registry are simply omitted (the
     client falls back to its defaults). ``role_effort`` is computed via
-    :func:`tournament.effort.resolve_role_effort`.
+    :func:`tournament.effort.resolve_role_effort`; ``role_timeout_s`` via
+    :func:`tournament.timeouts.resolve_role_timeout_s`.
+
+    Returns:
+        A 4-tuple ``(role_max_turns, role_allowed_tools, role_timeout_s,
+        role_effort)``. The ``timeout_s`` dict was added in v0.5.4 to escalate
+        the long-reasoning roles on complex plans without inflating the cheap
+        ones; it is the third element so the existing ``role_effort``
+        position is preserved as last.
     """
     role_max_turns: dict[str, int] = {}
     role_allowed_tools: dict[str, list[str] | None] = {}
+    role_timeout_s: dict[str, int] = {}
     role_effort: dict[str, str] = {}
 
     for role in _TOURNAMENT_ROLES:
@@ -75,6 +90,9 @@ def _build_role_overrides(
             continue
         role_max_turns[role] = spec.max_turns or 1
         role_allowed_tools[role] = list(spec.tools) if spec.tools else []
+        timeout_s = resolve_role_timeout_s(role, plan_complexity)
+        if timeout_s is not None:
+            role_timeout_s[role] = timeout_s
         effort = resolve_role_effort(
             role,
             orch.cfg.agents.get(role),
@@ -83,7 +101,7 @@ def _build_role_overrides(
         )
         if effort is not None:
             role_effort[role] = effort
-    return role_max_turns, role_allowed_tools, role_effort
+    return role_max_turns, role_allowed_tools, role_timeout_s, role_effort
 
 
 def _resolve_tournament_model(orch: "Orchestrator") -> str | None:
@@ -165,8 +183,8 @@ async def run_plan_tournament(
     # the markdown is the source-of-truth path during the plan tournament.
     plan_complexity = extract_complexity(initial_md)
 
-    role_max_turns, role_allowed_tools, role_effort = _build_role_overrides(
-        orch, plan_complexity
+    role_max_turns, role_allowed_tools, role_timeout_s, role_effort = (
+        _build_role_overrides(orch, plan_complexity)
     )
     client = AdapterLLMClient(
         orch.adapter,
@@ -174,6 +192,7 @@ async def run_plan_tournament(
         role_max_turns=role_max_turns,
         role_allowed_tools=role_allowed_tools,
         role_effort=role_effort,
+        role_timeout_s=role_timeout_s,
     )
 
     tcfg = TournamentConfig(

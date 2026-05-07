@@ -46,6 +46,7 @@ from tournament import (
     TournamentConfig,
 )
 from tournament.effort import resolve_role_effort
+from tournament.timeouts import resolve_role_timeout_s
 
 
 _TOURNAMENT_ROLES_FOR_CLI: tuple[str, ...] = (
@@ -59,7 +60,12 @@ _TOURNAMENT_ROLES_FOR_CLI: tuple[str, ...] = (
 def _cli_role_overrides(
     cfg: AutodevConfig,
     markdown: str | None = None,
-) -> tuple[dict[str, int], dict[str, list[str] | None], dict[str, str]]:
+) -> tuple[
+    dict[str, int],
+    dict[str, list[str] | None],
+    dict[str, int],
+    dict[str, str],
+]:
     """Build tournament-role overrides from an AutodevConfig (no registry).
 
     Mirrors the orchestrator helpers in ``plan_tournament_runner`` /
@@ -68,14 +74,18 @@ def _cli_role_overrides(
 
     When ``markdown`` is supplied (typically the loaded ``--input`` plan),
     the architect's ``COMPLEXITY:`` line is extracted from it and used to
-    derive per-role effort via the matrix. Without markdown (or with markdown
-    that lacks the directive), only explicit per-role ``agent_cfg.effort``
-    overrides take effect — non-architect roles fall through to None.
+    derive per-role effort via the matrix and per-role timeout_s via the
+    timeout table. Without markdown (or with markdown that lacks the
+    directive), only explicit per-role ``agent_cfg.effort`` overrides take
+    effect — non-architect roles fall through to None.
 
-    Returns ``(role_max_turns, role_allowed_tools, role_effort)``.
+    Returns
+        ``(role_max_turns, role_allowed_tools, role_timeout_s, role_effort)``.
+        ``role_timeout_s`` was added in v0.5.4.
     """
     role_max_turns: dict[str, int] = {}
     role_allowed_tools: dict[str, list[str] | None] = {}
+    role_timeout_s: dict[str, int] = {}
     role_effort: dict[str, str] = {}
 
     plan_complexity: str | None = (
@@ -89,12 +99,15 @@ def _cli_role_overrides(
         role_max_turns[role] = agent_cfg.max_turns or 1
         tools = resolve_claude_tools(role)
         role_allowed_tools[role] = list(tools) if tools else []
+        timeout_s = resolve_role_timeout_s(role, plan_complexity)
+        if timeout_s is not None:
+            role_timeout_s[role] = timeout_s
         effort = resolve_role_effort(
             role, agent_cfg, plan_complexity, cfg.user_complexity
         )
         if effort is not None:
             role_effort[role] = effort
-    return role_max_turns, role_allowed_tools, role_effort
+    return role_max_turns, role_allowed_tools, role_timeout_s, role_effort
 
 
 # ---------------------------------------------------------------------------
@@ -387,14 +400,15 @@ async def _run_plan_tournament_cli(
         adapter = await get_adapter(cfg.platform)
         # Pass the loaded plan markdown so _cli_role_overrides can extract
         # the architect's COMPLEXITY: classification and resolve per-role
-        # effort accordingly.
-        rmt, rat, ref = _cli_role_overrides(cfg, markdown)
+        # effort + timeout_s accordingly.
+        rmt, rat, rts, ref = _cli_role_overrides(cfg, markdown)
         client = AdapterLLMClient(
             adapter,
             cwd=cwd,
             role_max_turns=rmt,
             role_allowed_tools=rat,
             role_effort=ref,
+            role_timeout_s=rts,
         )
         judge_cfg = cfg.agents.get("judge")
         model = judge_cfg.model if judge_cfg else None
@@ -495,13 +509,14 @@ async def _run_impl_tournament_cli(
         from adapters.detect import get_adapter
 
         adapter = await get_adapter(cfg.platform)
-        rmt, rat, ref = _cli_role_overrides(cfg)
+        rmt, rat, rts, ref = _cli_role_overrides(cfg)
         client = AdapterLLMClient(
             adapter,
             cwd=cwd,
             role_max_turns=rmt,
             role_allowed_tools=rat,
             role_effort=ref,
+            role_timeout_s=rts,
         )
         judge_cfg = cfg.agents.get("judge")
         model = judge_cfg.model if judge_cfg else None
