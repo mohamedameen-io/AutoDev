@@ -121,6 +121,11 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 # Combined with ``score_stability_max_delta=2`` both detectors
                 # cover both failure modes (stuck-numbers AND stuck-labels).
                 winner_stability_window=3,
+                # v0.6.2 / Issue 5B: oversize-AB demotion. When the
+                # synthesizer's AB candidate exceeds 1.5× the incumbent line
+                # count, demote it to the next-best Borda winner so the
+                # tournament can't be hijacked by ever-growing merges.
+                max_plan_lines_growth_ratio=1.5,
             ),
             impl=TournamentPhaseConfig(
                 enabled=True,
@@ -137,6 +142,9 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 score_stability_max_delta=1,
                 # Smaller window=2 paired with the small max_rounds=3.
                 winner_stability_window=2,
+                # Impl tournaments operate on diff bundles, not line-counted
+                # plan markdown — leave the line-ratio knob disabled.
+                max_plan_lines_growth_ratio=None,
             ),
             max_parallel_subprocesses=3,
             auto_disable_for_models=["opus"],

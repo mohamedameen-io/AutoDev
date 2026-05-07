@@ -338,6 +338,10 @@ async def run_impl_tournament(
         score_stability_window=cfg.score_stability_window,
         score_stability_max_delta=cfg.score_stability_max_delta,
         winner_stability_window=cfg.winner_stability_window,
+        # Impl tournaments default ``max_plan_lines_growth_ratio=None``
+        # (impl artifacts are diff bundles, not line-counted plan markdown);
+        # plumbed through for symmetry with ``TournamentConfig``.
+        max_plan_lines_growth_ratio=cfg.max_plan_lines_growth_ratio,
     )
 
     wt_mgr = WorktreeManager(main_repo=orch.cwd, tournament_dir=worktree_dir)

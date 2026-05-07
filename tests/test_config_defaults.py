@@ -227,3 +227,53 @@ def test_tournament_phase_config_winner_stability_window_round_trip() -> None:
         TournamentPhaseConfig.model_validate(with_win.model_dump()).winner_stability_window
         == 3
     )
+
+
+# ---------------------------------------------------------------------------
+# default_config: v0.6.2 — max_plan_lines_growth_ratio (oversize-AB demotion)
+# ---------------------------------------------------------------------------
+
+
+def test_default_plan_tournament_max_plan_lines_growth_ratio_is_1_5() -> None:
+    """Plan ships ``max_plan_lines_growth_ratio=1.5`` so an AB winner that
+    more than 1.5×s the incumbent line count is demoted to the next-best
+    Borda winner. Combined with v0.6.2's stronger judge directive this
+    closes the 'verbose synthesizer wins forever' failure mode.
+    """
+    cfg = default_config()
+    assert cfg.tournaments.plan.max_plan_lines_growth_ratio == 1.5
+
+
+def test_default_impl_tournament_max_plan_lines_growth_ratio_is_none() -> None:
+    """Impl tournaments operate on diff bundles, not line-counted plan
+    markdown — the line-ratio knob is meaningless there. Default is ``None``
+    (feature off) for impl.
+    """
+    cfg = default_config()
+    assert cfg.tournaments.impl.max_plan_lines_growth_ratio is None
+
+
+def test_tournament_phase_config_max_plan_lines_growth_ratio_round_trip() -> None:
+    """The v0.6.2 ``max_plan_lines_growth_ratio`` field round-trips through
+    ``model_dump`` + ``model_validate`` cleanly. Default is ``None``.
+    """
+    from config.schema import TournamentPhaseConfig
+
+    base = TournamentPhaseConfig(
+        enabled=True,
+        num_judges=5,
+        convergence_k=2,
+        max_rounds=15,
+    )
+    assert base.max_plan_lines_growth_ratio is None
+
+    with_ratio = TournamentPhaseConfig(
+        enabled=True,
+        num_judges=5,
+        convergence_k=2,
+        max_rounds=15,
+        max_plan_lines_growth_ratio=1.5,
+    )
+    assert with_ratio.max_plan_lines_growth_ratio == 1.5
+    reloaded = TournamentPhaseConfig.model_validate(with_ratio.model_dump())
+    assert reloaded.max_plan_lines_growth_ratio == 1.5

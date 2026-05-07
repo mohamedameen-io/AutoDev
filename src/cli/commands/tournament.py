@@ -620,6 +620,7 @@ async def _run_plan_tournament_cli(
         score_stability_window=plan_cfg.score_stability_window,
         score_stability_max_delta=plan_cfg.score_stability_max_delta,
         winner_stability_window=plan_cfg.winner_stability_window,
+        max_plan_lines_growth_ratio=plan_cfg.max_plan_lines_growth_ratio,
     )
 
     console.print(
@@ -729,6 +730,9 @@ async def _run_impl_tournament_cli(
         score_stability_window=impl_cfg.score_stability_window,
         score_stability_max_delta=impl_cfg.score_stability_max_delta,
         winner_stability_window=impl_cfg.winner_stability_window,
+        # Impl tournaments default to ``None`` (line-ratio is plan-only);
+        # plumbed through for symmetry.
+        max_plan_lines_growth_ratio=impl_cfg.max_plan_lines_growth_ratio,
     )
 
     console.print(

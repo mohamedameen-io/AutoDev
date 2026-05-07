@@ -59,6 +59,15 @@ class TournamentPhaseConfig(BaseModel):
     # share the same non-A ``effective_winner`` (the QNX runaway pattern of
     # `[AB, AB, AB]`). Defaults to ``None`` so legacy on-disk configs validate.
     winner_stability_window: int | None = None
+    # Optional maximum line-growth ratio for AB winners (v0.6.2 / Issue 5B).
+    # When set, an AB Borda winner whose markdown exceeds
+    # ``max_plan_lines_growth_ratio * len(incumbent.splitlines())`` lines is
+    # demoted to the next-best Borda winner — the verbose synthesizer no
+    # longer wins by sheer volume. Defaults to ``None`` (off) so legacy
+    # configs validate; the plan-tournament default ships with ``1.5``.
+    # Impl tournaments leave this ``None`` because impl artifacts aren't
+    # line-counted plan markdown.
+    max_plan_lines_growth_ratio: float | None = None
 
 
 class TournamentsConfig(BaseModel):

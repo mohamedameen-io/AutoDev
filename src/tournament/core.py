@@ -106,6 +106,14 @@ class TournamentConfig:
     # same non-A ``effective_winner`` label. Complements ``convergence_k``
     # which already handles the A-streak case.
     winner_stability_window: int | None = None
+    # Optional oversize-AB demotion ratio (v0.6.2 / Issue 5B). ``None`` → off.
+    # When the Borda winner is AB AND
+    # ``len(v_ab.splitlines()) > max_plan_lines_growth_ratio *
+    # len(incumbent.splitlines())``, AB is demoted to the next-best Borda
+    # winner (max(scores[A], scores[B]); ties prefer A — the safe fallback
+    # since the incumbent stays unchanged). This guards against the
+    # 'verbose synthesizer wins forever' failure mode the QNX run hit.
+    max_plan_lines_growth_ratio: float | None = None
 
 
 class PassResult(BaseModel):
@@ -259,6 +267,50 @@ def _score_window_stable(
     for label in ("A", "B", "AB"):
         total += abs(last.get(label, 0) - first.get(label, 0))
     return total <= max_delta
+
+
+def _demote_oversized_winner(
+    winner: WinnerLabel,
+    scores: dict[str, int],
+    incumbent_md: str,
+    v_ab_md: str,
+    ratio: float | None,
+) -> tuple[WinnerLabel, dict[str, int]]:
+    """Demote an oversize AB winner to the next-best Borda winner.
+
+    The v0.6.2 cap on synthesizer growth: when the Borda winner is ``"AB"``
+    and the synthesizer's markdown line count exceeds ``ratio * incumbent
+    line count``, AB is demoted. The replacement winner is the higher-Borda
+    of {A, B}; on a tie we prefer ``"A"`` because the incumbent is the safe
+    fallback (no on-disk incumbent change → streak still increments).
+
+    Returns ``(winner, scores)`` unchanged if any of:
+        - ``ratio`` is ``None`` (feature disabled);
+        - ``winner != "AB"`` (only the synthesizer can produce oversize);
+        - the line count is within the threshold.
+
+    The ``scores`` dict is returned as-is — only the winner label changes,
+    not the underlying Borda counts. On-disk artifacts retain the original
+    scores so post-hoc analysis can see the demotion happened.
+    """
+    if ratio is None or winner != "AB":
+        return winner, scores
+
+    incumbent_lines = len(incumbent_md.splitlines())
+    ab_lines = len(v_ab_md.splitlines())
+    # Edge case: 0 incumbent lines → any non-empty AB triggers demotion.
+    if incumbent_lines == 0:
+        if ab_lines == 0:
+            return winner, scores
+        # Fall through to demotion.
+    elif ab_lines <= ratio * incumbent_lines:
+        return winner, scores
+
+    # AB is oversize: pick the next-best between A and B.
+    score_a = scores.get("A", 0)
+    score_b = scores.get("B", 0)
+    new_winner: WinnerLabel = "A" if score_a >= score_b else "B"
+    return new_winner, scores
 
 
 def _winner_window_stable(history: list["PassResult"], window: int) -> bool:
@@ -680,25 +732,61 @@ class Tournament(Generic[T]):
 
         # 5. Borda aggregation with conservative tiebreak to A
         tiebreak = "A" if self.cfg.conservative_tiebreak else None
-        winner, scores, valid_judges = aggregate_rankings(
+        raw_winner, scores, valid_judges = aggregate_rankings(
             rankings, labels=["A", "B", "AB"], tiebreak_winner=tiebreak
         )
 
+        # v0.6.2 / Issue 5B: demote oversize AB winners. The raw ``winner``
+        # we return drives the streak/incumbent update path in :meth:`run`;
+        # the ``result.winner`` field preserves the Borda outcome so
+        # post-hoc analysis can see exactly what the judges picked.
         elapsed = time.time() - t0
+        incumbent_md_for_check = self.handler.render_as_markdown(incumbent)
+        v_ab_md_for_check = self.handler.render_as_markdown(v_ab)
+        effective_after_demotion, _scores_unchanged = _demote_oversized_winner(
+            winner=raw_winner,  # type: ignore[arg-type]
+            scores=scores,
+            incumbent_md=incumbent_md_for_check,
+            v_ab_md=v_ab_md_for_check,
+            ratio=self.cfg.max_plan_lines_growth_ratio,
+        )
+        ab_oversize_rejected = (
+            raw_winner == "AB" and effective_after_demotion != "AB"
+        )
+        if ab_oversize_rejected:
+            ab_lines = len(v_ab_md_for_check.splitlines())
+            incumbent_lines = len(incumbent_md_for_check.splitlines())
+            self.log.warning(
+                "tournament.ab_oversize_rejected",
+                pass_num=pass_num,
+                ab_lines=ab_lines,
+                incumbent_lines=incumbent_lines,
+                ratio=self.cfg.max_plan_lines_growth_ratio,
+                demoted_to=effective_after_demotion,
+            )
+
+        # The label that drives streak + incumbent update in :meth:`run`.
+        winner: WinnerLabel = effective_after_demotion
+        # The on-disk record retains the raw Borda label so artifact analysis
+        # can distinguish a demotion from a genuine A/B win.
         winners_map: dict[str, T] = {"A": incumbent, "B": v_b, "AB": v_ab}
         chosen = winners_map[winner]
         hash_after = self.handler.hash(chosen)
 
+        meta: dict[str, Any] = {"timestamp": time.time()}
+        if ab_oversize_rejected:
+            meta["ab_oversize_rejected"] = True
+
         result = PassResult(
             pass_num=pass_num,
-            winner=winner,  # type: ignore[arg-type]
+            winner=raw_winner,  # type: ignore[arg-type]
             scores=scores,
             valid_judges=valid_judges,
             elapsed_s=round(elapsed, 3),
             judge_details=judge_details,
             incumbent_hash_before=hash_before,
             incumbent_hash_after=hash_after,
-            meta={"timestamp": time.time()},
+            meta=meta,
         )
 
         self.store.write_pass_result(pass_num, result)

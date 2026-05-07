@@ -214,6 +214,7 @@ async def run_plan_tournament(
         score_stability_window=cfg.score_stability_window,
         score_stability_max_delta=cfg.score_stability_max_delta,
         winner_stability_window=cfg.winner_stability_window,
+        max_plan_lines_growth_ratio=cfg.max_plan_lines_growth_ratio,
     )
 
     judge_plugins = (
