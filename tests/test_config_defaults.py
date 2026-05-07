@@ -115,12 +115,15 @@ def test_default_impl_tournament_keeps_single_judge() -> None:
 def test_default_plan_tournament_has_score_stability_enabled() -> None:
     """Plan tournament ships with the runaway detector enabled by default.
 
-    window=4 (half of max_rounds=15) and max_delta=1 — only fires when
-    Borda scores are genuinely stuck across several consecutive passes.
+    window=4 (half of max_rounds=15). v0.6.0 bumped ``max_delta`` 1→2 so
+    the detector fires on the QNX historical trajectory at pass 5; the
+    sub-test ``test_default_plan_tournament_score_stability_max_delta_bumped_to_2``
+    is the empirical anchor for the bumped value.
     """
     cfg = default_config()
     assert cfg.tournaments.plan.score_stability_window == 4
-    assert cfg.tournaments.plan.score_stability_max_delta == 1
+    # v0.6.0 bump: was 1, now 2.
+    assert cfg.tournaments.plan.score_stability_max_delta == 2
 
 
 def test_default_impl_tournament_has_score_stability_enabled() -> None:
@@ -158,3 +161,69 @@ def test_default_user_complexity_is_medium() -> None:
     a different complexity tier on the CLI or in their config.
     """
     assert default_config().user_complexity == "medium"
+
+
+# ---------------------------------------------------------------------------
+# default_config: v0.6.0 — bumped score_stability_max_delta + winner_stability
+# ---------------------------------------------------------------------------
+
+
+def test_default_plan_tournament_score_stability_max_delta_bumped_to_2() -> None:
+    """Plan ``score_stability_max_delta`` bumped 1→2 to fire on the QNX
+    historical trajectory ``[(5,10,15)*3, (5,12,13), (5,11,14)]`` at pass 5.
+    """
+    cfg = default_config()
+    assert cfg.tournaments.plan.score_stability_max_delta == 2
+
+
+def test_default_impl_tournament_score_stability_max_delta_unchanged() -> None:
+    """Impl ``score_stability_max_delta`` stays at 1 (max_rounds=3 makes 2
+    unsafe — bumping would trip on virtually any normal trajectory).
+    """
+    cfg = default_config()
+    assert cfg.tournaments.impl.score_stability_max_delta == 1
+
+
+def test_default_plan_tournament_has_winner_stability_window_3() -> None:
+    """Plan ships with ``winner_stability_window=3`` — terminates if 3
+    consecutive passes share the same non-A effective winner.
+    """
+    cfg = default_config()
+    assert cfg.tournaments.plan.winner_stability_window == 3
+
+
+def test_default_impl_tournament_has_winner_stability_window_2() -> None:
+    """Impl ships with ``winner_stability_window=2`` — max_rounds=3 means
+    the smaller window still permits one normal pass before the detector fires.
+    """
+    cfg = default_config()
+    assert cfg.tournaments.impl.winner_stability_window == 2
+
+
+# Round-trip the schema (new field must validate on existing-shape configs).
+def test_tournament_phase_config_winner_stability_window_round_trip() -> None:
+    """The v0.6.0 ``winner_stability_window`` field round-trips through
+    ``model_dump`` + ``model_validate`` cleanly. Default is ``None``.
+    """
+    from config.schema import TournamentPhaseConfig
+
+    base = TournamentPhaseConfig(
+        enabled=True,
+        num_judges=5,
+        convergence_k=2,
+        max_rounds=15,
+    )
+    assert base.winner_stability_window is None
+
+    with_win = TournamentPhaseConfig(
+        enabled=True,
+        num_judges=5,
+        convergence_k=2,
+        max_rounds=15,
+        winner_stability_window=3,
+    )
+    assert with_win.winner_stability_window == 3
+    assert (
+        TournamentPhaseConfig.model_validate(with_win.model_dump()).winner_stability_window
+        == 3
+    )

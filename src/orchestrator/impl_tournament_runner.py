@@ -337,6 +337,7 @@ async def run_impl_tournament(
         max_parallel_subprocesses=orch.cfg.tournaments.max_parallel_subprocesses,
         score_stability_window=cfg.score_stability_window,
         score_stability_max_delta=cfg.score_stability_max_delta,
+        winner_stability_window=cfg.winner_stability_window,
     )
 
     wt_mgr = WorktreeManager(main_repo=orch.cwd, tournament_dir=worktree_dir)

@@ -54,6 +54,11 @@ class TournamentPhaseConfig(BaseModel):
     # validate unchanged.
     score_stability_window: int | None = None
     score_stability_max_delta: int | None = None
+    # Optional winner-stability detector (v0.6.0 / Issue 4). When set,
+    # terminates early if the trailing ``winner_stability_window`` passes all
+    # share the same non-A ``effective_winner`` (the QNX runaway pattern of
+    # `[AB, AB, AB]`). Defaults to ``None`` so legacy on-disk configs validate.
+    winner_stability_window: int | None = None
 
 
 class TournamentsConfig(BaseModel):

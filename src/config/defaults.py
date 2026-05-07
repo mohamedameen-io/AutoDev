@@ -109,10 +109,18 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 max_rounds=15,
                 # Runaway detector: terminate early when per-pass Borda scores
                 # are stuck across several consecutive passes. Window=4 is
-                # half of max_rounds; max_delta=1 only fires on a genuinely
-                # flat trajectory (sum of |Δscore| across A/B/AB ≤ 1).
+                # half of max_rounds. v0.6.0 bumped ``max_delta`` 1→2 to fire
+                # on the QNX historical trajectory `[(5,10,15)*3, (5,12,13),
+                # (5,11,14)]` at pass 5 (window-[P2..P5] total delta = 2).
                 score_stability_window=4,
-                score_stability_max_delta=1,
+                score_stability_max_delta=2,
+                # v0.6.0 / Issue 4: winner-stability detector. Halts when 3
+                # consecutive passes share the same non-A effective winner —
+                # the QNX runaway pattern of `[AB, AB, AB]` that the score
+                # detector cannot catch on a divergent-but-stable trajectory.
+                # Combined with ``score_stability_max_delta=2`` both detectors
+                # cover both failure modes (stuck-numbers AND stuck-labels).
+                winner_stability_window=3,
             ),
             impl=TournamentPhaseConfig(
                 enabled=True,
@@ -122,9 +130,13 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 convergence_k=1,
                 max_rounds=3,
                 # max_rounds is small (3); window=2 still permits one normal
-                # pass before the detector can latch onto a stuck Borda outcome.
+                # pass before the detector can latch onto a stuck Borda
+                # outcome. ``max_delta`` stays at 1 — bumping to 2 would
+                # be unsafe with only 3 rounds total.
                 score_stability_window=2,
                 score_stability_max_delta=1,
+                # Smaller window=2 paired with the small max_rounds=3.
+                winner_stability_window=2,
             ),
             max_parallel_subprocesses=3,
             auto_disable_for_models=["opus"],

@@ -101,6 +101,11 @@ class TournamentConfig:
     # current incumbent.
     score_stability_window: int | None = None
     score_stability_max_delta: int | None = None
+    # Optional winner-stability detector (v0.6.0 / Issue 4). ``None`` → off.
+    # Halts when the trailing ``winner_stability_window`` passes all share the
+    # same non-A ``effective_winner`` label. Complements ``convergence_k``
+    # which already handles the A-streak case.
+    winner_stability_window: int | None = None
 
 
 class PassResult(BaseModel):
@@ -254,6 +259,32 @@ def _score_window_stable(
     for label in ("A", "B", "AB"):
         total += abs(last.get(label, 0) - first.get(label, 0))
     return total <= max_delta
+
+
+def _winner_window_stable(history: list["PassResult"], window: int) -> bool:
+    """True iff the last ``window`` passes share the same non-A effective winner.
+
+    Complements :func:`_score_window_stable`: the score detector fires when
+    Borda numbers stop moving; this detector fires when the *label* freezes.
+    The QNX-runaway pattern is `[AB, AB, AB]` — judges reliably preferring
+    the synthesizer's merge pass after pass without genuine new content.
+
+    A-streak is owned by ``convergence_k`` (via the ``streak`` counter), so
+    this helper deliberately excludes the ``"A"`` branch — both detectors
+    co-exist without double-counting.
+
+    Returns ``False`` if ``len(history) < window``.
+    """
+    if window < 1 or len(history) < window:
+        return False
+    last_passes = history[-window:]
+    winners = [
+        h.meta.get("effective_winner", h.winner) for h in last_passes
+    ]
+    first = winners[0]
+    if first == "A":  # convergence_k owns this case
+        return False
+    return all(w == first for w in winners)
 
 
 def _describe_skipped(partial: PartialPassState) -> list[str]:
@@ -493,10 +524,40 @@ class Tournament(Generic[T]):
                     window=window,
                     total_delta=total_delta,
                     max_delta=max_delta,
+                    trigger="score",
                 )
                 result.meta["runaway_detected"] = True
+                result.meta["runaway_trigger"] = "score"
                 # Re-persist the pass result with the runaway annotation so
                 # on-disk artifacts surface the early termination cause.
+                self.store.write_pass_result(pass_num, result)
+                break
+
+            # v0.6.0 / Issue 4: winner-stability detector. Halt when the
+            # trailing ``winner_stability_window`` passes all share the same
+            # non-A effective winner — the QNX runaway pattern where judges
+            # keep preferring AB merges pass after pass while genuine new
+            # content stops landing.  ``convergence_k`` already covers the
+            # A-only streak case; ``_winner_window_stable`` deliberately
+            # excludes A so the two detectors never double-fire.
+            winner_window = self.cfg.winner_stability_window
+            if (
+                winner_window is not None
+                and _winner_window_stable(history, winner_window)
+            ):
+                last_winners = [
+                    h.meta.get("effective_winner", h.winner)
+                    for h in history[-winner_window:]
+                ]
+                self.log.warning(
+                    "tournament.runaway_detected",
+                    pass_num=pass_num,
+                    window=winner_window,
+                    winners=last_winners,
+                    trigger="winner",
+                )
+                result.meta["runaway_detected"] = True
+                result.meta["runaway_trigger"] = "winner"
                 self.store.write_pass_result(pass_num, result)
                 break
 

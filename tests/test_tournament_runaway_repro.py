@@ -246,3 +246,145 @@ async def test_repro_error_max_turns_does_not_retry_on_deterministic_subtype(
     # And the per-role overrides flowed through.
     assert adapter.calls[0].max_turns == 5
     assert adapter.calls[0].allowed_tools == ["Read"]
+
+
+# ── v0.6.0 / Issue 4: trigger-tag and winner-stability integration tests ───
+
+
+@pytest.mark.asyncio
+async def test_runaway_meta_records_trigger_reason_score(tmp_path: Path) -> None:
+    """When the score-stability detector fires, ``meta["runaway_trigger"]=='score'``.
+    """
+    cfg = TournamentConfig(
+        num_judges=3,
+        convergence_k=2,
+        max_rounds=10,
+        score_stability_window=3,
+        score_stability_max_delta=1,
+    )
+    state: dict[str, int] = {"synth_n": 0}
+
+    def _cb(role: str, system: str, user: str) -> str:
+        if role == "critic_t":
+            return "- nit"
+        if role == "architect_b":
+            return "# Plan: B_VARIANT\n## Phase B\n"
+        if role == "synthesizer":
+            state["synth_n"] += 1
+            return f"# Plan: AB_{state['synth_n']}\n## Phase AB_{state['synth_n']}\n"
+        return _judge_prefer(user, f"# Plan: AB_{state['synth_n']}")
+
+    client = StubLLMClient(fn=_cb)
+    artifact = tmp_path / "tournaments" / "trig-score"
+    t = Tournament(
+        handler=PlanContentHandler(),
+        client=client,
+        cfg=cfg,
+        artifact_dir=artifact,
+        rng=random.Random(0xBEEF),
+    )
+    _final, history = await t.run("Repro task.", "# Plan: foo\n")
+
+    assert history[-1].meta.get("runaway_detected") is True
+    assert history[-1].meta.get("runaway_trigger") == "score"
+
+
+@pytest.mark.asyncio
+async def test_runaway_meta_records_trigger_reason_winner(tmp_path: Path) -> None:
+    """When the winner-stability detector fires, ``meta["runaway_trigger"]=='winner'``.
+
+    To force the winner detector ahead of the score detector, leave the
+    score knobs unset (or set their thresholds higher than the synthetic
+    deltas). Three trailing AB wins with diverging scores trips the winner
+    detector but NOT the score detector.
+    """
+    cfg = TournamentConfig(
+        num_judges=3,
+        convergence_k=10,  # never converge via streak
+        max_rounds=10,
+        # Score detector deliberately disabled so the winner detector wins.
+        score_stability_window=None,
+        score_stability_max_delta=None,
+        winner_stability_window=3,
+    )
+    state: dict[str, int] = {"synth_n": 0}
+
+    def _cb(role: str, system: str, user: str) -> str:
+        if role == "critic_t":
+            return "- nit"
+        if role == "architect_b":
+            return "# Plan: B_VARIANT\n## Phase B\n"
+        if role == "synthesizer":
+            state["synth_n"] += 1
+            # Different content each pass (so hash short-circuit doesn't
+            # convert AB wins into A wins).
+            return f"# Plan: AB_{state['synth_n']}\n## Phase AB_{state['synth_n']}\n"
+        return _judge_prefer(user, f"# Plan: AB_{state['synth_n']}")
+
+    client = StubLLMClient(fn=_cb)
+    artifact = tmp_path / "tournaments" / "trig-winner"
+    t = Tournament(
+        handler=PlanContentHandler(),
+        client=client,
+        cfg=cfg,
+        artifact_dir=artifact,
+        rng=random.Random(0xCAFE),
+    )
+    _final, history = await t.run("Repro task.", "# Plan: foo\n")
+
+    # The detector fires at exactly pass 3 (window=3).
+    assert len(history) == 3
+    assert history[-1].meta.get("runaway_detected") is True
+    assert history[-1].meta.get("runaway_trigger") == "winner"
+    # All effective winners are AB.
+    assert all(h.meta.get("effective_winner") == "AB" for h in history)
+
+
+# ── v0.6.0 / Issue 4: empirical anchor — the QNX trajectory at max_delta=2 ─
+
+
+def test_score_stability_fires_on_qnx_trajectory_2026_05_07() -> None:
+    """Empirical regression — the historical QNX run trajectory at pass 5.
+
+    The QNX OpenGL ES profiling run produced this exact score history:
+        Pass 1: A=5, B=10, AB=15
+        Pass 2: A=5, B=10, AB=15
+        Pass 3: A=5, B=10, AB=15
+        Pass 4: A=5, B=12, AB=13
+        Pass 5: A=5, B=11, AB=14
+
+    Pre-bump (max_delta=1): window-[P2..P5] total delta = `0 + 1 + 1 = 2`,
+    which is `> 1`, so the detector never fires — the run continues.
+
+    Post-bump (max_delta=2): the same delta ≤ 2, so the detector fires at
+    pass 5 with ``window=4``. This anchors the v0.6.0 default-bump to
+    historical evidence — any future bump must justify against this anchor.
+    """
+    from tournament.core import _score_window_stable
+
+    def _make_pass(pass_num: int, scores: tuple[int, int, int]) -> Any:
+        """Build a synthetic PassResult with given (A,B,AB) score tuple."""
+        from tournament.core import PassResult
+
+        return PassResult(
+            pass_num=pass_num,
+            winner="AB",
+            scores={"A": scores[0], "B": scores[1], "AB": scores[2]},
+            valid_judges=3,
+            elapsed_s=0.1,
+            incumbent_hash_before="hb",
+            incumbent_hash_after="ha",
+            meta={"effective_winner": "AB"},
+        )
+
+    history = [
+        _make_pass(1, (5, 10, 15)),
+        _make_pass(2, (5, 10, 15)),
+        _make_pass(3, (5, 10, 15)),
+        _make_pass(4, (5, 12, 13)),
+        _make_pass(5, (5, 11, 14)),
+    ]
+    # Pre-bump default (max_delta=1): does NOT fire.
+    assert _score_window_stable(history, window=4, max_delta=1) is False
+    # Post-bump default (max_delta=2): FIRES at pass 5.
+    assert _score_window_stable(history, window=4, max_delta=2) is True
