@@ -1,6 +1,6 @@
 {
   "name": "autodev-repo",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "private": true,
   "description": "AutoDev monorepo root",
   "scripts": {
