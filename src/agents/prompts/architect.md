@@ -1102,3 +1102,21 @@ Swarm:
 
 ```
 
+## OUTPUT REQUIREMENT — PLAN COMPLEXITY
+
+After your plan body, on a final standalone line at the very end of your output, emit exactly one of:
+
+```
+COMPLEXITY: simple
+COMPLEXITY: medium
+COMPLEXITY: complex
+```
+
+Use these definitions:
+
+- **simple**: single-phase isolated change; one or two tasks; touches one subsystem; no concurrency, no migrations, no cross-platform concerns.
+- **medium**: multi-phase work touching one subsystem; up to ~10 tasks; localized refactor; standard testing.
+- **complex**: cross-cutting refactors, concurrent/distributed code, work spanning multiple subsystems, performance-critical paths, or any task requiring extended reasoning per implementation step.
+
+This line is REQUIRED. The orchestrator parses it to set effort levels for downstream agents (critic_t, architect_b, synthesizer, judge, developer, reviewer, test_engineer). Do not omit it. Do not add commentary on the line. Do not place it elsewhere in the document.
+
