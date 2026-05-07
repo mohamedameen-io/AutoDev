@@ -25,7 +25,19 @@ import uuid
 from typing import Literal, cast
 
 from errors import AutodevError
+from autologging import get_logger
 from state.schemas import AcceptanceCriterion, Phase, Plan, Task
+
+
+logger = get_logger(__name__)
+
+
+# Tokens accepted on a ``Requires:`` line — must mirror the Literal in
+# :class:`state.schemas.Task.requires`. Kept as a frozenset for O(1) membership
+# checks during parsing; unknown tokens are dropped with a warning.
+_VALID_REQUIRES_TOKENS = frozenset(
+    {"hardware", "human", "external_service", "manual"}
+)
 
 
 class PlanParseError(AutodevError):
@@ -40,6 +52,14 @@ _RE_DESC = re.compile(r"^\s*-\s*Description\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _RE_ACCEPT_HEADER = re.compile(r"^\s*-\s*Acceptance\s*:?\s*$", re.IGNORECASE)
 _RE_ACCEPT_ITEM = re.compile(r"^\s*-\s*\[\s*[ xX]?\s*\]\s*(.+?)\s*$")
 _RE_DEPENDS = re.compile(r"^\s*-\s*Depends(?:_on|On)?\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_RE_REQUIRES = re.compile(
+    r"^\s*-?\s*Requires\s*:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+_RE_EXECUTABLE_BY = re.compile(
+    r"^\s*-?\s*EXECUTABLE_BY\s*:\s*(human|agent)\s*$",
+    re.IGNORECASE,
+)
 _RE_COMPLEXITY = re.compile(
     r"^COMPLEXITY:\s*(simple|medium|complex)\s*$",
     re.MULTILINE | re.IGNORECASE,
@@ -167,6 +187,7 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
                 "files": [],
                 "acceptance": [],
                 "depends_on": [],
+                "requires": [],
             }
             in_acceptance_block = False
             continue
@@ -193,6 +214,36 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
             current_task["depends_on"] = [
                 s.strip() for s in dep_m.group(1).split(",") if s.strip()
             ]
+            in_acceptance_block = False
+            continue
+
+        req_m = _RE_REQUIRES.match(line)
+        if req_m:
+            survivors: list[str] = []
+            for raw_token in req_m.group(1).split(","):
+                tok = raw_token.strip().lower()
+                if not tok:
+                    continue
+                if tok in _VALID_REQUIRES_TOKENS:
+                    survivors.append(tok)
+                else:
+                    logger.warning(
+                        "plan_parser.unknown_requires_token",
+                        token=tok,
+                        task_id=current_task["id"],
+                    )
+            current_task["requires"].extend(survivors)
+            in_acceptance_block = False
+            continue
+
+        exec_by_m = _RE_EXECUTABLE_BY.match(line)
+        if exec_by_m:
+            who = exec_by_m.group(1).strip().lower()
+            if who == "human":
+                current_task["requires"].append("manual")
+            # ``agent`` is a no-op — explicit declaration that the task is
+            # agent-executable. Recorded only to allow architects to be
+            # symmetric in their markup.
             in_acceptance_block = False
             continue
 
@@ -237,6 +288,7 @@ def _make_task(raw: dict, phase_id: str) -> Task:
         files=raw.get("files", []),
         acceptance=crit,
         depends_on=raw.get("depends_on", []),
+        requires=raw.get("requires", []),
         assigned_agent="developer",
     )
 
