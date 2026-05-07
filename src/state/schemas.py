@@ -60,6 +60,13 @@ class Task(BaseModel):
     files: list[str] = Field(default_factory=list)
     acceptance: list[AcceptanceCriterion] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
+    requires: list[Literal["hardware", "human", "external_service", "manual"]] = Field(
+        default_factory=list,
+        description=(
+            "Tokens marking the task as non-agent-executable. "
+            "Non-empty values cause execute_phase to skip the task."
+        ),
+    )
     retry_count: int = 0
     escalated: bool = False
     assigned_agent: str | None = None  # usually "developer"
