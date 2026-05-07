@@ -44,6 +44,7 @@ from tournament import (
     Tournament,
     TournamentConfig,
 )
+from tournament.effort import resolve_role_effort
 
 
 _TOURNAMENT_ROLES_FOR_CLI: tuple[str, ...] = (
@@ -56,15 +57,24 @@ _TOURNAMENT_ROLES_FOR_CLI: tuple[str, ...] = (
 
 def _cli_role_overrides(
     cfg: AutodevConfig,
-) -> tuple[dict[str, int], dict[str, list[str] | None]]:
+) -> tuple[dict[str, int], dict[str, list[str] | None], dict[str, str]]:
     """Build tournament-role overrides from an AutodevConfig (no registry).
 
     Mirrors the orchestrator helpers in ``plan_tournament_runner`` /
     ``impl_tournament_runner``. Used by the standalone CLI which has access
     to ``cfg`` but does not build a full ``Orchestrator`` registry.
+
+    Returns ``(role_max_turns, role_allowed_tools, role_effort)``. The CLI
+    standalone path doesn't have a parsed plan, so ``plan_complexity`` is
+    ``None`` — only explicit per-role ``agent_cfg.effort`` overrides take
+    effect (architect doesn't run in standalone tournament mode).
     """
     role_max_turns: dict[str, int] = {}
     role_allowed_tools: dict[str, list[str] | None] = {}
+    role_effort: dict[str, str] = {}
+
+    plan_complexity: str | None = None  # CLI tournament has no plan
+
     for role in _TOURNAMENT_ROLES_FOR_CLI:
         agent_cfg = cfg.agents.get(role)
         if agent_cfg is None:
@@ -72,7 +82,12 @@ def _cli_role_overrides(
         role_max_turns[role] = agent_cfg.max_turns or 1
         tools = resolve_claude_tools(role)
         role_allowed_tools[role] = list(tools) if tools else []
-    return role_max_turns, role_allowed_tools
+        effort = resolve_role_effort(
+            role, agent_cfg, plan_complexity, cfg.user_complexity
+        )
+        if effort is not None:
+            role_effort[role] = effort
+    return role_max_turns, role_allowed_tools, role_effort
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +378,13 @@ async def _run_plan_tournament_cli(
         from adapters.detect import get_adapter
 
         adapter = await get_adapter(cfg.platform)
-        rmt, rat = _cli_role_overrides(cfg)
+        rmt, rat, ref = _cli_role_overrides(cfg)
         client = AdapterLLMClient(
             adapter,
             cwd=cwd,
             role_max_turns=rmt,
             role_allowed_tools=rat,
+            role_effort=ref,
         )
         judge_cfg = cfg.agents.get("judge")
         model = judge_cfg.model if judge_cfg else None
@@ -469,12 +485,13 @@ async def _run_impl_tournament_cli(
         from adapters.detect import get_adapter
 
         adapter = await get_adapter(cfg.platform)
-        rmt, rat = _cli_role_overrides(cfg)
+        rmt, rat, ref = _cli_role_overrides(cfg)
         client = AdapterLLMClient(
             adapter,
             cwd=cwd,
             role_max_turns=rmt,
             role_allowed_tools=rat,
+            role_effort=ref,
         )
         judge_cfg = cfg.agents.get("judge")
         model = judge_cfg.model if judge_cfg else None

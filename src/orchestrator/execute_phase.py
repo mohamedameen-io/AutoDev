@@ -46,6 +46,7 @@ from state.schemas import (
     Task,
     TestEvidence,
 )
+from tournament.effort import resolve_role_effort
 
 
 if TYPE_CHECKING:
@@ -397,6 +398,24 @@ async def delegate(
     if lessons:
         parts.append("\n\n")
         parts.append(lessons)
+
+    # Resolve per-role effort using the parsed plan complexity. Once the
+    # execute phase begins, the architect has run and ``Plan.complexity`` is
+    # set (or None on legacy/pre-upgrade plans, which gracefully falls back
+    # to the user-global default).
+    agent_cfg = orch.cfg.agents.get(role)
+    plan_complexity: str | None = None
+    if orch.plan_manager is not None:
+        try:
+            existing_plan = await orch.plan_manager.load()
+        except Exception:  # noqa: BLE001
+            existing_plan = None
+        if existing_plan is not None:
+            plan_complexity = existing_plan.complexity
+    effort = resolve_role_effort(
+        role, agent_cfg, plan_complexity, orch.cfg.user_complexity
+    )
+
     inv = AgentInvocation(
         role=role,
         prompt="\n".join(parts),
@@ -404,6 +423,7 @@ async def delegate(
         model=spec.model,
         allowed_tools=list(spec.tools) if spec.tools else None,
         max_turns=spec.max_turns or 1,
+        effort=effort,
     )
 
     # Inline adapter: check for existing response (resume shortcut) or inject

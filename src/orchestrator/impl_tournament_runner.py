@@ -39,6 +39,7 @@ from tournament import (
     ImplTournament,
     TournamentConfig,
 )
+from tournament.effort import resolve_role_effort
 
 
 if TYPE_CHECKING:
@@ -77,23 +78,47 @@ def _is_auto_disabled(model: str | None, auto_disable: list[str]) -> bool:
     return any(marker.lower() in low for marker in auto_disable)
 
 
-def _build_tournament_role_overrides(
+async def _build_tournament_role_overrides(
     orch: "Orchestrator",
-) -> tuple[dict[str, int], dict[str, list[str] | None]]:
+) -> tuple[dict[str, int], dict[str, list[str] | None], dict[str, str]]:
     """Build per-role overrides for the tournament's :class:`AdapterLLMClient`.
 
     Mirrors :func:`plan_tournament_runner._build_role_overrides`. Roles that
     aren't in the registry are omitted; the client then uses its defaults.
+
+    Returns a 3-tuple ``(role_max_turns, role_allowed_tools, role_effort)``.
+    The third dict is populated from
+    :func:`tournament.effort.resolve_role_effort` keyed on the parsed plan
+    complexity (architect classification) and ``cfg.user_complexity``.
     """
     role_max_turns: dict[str, int] = {}
     role_allowed_tools: dict[str, list[str] | None] = {}
+    role_effort: dict[str, str] = {}
+
+    plan_complexity: str | None = None
+    if orch.plan_manager is not None:
+        try:
+            existing_plan = await orch.plan_manager.load()
+        except Exception:  # noqa: BLE001
+            existing_plan = None
+        if existing_plan is not None:
+            plan_complexity = existing_plan.complexity
+
     for role in _TOURNAMENT_ROLES:
         spec = orch.registry.get(role)
         if spec is None:
             continue
         role_max_turns[role] = spec.max_turns or 1
         role_allowed_tools[role] = list(spec.tools) if spec.tools else []
-    return role_max_turns, role_allowed_tools
+        effort = resolve_role_effort(
+            role,
+            orch.cfg.agents.get(role),
+            plan_complexity,
+            orch.cfg.user_complexity,
+        )
+        if effort is not None:
+            role_effort[role] = effort
+    return role_max_turns, role_allowed_tools, role_effort
 
 
 class _CoderRunner:
@@ -145,6 +170,24 @@ class _CoderRunner:
             ]
         )
 
+        # Resolve per-role effort once for both developer and test_engineer
+        # below. The plan exists by the time the impl tournament runs.
+        plan_complexity: str | None = None
+        if orch.plan_manager is not None:
+            try:
+                existing_plan = await orch.plan_manager.load()
+            except Exception:  # noqa: BLE001
+                existing_plan = None
+            if existing_plan is not None:
+                plan_complexity = existing_plan.complexity
+
+        developer_effort = resolve_role_effort(
+            "developer",
+            orch.cfg.agents.get("developer"),
+            plan_complexity,
+            orch.cfg.user_complexity,
+        )
+
         developer_inv = AgentInvocation(
             role="developer",
             prompt=developer_prompt,
@@ -152,6 +195,7 @@ class _CoderRunner:
             model=developer_spec.model,
             allowed_tools=list(developer_spec.tools) if developer_spec.tools else None,
             max_turns=developer_spec.max_turns or 1,
+            effort=developer_effort,
         )
         developer_result = await orch.adapter.execute(developer_inv)
 
@@ -185,6 +229,13 @@ class _CoderRunner:
             ]
         )
 
+        test_effort = resolve_role_effort(
+            "test_engineer",
+            orch.cfg.agents.get("test_engineer"),
+            plan_complexity,
+            orch.cfg.user_complexity,
+        )
+
         test_inv = AgentInvocation(
             role="test_engineer",
             prompt=test_prompt,
@@ -192,6 +243,7 @@ class _CoderRunner:
             model=test_spec.model,
             allowed_tools=list(test_spec.tools) if test_spec.tools else None,
             max_turns=test_spec.max_turns or 1,
+            effort=test_effort,
         )
         test_result = await orch.adapter.execute(test_inv)
         passed, failed, total = _parse_test_counts(test_result.text)
@@ -253,12 +305,15 @@ async def run_impl_tournament(
     artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
     worktree_dir = artifact_dir / "worktrees"
 
-    role_max_turns, role_allowed_tools = _build_tournament_role_overrides(orch)
+    role_max_turns, role_allowed_tools, role_effort = (
+        await _build_tournament_role_overrides(orch)
+    )
     client = AdapterLLMClient(
         orch.adapter,
         cwd=orch.cwd,
         role_max_turns=role_max_turns,
         role_allowed_tools=role_allowed_tools,
+        role_effort=role_effort,
     )
 
     tcfg = TournamentConfig(

@@ -38,6 +38,7 @@ from state.schemas import (
     Plan,
     SMEEvidence,
 )
+from tournament.effort import resolve_role_effort
 
 
 if TYPE_CHECKING:
@@ -241,6 +242,24 @@ async def _delegate(
     if lessons:
         parts.append("\n\n")
         parts.append(lessons)
+
+    # Resolve per-role effort: explicit override > architect floor > matrix > None.
+    # In plan phase the plan doesn't exist yet for the architect call (and on
+    # the architect retry path); ``resolve_role_effort`` returns the architect
+    # floor based on ``user_complexity`` regardless.
+    agent_cfg = orch.cfg.agents.get(role)
+    plan_complexity: str | None = None
+    if orch.plan_manager is not None:
+        try:
+            existing_plan = await orch.plan_manager.load()
+        except Exception:  # noqa: BLE001
+            existing_plan = None
+        if existing_plan is not None:
+            plan_complexity = existing_plan.complexity
+    effort = resolve_role_effort(
+        role, agent_cfg, plan_complexity, orch.cfg.user_complexity
+    )
+
     inv = AgentInvocation(
         role=role,
         prompt="\n".join(parts),
@@ -248,6 +267,7 @@ async def _delegate(
         model=spec.model,
         allowed_tools=list(spec.tools) if spec.tools else None,
         max_turns=max_turns_override or spec.max_turns or 1,
+        effort=effort,
     )
 
     if isinstance(orch.adapter, InlineAdapter):
