@@ -59,6 +59,8 @@ Revise the proposal to address these problems.
 For each change, state which problem it fixes.
 Do not make changes that aren't motivated by an identified problem.
 
+If, after careful review, the criticism contains no substantive issue that warrants a change to the proposal — for example, the criticisms are stylistic only, or already addressed elsewhere — you MAY return the proposal unchanged. Do not invent revisions; do not add content for its own sake. A no-op revision is the correct output when no genuine problem has been identified.
+
 OUTPUT FORMAT — STRICT:
 Your output MUST begin with the markdown heading `# Plan:` (or whatever H1 the existing plan uses). Do not write any preamble, commentary, or summary text before the heading. The first non-whitespace character of your output must be `#`."""
 
@@ -82,6 +84,8 @@ VERSION Y:
 Produce a synthesis that keeps the strongest elements from both.
 Pick the best version of each section and make them cohere.
 
+A no-op is allowed: if version X is at least as good as version Y on every substantive dimension and Y adds nothing of value (or vice versa), you MAY emit the stronger version verbatim, unchanged. Do not synthesize for the sake of synthesizing — when no real improvement is available, returning one input unchanged is the correct output.
+
 OUTPUT FORMAT — STRICT:
 Your output MUST begin with the markdown heading `# Plan:` (or whatever H1 the existing plan uses). Do not write any preamble, commentary, or summary text before the heading. The first non-whitespace character of your output must be `#`."""
 
@@ -95,6 +99,9 @@ Three proposals have been produced independently. Evaluate how well each accompl
 {judge_proposals}
 
 For each proposal, state what it gets right and what it gets wrong.
+
+Consider not only correctness and completeness but also whether the level of detail is appropriate. Penalize unnecessary bloat — proposals that pad with redundant annotations, restate the same issue in multiple sections, or expand verbosity without adding new substance are not better than concise proposals that cover the same ground. When two proposals are functionally equivalent, prefer the shorter one.
+
 Then rank all three from best to worst:
 
 RANKING: [best], [second], [worst]

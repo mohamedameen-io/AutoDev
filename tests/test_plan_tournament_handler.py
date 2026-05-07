@@ -11,6 +11,7 @@ from tournament.plan_tournament import PlanContentHandler
 from tournament.prompts import (
     ARCHITECT_B_PROMPT,
     CRITIC_PROMPT,
+    JUDGE_RANK_3_PROMPT,
     SYNTHESIZER_PROMPT,
 )
 
@@ -232,3 +233,41 @@ def test_handler_conforms_to_content_handler_protocol() -> None:
     h = PlanContentHandler()
     # Protocol is runtime_checkable — isinstance works.
     assert isinstance(h, ContentHandler)
+
+
+# ── Anti-runaway prompt directives (Steps 4 & 5) ──────────────────────────
+
+
+def test_judge_prompt_contains_length_awareness_directive() -> None:
+    """Judge ranking must explicitly weigh detail-vs-bloat.
+
+    Step 4 of the anti-runaway plan adds a length-aware clause to
+    JUDGE_RANK_3_PROMPT so judges don't reflexively prefer the longer
+    proposal when functional equivalence holds. The sentinel phrase
+    'Penalize unnecessary bloat' is the load-bearing directive — its
+    presence is what shifts unanimous 0-3 votes toward 1-2/2-1, letting
+    the tiebreak fire and the tournament converge.
+    """
+    assert "Penalize unnecessary bloat" in JUDGE_RANK_3_PROMPT
+
+
+def test_synthesizer_prompt_allows_noop() -> None:
+    """Synthesizer must be told a no-op (verbatim emit) is acceptable.
+
+    Step 5 of the anti-runaway plan adds explicit permission for the
+    synthesizer to return one input unchanged when the other adds
+    nothing of value. Combined with Fix 1's hash short-circuit in
+    tournament.core, a byte-stable synth output ends the runaway.
+    """
+    assert "no-op is allowed" in SYNTHESIZER_PROMPT
+
+
+def test_architect_b_prompt_allows_noop() -> None:
+    """Architect_b must be told to skip revision when the critic has no real bite.
+
+    Step 5 of the anti-runaway plan also adds explicit permission for
+    architect_b to return the proposal unchanged when criticisms are
+    stylistic or already addressed. This blocks one half of the
+    arms-race feedback loop at its source.
+    """
+    assert "no-op revision is the correct output" in ARCHITECT_B_PROMPT
