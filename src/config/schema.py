@@ -41,6 +41,13 @@ class TournamentPhaseConfig(BaseModel):
     num_judges: int
     convergence_k: int
     max_rounds: int
+    # Optional runaway detector: terminate early when the per-pass Borda
+    # scores barely change across ``score_stability_window`` consecutive
+    # passes (sum of |Δscore| across A/B/AB is ≤ ``score_stability_max_delta``).
+    # Both fields default to ``None`` — feature off — so existing config files
+    # validate unchanged.
+    score_stability_window: int | None = None
+    score_stability_max_delta: int | None = None
 
 
 class TournamentsConfig(BaseModel):

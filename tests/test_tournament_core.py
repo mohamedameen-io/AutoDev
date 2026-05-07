@@ -243,9 +243,26 @@ async def test_convergence_all_A_in_two_passes(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_ab_always_wins_hits_cap(tmp_path: Path) -> None:
-    """When judges always favor AB, no streak forms; we hit max_rounds."""
+    """When judges always favor AB AND content changes each pass, no streak forms.
+
+    The synthesizer must produce a different output each pass to genuinely
+    represent a divergent (non-converging) scenario; otherwise Fix 1's
+    no-change short-circuit (hash equality) will rescue the loop.
+    """
     cfg = TournamentConfig(num_judges=3, convergence_k=2, max_rounds=3)
-    client = StubLLMClient(fn=_favor_label_factory("AB", _prefix_map()))
+
+    prefix_map = _prefix_map()
+
+    def _cb(role: str, system: str, user: str) -> str:
+        if role == "synthesizer":
+            n = getattr(_cb, "_n", 0) + 1
+            _cb._n = n  # type: ignore[attr-defined]
+            return f"MARK_AB_ONLY_PASS{n}"  # different each pass → AB by hash too
+        if role != "judge":
+            return _role_defaults(role, user)
+        return _judge_prefer(user, prefix_map["AB"])
+
+    client = StubLLMClient(fn=_cb)
     artifact = tmp_path / "tournaments" / "ab-wins"
 
     t = Tournament(
@@ -260,14 +277,19 @@ async def test_ab_always_wins_hits_cap(tmp_path: Path) -> None:
         initial="MARK_A_ONLY_INITIAL",
     )
 
-    assert final == "MARK_AB_ONLY"
+    assert final == "MARK_AB_ONLY_PASS3"
     assert len(history) == cfg.max_rounds
     assert all(h.winner == "AB" for h in history)
 
     # Each non-A pass should have produced an incumbent_after_NN.md.
     incs = sorted(artifact.glob("incumbent_after_*.md"))
     assert len(incs) == 3
-    assert all(p.read_text() == "MARK_AB_ONLY" for p in incs)
+    # Each pass writes a distinct AB content.
+    assert [p.read_text() for p in incs] == [
+        "MARK_AB_ONLY_PASS1",
+        "MARK_AB_ONLY_PASS2",
+        "MARK_AB_ONLY_PASS3",
+    ]
 
 
 @pytest.mark.asyncio
@@ -656,3 +678,227 @@ async def test_checkpoint_timing_writes_artifacts_incrementally(tmp_path: Path) 
         assert (pass1_dir / "judges" / f"{i}_order.json").exists()
         assert (pass1_dir / "judges" / f"{i}_response.json").exists()
     assert (pass1_dir / "result.json").exists()
+
+
+# ── Fix 1: hash short-circuit advances streak ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_no_change_advances_streak(tmp_path: Path) -> None:
+    """When AB wins by Borda but content is byte-stable, the streak advances.
+
+    Reproduces the ``plan-47a530bd`` failure shape: judges always pick AB,
+    but the synthesizer returns the incumbent verbatim. Without the
+    hash-equality short-circuit (Fix 1) the streak would never advance and
+    the loop would burn ``max_rounds``.
+    """
+    cfg = TournamentConfig(num_judges=3, convergence_k=2, max_rounds=10)
+    prefix_map = _prefix_map()
+
+    def _cb(role: str, system: str, user: str) -> str:
+        if role == "synthesizer":
+            # Return the X version verbatim (which is the incumbent on a
+            # coin-flip miss; close enough — both X/Y contain incumbent or
+            # B; we want a deterministic byte-stable AB).
+            # Simplest: hard-code the same string the test starts with.
+            return "MARK_AB_ONLY_STABLE"
+        if role != "judge":
+            return _role_defaults(role, user)
+        return _judge_prefer(user, prefix_map["AB"])
+
+    client = StubLLMClient(fn=_cb)
+    artifact = tmp_path / "tournaments" / "no-change"
+
+    t = Tournament(
+        handler=_handler(),
+        client=client,
+        cfg=cfg,
+        artifact_dir=artifact,
+        rng=random.Random(7),
+    )
+    _final, history = await t.run("Task.", "MARK_A_ONLY_INITIAL")
+
+    # Pass 1: incumbent flips from initial → MARK_AB_ONLY_STABLE; AB wins
+    #   by Borda AND by hash (different content). effective_winner=AB,
+    #   streak=0.
+    # Pass 2: incumbent already MARK_AB_ONLY_STABLE; synth returns same;
+    #   AB wins by Borda but hashes equal → effective_winner=A. streak=1.
+    # Pass 3: same → streak=2 → converge.
+    assert len(history) == 3
+    assert history[0].winner == "AB"
+    assert history[0].meta.get("effective_winner") == "AB"
+    assert history[1].winner == "AB"
+    assert history[1].meta.get("effective_winner") == "A"
+    assert history[2].winner == "AB"
+    assert history[2].meta.get("effective_winner") == "A"
+
+
+# ── Fix 6: score-stability runaway detector ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_score_stability_triggers_runaway(tmp_path: Path) -> None:
+    """When scores barely change over ``window`` passes, terminate early.
+
+    Constructs a divergent scenario (judges always pick AB, content drifts
+    each pass so Fix 1 doesn't short-circuit) where the Borda *scores*
+    never deviate by more than ``max_delta`` across the window. The runaway
+    detector must fire at the first eligible pass.
+    """
+    cfg = TournamentConfig(
+        num_judges=3,
+        convergence_k=2,
+        max_rounds=10,
+        score_stability_window=3,
+        score_stability_max_delta=1,
+    )
+    state: dict[str, int] = {"synth_n": 0}
+
+    def _cb(role: str, system: str, user: str) -> str:
+        if role == "synthesizer":
+            state["synth_n"] += 1
+            return f"CURRENT_AB_{state['synth_n']}"
+        if role != "judge":
+            return _role_defaults(role, user)
+        return _judge_prefer(user, f"CURRENT_AB_{state['synth_n']}")
+
+    client = StubLLMClient(fn=_cb)
+    artifact = tmp_path / "tournaments" / "runaway"
+    t = Tournament(
+        handler=_handler(),
+        client=client,
+        cfg=cfg,
+        artifact_dir=artifact,
+        rng=random.Random(11),
+    )
+    _final, history = await t.run("Task.", "MARK_A_ONLY_INITIAL")
+
+    # All judges always vote AB-first → AB wins every pass.
+    assert all(h.winner == "AB" for h in history)
+    # AB's score is the same every pass (each judge gives AB 3 points → 9).
+    assert all(h.scores["AB"] == 9 for h in history)
+    # Detector fires at pass `window` (=3), so we have exactly 3 passes.
+    assert len(history) == 3
+    assert history[-1].meta.get("runaway_detected") is True
+    # Earlier passes should NOT be marked runaway.
+    assert history[0].meta.get("runaway_detected") is None
+    assert history[1].meta.get("runaway_detected") is None
+
+
+@pytest.mark.asyncio
+async def test_score_stability_disabled_when_none(tmp_path: Path) -> None:
+    """With both knobs ``None`` (default), the detector never fires."""
+    cfg = TournamentConfig(
+        num_judges=3,
+        convergence_k=2,
+        max_rounds=4,
+        score_stability_window=None,
+        score_stability_max_delta=None,
+    )
+    state: dict[str, int] = {"synth_n": 0}
+
+    def _cb(role: str, system: str, user: str) -> str:
+        if role == "synthesizer":
+            state["synth_n"] += 1
+            return f"CURRENT_AB_{state['synth_n']}"
+        if role != "judge":
+            return _role_defaults(role, user)
+        return _judge_prefer(user, f"CURRENT_AB_{state['synth_n']}")
+
+    client = StubLLMClient(fn=_cb)
+    artifact = tmp_path / "tournaments" / "no-detector"
+    t = Tournament(
+        handler=_handler(),
+        client=client,
+        cfg=cfg,
+        artifact_dir=artifact,
+        rng=random.Random(13),
+    )
+    _final, history = await t.run("Task.", "MARK_A_ONLY_INITIAL")
+
+    # Hits max_rounds, no early termination.
+    assert len(history) == cfg.max_rounds
+    assert all(h.meta.get("runaway_detected") is None for h in history)
+
+
+@pytest.mark.asyncio
+async def test_score_stability_does_not_fire_when_changing(tmp_path: Path) -> None:
+    """When score deltas exceed ``max_delta``, the detector stays quiet."""
+    cfg = TournamentConfig(
+        num_judges=3,
+        convergence_k=10,  # never converge in the small max_rounds we set
+        max_rounds=4,
+        score_stability_window=3,
+        score_stability_max_delta=1,
+    )
+    # Cycle the favored label each pass so scores swing widely.
+    favored_seq = ["A", "B", "AB", "A"]
+    state: dict[str, int] = {"synth_n": 0, "pass": 0}
+    prefix_map = _prefix_map()
+
+    def _cb(role: str, system: str, user: str) -> str:
+        if role == "synthesizer":
+            state["synth_n"] += 1
+            return f"CURRENT_AB_{state['synth_n']}"
+        if role != "judge":
+            return _role_defaults(role, user)
+        # 3 judges per pass → divide call counter by 3 to derive pass index.
+        idx = state.get("judge_n", 0)
+        state["judge_n"] = idx + 1
+        pass_idx = idx // 3
+        target = favored_seq[pass_idx % len(favored_seq)]
+        return _judge_prefer(user, prefix_map[target])
+
+    client = StubLLMClient(fn=_cb)
+    artifact = tmp_path / "tournaments" / "swinging"
+    t = Tournament(
+        handler=_handler(),
+        client=client,
+        cfg=cfg,
+        artifact_dir=artifact,
+        rng=random.Random(17),
+    )
+    _final, history = await t.run("Task.", "MARK_A_ONLY_INITIAL")
+
+    # Should run all max_rounds — no runaway termination.
+    assert len(history) == cfg.max_rounds
+    assert all(h.meta.get("runaway_detected") is None for h in history)
+
+
+@pytest.mark.asyncio
+async def test_change_does_not_short_circuit(tmp_path: Path) -> None:
+    """When the synthesizer's output differs each pass, no short-circuit fires.
+
+    The judge callback prefers the slot containing the *current* pass's
+    unique synthesizer marker (``CURRENT_AB_<n>``). This isolates the
+    judge's preference from the incumbent (which on pass N≥2 contains the
+    previous pass's marker, not the current one).
+    """
+    cfg = TournamentConfig(num_judges=3, convergence_k=2, max_rounds=4)
+
+    state: dict[str, int] = {"synth_n": 0}
+
+    def _cb(role: str, system: str, user: str) -> str:
+        if role == "synthesizer":
+            state["synth_n"] += 1
+            return f"CURRENT_AB_{state['synth_n']}"
+        if role != "judge":
+            return _role_defaults(role, user)
+        # Prefer the slot whose body contains the LATEST synthesizer output.
+        return _judge_prefer(user, f"CURRENT_AB_{state['synth_n']}")
+
+    client = StubLLMClient(fn=_cb)
+    artifact = tmp_path / "tournaments" / "drifting"
+    t = Tournament(
+        handler=_handler(),
+        client=client,
+        cfg=cfg,
+        artifact_dir=artifact,
+        rng=random.Random(8),
+    )
+    _final, history = await t.run("Task.", "MARK_A_ONLY_INITIAL")
+
+    # Every pass: hashes differ → effective_winner=AB → streak=0 → hit cap.
+    assert len(history) == cfg.max_rounds
+    assert all(h.winner == "AB" for h in history)
+    assert all(h.meta.get("effective_winner") == "AB" for h in history)

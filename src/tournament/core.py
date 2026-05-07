@@ -92,6 +92,15 @@ class TournamentConfig:
     model: str | None = None
     conservative_tiebreak: bool = True
     max_parallel_subprocesses: int = 3
+    # Optional runaway detector (Fix 6). Both ``None`` → feature disabled.
+    # ``score_stability_window`` is the number of trailing passes to compare;
+    # ``score_stability_max_delta`` is the maximum allowed sum of |Δscore|
+    # across A/B/AB between the first and last pass in the window. When the
+    # window is full and the delta is below the threshold, the engine emits
+    # ``tournament.runaway_detected`` and breaks out of the loop with the
+    # current incumbent.
+    score_stability_window: int | None = None
+    score_stability_max_delta: int | None = None
 
 
 class PassResult(BaseModel):
@@ -228,6 +237,23 @@ def aggregate_rankings(
         priority = {label: i for i, label in enumerate(labels)}
     ranked = sorted(scores.keys(), key=lambda k: (-scores[k], priority[k]))
     return ranked[0], scores, len(valid)
+
+
+def _score_window_stable(
+    history: list["PassResult"], window: int, max_delta: int
+) -> bool:
+    """Return True if the trailing ``window`` passes have near-stable scores.
+
+    "Stable" means the sum of absolute deltas across the A/B/AB scores
+    between ``history[-window]`` and ``history[-1]`` is ≤ ``max_delta``.
+    Caller must ensure ``len(history) >= window`` and ``window >= 1``.
+    """
+    first = history[-window].scores
+    last = history[-1].scores
+    total = 0
+    for label in ("A", "B", "AB"):
+        total += abs(last.get(label, 0) - first.get(label, 0))
+    return total <= max_delta
 
 
 def _describe_skipped(partial: PartialPassState) -> list[str]:
@@ -392,9 +418,29 @@ class Tournament(Generic[T]):
             winner, new_incumbent, result = await self.run_pass(
                 task_prompt, incumbent, pass_num, partial=pass_partial
             )
+
+            # Fix 1: hash-equality short-circuit. If the chosen variant is
+            # byte-identical to the incumbent (e.g. synthesizer regurgitated
+            # incumbent unchanged), treat the pass as an A-win for streak
+            # purposes regardless of the Borda label. This breaks the
+            # "AB wins forever but content is stable" deadlock observed in
+            # the plan-47a530bd run.
+            no_change = (
+                result.incumbent_hash_before == result.incumbent_hash_after
+            )
+            effective_winner: WinnerLabel = "A" if no_change else winner
+            result.meta["effective_winner"] = effective_winner
+            if no_change and winner != "A":
+                self.log.info(
+                    "tournament.no_change_winner",
+                    pass_num=pass_num,
+                    raw_winner=winner,
+                    effective_winner=effective_winner,
+                )
+
             history.append(result)
 
-            if winner == "A":
+            if effective_winner == "A":
                 streak += 1
             else:
                 streak = 0
@@ -407,6 +453,7 @@ class Tournament(Generic[T]):
                 "pass_complete",
                 pass_num=pass_num,
                 winner=winner,
+                effective_winner=effective_winner,
                 scores=result.scores,
                 valid_judges=result.valid_judges,
                 streak=streak,
@@ -414,6 +461,38 @@ class Tournament(Generic[T]):
 
             if streak >= self.cfg.convergence_k:
                 self.log.info("converged", pass_num=pass_num, streak=streak)
+                break
+
+            # Fix 6: runaway detector. If both knobs are configured and the
+            # trailing-window scores haven't moved by more than max_delta, we
+            # are stuck producing the same Borda outcome each pass — abort
+            # rather than burn the remaining max_rounds on identical
+            # synthesizer-style refinements.
+            window = self.cfg.score_stability_window
+            max_delta = self.cfg.score_stability_max_delta
+            if (
+                window is not None
+                and max_delta is not None
+                and len(history) >= window
+                and _score_window_stable(history, window, max_delta)
+            ):
+                first_scores = history[-window].scores
+                last_scores = history[-1].scores
+                total_delta = sum(
+                    abs(last_scores.get(k, 0) - first_scores.get(k, 0))
+                    for k in ("A", "B", "AB")
+                )
+                self.log.warning(
+                    "tournament.runaway_detected",
+                    pass_num=pass_num,
+                    window=window,
+                    total_delta=total_delta,
+                    max_delta=max_delta,
+                )
+                result.meta["runaway_detected"] = True
+                # Re-persist the pass result with the runaway annotation so
+                # on-disk artifacts surface the early termination cause.
+                self.store.write_pass_result(pass_num, result)
                 break
 
         self.store.write_final(self.handler.render_as_markdown(incumbent), history)
