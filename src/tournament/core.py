@@ -437,6 +437,11 @@ class Tournament(Generic[T]):
                     raw_winner=winner,
                     effective_winner=effective_winner,
                 )
+            # Re-persist the pass result so the on-disk artifact reflects the
+            # in-memory ``effective_winner``. Mirrors the runaway-detector
+            # branch below; idempotent re-write of the same pass dir's
+            # ``result.json``.
+            self.store.write_pass_result(pass_num, result)
 
             history.append(result)
 

@@ -733,6 +733,70 @@ async def test_no_change_advances_streak(tmp_path: Path) -> None:
     assert history[2].meta.get("effective_winner") == "A"
 
 
+@pytest.mark.asyncio
+async def test_pass_result_persists_effective_winner_to_disk(tmp_path: Path) -> None:
+    """Regression: ``meta["effective_winner"]`` must be present in the on-disk
+    ``pass_NN/result.json`` for every pass.
+
+    Mirrors the ``test_no_change_advances_streak`` scenario where Fix 1's
+    hash-equality short-circuit fires (Borda picks "AB" but the synthesizer
+    returns the incumbent verbatim, so ``effective_winner`` collapses to
+    ``"A"``). Without re-persisting after the in-memory mutation, the on-disk
+    artifact only carries ``meta = {"timestamp": ...}`` — losing diagnostic
+    fidelity for post-hoc analysis.
+    """
+    cfg = TournamentConfig(num_judges=3, convergence_k=2, max_rounds=10)
+    prefix_map = _prefix_map()
+
+    def _cb(role: str, system: str, user: str) -> str:
+        if role == "synthesizer":
+            # Always emit the byte-stable AB so passes 2+ trigger Fix 1's
+            # hash short-circuit (winner=="AB" but effective_winner=="A").
+            return "MARK_AB_ONLY_STABLE"
+        if role != "judge":
+            return _role_defaults(role, user)
+        return _judge_prefer(user, prefix_map["AB"])
+
+    client = StubLLMClient(fn=_cb)
+    artifact = tmp_path / "tournaments" / "persist-effective-winner"
+
+    t = Tournament(
+        handler=_handler(),
+        client=client,
+        cfg=cfg,
+        artifact_dir=artifact,
+        rng=random.Random(7),
+    )
+    _final, history = await t.run("Task.", "MARK_A_ONLY_INITIAL")
+
+    # Pass 1: AB wins by Borda, content actually changes (initial → stable).
+    # Passes 2+: AB wins by Borda but hash matches → effective_winner="A".
+    assert len(history) == 3
+
+    # Read the on-disk result.json for each pass and assert effective_winner
+    # is present and well-formed.
+    for n in range(1, len(history) + 1):
+        result_path = artifact / f"pass_{n:02d}" / "result.json"
+        assert result_path.exists(), f"missing {result_path}"
+        on_disk = json.loads(result_path.read_text())
+        assert "meta" in on_disk
+        ew = on_disk["meta"].get("effective_winner")
+        assert ew in {"A", "B", "AB"}, (
+            f"pass {n}: expected effective_winner in {{A,B,AB}}, got {ew!r}"
+        )
+        # In-memory and on-disk values must match.
+        assert ew == history[n - 1].meta.get("effective_winner")
+
+    # The crux: passes where Fix 1 fires should show effective_winner="A"
+    # on disk even though the raw winner is "AB".
+    pass_2 = json.loads((artifact / "pass_02" / "result.json").read_text())
+    pass_3 = json.loads((artifact / "pass_03" / "result.json").read_text())
+    assert pass_2["winner"] == "AB"
+    assert pass_2["meta"]["effective_winner"] == "A"
+    assert pass_3["winner"] == "AB"
+    assert pass_3["meta"]["effective_winner"] == "A"
+
+
 # ── Fix 6: score-stability runaway detector ──────────────────────────────
 
 
