@@ -30,15 +30,19 @@ from orchestrator.plan_parser import (
     PlanParseError,
     parse_plan_markdown,
 )
-from orchestrator.plan_tournament_runner import run_plan_tournament
+from orchestrator.plan_tournament_runner import (
+    _plan_tournament_id,
+    run_plan_tournament,
+)
 from state.evidence import write_evidence
-from state.paths import ensure_autodev_dir, spec_path
+from state.paths import autodev_root, ensure_autodev_dir, spec_path
 from state.schemas import (
     ExploreEvidence,
     Plan,
     SMEEvidence,
 )
 from tournament.effort import resolve_role_effort
+from tournament.state import TournamentArtifactStore
 
 
 if TYPE_CHECKING:
@@ -182,7 +186,32 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                 )
             except TournamentError as exc:
                 logger.warning("plan_phase.tournament_failed", err=str(exc))
+                # Salvage path (v0.6.0 / Issue 2): on a tournament error,
+                # try to recover the latest persisted ``incumbent_after_NN.md``
+                # rather than dropping every refinement that already landed
+                # on disk. Falling through to ``refined_md = plan_md`` if
+                # the recovery fails preserves legacy behavior.
                 refined_md = plan_md
+                try:
+                    artifact_dir = (
+                        autodev_root(orch.cwd)
+                        / "tournaments"
+                        / _plan_tournament_id(spec_hash)
+                    )
+                    store = TournamentArtifactStore(artifact_dir)
+                    recovered = store.latest_incumbent_md()
+                    if recovered:
+                        refined_md = recovered
+                        logger.info(
+                            "plan_phase.tournament_recovered_from_disk",
+                            pass_num=store.latest_incumbent_pass_num(),
+                            bytes=len(recovered),
+                        )
+                except Exception as recovery_exc:  # noqa: BLE001
+                    logger.warning(
+                        "plan_phase.tournament_recovery_failed",
+                        err=str(recovery_exc),
+                    )
             if refined_md and refined_md != plan_md:
                 try:
                     plan = parse_plan_markdown(refined_md, spec_hash=spec_hash)

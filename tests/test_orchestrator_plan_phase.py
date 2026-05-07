@@ -245,3 +245,126 @@ async def test_plan_phase_persists_via_ledger(tmp_path: Path) -> None:
     assert (tmp_path / ".autodev" / "spec.md").exists()
     spec_text = (tmp_path / ".autodev" / "spec.md").read_text()
     assert "subtract" in spec_text
+
+
+# --- Tournament-failure salvage tests (v0.6.0 / Issue 2) -------------------
+
+
+SALVAGE_INCUMBENT_3_MD = """# Plan: Salvaged at pass 3
+
+## Phase 1: Implement
+
+### Task 1.1: pass-3 task
+  - Description: from incumbent_after_03.md
+  - Files: foo.py
+  - Acceptance:
+    - [ ] pass-3 marker present
+"""
+
+
+SALVAGE_INCUMBENT_5_MD = """# Plan: Salvaged at pass 5
+
+## Phase 1: Implement
+
+### Task 1.1: pass-5 task
+  - Description: from incumbent_after_05.md
+  - Files: foo.py
+  - Acceptance:
+    - [ ] pass-5 marker present
+"""
+
+
+@pytest.mark.asyncio
+async def test_plan_phase_falls_back_to_latest_incumbent_on_tournament_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ``run_plan_tournament`` raises ``TournamentError``, ``run_plan_phase``
+    must read the latest ``incumbent_after_NN.md`` from disk rather than dropping
+    refinement and falling back to the original architect output.
+    """
+    from errors import TournamentError
+    from orchestrator import plan_phase as plan_phase_mod
+    from orchestrator.plan_tournament_runner import _plan_tournament_id
+
+    adapter = StubAdapter(
+        {
+            "explorer": ok("found stuff"),
+            "domain_expert": ok("ok"),
+            "architect": ok(CANONICAL_PLAN_MD),
+        }
+    )
+    cfg = default_config()
+    cfg.tournaments.plan.enabled = True
+    cfg.tournaments.impl.enabled = False
+    registry = build_registry(cfg)
+    orch = Orchestrator(
+        cwd=tmp_path,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id="sess-test-salvage",
+    )
+
+    # Pre-populate the on-disk tournament dir with two incumbents.
+    spec_hash = plan_phase_mod._spec_hash("Add subtract(a, b)")
+    tournament_id = _plan_tournament_id(spec_hash)
+    artifact_dir = tmp_path / ".autodev" / "tournaments" / tournament_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "incumbent_after_03.md").write_text(
+        SALVAGE_INCUMBENT_3_MD, encoding="utf-8"
+    )
+    (artifact_dir / "incumbent_after_05.md").write_text(
+        SALVAGE_INCUMBENT_5_MD, encoding="utf-8"
+    )
+
+    async def _raise(*args: object, **kwargs: object) -> str:
+        raise TournamentError("simulated tournament failure")
+
+    monkeypatch.setattr(plan_phase_mod, "run_plan_tournament", _raise)
+
+    plan = await orch.plan("Add subtract(a, b)")
+    assert plan is not None
+    # The recovered plan came from incumbent_after_05.md (highest pass).
+    assert plan.metadata["title"] == "Salvaged at pass 5"
+    # And not from incumbent_after_03.md.
+    assert plan.metadata["title"] != "Salvaged at pass 3"
+    # And not from the original architect output (CANONICAL_PLAN_MD title).
+    assert plan.metadata["title"] != "Add subtract(a, b)"
+
+
+@pytest.mark.asyncio
+async def test_plan_phase_falls_back_to_original_when_no_incumbents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No on-disk incumbents → legacy behavior: fall back to architect's plan."""
+    from errors import TournamentError
+    from orchestrator import plan_phase as plan_phase_mod
+
+    adapter = StubAdapter(
+        {
+            "explorer": ok("found stuff"),
+            "domain_expert": ok("ok"),
+            "architect": ok(CANONICAL_PLAN_MD),
+        }
+    )
+    cfg = default_config()
+    cfg.tournaments.plan.enabled = True
+    cfg.tournaments.impl.enabled = False
+    registry = build_registry(cfg)
+    orch = Orchestrator(
+        cwd=tmp_path,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id="sess-test-salvage-no-incumbent",
+    )
+
+    async def _raise(*args: object, **kwargs: object) -> str:
+        raise TournamentError("simulated tournament failure")
+
+    monkeypatch.setattr(plan_phase_mod, "run_plan_tournament", _raise)
+
+    plan = await orch.plan("Add subtract(a, b)")
+    assert plan is not None
+    # The legacy path: architect's CANONICAL_PLAN_MD title.
+    assert plan.metadata["title"] == "Add subtract(a, b)"
