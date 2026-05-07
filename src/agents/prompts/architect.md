@@ -1108,11 +1108,19 @@ The plans you produce are consumed by AutoDev's downstream agents — these are 
 
 - Tasks must be executable by a non-interactive autonomous agent in the current repo. The agent has access to: read/write/edit files, run shell commands inside the repo, run tests, and search code via grep/AST tools. It does NOT have: GPU access, hardware peripherals, network access outside package registries (npm/pypi/cargo), interactive TTY prompts, or human eyes-on validation.
 - Do **NOT** emit tasks that require: physical hardware (boards, sensors, microcontrollers), hardware-specific runtimes (e.g. QNX, embedded RTOSes, vendor SDKs not pip-installable), interactive debuggers (gdb-step-through, IDE breakpoints), human-in-the-loop validation (UX review, manual smoke-tests), new external SaaS provisioning (cloud accounts, paid API keys not already configured), or new test-infrastructure provisioning (CI runners, K8s clusters).
-- If a phase **requires** one of the above, prefix that task's title with the literal token `[MANUAL]` so downstream tooling can skip it. Example: `### Task 4.2: [MANUAL] Flash firmware to QNX target board`. The `[MANUAL]` token is a contract — keep it bracketed exactly as shown.
-- When in doubt about whether a task is agent-executable, **decompose** it into two adjacent tasks: a "Decide what to do" sub-task (agent-OK: design notes, configuration files, scripted commands) followed by a "Run it on hardware / publish to prod / hand to a reviewer" sub-task tagged `[MANUAL]`. The agent will execute the first, log the artifacts, and stop at the second.
+- If a task is not agent-executable, add a body line `- Requires: <token>` (one of `hardware`, `human`, `external_service`, `manual`) **immediately beneath the task title**. The orchestrator will mark such tasks as `skipped` and never invoke any adapter for them. Multiple tokens are comma-separated: `- Requires: hardware, human`.
+- **Worked example**:
+  ```
+  ### Task 1.1: Reproduce GL error on QNX hardware
+    - Requires: hardware
+    - Description: Run the multi-window GLES app on a QNX device and capture the four GL error patterns.
+    - Acceptance:
+      - [ ] Four error patterns observed and logged.
+  ```
+- When in doubt about whether a task is agent-executable, **decompose** it into two adjacent tasks: a "Decide what to do" sub-task (agent-OK: design notes, configuration files, scripted commands) followed by a "Run it on hardware / publish to prod / hand to a reviewer" sub-task tagged with `- Requires: <token>`. The agent will execute the first, log the artifacts, and stop at the second.
 - Setup steps that *do* belong inside the autonomous loop: file creation, config edits, library installation via package managers, code refactoring, test scaffolding, documentation, schema migrations expressible as code, and any work whose outcome is a diff-on-disk that `git status` would show.
 
-This is the **prompt-only contract** in v0.5.4 — downstream agents currently parse the `[MANUAL]` token by string match. A future release (v0.6.1) will promote this convention to a typed `Requires:` schema field on `Task`, at which point this section will reference the schema. Until then, the `[MANUAL]` prefix is the single signal AutoDev relies on; do not invent alternative spellings.
+`Requires:` is the **structured contract** as of v0.6.1 — `Task.requires` is a typed schema field and the orchestrator skips any task with a non-empty value programmatically. The legacy `[MANUAL]` title prefix from v0.5.4 is superseded; emit `- Requires: manual` (or a more specific token) instead. Do not invent alternative spellings or new tokens — only the four listed above are recognized; unknown tokens are dropped with a warning.
 
 ## OUTPUT REQUIREMENT — PLAN COMPLEXITY
 
