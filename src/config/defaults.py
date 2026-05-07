@@ -101,10 +101,30 @@ def default_config(platform: str = "auto") -> AutodevConfig:
         agents=agents,
         tournaments=TournamentsConfig(
             plan=TournamentPhaseConfig(
-                enabled=True, num_judges=3, convergence_k=2, max_rounds=15
+                enabled=True,
+                # Bumped 3 -> 5: autoreason finds 7 judges yield ~3x faster
+                # convergence than 3. We pick 5 as a cost/quality middle ground.
+                num_judges=5,
+                convergence_k=2,
+                max_rounds=15,
+                # Runaway detector: terminate early when per-pass Borda scores
+                # are stuck across several consecutive passes. Window=4 is
+                # half of max_rounds; max_delta=1 only fires on a genuinely
+                # flat trajectory (sum of |Δscore| across A/B/AB ≤ 1).
+                score_stability_window=4,
+                score_stability_max_delta=1,
             ),
             impl=TournamentPhaseConfig(
-                enabled=True, num_judges=1, convergence_k=1, max_rounds=3
+                enabled=True,
+                # Impl tournament stays single-judge by convention — it's
+                # structurally different (git worktree variants).
+                num_judges=1,
+                convergence_k=1,
+                max_rounds=3,
+                # max_rounds is small (3); window=2 still permits one normal
+                # pass before the detector can latch onto a stuck Borda outcome.
+                score_stability_window=2,
+                score_stability_max_delta=1,
             ),
             max_parallel_subprocesses=3,
             auto_disable_for_models=["opus"],
