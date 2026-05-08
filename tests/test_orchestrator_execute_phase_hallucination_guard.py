@@ -29,6 +29,10 @@ def _stub_orch(tmp_path: Path, *, hallucination_guard: bool = True) -> object:
             build_check = True
             test_runner = True
             secretscan = True
+            secretscan_baseline_enabled = False
+            secretscan_per_extension_thresholds = None
+            mutation_test_enabled = False
+            mutation_test_threshold = 0.7
 
         # Top-level toggle (read off cfg.hallucination_guard, mirrors
         # the existing pattern for `cfg.qa_gates.*`).

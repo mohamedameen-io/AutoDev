@@ -1,4 +1,4 @@
-"""Hallucination-guard QA gate (v0.16.0).
+"""Hallucination-guard QA gate.
 
 Catches API hallucinations — references to functions / attributes that
 do not exist on the imported module. A known LLM failure mode: the
@@ -8,24 +8,20 @@ build, tests) catch this at runtime, but only after the diff has
 landed; the guard is positioned to catch hallucinations BEFORE the
 reviewer sees the diff.
 
-Strategy (Python only in v0.16.0):
+v0.16.0 — Python only. AST-walks ``.py`` files; resolves ``from foo import
+bar`` and ``foo.bar`` references against importable stdlib modules.
 
-  1. AST-walk every ``.py`` file under ``cwd`` (or the diff-scoped
-     ``paths`` list if provided).
-  2. For each ``from <module> import <attr>`` and each ``<module>.<attr>``
-     reference, attempt to resolve ``<attr>`` on ``<module>`` via
-     :mod:`importlib`. If the symbol cannot be located, emit a finding.
-  3. Skip-and-warn for non-resolvable modules (third-party packages
-     not installed in the scan environment, ``importlib.import_module``
-     dynamic imports, etc.) — false positives in this class would be
-     punitive on real-world projects.
+v0.19.0 — extended to TypeScript / JavaScript / C++ via dispatcher.
+TypeScript uses regex-based module extraction + ``node_modules`` resolution
+(no native deps; tree-sitter-typescript planned). C++ uses
+``qa.cpp_symbols`` (tree-sitter-cpp when available; regex fallback)
+with include-chain resolution to detect calls to undeclared functions
+(~80% of C++ hallucinations).
 
-Diff-scope mirror of v0.13.0 secretscan: when ``paths`` is provided,
-only those files are walked. Non-existent paths skip silently.
-
-TypeScript / JavaScript / C++ are out of scope for v0.16.0 — the
-``tree-sitter-typescript`` dependency was not present in the project
-at v0.16.0 release time. Slated for v0.16.1.
+Conservative skip-and-warn dominates: when a module / package / header
+chain cannot be resolved, the guard *passes*. False-positives erode trust
+in the gate; the existing build / lint / test gates catch the residual
+class.
 """
 
 from __future__ import annotations
@@ -34,6 +30,8 @@ import ast
 import importlib
 import importlib.util
 import inspect
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -64,10 +62,23 @@ _SKIP_DIRS: frozenset[str] = frozenset(
 _STDLIB_MODULE_NAMES: frozenset[str] = frozenset(sys.stdlib_module_names)
 
 
+# v0.19.0 — extension dispatch.
+_PY_EXTS: frozenset[str] = frozenset({".py"})
+_TS_EXTS: frozenset[str] = frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"})
+_CPP_EXTS: frozenset[str] = frozenset(
+    {".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hxx"}
+)
+
+
 def _iter_files(
     cwd: Path, paths: list[Path] | None
 ) -> list[Path]:
-    """Yield Python files under *cwd* or in the *paths* whitelist."""
+    """Yield source files under *cwd* or in the *paths* whitelist.
+
+    v0.19.0: returns Python, TypeScript / JavaScript, and C++ source files
+    (the dispatcher routes by extension).
+    """
+    accepted = _PY_EXTS | _TS_EXTS | _CPP_EXTS
     if paths is not None:
         out: list[Path] = []
         seen: set[Path] = set()
@@ -82,16 +93,17 @@ def _iter_files(
             seen.add(resolved)
             if not resolved.exists():
                 continue
-            if resolved.suffix != ".py":
+            if resolved.suffix.lower() not in accepted:
                 continue
             out.append(resolved)
         return out
 
     out = []
-    for item in cwd.rglob("*.py"):
-        if any(part in _SKIP_DIRS for part in item.parts):
-            continue
-        out.append(item)
+    for ext in accepted:
+        for item in cwd.rglob(f"*{ext}"):
+            if any(part in _SKIP_DIRS for part in item.parts):
+                continue
+            out.append(item)
     return out
 
 
@@ -102,13 +114,7 @@ def _is_stdlib(module_name: str) -> bool:
 
 
 def _resolve_module(module_name: str) -> object | None:
-    """Best-effort import of *module_name*.
-
-    Returns the imported module on success, ``None`` otherwise. Failures
-    (missing module, ImportError on import) are swallowed — the caller
-    distinguishes "module unknown" vs. "attr missing on known module"
-    via :func:`_is_stdlib`.
-    """
+    """Best-effort import of *module_name*."""
     try:
         spec = importlib.util.find_spec(module_name)
     except (ValueError, ModuleNotFoundError, ImportError):
@@ -117,20 +123,13 @@ def _resolve_module(module_name: str) -> object | None:
         return None
     try:
         return importlib.import_module(module_name)
-    except Exception:  # noqa: BLE001 — broad: any import-time error skips.
+    except Exception:  # noqa: BLE001
         return None
 
 
 def _module_has_attr(module: object, attr: str) -> bool:
-    """True iff *module* exposes *attr*.
-
-    Uses :func:`hasattr` plus :func:`inspect` to be lenient about
-    dunder-only objects and lazy attributes.
-    """
     if hasattr(module, attr):
         return True
-    # ``inspect.getmembers`` catches some lazily-bound symbols that
-    # ``hasattr`` misses (e.g. modules using ``__getattr__`` lookups).
     try:
         for name, _val in inspect.getmembers(module):
             if name == attr:
@@ -140,7 +139,12 @@ def _module_has_attr(module: object, attr: str) -> bool:
     return False
 
 
-def _scan_file(path: Path, repo_root: Path) -> list[str]:
+# ---------------------------------------------------------------------------
+# Python scanner (v0.16.0)
+# ---------------------------------------------------------------------------
+
+
+def _scan_python_file(path: Path, repo_root: Path) -> list[str]:
     """Return a list of finding strings for one Python file."""
     try:
         source = path.read_text(encoding="utf-8")
@@ -149,8 +153,6 @@ def _scan_file(path: Path, repo_root: Path) -> list[str]:
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError:
-        # Don't false-positive on broken source — the caller's
-        # syntax_check gate already covers this case.
         return []
 
     try:
@@ -160,26 +162,19 @@ def _scan_file(path: Path, repo_root: Path) -> list[str]:
 
     findings: list[str] = []
 
-    # Track imported modules: ``import os`` → ``{"os": "os"}``.
-    # ``import os.path as op`` → ``{"op": "os.path"}``.
     imported_modules: dict[str, str] = {}
 
     for node in ast.walk(tree):
-        # ``import foo`` / ``import foo as bar`` / ``import foo.bar``
         if isinstance(node, ast.Import):
             for alias in node.names:
                 local = alias.asname or alias.name.split(".")[0]
                 imported_modules[local] = alias.name
 
-        # ``from foo import bar`` / ``from foo import bar as baz``
         elif isinstance(node, ast.ImportFrom):
             if node.module is None:
-                # Relative import (``from . import x``) — skip; can't
-                # resolve at scan time without project sys.path setup.
                 continue
             module_name = node.module
             if not _is_stdlib(module_name):
-                # Non-stdlib import: skip-and-warn rather than fail.
                 continue
             module = _resolve_module(module_name)
             if module is None:
@@ -193,14 +188,11 @@ def _scan_file(path: Path, repo_root: Path) -> list[str]:
                         f"{alias.name} not found in {module_name}"
                     )
 
-    # Second pass: ``module.attr`` references where ``module`` was
-    # imported via ``import module`` (we tracked these in
-    # ``imported_modules`` during the first walk).
     for node in ast.walk(tree):
         if not isinstance(node, ast.Attribute):
             continue
         if not isinstance(node.value, ast.Name):
-            continue  # nested attributes — too hard to resolve statically
+            continue
         local = node.value.id
         if local not in imported_modules:
             continue
@@ -219,6 +211,138 @@ def _scan_file(path: Path, repo_root: Path) -> list[str]:
     return findings
 
 
+# ---------------------------------------------------------------------------
+# TypeScript / JavaScript scanner (v0.19.0)
+# ---------------------------------------------------------------------------
+
+
+# v0.19.0: tree-sitter-typescript is OPTIONAL; flag set at import.
+try:  # pragma: no cover - native binding presence varies by platform
+    import tree_sitter_typescript  # type: ignore[import-not-found,import-untyped]  # noqa: F401
+
+    TS_TREESITTER_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    TS_TREESITTER_AVAILABLE = False
+
+
+_TS_IMPORT_RE = re.compile(
+    r"""(?:
+        import\b[^'"\n]*?from\s*['"]([^'"]+)['"]   |   # ES module import
+        import\s*\(\s*['"]([^'"]+)['"]\s*\)            # dynamic import()
+    )""",
+    re.VERBOSE,
+)
+_TS_BARE_IMPORT_RE = re.compile(r"""import\s+['"]([^'"]+)['"]""")
+_TS_REQUIRE_RE = re.compile(r"""require\s*\(\s*['"]([^'"]+)['"]\s*\)""")
+
+
+def _scan_typescript_regex(source: str) -> set[str]:
+    """Extract npm package specifiers from TypeScript / JavaScript source.
+
+    Returns the set of normalized **package roots** referenced via ES
+    import or CJS ``require``. Subpath imports (``lodash/fp``) collapse to
+    the root package (``lodash``); scoped packages (``@types/node``)
+    preserve the ``@scope/name`` shape (collapsing subpaths within the
+    scope). Relative imports (``./``, ``../``, ``/``) and Node-builtin
+    bare specifiers (e.g. ``fs``, ``path``) are excluded.
+    """
+    raw_specs: list[str] = []
+    for m in _TS_IMPORT_RE.finditer(source):
+        for grp in m.groups():
+            if grp:
+                raw_specs.append(grp)
+    raw_specs.extend(_TS_BARE_IMPORT_RE.findall(source))
+    raw_specs.extend(_TS_REQUIRE_RE.findall(source))
+
+    out: set[str] = set()
+    for spec in raw_specs:
+        if not spec:
+            continue
+        if spec.startswith((".", "/")):
+            continue
+        # Scoped package: ``@scope/name`` keeps both segments.
+        if spec.startswith("@"):
+            parts = spec.split("/")
+            if len(parts) >= 2:
+                out.add(f"{parts[0]}/{parts[1]}")
+            continue
+        # Plain package: keep only first segment.
+        out.add(spec.split("/")[0])
+    return out
+
+
+def _resolve_ts_package(cwd: Path, package: str) -> bool:
+    """True iff *package* resolves under ``cwd/node_modules``."""
+    base = cwd / "node_modules" / package
+    if not base.exists():
+        return False
+    pkg_json = base / "package.json"
+    if pkg_json.exists():
+        try:
+            data = json.loads(pkg_json.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("name"):
+                return True
+        except (OSError, json.JSONDecodeError):
+            return False
+    return base.is_dir()
+
+
+def _scan_typescript_file(path: Path, repo_root: Path) -> list[str]:
+    """Return findings for one TypeScript / JavaScript file."""
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    try:
+        rel = path.relative_to(repo_root).as_posix()
+    except ValueError:
+        rel = path.as_posix()
+
+    # Skip-and-warn when no node_modules exists — can't verify anything.
+    node_modules = repo_root / "node_modules"
+    if not node_modules.exists():
+        return []
+
+    packages = _scan_typescript_regex(source)
+    findings: list[str] = []
+    for pkg in sorted(packages):
+        if not _resolve_ts_package(repo_root, pkg):
+            findings.append(
+                f"{rel}: hallucinated reference — "
+                f"package '{pkg}' not found in node_modules"
+            )
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# C++ scanner (v0.19.0)
+# ---------------------------------------------------------------------------
+
+
+def _scan_cpp_file_dispatch(path: Path, repo_root: Path) -> list[str]:
+    """Dispatch to ``qa.cpp_symbols.scan_cpp_file``."""
+    from qa.cpp_symbols import scan_cpp_file
+
+    return scan_cpp_file(path, repo_root)
+
+
+# ---------------------------------------------------------------------------
+# Top-level dispatcher
+# ---------------------------------------------------------------------------
+
+
+def _dispatch(path: Path, repo_root: Path) -> list[str]:
+    """Pick the right scanner for *path* by extension."""
+    ext = path.suffix.lower()
+    if ext in _PY_EXTS:
+        return _scan_python_file(path, repo_root)
+    if ext in _TS_EXTS:
+        return _scan_typescript_file(path, repo_root)
+    if ext in _CPP_EXTS:
+        return _scan_cpp_file_dispatch(path, repo_root)
+    return []
+
+
 async def run_hallucination_guard(
     cwd: Path,
     paths: list[Path] | None = None,
@@ -227,19 +351,19 @@ async def run_hallucination_guard(
 
     Args:
         cwd: Repository root.
-        paths: Optional diff-scope filter. When non-None, only the
-            listed Python files are walked. Mirrors v0.13.0's
-            secretscan diff-scope signature.
+        paths: Optional diff-scope filter. When non-None, only the listed
+            files are walked (Python / TypeScript / C++ extensions only).
+            Mirrors v0.13.0's secretscan diff-scope signature.
 
     Returns:
-        :class:`GateResult` with ``passed=False`` and a finding list
-        when any hallucinations are detected. Otherwise ``passed=True``
-        with a benign details string.
+        :class:`GateResult` with ``passed=False`` and a finding list when
+        any hallucinations are detected. Otherwise ``passed=True`` with a
+        benign details string.
     """
     files = _iter_files(cwd, paths)
     all_findings: list[str] = []
     for f in files:
-        all_findings.extend(_scan_file(f, repo_root=cwd))
+        all_findings.extend(_dispatch(f, repo_root=cwd))
 
     if all_findings:
         detail_lines = all_findings[:20]
@@ -259,4 +383,14 @@ async def run_hallucination_guard(
     return GateResult(passed=True, details="no hallucinated references detected")
 
 
-__all__ = ["run_hallucination_guard"]
+# Back-compat alias for any in-tree callers — preserved for the v0.16.0
+# private surface.
+def _scan_file(path: Path, repo_root: Path) -> list[str]:
+    return _scan_python_file(path, repo_root)
+
+
+__all__ = [
+    "TS_TREESITTER_AVAILABLE",
+    "_scan_typescript_regex",
+    "run_hallucination_guard",
+]

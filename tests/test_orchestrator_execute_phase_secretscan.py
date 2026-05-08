@@ -102,7 +102,11 @@ async def test_secretscan_invoked_with_developer_diff_paths(
     captured: dict = {}
 
     async def fake_run_secretscan(
-        cwd: Path, paths: list[Path] | None = None
+        cwd: Path,
+        paths: list[Path] | None = None,
+        edit_scope: list[str] | None = None,
+        per_extension_thresholds: dict[str, float] | None = None,
+        baseline_enabled: bool = False,
     ) -> GateResult:
         captured["cwd"] = cwd
         captured["paths"] = paths
@@ -129,6 +133,10 @@ async def test_secretscan_invoked_with_developer_diff_paths(
             build_check = True
             test_runner = True
             secretscan = True
+            secretscan_baseline_enabled = False
+            secretscan_per_extension_thresholds = None
+            mutation_test_enabled = False
+            mutation_test_threshold = 0.7
 
     orch = type(
         "OrchStub",
@@ -167,7 +175,11 @@ async def test_secretscan_invoked_without_paths_when_no_developer_result(
     captured: dict = {}
 
     async def fake_run_secretscan(
-        cwd: Path, paths: list[Path] | None = None
+        cwd: Path,
+        paths: list[Path] | None = None,
+        edit_scope: list[str] | None = None,
+        per_extension_thresholds: dict[str, float] | None = None,
+        baseline_enabled: bool = False,
     ) -> GateResult:
         captured["paths"] = paths
         return GateResult(passed=True, details="ok")
@@ -191,6 +203,10 @@ async def test_secretscan_invoked_without_paths_when_no_developer_result(
             build_check = True
             test_runner = True
             secretscan = True
+            secretscan_baseline_enabled = False
+            secretscan_per_extension_thresholds = None
+            mutation_test_enabled = False
+            mutation_test_threshold = 0.7
 
     orch = type(
         "OrchStub",
