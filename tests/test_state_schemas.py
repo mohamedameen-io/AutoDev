@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from state.schemas import Task
+from state.schemas import AcceptanceCriterion, Phase, Task, TournamentEvidence
 
 
 # ---------------------------------------------------------------------------
@@ -210,3 +210,106 @@ def test_task_load_legacy_without_complexity_returns_none() -> None:
     }
     task = Task.model_validate(legacy_payload)
     assert task.complexity is None
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0 — ``Phase`` extension fields
+# ---------------------------------------------------------------------------
+
+
+def _make_dummy_task(id: str = "1.1") -> Task:
+    return Task(id=id, phase_id="1", title="t", description="d")
+
+
+def test_phase_acceptance_field() -> None:
+    """``Phase.acceptance`` accepts a list of ``AcceptanceCriterion``."""
+    crit = AcceptanceCriterion(id="ac-1", description="all tests pass")
+    phase = Phase(
+        id="1",
+        title="Setup",
+        tasks=[_make_dummy_task()],
+        acceptance=[crit],
+    )
+    assert len(phase.acceptance) == 1
+    assert phase.acceptance[0].description == "all tests pass"
+
+
+def test_phase_baseline_commit_default_none() -> None:
+    """``Phase.baseline_commit`` defaults to ``None`` until execute_phase
+    captures it at phase entry."""
+    phase = Phase(id="1", title="Setup", tasks=[_make_dummy_task()])
+    assert phase.baseline_commit is None
+
+
+def test_phase_review_status_states() -> None:
+    """All five literal values are accepted on ``Phase.review_status``.
+
+    The state machine: ``None`` → ``"in_progress"`` → terminal
+    (``"accepted"`` | ``"corrective_required"`` | ``"skipped"``). The
+    ``"pending"`` value is reserved for future use.
+    """
+    for status in (
+        "pending",
+        "in_progress",
+        "accepted",
+        "corrective_required",
+        "skipped",
+    ):
+        phase = Phase(
+            id="1",
+            title="Setup",
+            tasks=[_make_dummy_task()],
+            review_status=status,  # type: ignore[arg-type]
+        )
+        assert phase.review_status == status
+
+
+def test_phase_corrective_task_ids_default_empty() -> None:
+    """``Phase.corrective_task_ids`` defaults to ``[]``; new injections
+    append to it."""
+    phase = Phase(id="1", title="Setup", tasks=[_make_dummy_task()])
+    assert phase.corrective_task_ids == []
+    phase.corrective_task_ids.append("1.c1")
+    assert phase.corrective_task_ids == ["1.c1"]
+
+
+def test_legacy_phase_loads_with_defaults() -> None:
+    """A v0.8.0-shape Phase dict (no acceptance/baseline_commit/
+    review_status/corrective_task_ids) loads with all four new fields at
+    defaults — the migration guarantee."""
+    legacy_payload = {
+        "id": "1",
+        "title": "Setup",
+        "description": "",
+        "tasks": [
+            {
+                "id": "1.1",
+                "phase_id": "1",
+                "title": "t",
+                "description": "d",
+            }
+        ],
+    }
+    phase = Phase.model_validate(legacy_payload)
+    assert phase.acceptance == []
+    assert phase.baseline_commit is None
+    assert phase.review_status is None
+    assert phase.corrective_task_ids == []
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0 — ``TournamentEvidence.phase`` extension
+# ---------------------------------------------------------------------------
+
+
+def test_tournament_evidence_phase_review_kind() -> None:
+    """``TournamentEvidence.phase = "phase_review"`` is now a valid value."""
+    ev = TournamentEvidence(
+        task_id="phase-1",
+        tournament_id="phase-review-abcd1234-1",
+        phase="phase_review",
+        passes=2,
+        winner="A",
+        converged=True,
+    )
+    assert ev.phase == "phase_review"

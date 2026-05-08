@@ -93,6 +93,35 @@ class Phase(BaseModel):
     title: str
     description: str = ""
     tasks: list[Task]
+    # v0.9.0: per-phase acceptance criteria for the phase-review tournament.
+    # Parsed from the architect markdown's ``- Acceptance:`` block placed
+    # directly under each ``## Phase N:`` header (mirrors task-level
+    # acceptance shape). Empty list for legacy plans (no phase-level
+    # Acceptance block) — the judge prompt gracefully falls back to
+    # evaluating against the task list and phase title in that case.
+    acceptance: list[AcceptanceCriterion] = Field(default_factory=list)
+    # v0.9.0: HEAD commit at phase entry, captured by execute_phase before
+    # the first task in the phase begins. Used as the ``from_sha`` of
+    # ``_git_diff_range`` when the phase-review tournament builds the
+    # PhaseReviewBundle. ``None`` for legacy plans / phases that haven't
+    # started executing yet.
+    baseline_commit: str | None = None
+    # v0.9.0: phase-review state machine. ``None`` (initial) →
+    # ``"in_progress"`` (when the tournament starts) → ``"accepted"`` |
+    # ``"corrective_required"`` | ``"skipped"`` (terminal). The orchestrator
+    # uses this as a critical loop guard: once a phase has been reviewed,
+    # the next observation of all-terminal task state does NOT re-fire the
+    # tournament. Corrective tasks landing terminal transition the status
+    # from ``"corrective_required"`` → ``"accepted"`` directly.
+    review_status: (
+        Literal["pending", "in_progress", "accepted", "corrective_required", "skipped"]
+        | None
+    ) = None
+    # v0.9.0: ids of corrective tasks injected by ``parse_corrective_direction``
+    # after a B/AB-winner phase review. Mirrors the role of ``Task.depends_on``
+    # but at phase scope — observability for "which sub-tasks were synthesized
+    # from architect_b's direction text vs. the architect's original plan".
+    corrective_task_ids: list[str] = Field(default_factory=list)
 
 
 class Plan(BaseModel):
@@ -201,7 +230,11 @@ class TournamentEvidence(_BaseEvidence):
 
     kind: Literal["tournament"] = "tournament"
     tournament_id: str
-    phase: Literal["plan", "impl"]
+    # v0.9.0: extended to include ``"phase_review"`` for the per-phase code
+    # review tournament. Backward compat: existing evidence files load via
+    # the discriminator without migration (the field is parsed strictly so
+    # legacy values ``"plan"`` / ``"impl"`` continue to validate).
+    phase: Literal["plan", "impl", "phase_review"]
     passes: int
     winner: Literal["A", "B", "AB"]
     converged: bool
