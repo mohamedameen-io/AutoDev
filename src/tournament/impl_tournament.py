@@ -195,6 +195,44 @@ concrete: for each relevant file, which version's approach should survive,
 and why? Output 2-6 short bullet points. A coder will apply the synthesis."""
 
 
+# v0.21.0 A2: meta-merge prompt for the multi-branch impl-tournament. The
+# diff-synthesizer receives N candidate diffs (one per branch winner) side-
+# by-side and must produce a SINGLE unified-diff markdown that combines the
+# strongest elements. The synthesizer's output feeds back through
+# CoderRunner re-materialization in a fresh worktree so the result is a
+# real on-disk diff, not just text. Designed to be parseable as a unified
+# diff via :func:`adapters.git_utils.extract_files_from_diff` — emit
+# standard ``diff --git`` headers when possible.
+_DIFF_SYNTHESIS_PROMPT_IMPL = """ORIGINAL TASK:
+---
+{task_prompt}
+---
+
+You are reviewing {n_candidates} independent implementations of the same
+task. Each was produced by a different exploratory branch and is the
+winner of its own per-branch impl tournament.
+
+Your goal: synthesize a SINGLE merged diff that combines the strongest
+ideas from each candidate. The merged diff will be re-materialized into
+a fresh worktree by a coder, so output realistic unified-diff markdown
+(``diff --git ...`` headers + hunks). Avoid contradictions: when two
+candidates touch the same lines differently, pick one approach with a
+brief rationale.
+
+{diff_block}
+
+Emit:
+
+1. A short prose summary (1-3 bullet points) of WHICH parts of WHICH
+   candidate you kept and why.
+2. A unified diff block (fenced ```diff ... ``` ) capturing the merged
+   change. The coder will pipe this into a worktree.
+
+If the candidates are too divergent to merge cleanly, pick the strongest
+single candidate and emit its diff verbatim — the worst case is "no
+merge happened" rather than a corrupt diff."""
+
+
 _JUDGE_PROMPT_IMPL = """ORIGINAL TASK:
 ---
 {task_prompt}
@@ -277,6 +315,41 @@ class ImplContentHandler:
             y_tests_failed=y.tests_failed,
             y_tests_total=y.tests_total,
             y_diff=_limit(y.diff, 8000),
+        )
+
+    def render_for_diff_synthesis(
+        self,
+        task_prompt: str,
+        diffs: list[str],
+    ) -> str:
+        """v0.21.0 A2: render the meta-merge prompt for multi-branch impl.
+
+        Shows ``architect_b`` / ``synthesizer`` the N candidate diffs
+        side-by-side and asks for a synthesis emitted as a unified-diff
+        markdown block. The orchestrator's CoderRunner re-materializes
+        the merged diff in a fresh worktree to produce the final
+        :class:`ImplBundle`.
+
+        Truncates each input diff to 8000 chars to keep the prompt
+        bounded — large diffs at scale would blow the context window.
+        Empty / missing diffs are emitted as ``<empty diff>`` so the
+        synthesizer can still see WHICH branch produced no change.
+        """
+        if not diffs:
+            raise ValueError("render_for_diff_synthesis requires ≥1 diff")
+
+        chunks: list[str] = []
+        for idx, d in enumerate(diffs):
+            label = f"CANDIDATE {idx + 1}"
+            body = _limit(d, 8000) if d else "<empty diff>"
+            chunks.append(
+                f"{label}:\n---\n{body}\n---"
+            )
+        diff_block = "\n\n".join(chunks)
+        return _DIFF_SYNTHESIS_PROMPT_IMPL.format(
+            task_prompt=task_prompt,
+            n_candidates=len(diffs),
+            diff_block=diff_block,
         )
 
     def render_for_judge(
