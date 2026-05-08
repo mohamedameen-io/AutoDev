@@ -48,6 +48,26 @@ _ENTROPY_THRESHOLD = 4.5
 _MIN_ENTROPY_LEN = 20
 
 
+def _path_in_scope(rel_path: str, scope_prefixes: list[str]) -> bool:
+    """Return True iff *rel_path* lies under any prefix in *scope_prefixes*.
+
+    Mirrors :func:`orchestrator.dag.is_in_scope` semantics — kept local
+    here to avoid an orchestrator → qa import edge that would tangle
+    layering. Empty / falsy *scope_prefixes* would be a programming
+    error at this call site (the caller short-circuits before reaching
+    here), but for safety we still return True in that case.
+    """
+    if not scope_prefixes:
+        return True
+    for raw_prefix in scope_prefixes:
+        prefix = raw_prefix.rstrip("/")
+        if rel_path == prefix:
+            return True
+        if rel_path.startswith(prefix + "/"):
+            return True
+    return False
+
+
 def _shannon_entropy(text: str) -> float:
     """Compute Shannon entropy (bits per character) of *text*."""
     if not text:
@@ -69,6 +89,7 @@ def _high_entropy_strings(content: str) -> list[str]:
 async def run_secretscan(
     cwd: Path,
     paths: list[Path] | None = None,
+    edit_scope: list[str] | None = None,
 ) -> GateResult:
     """Scan *cwd* for hard-coded secrets.
 
@@ -80,12 +101,36 @@ async def run_secretscan(
 
     When *paths* is None (legacy), walk the whole tree under *cwd*.
 
+    v0.14.0: when *edit_scope* is non-empty, additionally restrict the
+    scan to files under any prefix in the scope. Composes with *paths*:
+    when both are set, only files in the intersection (in-diff AND
+    in-scope) are scanned. When *paths* is None and *edit_scope* is
+    non-empty, the whole-tree walk is filtered to the scope.
+
     Returns ``GateResult(passed=False, ...)`` if any secrets are found,
     ``GateResult(passed=True, ...)`` otherwise.
     """
     findings: list[str] = []
 
+    # Normalize the scope to "filter is active" iff non-empty list. Empty
+    # list / None preserves legacy semantics (no scope filter).
+    scope_active = bool(edit_scope)
+    scope_prefixes = [p.rstrip("/") for p in (edit_scope or [])]
+
     for path in _iter_files(cwd, paths=paths):
+        # v0.14.0 scope filter: applied after _iter_files so it composes
+        # naturally with both walk modes (full-tree and diff-paths).
+        if scope_active:
+            try:
+                rel_for_scope = path.relative_to(cwd).as_posix()
+            except ValueError:
+                # Caller passed an absolute path outside cwd. Without a
+                # repo-relative form we can't decide scope membership;
+                # treat as out-of-scope (conservative).
+                continue
+            if not _path_in_scope(rel_for_scope, scope_prefixes):
+                continue
+
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
