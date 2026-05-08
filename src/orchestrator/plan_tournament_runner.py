@@ -25,6 +25,7 @@ from adapters import InlineAdapter
 from autologging import get_logger
 from orchestrator.plan_parser import extract_complexity
 from runtime.resource_probe import probe_host, resolve_parallelism
+from state.knowledge import TournamentEvent
 from state.paths import autodev_root
 from tournament import (
     AdapterLLMClient,
@@ -360,6 +361,28 @@ async def run_plan_tournament(
         artifact_dir=str(artifact_dir),
     )
 
+    # v0.15.0: emit cross-run lessons from the tournament outcome. Per-pass
+    # discards (every non-winning candidate per pass) AND the final
+    # winner_promoted event get recorded into the swarm tier so future
+    # tournaments + future runs of this project can consult what worked
+    # and what was rejected. Errors are swallowed with a warning — a
+    # knowledge-write failure must never break a converged tournament.
+    try:
+        await _emit_plan_tournament_lessons(
+            orch,
+            tournament_id=tournament_id,
+            history=history,
+            final_md=final_md,
+            initial_md=initial_md,
+            branch_index=branch_index,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "plan_tournament.lessons_emit_failed",
+            tournament_id=tournament_id,
+            error=str(exc),
+        )
+
     # Breadcrumb for resume + observability.
     await orch.plan_manager.ledger_append(
         op="plan_tournament_complete",
@@ -374,6 +397,87 @@ async def run_plan_tournament(
     )
 
     return final_md
+
+
+async def _emit_plan_tournament_lessons(
+    orch: "Orchestrator",
+    *,
+    tournament_id: str,
+    history: list,
+    final_md: str,
+    initial_md: str,
+    branch_index: int | None,
+) -> None:
+    """Emit cross-run lessons from a completed plan tournament.
+
+    For each pass in ``history``:
+        * Records ONE ``discard`` event per non-winning candidate label
+          (out of the {A, B, AB} cohort). The lesson body carries the
+          Borda scores so future passes can see *how* the discard lost.
+
+    After the loop:
+        * Records ONE ``winner_promoted`` event keyed off the trailing
+          winner streak label so future runs can prefer it.
+
+    All errors are bubbled to the caller, which logs and swallows them
+    — see :func:`run_plan_tournament`'s wrapping ``try/except``.
+    """
+    family = "plan-tournament"
+    branch_tag = (
+        f" branch={branch_index}" if branch_index is not None else ""
+    )
+
+    for pr in history:
+        pass_num = getattr(pr, "pass_num", "?")
+        winner_label = getattr(pr, "winner", "")
+        scores = getattr(pr, "scores", {}) or {}
+        candidate_labels = ("A", "B", "AB")
+        for label in candidate_labels:
+            if label == winner_label:
+                continue
+            evidence = (
+                f"tournament={tournament_id}{branch_tag} pass={pass_num} "
+                f"winner={winner_label} loser={label} "
+                f"scores={scores}"
+            )
+            await orch.knowledge.record_tournament_event(
+                TournamentEvent(
+                    event_type="discard",
+                    family=family,
+                    hypothesis=(
+                        f"candidate {label} did not win pass {pass_num} "
+                        f"of tournament {tournament_id}"
+                    ),
+                    evidence=evidence,
+                    rollback_reason=f"borda-loss-to-{winner_label}",
+                )
+            )
+
+    # Final winner_promoted: indicate the converged plan's identity by
+    # length-fingerprint + the trailing winner streak label so the lesson
+    # is descriptive enough to be useful but never dumps the full plan
+    # markdown into the lessons text (size cap protection).
+    final_label = history[-1].winner if history else None
+    final_fingerprint = (
+        f"len={len(final_md)} "
+        f"line_count={len(final_md.splitlines())} "
+        f"trailing_winner={final_label}"
+    )
+    await orch.knowledge.record_tournament_event(
+        TournamentEvent(
+            event_type="winner_promoted",
+            family=family,
+            hypothesis=(
+                f"tournament {tournament_id}{branch_tag} converged with "
+                f"trailing winner {final_label}"
+            ),
+            evidence=final_fingerprint,
+            next_action_hint=(
+                "future passes on this spec should prefer the converged "
+                "structure over alternatives in the same family"
+            ),
+        )
+    )
 
 
 __all__ = ["_plan_tournament_id", "run_plan_tournament"]
