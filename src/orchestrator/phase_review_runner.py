@@ -49,6 +49,7 @@ from tournament.timeouts import resolve_role_timeout_s
 
 
 if TYPE_CHECKING:
+    from config.schema import BranchConfig
     from orchestrator import Orchestrator
     from state.schemas import Phase
 
@@ -192,6 +193,8 @@ async def run_phase_review_tournament(
     baseline_commit: str,
     tip_commit: str,
     spec_md: str,
+    *,
+    branch_config: "BranchConfig | None" = None,
 ) -> PhaseReviewOutcome:
     """Run the phase-review tournament and return the outcome.
 
@@ -207,6 +210,12 @@ async def run_phase_review_tournament(
             HEAD).
         spec_md: Original spec markdown — used as the tournament's
             ``task_prompt``.
+        branch_config: v0.18.0 A1 — optional per-branch config providing
+            heterogeneous-model overrides + lane tag. ``None`` (default)
+            preserves homogeneous behavior. When set, the runner threads
+            ``branch_config.model_overrides`` into the
+            :class:`AdapterLLMClient` and suffixes the artifact dir with
+            ``-{lane}``.
 
     Returns:
         :class:`PhaseReviewOutcome`. On A win → ``accept_phase=True,
@@ -247,7 +256,14 @@ async def run_phase_review_tournament(
     plan = await orch.plan_manager.load()
     spec_hash = (plan.spec_hash or "phase-review-stub")[:16].ljust(16, "0") if plan else "phase-review-stub00"
     tournament_id = _phase_review_tournament_id(spec_hash, phase.id)
-    artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
+    # v0.18.0 A1: when a branch_config is supplied, suffix the artifact dir
+    # with the lane label so the on-disk layout records each branch's
+    # divergent trajectory at a glance.
+    if branch_config is not None:
+        artifact_dir_name = f"{tournament_id}-{branch_config.lane}"
+    else:
+        artifact_dir_name = tournament_id
+    artifact_dir = autodev_root(orch.cwd) / "tournaments" / artifact_dir_name
 
     # Build the as-implemented diff for the A variant.
     diff_text = _git_diff_range(orch.cwd, baseline_commit, tip_commit) or ""
@@ -272,6 +288,14 @@ async def run_phase_review_tournament(
     role_max_turns, role_allowed_tools, role_timeout_s, role_effort = (
         _build_role_overrides(orch, plan_complexity)
     )
+
+    # v0.18.0 A1: per-branch role-model overrides. Empty dict / None
+    # preserves legacy homogeneous behavior — the global ``model``
+    # passed into ``client.call`` is used for every role.
+    role_model_overrides: dict[str, str] | None = None
+    if branch_config is not None and branch_config.model_overrides:
+        role_model_overrides = dict(branch_config.model_overrides)
+
     client = AdapterLLMClient(
         orch.adapter,
         cwd=orch.cwd,
@@ -279,6 +303,7 @@ async def run_phase_review_tournament(
         role_allowed_tools=role_allowed_tools,
         role_effort=role_effort,
         role_timeout_s=role_timeout_s,
+        role_model_overrides=role_model_overrides,
     )
 
     # v0.10.0: resolve subprocess parallelism via the runtime probe.
