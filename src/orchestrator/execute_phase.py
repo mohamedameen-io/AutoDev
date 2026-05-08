@@ -1882,6 +1882,32 @@ async def delegate(
                 err=str(exc),
             )
             patterns = []
+
+        # v0.20.0 A1: optional LLM-augmentation. When ``cfg.prm.strategy``
+        # is ``"rules+ml"`` AND the orchestrator carries an
+        # ``llm_trajectory_classifier`` attribute, run the classifier and
+        # merge its patterns with the rule-based ones. Rules win on dedup;
+        # graceful degradation on any error (already implemented inside
+        # :class:`LLMTrajectoryClassifier`).
+        prm_strategy = getattr(
+            getattr(orch.cfg, "prm", None), "strategy", "rules"
+        )
+        ml_clf = getattr(orch, "llm_trajectory_classifier", None)
+        if prm_strategy == "rules+ml" and ml_clf is not None:
+            try:
+                events_for_clf = trajectory_store.events_for(envelope.task_id)
+                ml_patterns = await ml_clf.classify(events_for_clf)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.prm_ml_classify_failed",
+                    task_id=envelope.task_id,
+                    err=str(exc),
+                )
+                ml_patterns = []
+            if ml_patterns:
+                from orchestrator.prm import merge_patterns
+
+                patterns = merge_patterns(patterns, ml_patterns)
         if patterns:
             from orchestrator.prm import CourseCorrection
 
