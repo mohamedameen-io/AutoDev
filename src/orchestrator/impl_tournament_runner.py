@@ -45,6 +45,7 @@ from tournament.timeouts import resolve_role_timeout_s
 
 
 if TYPE_CHECKING:
+    from config.schema import BranchConfig
     from orchestrator import Orchestrator
     from state.schemas import Task
 
@@ -287,6 +288,8 @@ async def run_impl_tournament(
     orch: "Orchestrator",
     task: "Task",
     initial_bundle: ImplBundle,
+    *,
+    branch_config: "BranchConfig | None" = None,
 ) -> ImplBundle:
     """Run the impl tournament and return the refined :class:`ImplBundle`.
 
@@ -297,6 +300,18 @@ async def run_impl_tournament(
           and returns the final incumbent.
         - Writes :class:`TournamentEvidence` to ``evidence/{task_id}-tournament.json``.
         - Appends an ``impl_tournament_complete`` ledger entry at the end.
+
+    Args:
+        orch: Orchestrator carrying adapter / config / plugin registry.
+        task: Task being implemented.
+        initial_bundle: Variant A (incumbent) bundle.
+        branch_config: v0.18.0 A1 — optional per-branch config providing
+            heterogeneous-model overrides + lane tag. ``None`` (default)
+            preserves v0.17.0 homogeneous behavior. When set, the runner
+            threads ``branch_config.model_overrides`` into the
+            :class:`AdapterLLMClient` and suffixes the artifact dir with
+            ``-{lane}`` so on-disk forensics record the divergent
+            trajectory.
     """
     cfg = orch.cfg.tournaments.impl
     auto_disable = orch.cfg.tournaments.auto_disable_for_models
@@ -315,12 +330,27 @@ async def run_impl_tournament(
     )
 
     tournament_id = f"impl-{uuid.uuid4().hex[:8]}"
-    artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
+    # v0.18.0 A1: when a branch_config is supplied, suffix the artifact dir
+    # with the lane label so the on-disk layout records each branch's
+    # divergent trajectory at a glance.
+    if branch_config is not None:
+        artifact_dir_name = f"{tournament_id}-{branch_config.lane}"
+    else:
+        artifact_dir_name = tournament_id
+    artifact_dir = autodev_root(orch.cwd) / "tournaments" / artifact_dir_name
     worktree_dir = artifact_dir / "worktrees"
 
     role_max_turns, role_allowed_tools, role_timeout_s, role_effort = (
         await _build_tournament_role_overrides(orch)
     )
+
+    # v0.18.0 A1: per-branch role-model overrides. Empty dict / None
+    # preserves legacy homogeneous behavior — the global ``model`` passed
+    # into ``client.call`` is used for every role.
+    role_model_overrides: dict[str, str] | None = None
+    if branch_config is not None and branch_config.model_overrides:
+        role_model_overrides = dict(branch_config.model_overrides)
+
     client = AdapterLLMClient(
         orch.adapter,
         cwd=orch.cwd,
@@ -328,6 +358,7 @@ async def run_impl_tournament(
         role_allowed_tools=role_allowed_tools,
         role_effort=role_effort,
         role_timeout_s=role_timeout_s,
+        role_model_overrides=role_model_overrides,
     )
 
     # v0.7.0 / Issue 5C: ``complex_plan_num_judges_override`` is a plan-only
