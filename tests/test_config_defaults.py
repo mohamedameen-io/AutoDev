@@ -361,3 +361,29 @@ def test_execute_max_parallel_tasks_default_none() -> None:
     at run_execute_phase entry (role_mix='execute')."""
     cfg = default_config()
     assert cfg.tournaments.execute_max_parallel_tasks is None
+
+
+# ---------------------------------------------------------------------------
+# v0.12.0 — num_branches defaults: plan=3, impl=1, phase_review=1
+# ---------------------------------------------------------------------------
+
+
+def test_plan_default_num_branches_3() -> None:
+    """v0.12.0: the plan-tournament default ships ``num_branches=3`` for
+    user-locked-in maximum-diversity fan-out (3 parallel branches)."""
+    cfg = default_config()
+    assert cfg.tournaments.plan.num_branches == 3
+
+
+def test_impl_default_num_branches_1() -> None:
+    """v0.12.0: impl tournament stays single-branch (1) — branch fan-out
+    is plan-tournament-only in this release."""
+    cfg = default_config()
+    assert cfg.tournaments.impl.num_branches == 1
+
+
+def test_phase_review_default_num_branches_1() -> None:
+    """v0.12.0: phase-review tournament stays single-branch (1) — branch
+    fan-out is plan-tournament-only in this release."""
+    cfg = default_config()
+    assert cfg.tournaments.phase_review.num_branches == 1

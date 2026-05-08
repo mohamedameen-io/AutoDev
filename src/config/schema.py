@@ -114,6 +114,7 @@ def _default_phase_review_cfg() -> "TournamentPhaseConfig":
         winner_stability_window=None,
         max_plan_lines_growth_ratio=None,
         complex_plan_num_judges_override=None,
+        num_branches=1,
     )
 
 

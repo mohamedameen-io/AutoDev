@@ -131,6 +131,16 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 # 7 judges → ~3× faster convergence than 3). Medium / simple
                 # plans stay at the cheaper default of 5 judges above.
                 complex_plan_num_judges_override=7,
+                # v0.12.0: number of independent RNG-seeded tournament
+                # branches to run in parallel for the plan phase. ``3`` is
+                # the user-locked-in default ("maximum diversity"): three
+                # parallel trajectories, each seeded from
+                # ``int(spec_hash, 16) + branch_index``, with their final
+                # outputs meta-merged via the existing
+                # :class:`~tournament.plan_tournament.PlanContentHandler`
+                # synthesizer. Cost: 3x LLM call volume per plan-phase
+                # (mitigated by v0.10.0's resource probe throttling).
+                num_branches=3,
             ),
             impl=TournamentPhaseConfig(
                 enabled=True,
@@ -154,6 +164,9 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 # complexity from a plan markdown, so the override stays
                 # ``None``. Field is plumbed through for schema symmetry.
                 complex_plan_num_judges_override=None,
+                # v0.12.0: impl tournament stays single-branch — branch
+                # fan-out isn't wired into the impl runner in this release.
+                num_branches=1,
             ),
             # v0.9.0: per-phase code review tournament. Default-on per the
             # user-locked-in design. Single-pass (``max_rounds=2``) keeps
@@ -171,6 +184,9 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 winner_stability_window=None,
                 max_plan_lines_growth_ratio=None,
                 complex_plan_num_judges_override=None,
+                # v0.12.0: phase_review tournament stays single-branch —
+                # branch fan-out is plan-tournament-only in this release.
+                num_branches=1,
             ),
             # v0.10.0: default flips 3 → None (auto-resolve via
             # ``runtime.resource_probe.resolve_parallelism`` at tournament
