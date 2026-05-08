@@ -414,7 +414,47 @@ async def run_impl_tournament(
     if getattr(cfg, "voting_strategy", "borda") == "veto":
         from tournament.voting import VetoAggregator
 
-        voting_strategy = VetoAggregator()
+        # v0.18.0 C2: when veto is active and the architect populated
+        # Task.acceptance, persist criteria to a council sidecar JSON for
+        # forensics + per-criterion vote tracking.
+        if task.acceptance:
+            try:
+                import json as _json
+
+                from state.paths import council_criteria_path
+
+                sidecar = council_criteria_path(orch.cwd, task.id)
+                sidecar.parent.mkdir(parents=True, exist_ok=True)
+                sidecar.write_text(
+                    _json.dumps(
+                        {
+                            "task_id": task.id,
+                            "criteria": [
+                                ac.model_dump(mode="json")
+                                for ac in task.acceptance
+                            ],
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                voting_strategy = VetoAggregator(criteria=list(task.acceptance))
+            except Exception as exc:  # noqa: BLE001 — sidecar is forensics-only
+                logger.warning(
+                    "impl_tournament.council_sidecar_write_failed",
+                    task_id=task.id,
+                    err=str(exc),
+                )
+                voting_strategy = VetoAggregator()
+        else:
+            # No acceptance criteria → veto agg behaves as plain
+            # last-place-rejects-candidate policy without per-criterion
+            # bookkeeping.
+            logger.warning(
+                "impl_tournament.veto_without_criteria",
+                task_id=task.id,
+            )
+            voting_strategy = VetoAggregator()
 
     tournament = ImplTournament(
         handler=ImplContentHandler(),

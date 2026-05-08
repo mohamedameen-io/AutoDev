@@ -1253,6 +1253,33 @@ Tasks that produce documentation or notes (no code changes) MUST target git-trac
 
 When in doubt, run `git check-ignore <path>` mentally: if the path is ignored, the phase-review judge will see no diff and mark the task incomplete.
 
+## COUNCIL CRITERIA (council/veto-mode tournaments only)
+
+When the impl tournament will run with `voting_strategy=veto` (council mode), you MUST populate each task's `Acceptance:` list with concrete, judge-evaluable criteria. Each criterion is a single check-box assertion that an implementation either satisfies or doesn't.
+
+A council task with empty acceptance criteria falls back to the legacy Borda aggregation (no veto fires) — emit a warning if the operator opted into veto but you couldn't enumerate criteria.
+
+Good criteria are:
+
+- **Testable**: a judge can read the diff and decide PASS/FAIL.
+- **Atomic**: one assertion per criterion.
+- **Falsifiable**: includes the failure mode, not just the success.
+
+Example:
+
+```
+### Task 2.3: Add rate limiter
+  - Description: Implement leaky-bucket rate limiter for /api endpoints.
+  - Files: src/api/middleware.py, tests/test_rate_limit.py
+  - Acceptance:
+    - [ ] Returns 429 with Retry-After header when limit exceeded.
+    - [ ] No global mutable state — bucket per-IP via cache.
+    - [ ] Unit tests cover burst + sustained-load + cooldown paths.
+    - [ ] Defaults are configurable via cfg.api.rate_limit.
+```
+
+When the orchestrator runs the council tournament, each judge evaluates the implementation against EVERY criterion. A judge ranking a candidate last (as a veto) typically signals at least one criterion is unmet.
+
 ## OUTPUT REQUIREMENT — PLAN COMPLEXITY
 
 After your plan body, on a final standalone line at the very end of your output, emit exactly one of:
