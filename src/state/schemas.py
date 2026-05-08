@@ -218,6 +218,16 @@ class Phase(BaseModel):
     # PhaseReviewBundle. ``None`` for legacy plans / phases that haven't
     # started executing yet.
     baseline_commit: str | None = None
+    # v0.21.0 B1: HEAD commit captured at phase-completion checkpoint —
+    # the moment ALL tasks in the phase reach a terminal state. Distinct
+    # from the live HEAD because, with cross-phase parallelism enabled,
+    # the next phase's tasks may start landing commits before the
+    # phase-review tournament runs. The phase-review runner uses this
+    # field as the ``tip_commit`` of its diff range so the as-implemented
+    # diff captures only this phase's work even when phase N+1 runs
+    # concurrently. ``None`` for legacy plans / phases that haven't
+    # finished yet.
+    end_checkpoint_commit: str | None = None
     # v0.9.0: phase-review state machine. ``None`` (initial) →
     # ``"in_progress"`` (when the tournament starts) → ``"accepted"`` |
     # ``"corrective_required"`` | ``"skipped"`` (terminal). The orchestrator

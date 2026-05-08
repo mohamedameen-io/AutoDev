@@ -587,6 +587,36 @@ class AutodevConfig(BaseModel):
     # older than 2.25. Default False — sparse-checkout speeds up huge
     # repos but breaks tasks that need files outside the declared scope.
     worktree_sparse_checkout_enabled: bool = False
+    # v0.21.0 A1: opt-in worktree warm-start pool. When True, the
+    # orchestrator pre-creates ``resolve_parallelism(role_mix='execute')``
+    # worktrees at execute-phase entry and recycles them via
+    # ``git reset --hard <baseline> && git clean -fdx`` instead of paying
+    # ``git worktree add`` cost on every task dispatch. Persistent dir:
+    # ``.autodev/execute_worktrees_pool/``. Default False (opt-in)
+    # because cold-start adds 2-5 s of upfront latency that's only
+    # worthwhile on multi-task plans.
+    worktree_pool_enabled: bool = False
+    # v0.21.0 B1: opt-in cross-phase parallelism. When True, the execute
+    # dispatcher allows tasks from phase N+1 to begin executing while
+    # phase N's tail tasks finish, provided the new task's files don't
+    # overlap any in-flight task's files AND its dependencies are
+    # terminal. Phase-review still fires only after ALL tasks in the
+    # phase reach terminal — its diff range uses
+    # ``Phase.end_checkpoint_commit`` (captured at that moment) so phase
+    # N+1's concurrent commits don't pollute phase N's review. Default
+    # False (opt-in) because the priority-queue scheduler is novel and
+    # operators may want to validate behavior on their plan before
+    # opting in.
+    cross_phase_parallelism_enabled: bool = False
+    # v0.21.0 B2: opt-in speculative execution. When True, the execute
+    # dispatcher may speculatively start ONE child task while its
+    # parent is still in-flight (parent.retry_count==0 + child has a
+    # SINGLE parent + file-disjoint with all in-flight). If the parent
+    # later succeeds, the speculative work is valid. If the parent
+    # fails, the speculative worktree is reset and the speculative task
+    # re-queues as pending. Default False (opt-in) because rollback
+    # complexity warrants cautious adoption.
+    speculative_execution_enabled: bool = False
 
     def require_all_roles(self) -> None:
         """Raise ValueError if any required role is missing from `agents`."""

@@ -689,13 +689,16 @@ class PlanManager:
         *,
         baseline_commit: str | None = None,
         review_status: str | None = None,
+        end_checkpoint_commit: str | None = None,
     ) -> Plan:
-        """Update phase-level metadata fields (baseline_commit / review_status).
+        """Update phase-level metadata fields.
 
-        Lock + ledger + snapshot. Either field can be ``None`` to leave
-        unchanged; passing both updates them in one ledger entry. Mirrors
-        :meth:`update_task_status` semantics so resumes / replays
-        reproduce the metadata transitions exactly.
+        Supported fields: ``baseline_commit`` (v0.9.0 / phase entry SHA),
+        ``review_status`` (v0.9.0 / phase-review state machine), and
+        ``end_checkpoint_commit`` (v0.21.0 B1 / phase completion SHA).
+        Lock + ledger + snapshot. Any field can be ``None`` to leave
+        unchanged. Mirrors :meth:`update_task_status` semantics so
+        resumes / replays reproduce the metadata transitions exactly.
         """
         async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
             plan = self._load_sync()
@@ -716,6 +719,9 @@ class PlanManager:
             if review_status is not None:
                 phase.review_status = review_status  # type: ignore[assignment]
                 payload["review_status"] = review_status
+            if end_checkpoint_commit is not None:
+                phase.end_checkpoint_commit = end_checkpoint_commit
+                payload["end_checkpoint_commit"] = end_checkpoint_commit
 
             await append_entry(
                 self._cwd,
@@ -730,6 +736,7 @@ class PlanManager:
                 phase_id=phase_id,
                 baseline_commit=baseline_commit,
                 review_status=review_status,
+                end_checkpoint_commit=end_checkpoint_commit,
             )
             return plan
 
@@ -923,7 +930,8 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
         return plan
 
     if op == "update_phase_meta":
-        # v0.9.0: idempotent phase-meta update.
+        # v0.9.0: idempotent phase-meta update. v0.21.0 B1 adds
+        # ``end_checkpoint_commit`` for cross-phase parallelism.
         phase_id = payload.get("phase_id")
         if not isinstance(phase_id, str):
             return plan
@@ -936,6 +944,9 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
         if "review_status" in payload:
             val = payload["review_status"]
             phase.review_status = val if isinstance(val, str) else None  # type: ignore[assignment]
+        if "end_checkpoint_commit" in payload:
+            val = payload["end_checkpoint_commit"]
+            phase.end_checkpoint_commit = val if isinstance(val, str) else None
         return plan
 
     return plan

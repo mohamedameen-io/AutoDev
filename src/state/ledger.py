@@ -137,6 +137,28 @@ LedgerOp = Literal[
     #   ``{branch_index, prior_lane, new_lane, family | None}``.
     "plateau_detected",
     "plateau_forced_lane_change",
+    # v0.21.0 A2: multi-branch impl-tournament fan-out audit ops. All
+    # observability-only — they do NOT mutate plan state. Replay treats
+    # them as no-ops. Payload contents:
+    # - ``multi_branch_impl_start``:
+    #   ``{task_id, n_branches, lanes: list[str | None]}``.
+    # - ``multi_branch_impl_meta_merge_complete``:
+    #   ``{task_id, n_survivors, n_branches}``.
+    # - ``multi_branch_impl_complete``:
+    #   ``{task_id, n_branches, n_survivors, winner_diff_bytes}``.
+    "multi_branch_impl_start",
+    "multi_branch_impl_meta_merge_complete",
+    "multi_branch_impl_complete",
+    # v0.21.0 B2: speculative-execution audit ops. Observability-only.
+    # - ``speculative_started``:
+    #   ``{task_id, parent_task_id}``.
+    # - ``speculative_rolled_back``:
+    #   ``{task_id, parent_task_id, reason}``.
+    # - ``speculative_committed``:
+    #   ``{task_id, parent_task_id}``.
+    "speculative_started",
+    "speculative_rolled_back",
+    "speculative_committed",
 ]
 
 
@@ -480,6 +502,41 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # critic prompt is the executor's responsibility.
         return plan
 
+    if op in (
+        "multi_branch_phase_review_start",
+        "multi_branch_phase_review_meta_merge_complete",
+        "multi_branch_phase_review_complete",
+    ):
+        # v0.18.0 A2: multi-branch phase-review fan-out audit ops.
+        # Plan state mutations (review_status, corrective tasks) flow
+        # through the regular ``update_phase_meta`` /
+        # ``append_corrective_tasks`` ops; these three are forensics.
+        return plan
+
+    if op in ("plateau_detected", "plateau_forced_lane_change"):
+        # v0.18.0 B2: plateau-detector telemetry. Audit-only.
+        return plan
+
+    if op in (
+        "multi_branch_impl_start",
+        "multi_branch_impl_meta_merge_complete",
+        "multi_branch_impl_complete",
+    ):
+        # v0.21.0 A2: multi-branch impl-tournament audit ops. The
+        # winning diff is applied to main via the regular impl-tournament
+        # path; these ops are forensics for the fan-out + meta-merge.
+        return plan
+
+    if op in (
+        "speculative_started",
+        "speculative_rolled_back",
+        "speculative_committed",
+    ):
+        # v0.21.0 B2: speculative-execution audit ops. The actual task
+        # status transitions live in regular ``update_task_status``
+        # entries emitted alongside.
+        return plan
+
     if plan is None:
         raise LedgerCorruptError(
             f"entry seq={entry.seq} op={op} applied before any init_plan"
@@ -582,8 +639,9 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
 
     if op == "update_phase_meta":
         # v0.9.0: update arbitrary phase-level metadata fields. Currently
-        # carries ``baseline_commit`` and ``review_status``. Idempotent:
-        # re-applying overwrites with the same values.
+        # carries ``baseline_commit``, ``review_status``, and
+        # ``end_checkpoint_commit`` (v0.21.0 B1). Idempotent: re-applying
+        # overwrites with the same values.
         phase_id = payload.get("phase_id")
         if not isinstance(phase_id, str):
             raise LedgerCorruptError(
@@ -600,6 +658,9 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         if "review_status" in payload:
             val = payload["review_status"]
             phase.review_status = val if isinstance(val, str) else None  # type: ignore[assignment]
+        if "end_checkpoint_commit" in payload:
+            val = payload["end_checkpoint_commit"]
+            phase.end_checkpoint_commit = val if isinstance(val, str) else None
         return plan
 
     if op == "mark_blocked_descendants":
