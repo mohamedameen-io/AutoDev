@@ -253,3 +253,96 @@ async def test_no_complexity_directive_keeps_default(
     cfg = capture_tournament.captured_cfg
     assert cfg is not None
     assert cfg.num_judges == 5
+
+
+# ---------------------------------------------------------------------------
+# v0.10.0 — resolve_parallelism wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_runner_resolves_parallelism_via_runtime_helper(
+    tmp_path: Path,
+    capture_tournament: type[_CapturingTournament],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The plan-runner asks ``runtime.resource_probe.resolve_parallelism``
+    for the value it stuffs into ``TournamentConfig.max_parallel_subprocesses``.
+
+    Test strategy: monkeypatch ``resolve_parallelism`` in the runner's
+    namespace (not the runtime module) to return a sentinel value (``42``).
+    Assert the captured ``TournamentConfig`` carries that exact value —
+    proves the runner is calling the resolver, not falling back to the
+    legacy literal pass-through.
+    """
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = _make_orch(tmp_path, adapter)
+    # Default config: max_parallel_subprocesses is None (v0.10.0 default).
+    assert orch.cfg.tournaments.max_parallel_subprocesses is None
+    md = _plan_md("medium")
+
+    captured_kwargs: dict = {}
+
+    def fake_resolve(
+        configured: int | None,
+        capacity: object,
+        role_mix: str,
+        num_judges: int,
+    ) -> int:
+        captured_kwargs.update(
+            configured=configured,
+            role_mix=role_mix,
+            num_judges=num_judges,
+        )
+        return 42
+
+    monkeypatch.setattr(ptr, "resolve_parallelism", fake_resolve)
+
+    await ptr.run_plan_tournament(orch, md, "spec text", spec_hash=_SPEC_HASH)
+
+    cfg = capture_tournament.captured_cfg
+    assert cfg is not None
+    assert cfg.max_parallel_subprocesses == 42, (
+        f"Expected the runner to wire resolve_parallelism's return value "
+        f"into TournamentConfig.max_parallel_subprocesses; got "
+        f"{cfg.max_parallel_subprocesses}"
+    )
+    assert captured_kwargs["role_mix"] == "plan"
+    assert captured_kwargs["num_judges"] == 5  # default cfg.num_judges
+    assert captured_kwargs["configured"] is None  # auto path
+
+
+@pytest.mark.asyncio
+async def test_plan_runner_passes_configured_int_through_resolver(
+    tmp_path: Path,
+    capture_tournament: type[_CapturingTournament],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the operator pins ``max_parallel_subprocesses=8``, the runner
+    forwards that value into ``resolve_parallelism`` (which then returns
+    ``8`` per the explicit-int passthrough rule)."""
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = _make_orch(tmp_path, adapter)
+    orch.cfg.tournaments.max_parallel_subprocesses = 8
+
+    captured_kwargs: dict = {}
+
+    def fake_resolve(
+        configured: int | None,
+        capacity: object,
+        role_mix: str,
+        num_judges: int,
+    ) -> int:
+        captured_kwargs["configured"] = configured
+        return configured if configured is not None else 1
+
+    monkeypatch.setattr(ptr, "resolve_parallelism", fake_resolve)
+
+    await ptr.run_plan_tournament(
+        orch, _plan_md("medium"), "spec text", spec_hash=_SPEC_HASH
+    )
+
+    cfg = capture_tournament.captured_cfg
+    assert cfg is not None
+    assert cfg.max_parallel_subprocesses == 8
+    assert captured_kwargs["configured"] == 8

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from adapters import InlineAdapter
 from autologging import get_logger
 from orchestrator.plan_parser import extract_complexity
+from runtime.resource_probe import probe_host, resolve_parallelism
 from state.paths import autodev_root
 from tournament import (
     AdapterLLMClient,
@@ -224,17 +225,24 @@ async def run_plan_tournament(
         role_timeout_s=role_timeout_s,
     )
 
-    # v0.10.0: ``max_parallel_subprocesses`` is now ``int | None`` in the
-    # config schema; ``None`` is replaced by host-aware
-    # :func:`runtime.resource_probe.resolve_parallelism` in the next
-    # commit. Until then, keep the legacy literal default (3) when None.
-    _legacy_parallelism = orch.cfg.tournaments.max_parallel_subprocesses or 3
+    # v0.10.0: resolve subprocess parallelism via the runtime probe.
+    # When the operator hasn't pinned an explicit int, this returns a
+    # host-aware value derived from CPU count, available memory, and the
+    # judge cohort size — replacing the fixed ``max_parallel_subprocesses=3``
+    # cap. The probe is cheap (microseconds) so we can afford a fresh
+    # capacity reading at every tournament startup.
+    resolved_parallelism = resolve_parallelism(
+        configured=orch.cfg.tournaments.max_parallel_subprocesses,
+        capacity=probe_host(),
+        role_mix="plan",
+        num_judges=effective_num_judges,
+    )
     tcfg = TournamentConfig(
         num_judges=effective_num_judges,
         convergence_k=cfg.convergence_k,
         max_rounds=cfg.max_rounds,
         model=model,
-        max_parallel_subprocesses=_legacy_parallelism,
+        max_parallel_subprocesses=resolved_parallelism,
         score_stability_window=cfg.score_stability_window,
         score_stability_max_delta=cfg.score_stability_max_delta,
         winner_stability_window=cfg.winner_stability_window,
