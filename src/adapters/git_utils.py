@@ -10,6 +10,7 @@ __all__ = [
     "_git_diff",
     "_git_diff_range",
     "_git_rev_parse_head",
+    "extract_files_from_diff",
 ]
 
 
@@ -119,6 +120,38 @@ def _git_diff_range(cwd: Path, from_sha: str, to_sha: str) -> str | None:
     if out.returncode != 0:
         return None
     return out.stdout or None
+
+
+def extract_files_from_diff(diff: str) -> list[str]:
+    """Pull file paths from a unified diff (lightweight, deterministic).
+
+    Parses the ``+++ b/<path>`` lines from a unified diff, returning paths
+    in first-seen order with duplicates removed. ``+++ /dev/null`` (file
+    deletion target) is naturally excluded because the prefix doesn't match.
+
+    Lifted from ``orchestrator.phase_review_runner`` in v0.13.0 for reuse
+    by the secretscan diff-scope path. The phase-review wrapper continues
+    to import this function under the legacy private name to keep its
+    callers stable.
+
+    Args:
+        diff: Unified diff text. May be empty.
+
+    Returns:
+        Repo-relative paths for each file the diff modifies. Empty list
+        when the diff is empty or contains no parseable headers.
+    """
+    if not diff:
+        return []
+    files: list[str] = []
+    seen: set[str] = set()
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            path = line[len("+++ b/"):].strip()
+            if path and path not in seen:
+                files.append(path)
+                seen.add(path)
+    return files
 
 
 def _git_rev_parse_head(cwd: Path) -> str | None:

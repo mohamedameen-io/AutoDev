@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from adapters import InlineAdapter
-from adapters.git_utils import _git_diff_range
+from adapters.git_utils import _git_diff_range, extract_files_from_diff
 from autologging import get_logger
 from runtime.resource_probe import probe_host, resolve_parallelism
 from state.evidence import write_evidence
@@ -410,19 +410,11 @@ async def run_phase_review_tournament(
     )
 
 
-def _extract_files_from_diff(diff: str) -> list[str]:
-    """Pull file paths from a unified diff (lightweight, deterministic)."""
-    if not diff:
-        return []
-    files: list[str] = []
-    seen: set[str] = set()
-    for line in diff.splitlines():
-        if line.startswith("+++ b/"):
-            path = line[len("+++ b/") :].strip()
-            if path and path not in seen:
-                files.append(path)
-                seen.add(path)
-    return files
+# v0.13.0: lifted to ``adapters.git_utils.extract_files_from_diff`` so the
+# secretscan diff-scope path can reuse it. The legacy private name is kept
+# as an alias for any callers (test fixtures, etc.) that still reference
+# it from this module.
+_extract_files_from_diff = extract_files_from_diff
 
 
 __all__ = [

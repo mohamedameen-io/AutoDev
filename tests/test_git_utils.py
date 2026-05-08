@@ -13,6 +13,7 @@ from adapters.git_utils import (
     _git_diff_range,
     _git_porcelain_set,
     _git_rev_parse_head,
+    extract_files_from_diff,
 )
 
 
@@ -309,3 +310,54 @@ def test_git_rev_parse_head_subprocess_error(tmp_path: Path) -> None:
     with patch("subprocess.run", side_effect=OSError("fail")):
         result = _git_rev_parse_head(tmp_path)
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# v0.13.0: extract_files_from_diff (lifted from phase_review_runner)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_files_from_diff_empty_returns_empty_list() -> None:
+    assert extract_files_from_diff("") == []
+
+
+def test_extract_files_from_diff_parses_single_file() -> None:
+    diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "index 1234..5678 100644\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    assert extract_files_from_diff(diff) == ["foo.py"]
+
+
+def test_extract_files_from_diff_dedupes() -> None:
+    """Duplicates (e.g. multiple hunks per file) appear once in first-seen order."""
+    diff = (
+        "+++ b/foo.py\n"
+        "+++ b/bar.py\n"
+        "+++ b/foo.py\n"
+    )
+    assert extract_files_from_diff(diff) == ["foo.py", "bar.py"]
+
+
+def test_extract_files_from_diff_skips_dev_null() -> None:
+    """``+++ /dev/null`` (deletion target) is excluded by the prefix match."""
+    diff = (
+        "--- a/old.py\n"
+        "+++ /dev/null\n"
+        "--- a/keep.py\n"
+        "+++ b/keep.py\n"
+    )
+    assert extract_files_from_diff(diff) == ["keep.py"]
+
+
+def test_extract_files_from_diff_phase_review_alias_unchanged() -> None:
+    """The legacy private name on phase_review_runner still resolves
+    to the lifted function (no consumer breakage)."""
+    from orchestrator import phase_review_runner
+
+    assert phase_review_runner._extract_files_from_diff is extract_files_from_diff
