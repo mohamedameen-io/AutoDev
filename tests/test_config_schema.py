@@ -210,3 +210,36 @@ def test_tournament_phase_config_complex_plan_num_judges_override_accepts_none()
     assert cfg.complex_plan_num_judges_override is None
     reloaded = TournamentPhaseConfig.model_validate(cfg.model_dump())
     assert reloaded.complex_plan_num_judges_override is None
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0 — TournamentsConfig.phase_review default factory
+# ---------------------------------------------------------------------------
+
+
+def test_phase_review_field_default_factory_returns_enabled_true() -> None:
+    """The factory returns a fully-formed phase_review block — default-on."""
+    cfg = default_config()
+    assert cfg.tournaments.phase_review.enabled is True
+    assert cfg.tournaments.phase_review.num_judges == 3
+    assert cfg.tournaments.phase_review.convergence_k == 1
+    assert cfg.tournaments.phase_review.max_rounds == 2
+
+
+def test_legacy_config_without_phase_review_loads_via_default(tmp_path: Path) -> None:
+    """A v0.8.0-shape config (no ``phase_review`` block under tournaments)
+    validates via the field's default factory without raising.
+
+    This is the migration guarantee: existing on-disk configs from v0.8.0
+    keep loading after v0.9.0 ships.
+    """
+    cfg = default_config()
+    data = cfg.model_dump(mode="json")
+    # Strip the phase_review block from the serialized config to mimic
+    # a v0.8.0 file.
+    data["tournaments"].pop("phase_review", None)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    reloaded = load_config(path)
+    assert reloaded.tournaments.phase_review.enabled is True
+    assert reloaded.tournaments.phase_review.num_judges == 3

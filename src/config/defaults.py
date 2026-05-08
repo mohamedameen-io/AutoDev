@@ -155,6 +155,23 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 # ``None``. Field is plumbed through for schema symmetry.
                 complex_plan_num_judges_override=None,
             ),
+            # v0.9.0: per-phase code review tournament. Default-on per the
+            # user-locked-in design. Single-pass (``max_rounds=2``) keeps
+            # cost contained. 3 judges balances signal vs cost. The
+            # stability detectors are unset because ``max_rounds=2`` is
+            # too small for the windows to fire (the runner's tournament
+            # config plumbs through the ``None``s without harm).
+            phase_review=TournamentPhaseConfig(
+                enabled=True,
+                num_judges=3,
+                convergence_k=1,
+                max_rounds=2,
+                score_stability_window=None,
+                score_stability_max_delta=None,
+                winner_stability_window=None,
+                max_plan_lines_growth_ratio=None,
+                complex_plan_num_judges_override=None,
+            ),
             max_parallel_subprocesses=3,
             auto_disable_for_models=["opus"],
         ),

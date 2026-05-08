@@ -300,3 +300,35 @@ def test_impl_default_complex_plan_num_judges_override_is_none() -> None:
     """
     cfg = default_config()
     assert cfg.tournaments.impl.complex_plan_num_judges_override is None
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0 — phase_review defaults
+# ---------------------------------------------------------------------------
+
+
+def test_phase_review_default_enabled() -> None:
+    """Default-on per the user-locked-in design — bigger blast radius but
+    faster real-world validation."""
+    cfg = default_config()
+    assert cfg.tournaments.phase_review.enabled is True
+
+
+def test_phase_review_default_num_judges_3() -> None:
+    """3 judges balances signal vs cost for the per-phase review."""
+    cfg = default_config()
+    assert cfg.tournaments.phase_review.num_judges == 3
+
+
+def test_phase_review_default_convergence_k_1() -> None:
+    """Single-pass convergence — when A wins once, accept the phase
+    immediately (no second confirmation pass)."""
+    cfg = default_config()
+    assert cfg.tournaments.phase_review.convergence_k == 1
+
+
+def test_phase_review_default_max_rounds_2() -> None:
+    """``max_rounds=2`` keeps cost contained: at most one corrective pass
+    after the initial review pass."""
+    cfg = default_config()
+    assert cfg.tournaments.phase_review.max_rounds == 2

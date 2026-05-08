@@ -81,11 +81,40 @@ class TournamentPhaseConfig(BaseModel):
     complex_plan_num_judges_override: int | None = None
 
 
+def _default_phase_review_cfg() -> "TournamentPhaseConfig":
+    """Default-on phase-review config used when an existing ``config.json``
+    omits the new v0.9.0 field.
+
+    Defaults: enabled, single-pass (max_rounds=2), 3 judges. Single-pass
+    keeps cost contained; 3 judges balances signal vs. cost. The
+    score / winner-stability detectors are not configured because
+    ``max_rounds=2`` is too small for the windows to fire.
+    """
+    return TournamentPhaseConfig(
+        enabled=True,
+        num_judges=3,
+        convergence_k=1,
+        max_rounds=2,
+        score_stability_window=None,
+        score_stability_max_delta=None,
+        winner_stability_window=None,
+        max_plan_lines_growth_ratio=None,
+        complex_plan_num_judges_override=None,
+    )
+
+
 class TournamentsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     plan: TournamentPhaseConfig
     impl: TournamentPhaseConfig
+    # v0.9.0: per-phase code review tournament config. Default-on per the
+    # user-locked-in design. The ``Field(default_factory=...)`` ensures
+    # legacy on-disk configs (written by v0.8.0 or earlier) without this
+    # field still validate — the factory inlines the v0.9.0 defaults.
+    phase_review: TournamentPhaseConfig = Field(
+        default_factory=_default_phase_review_cfg
+    )
     max_parallel_subprocesses: int = 3
     auto_disable_for_models: list[str] = Field(default_factory=lambda: ["opus"])
 
