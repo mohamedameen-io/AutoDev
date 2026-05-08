@@ -19,6 +19,7 @@ escalated, mark it blocked, and stop the loop.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ from state.schemas import (
     CoderEvidence,
     CriticEvidence,
     Phase,
+    Plan,
     ReviewEvidence,
     Task,
     TestEvidence,
@@ -659,60 +661,105 @@ async def run_execute_phase(
                             pass
             return processed
 
-        for phase in plan.phases:
+        # v0.21.0 B1: when cross-phase parallelism is enabled, ``Task.
+        # depends_on`` may legitimately reference tasks in EARLIER phases.
+        # The per-phase DAG validator rejects those as "undefined
+        # references", so under the cross-phase flag we run a relaxed
+        # plan-level DAG check that accepts cross-phase deps as long as
+        # every dep resolves SOMEWHERE in the plan.
+        if getattr(orch.cfg, "cross_phase_parallelism_enabled", False):
             try:
-                validate_phase_dag(phase)
+                _validate_cross_phase_dag(plan)
             except DagValidationError as exc:
                 logger.warning(
-                    "execute_phase.dag_invalid",
-                    phase_id=phase.id,
-                    err=str(exc),
+                    "execute_phase.cross_phase_dag_invalid", err=str(exc)
                 )
-                # Block every pending task in the offending phase so the
-                # run terminates cleanly.
-                for t in phase.tasks:
-                    if t.status == "pending":
-                        try:
-                            await orch.plan_manager.update_task_status(
-                                t.id,
-                                "blocked",
-                                meta={
-                                    "blocked_reason": f"dag_invalid: {exc}"
-                                },
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
+                for phase in plan.phases:
+                    for t in phase.tasks:
+                        if t.status == "pending":
+                            try:
+                                await orch.plan_manager.update_task_status(
+                                    t.id,
+                                    "blocked",
+                                    meta={
+                                        "blocked_reason": (
+                                            f"cross_phase_dag_invalid: {exc}"
+                                        )
+                                    },
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                return processed
+        else:
+            for phase in plan.phases:
+                try:
+                    validate_phase_dag(phase)
+                except DagValidationError as exc:
+                    logger.warning(
+                        "execute_phase.dag_invalid",
+                        phase_id=phase.id,
+                        err=str(exc),
+                    )
+                    # Block every pending task in the offending phase so the
+                    # run terminates cleanly.
+                    for t in phase.tasks:
+                        if t.status == "pending":
+                            try:
+                                await orch.plan_manager.update_task_status(
+                                    t.id,
+                                    "blocked",
+                                    meta={
+                                        "blocked_reason": f"dag_invalid: {exc}"
+                                    },
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
 
-        for phase in plan.phases:
-            await _maybe_record_phase_entry(orch, phase.id)
-            # Run the worker pool for this phase, then phase-review.
-            # If phase-review injects corrective tasks (review_status
-            # transitions to ``corrective_required``), loop again so
-            # those tasks execute within this phase before advancing
-            # to the next. Cap at a small number of iterations as a
-            # defensive net against pathological architect_b output.
-            for _round in range(3):
-                phase_processed = await _execute_phase_dag(
-                    orch, phase.id, worktree_mgr, parallelism
-                )
-                processed.extend(phase_processed)
-                await _maybe_run_phase_review(orch, phase.id)
-                # Did phase-review accept? If so we're done with this
-                # phase. Otherwise (corrective_required) the next loop
-                # iteration will run any newly-injected tasks.
-                latest_plan = await orch.plan_manager.load()
-                if latest_plan is None:
-                    break
-                latest_phase = next(
-                    (p for p in latest_plan.phases if p.id == phase.id), None
-                )
-                if latest_phase is None:
-                    break
-                if latest_phase.review_status in ("accepted", "skipped"):
-                    break
-                # Any new pending tasks? If not, stop looping.
-                if not any(t.status == "pending" for t in latest_phase.tasks):
-                    break
+        # v0.21.0 B1: cross-phase parallelism. When enabled, run a
+        # single dispatcher across all phases — tasks from phase N+1
+        # may begin executing while phase N's tail is in-flight,
+        # provided their deps are terminal AND their files don't
+        # conflict. Phase-review still fires per-phase as each phase
+        # observes all-terminal, using ``end_checkpoint_commit`` for
+        # diff isolation.
+        if getattr(orch.cfg, "cross_phase_parallelism_enabled", False):
+            for phase in plan.phases:
+                await _maybe_record_phase_entry(orch, phase.id)
+            cross_processed = await _execute_cross_phase_dag(
+                orch, worktree_mgr, parallelism
+            )
+            processed.extend(cross_processed)
+        else:
+            for phase in plan.phases:
+                await _maybe_record_phase_entry(orch, phase.id)
+                # Run the worker pool for this phase, then phase-review.
+                # If phase-review injects corrective tasks (review_status
+                # transitions to ``corrective_required``), loop again so
+                # those tasks execute within this phase before advancing
+                # to the next. Cap at a small number of iterations as a
+                # defensive net against pathological architect_b output.
+                for _round in range(3):
+                    phase_processed = await _execute_phase_dag(
+                        orch, phase.id, worktree_mgr, parallelism
+                    )
+                    processed.extend(phase_processed)
+                    await _maybe_run_phase_review(orch, phase.id)
+                    # Did phase-review accept? If so we're done with this
+                    # phase. Otherwise (corrective_required) the next loop
+                    # iteration will run any newly-injected tasks.
+                    latest_plan = await orch.plan_manager.load()
+                    if latest_plan is None:
+                        break
+                    latest_phase = next(
+                        (p for p in latest_plan.phases if p.id == phase.id), None
+                    )
+                    if latest_phase is None:
+                        break
+                    if latest_phase.review_status in ("accepted", "skipped"):
+                        break
+                    # Any new pending tasks? If not, stop looping.
+                    if not any(t.status == "pending" for t in latest_phase.tasks):
+                        break
     finally:
         if worktree_mgr is not None:
             try:
@@ -885,6 +932,184 @@ async def _execute_phase_dag(
                     )
 
 
+def _validate_cross_phase_dag(plan: "Plan") -> None:
+    """v0.21.0 B1: relaxed DAG validation accepting cross-phase deps.
+
+    Mirrors :func:`orchestrator.dag.validate_phase_dag` but operates at
+    plan-level: every ``Task.depends_on`` id must resolve somewhere in
+    the plan (not just within its own phase). Cycle detection runs
+    across the unified graph too — a backward dep from phase 1 to
+    phase 2 would still count as a cycle.
+
+    Raises :class:`orchestrator.dag.DagValidationError` on:
+
+    * an undefined dep (no task with that id anywhere in the plan)
+    * any cycle in the unified DAG
+    """
+    from orchestrator.dag import DagValidationError
+
+    by_id: dict[str, "Task"] = {}
+    for phase in plan.phases:
+        for t in phase.tasks:
+            by_id[t.id] = t
+
+    # Pass 1: undefined references.
+    for tid, t in by_id.items():
+        for dep in t.depends_on:
+            if dep not in by_id:
+                raise DagValidationError(
+                    f"task {tid!r} depends_on undefined task {dep!r} "
+                    "(plan-level)"
+                )
+
+    # Pass 2: cycle detection across the unified graph.
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: dict[str, int] = {tid: WHITE for tid in by_id}
+
+    def dfs(node: str, path: list[str]) -> None:
+        color[node] = GRAY
+        path.append(node)
+        for dep in by_id[node].depends_on:
+            if color[dep] == GRAY:
+                start = path.index(dep)
+                cycle = " -> ".join(path[start:] + [dep])
+                raise DagValidationError(
+                    f"cycle detected (plan-level): {cycle}"
+                )
+            if color[dep] == WHITE:
+                dfs(dep, path)
+        path.pop()
+        color[node] = BLACK
+
+    for tid in by_id:
+        if color[tid] == WHITE:
+            dfs(tid, [])
+
+
+async def _execute_cross_phase_dag(
+    orch: "Orchestrator",
+    worktree_mgr: WorktreeManager | None,
+    parallelism: int,
+) -> list[Task]:
+    """v0.21.0 B1: cross-phase parallel dispatcher.
+
+    Runs a single worker pool over ALL phases of the plan, allowing tasks
+    from phase N+1 to begin executing while phase N's tail is still
+    in-flight, subject to:
+
+    * dependencies in :attr:`Task.depends_on` are all in a terminal state
+      (the existing :meth:`PlanManager.next_pending_tasks` already enforces
+      this and is unchanged), AND
+    * the new task's files don't intersect any in-flight task's files
+      (also enforced by :meth:`next_pending_tasks` via ``exclude_files``).
+
+    Phase-review fires per-phase as each phase observes all-terminal,
+    using :func:`_maybe_run_phase_review` and :func:`_maybe_record_phase_checkpoint`
+    so the diff range honors the captured ``end_checkpoint_commit``
+    rather than live HEAD (preserves correctness when phase N+1 is
+    landing commits during phase N's review).
+
+    Termination: every task across every phase is in a terminal state
+    AND no workers are in-flight. Then any phases without phase-review
+    completion are walked once more so corrective tasks (if any) get
+    a chance to run.
+    """
+    in_flight: dict[str, asyncio.Task[Task]] = {}
+    in_flight_phase_id: dict[str, str] = {}  # task_id → phase_id
+    processed: list[Task] = []
+
+    async def _all_terminal_across_plan() -> bool:
+        plan = await orch.plan_manager.load()
+        if plan is None:
+            return True
+        for phase in plan.phases:
+            for t in phase.tasks:
+                if t.status not in _TERMINAL_TASK_STATUSES:
+                    return False
+        return True
+
+    while True:
+        if not in_flight and await _all_terminal_across_plan():
+            # Fire phase-reviews for every phase that's now terminal.
+            plan = await orch.plan_manager.load()
+            if plan is not None:
+                for phase in plan.phases:
+                    await _maybe_run_phase_review(orch, phase.id)
+            return processed
+
+        # Spawn workers up to parallelism cap. The dispatcher honors
+        # the existing file-overlap and depends-on guards, but does NOT
+        # restrict by phase_id (the cross-phase contract).
+        if len(in_flight) < parallelism:
+            slots = parallelism - len(in_flight)
+            excluded = await orch.plan_manager.in_flight_files()
+            tasks_to_run = await orch.plan_manager.next_pending_tasks(
+                limit=slots, exclude_files=excluded
+            )
+            for t in tasks_to_run:
+                if t.id in in_flight:
+                    continue
+                await orch.plan_manager.mark_in_flight(t.id)
+                in_flight[t.id] = asyncio.create_task(
+                    _execute_one_worker(orch, t, worktree_mgr)
+                )
+                in_flight_phase_id[t.id] = t.phase_id
+
+        if not in_flight:
+            # Nothing dispatchable but not all terminal — likely waiting
+            # on a different worker; brief sleep then re-poll.
+            if await _all_terminal_across_plan():
+                continue
+            await asyncio.sleep(0.05)
+            continue
+
+        # Wait for any worker to finish.
+        done, _pending = await asyncio.wait(
+            list(in_flight.values()), return_when=asyncio.FIRST_COMPLETED
+        )
+        finished_phases: set[str] = set()
+        for d in done:
+            finished_id = next(
+                (tid for tid, h in in_flight.items() if h is d), None
+            )
+            if finished_id is None:
+                continue
+            finished_phase_id = in_flight_phase_id.pop(finished_id, "")
+            del in_flight[finished_id]
+            await orch.plan_manager.clear_in_flight(finished_id)
+            try:
+                completed_task = d.result()
+                processed.append(completed_task)
+            except DelegationPendingSignal:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.cross_phase_worker_unhandled_exception",
+                    task_id=finished_id,
+                    err=str(exc),
+                )
+                if finished_phase_id:
+                    try:
+                        await orch.plan_manager.mark_blocked_descendants(
+                            finished_phase_id, finished_id, str(exc)
+                        )
+                    except Exception as exc2:  # noqa: BLE001
+                        logger.warning(
+                            "execute_phase.cross_phase_cascade_block_failed",
+                            phase_id=finished_phase_id,
+                            task_id=finished_id,
+                            err=str(exc2),
+                        )
+            if finished_phase_id:
+                finished_phases.add(finished_phase_id)
+
+        # After draining, fire phase-review for any phase that just
+        # observed all-terminal. ``_maybe_run_phase_review`` is
+        # idempotent + race-safe (in_flight count check).
+        for phid in finished_phases:
+            await _maybe_run_phase_review(orch, phid)
+
+
 async def _execute_one_worker(
     orch: "Orchestrator",
     task: Task,
@@ -973,6 +1198,53 @@ async def _maybe_record_phase_entry(orch: "Orchestrator", phase_id: str) -> None
         )
 
 
+async def _maybe_record_phase_checkpoint(
+    orch: "Orchestrator", phase_id: str
+) -> None:
+    """v0.21.0 B1: capture ``Phase.end_checkpoint_commit`` once at phase
+    completion.
+
+    Idempotent: phases already carrying an end_checkpoint_commit are
+    skipped. This SHA is the ``tip_commit`` for the phase-review
+    tournament's diff range — captured at the moment ALL tasks in the
+    phase reach a terminal state. Critically, this happens BEFORE the
+    next phase's tasks start landing commits (which is possible under
+    cross-phase parallelism), so the diff window is phase-isolated.
+
+    Reads the latest plan; if every task in the phase is terminal AND
+    end_checkpoint_commit is unset, captures HEAD and persists.
+    """
+    plan = await orch.plan_manager.load()
+    if plan is None:
+        return
+    phase = next((p for p in plan.phases if p.id == phase_id), None)
+    if phase is None or phase.end_checkpoint_commit is not None:
+        return
+    if not _all_phase_tasks_terminal(phase):
+        return
+    sha = _git_rev_parse_head(orch.cwd)
+    if sha is None:
+        logger.info(
+            "execute_phase.end_checkpoint_unavailable", phase_id=phase_id
+        )
+        return
+    try:
+        await orch.plan_manager.update_phase_meta(
+            phase_id, end_checkpoint_commit=sha
+        )
+        logger.info(
+            "execute_phase.end_checkpoint_captured",
+            phase_id=phase_id,
+            sha=sha[:12],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.end_checkpoint_capture_failed",
+            phase_id=phase_id,
+            err=str(exc),
+        )
+
+
 def _all_phase_tasks_terminal(phase: Phase) -> bool:
     """Return ``True`` iff every task in the phase is in a terminal state.
 
@@ -1042,6 +1314,21 @@ async def _maybe_run_phase_review(
     if not _all_phase_tasks_terminal(phase):
         return
 
+    # v0.21.0 B1: capture end_checkpoint_commit at the moment we observe
+    # all tasks terminal — BEFORE any concurrent next-phase tasks land
+    # commits. Idempotent: re-entry with end_checkpoint already set is a
+    # no-op. The captured SHA is read by the phase-review runner as
+    # tip_commit so the diff range is phase-isolated.
+    await _maybe_record_phase_checkpoint(orch, phase_id)
+
+    # Re-load to pick up the captured checkpoint (used downstream).
+    plan = await orch.plan_manager.load()
+    if plan is None:
+        return
+    phase = next((p for p in plan.phases if p.id == phase_id), None)
+    if phase is None:
+        return
+
     await _run_phase_review(orch, phase)
 
 
@@ -1074,7 +1361,13 @@ async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
         )
 
     baseline_commit = phase.baseline_commit or ""
-    tip_commit = _git_rev_parse_head(orch.cwd) or ""
+    # v0.21.0 B1: prefer the captured end-checkpoint SHA (set in
+    # ``_maybe_record_phase_checkpoint``) so the diff range is phase-
+    # isolated even when cross-phase parallelism is active. Falls back
+    # to live HEAD when the checkpoint isn't recorded (e.g. legacy
+    # plans, pre-v0.21.0 phases that never executed under the new
+    # capture path).
+    tip_commit = phase.end_checkpoint_commit or _git_rev_parse_head(orch.cwd) or ""
     spec_md = ""
     spec_path = autodev_root(orch.cwd) / "spec.md"
     if spec_path.exists():
