@@ -24,6 +24,7 @@ from config.schema import AutodevConfig
 from guardrails import GuardrailEnforcer, LoopDetector
 from autologging import get_logger
 from plugins.registry import PluginRegistry
+from runtime.repo_probe import RepoCapacity, probe_repo
 from state.knowledge import KnowledgeStore
 from state.plan_manager import PlanManager
 from state.schemas import Plan, Task
@@ -61,6 +62,13 @@ class Orchestrator:
         self.guardrails = GuardrailEnforcer(cfg.guardrails)
         self.loop_detector = LoopDetector()
         self.plugin_registry: PluginRegistry | None = plugin_registry
+
+        # v0.13.0: lazy-init slot for the repo-size snapshot. The probe is
+        # cheap (~10ms typical, up to ~1s on Unity-class repos) so we run it
+        # on the first plan()/execute() entry and cache the result for the
+        # session. ``None`` means "not yet probed"; populated once any of
+        # the high-level operations is invoked.
+        self._repo_capacity: RepoCapacity | None = None
 
         # Wire AgentExtensionPlugins: merge their specs into the agent registry.
         if plugin_registry is not None:
@@ -144,12 +152,37 @@ class Orchestrator:
     def disable_impl_tournament(self) -> bool:
         return self._disable_impl_tournament
 
+    @property
+    def repo_capacity(self) -> RepoCapacity:
+        """Return the cached repo-size snapshot, probing lazily on first access.
+
+        v0.13.0: orchestrator entry points (``plan``/``execute``/``resume``)
+        and the ``delegate`` site read this property. The probe runs at
+        most once per Orchestrator instance; subsequent reads return the
+        cached :class:`RepoCapacity`.
+        """
+        if self._repo_capacity is None:
+            # Resolve the probe through the orchestrator package's import
+            # surface so tests can monkeypatch ``orchestrator.probe_repo``
+            # to substitute a fake without having to also patch the
+            # underlying ``runtime.repo_probe`` module.
+            import orchestrator as _orch_mod
+
+            probe = getattr(_orch_mod, "probe_repo", probe_repo)
+            self._repo_capacity = probe(self._cwd)
+        return self._repo_capacity
+
     # --- High-level operations ---
 
     async def plan(self, intent: str) -> Plan:
         """Run the plan phase to completion. Returns the approved plan."""
         # Local import breaks a module cycle.
         from orchestrator.plan_phase import run_plan_phase
+
+        # v0.13.0: trigger the lazy probe at the entry point so the
+        # snapshot is available to downstream callers (delegate's
+        # ``resolve_task_max_turns`` reads it).
+        _ = self.repo_capacity
 
         self._log.info("orchestrator.plan.start", intent_bytes=len(intent))
         plan = await run_plan_phase(self, intent)
@@ -163,6 +196,10 @@ class Orchestrator:
     async def execute(self, task_id: str | None = None) -> list[Task]:
         """Run execute-phase loop. Returns the list of tasks processed."""
         from orchestrator.execute_phase import run_execute_phase
+
+        # v0.13.0: probe lazily on first entry; downstream delegate site
+        # reads ``self._repo_capacity`` to resolve per-task max_turns.
+        _ = self.repo_capacity
 
         self._log.info("orchestrator.execute.start", task_id=task_id or "<all-pending>")
         tasks = await run_execute_phase(self, task_id)
@@ -193,6 +230,9 @@ class Orchestrator:
             clear_suspend_state,
             load_suspend_state,
         )
+
+        # v0.13.0: probe lazily on resume entry (mirrors plan/execute).
+        _ = self.repo_capacity
 
         if isinstance(self._adapter, InlineAdapter):
             state = load_suspend_state(self._cwd)
