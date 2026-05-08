@@ -471,6 +471,8 @@ class PlanManager:
             return StuckState(
                 discard_count=existing.discard_count,
                 pivot_count=existing.pivot_count,
+                search_count=existing.search_count,
+                last_search_iter=existing.last_search_iter,
                 last_event=existing.last_event,
             )
 
@@ -489,12 +491,16 @@ class PlanManager:
             updated = StuckState(
                 discard_count=existing.discard_count + 1,
                 pivot_count=existing.pivot_count,
+                search_count=existing.search_count,
+                last_search_iter=existing.last_search_iter,
                 last_event="discard",
             )
             self._stuck_state[task_id] = updated
             return StuckState(
                 discard_count=updated.discard_count,
                 pivot_count=updated.pivot_count,
+                search_count=updated.search_count,
+                last_search_iter=updated.last_search_iter,
                 last_event=updated.last_event,
             )
 
@@ -512,12 +518,47 @@ class PlanManager:
             updated = StuckState(
                 discard_count=existing.discard_count,
                 pivot_count=existing.pivot_count + 1,
+                search_count=existing.search_count,
+                last_search_iter=existing.last_search_iter,
                 last_event="pivot",
             )
             self._stuck_state[task_id] = updated
             return StuckState(
                 discard_count=updated.discard_count,
                 pivot_count=updated.pivot_count,
+                search_count=updated.search_count,
+                last_search_iter=updated.last_search_iter,
+                last_event=updated.last_event,
+            )
+
+    async def increment_search(self, task_id: str) -> "StuckState":
+        """v0.17.0 S2: bump ``search_count`` for ``task_id``.
+
+        Mirrors :meth:`increment_discard` / :meth:`increment_pivot`.
+        Used by the escalation ladder when a WEB_SEARCH rung fires; the
+        counter caps autonomous searches at
+        :data:`orchestrator.escalation_ladder._SEARCH_COOLDOWN_CAP`
+        (3 per task).
+        """
+        from orchestrator.escalation_ladder import StuckState
+
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            existing = self._stuck_state.get(task_id)
+            if existing is None:
+                existing = StuckState()
+            updated = StuckState(
+                discard_count=existing.discard_count,
+                pivot_count=existing.pivot_count,
+                search_count=existing.search_count + 1,
+                last_search_iter=existing.last_search_iter + 1,
+                last_event="web_search",
+            )
+            self._stuck_state[task_id] = updated
+            return StuckState(
+                discard_count=updated.discard_count,
+                pivot_count=updated.pivot_count,
+                search_count=updated.search_count,
+                last_search_iter=updated.last_search_iter,
                 last_event=updated.last_event,
             )
 
@@ -821,6 +862,10 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
 
     if op == "hypothesis_repeat_detected":
         # v0.17.0 S4: advisory repeat-hypothesis tag (forensics only).
+        return plan
+
+    if op == "web_search_invoked":
+        # v0.17.0 S2: audit-only forensics — does not mutate plan state.
         return plan
 
     if op == "mark_blocked_descendants":

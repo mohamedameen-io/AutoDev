@@ -267,8 +267,14 @@ async def test_3_pivots_invokes_stuck_critic_in_soft_blocker_mode(
     out = await ep._try_retry_or_escalate(
         orch, task, retry_limit=10, reason="coder failure"
     )
-    # SOFT_BLOCKER fires escalated + blocked.
-    assert captured == ["PIVOT"] or captured == ["SOFT_BLOCKER"]
+    # v0.17.0: at pivot_count=2 + search_count=0, the ladder returns
+    # ``WEB_SEARCH``. The legacy v0.15.0 expectation was PIVOT/SOFT_BLOCKER.
+    # The executor's `_try_retry_or_escalate` doesn't yet handle WEB_SEARCH
+    # explicitly (deferred to v0.18.0); the captured ladder step may be
+    # WEB_SEARCH (new) or PIVOT/SOFT_BLOCKER (when the ladder progresses).
+    assert captured in (
+        ["WEB_SEARCH"], ["PIVOT"], ["SOFT_BLOCKER"]
+    )
     # If the resolution is soft-blocker, the task must be blocked.
     if out.escalated:
         assert out.status == "blocked"
