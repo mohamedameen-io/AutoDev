@@ -40,6 +40,7 @@ from qa import (
     detect_language,
     run_build_check,
     run_lint,
+    run_hallucination_guard,
     run_secretscan,
     run_syntax_check,
     run_tests,
@@ -2147,6 +2148,12 @@ async def _run_qa_gates(
     language = detect_language(cwd)
 
     secretscan_paths = _files_changed_for_secretscan(developer_result)
+    # v0.16.0: hallucination-guard reuses the diff-scope path list so the
+    # AST walk only visits files the executor just touched. ``cfg.hallucination_guard``
+    # is a top-level toggle (default True) — see :class:`AutodevConfig`.
+    hallucination_guard_enabled = bool(
+        getattr(orch.cfg, "hallucination_guard", True)
+    )
 
     gates: list[tuple[bool, Callable[[], Awaitable[GateResult]]]] = [
         (cfg.syntax_check, lambda: run_syntax_check(cwd, language)),
@@ -2154,6 +2161,10 @@ async def _run_qa_gates(
         (cfg.build_check, lambda: run_build_check(cwd, language)),
         (cfg.test_runner, lambda: run_tests(cwd)),
         (cfg.secretscan, lambda: run_secretscan(cwd, paths=secretscan_paths)),
+        (
+            hallucination_guard_enabled,
+            lambda: run_hallucination_guard(cwd, paths=secretscan_paths),
+        ),
     ]
 
     for enabled, gate_fn in gates:
