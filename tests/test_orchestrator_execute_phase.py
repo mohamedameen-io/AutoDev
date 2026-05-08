@@ -454,3 +454,131 @@ async def test_resume_picks_up_pending_tasks(tmp_path: Path) -> None:
     final = await pm.load()
     assert final is not None
     assert all(t.status == "complete" for p in final.phases for t in p.tasks)
+
+
+# ---------------------------------------------------------------------------
+# v0.8.0 — per-task complexity → AgentInvocation max_turns + timeout_s
+# ---------------------------------------------------------------------------
+
+
+def _mk_plan_with_complexity(complexity: str | None) -> Plan:
+    """Plan with a single task carrying the given complexity bucket."""
+    return Plan(
+        plan_id="p-complexity",
+        spec_hash="d",
+        phases=[
+            Phase(
+                id="1",
+                title="Work",
+                tasks=[
+                    Task(
+                        id="1.1",
+                        phase_id="1",
+                        title="t",
+                        description="d",
+                        files=["math.py"],
+                        complexity=complexity,  # type: ignore[arg-type]
+                        acceptance=[
+                            AcceptanceCriterion(id="ac-1", description="passes"),
+                        ],
+                    ),
+                ],
+            )
+        ],
+        created_at=_iso(),
+        updated_at=_iso(),
+    )
+
+
+async def _orch_with_complexity_plan(
+    cwd: Path, adapter: StubAdapter, complexity: str | None
+) -> Orchestrator:
+    cfg = default_config()
+    cfg.tournaments.plan.enabled = False
+    cfg.tournaments.impl.enabled = False
+    registry = build_registry(cfg)
+    orch = Orchestrator(
+        cwd=cwd,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id="sess-complexity",
+    )
+    await orch.plan_manager.init_plan(_mk_plan_with_complexity(complexity))
+    return orch
+
+
+def _developer_invocation(adapter: StubAdapter):
+    """Return the first AgentInvocation the stub recorded for the developer."""
+    devs = [c for c in adapter.calls if c.role == "developer"]
+    assert devs, "expected at least one developer invocation"
+    return devs[0]
+
+
+@pytest.mark.asyncio
+async def test_developer_max_turns_overridden_by_task_complexity_complex(
+    tmp_path: Path,
+) -> None:
+    """``Task(complexity="complex")`` causes the developer's invocation to
+    run with ``max_turns=40`` and ``timeout_s=1800`` — the per-task scaling
+    that v0.8.0 introduces. Anchors the load-bearing edit at
+    ``execute_phase.delegate``.
+    """
+    adapter = StubAdapter(
+        {
+            "developer": _coder_ok_with_diff(),
+            "reviewer": _reviewer("APPROVED"),
+            "test_engineer": _test_engineer_ok(),
+        }
+    )
+    orch = await _orch_with_complexity_plan(tmp_path, adapter, "complex")
+    await orch.execute()
+    inv = _developer_invocation(adapter)
+    assert inv.max_turns == 40
+    assert inv.timeout_s == 1800
+
+
+@pytest.mark.asyncio
+async def test_developer_timeout_overridden_by_task_complexity_simple(
+    tmp_path: Path,
+) -> None:
+    """``Task(complexity="simple")`` → developer ``timeout_s == 600`` (the
+    cheapest tier; no need to burn a 30-min wall clock on a one-file diff).
+    """
+    adapter = StubAdapter(
+        {
+            "developer": _coder_ok_with_diff(),
+            "reviewer": _reviewer("APPROVED"),
+            "test_engineer": _test_engineer_ok(),
+        }
+    )
+    orch = await _orch_with_complexity_plan(tmp_path, adapter, "simple")
+    await orch.execute()
+    inv = _developer_invocation(adapter)
+    assert inv.max_turns == 10
+    assert inv.timeout_s == 600
+
+
+@pytest.mark.asyncio
+async def test_developer_max_turns_falls_back_to_spec_when_complexity_none(
+    tmp_path: Path,
+) -> None:
+    """Regression — v0.7.0 behavior preserved when ``Task.complexity is None``.
+    The developer's invocation uses ``spec.max_turns`` (10 in defaults) and
+    the orchestrator-level fallback timeout (``_DEFAULT_DEVELOPER_TIMEOUT_S
+    = 900``).
+    """
+    adapter = StubAdapter(
+        {
+            "developer": _coder_ok_with_diff(),
+            "reviewer": _reviewer("APPROVED"),
+            "test_engineer": _test_engineer_ok(),
+        }
+    )
+    orch = await _orch_with_complexity_plan(tmp_path, adapter, None)
+    await orch.execute()
+    inv = _developer_invocation(adapter)
+    # spec.max_turns for the developer is 10 in default_config().
+    assert inv.max_turns == 10
+    # Orchestrator fallback when no per-task override: 900s.
+    assert inv.timeout_s == 900

@@ -47,6 +47,10 @@ from state.schemas import (
     TestEvidence,
 )
 from tournament.effort import resolve_role_effort
+from tournament.task_overrides import (
+    resolve_task_max_turns,
+    resolve_task_timeout_s,
+)
 
 
 if TYPE_CHECKING:
@@ -54,6 +58,15 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+
+# Default subprocess timeout for the developer adapter when ``Task.complexity``
+# is ``None`` (legacy / pre-v0.8.0 plans). 900s = 15 minutes — picked to give
+# untagged tasks comfortable runway without slipping into the 1800s reserved
+# for the architect-tagged ``complex`` bucket. Reused by the per-task
+# resolver's ``spec_default`` argument for symmetry; the resolver itself
+# returns ``None`` and ``delegate`` falls back to this constant.
+_DEFAULT_DEVELOPER_TIMEOUT_S = 900
 
 
 class TaskEscalatedError(AutodevError):
@@ -128,6 +141,7 @@ async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
                     developer_env,
                     retry_count=task.retry_count,
                     last_issues=last_issues,
+                    task=task,
                 )
             except GuardrailExceededError as exc:
                 logger.warning(
@@ -392,6 +406,7 @@ async def delegate(
     extra_context: str = "",
     retry_count: int = 0,
     last_issues: list[str] | None = None,
+    task: Task | None = None,
 ) -> AgentResult:
     """Build an :class:`AgentInvocation` from the envelope and call the adapter.
 
@@ -405,6 +420,13 @@ async def delegate(
     - Otherwise inject ``task_id`` into ``inv.metadata`` so the adapter can
       name the delegation file, then re-raise :class:`DelegationPendingSignal`
       after writing suspend state.
+
+    v0.8.0: when ``task`` is provided, the per-task complexity resolvers
+    override ``max_turns`` and ``timeout_s`` on the constructed invocation.
+    The developer call passes ``task`` so its budget scales with the
+    architect-tagged complexity bucket; reviewer/test_engineer/critic_t
+    calls leave it unset and inherit the spec defaults (which are tuned
+    for shorter, single-purpose passes).
     """
     spec = orch.registry.get(role)
     if spec is None:
@@ -437,14 +459,33 @@ async def delegate(
         role, agent_cfg, plan_complexity, orch.cfg.user_complexity
     )
 
+    # v0.8.0: per-task complexity overrides for ``max_turns`` and
+    # ``timeout_s``. Resolvers return ``None`` when no override applies (or
+    # when ``task`` is unset for non-developer roles), and the spec / module
+    # constant defaults take over.
+    spec_max_turns = spec.max_turns or 1
+    if task is not None:
+        max_turns = (
+            resolve_task_max_turns(task, spec.max_turns)
+            or spec.max_turns
+            or 1
+        )
+        timeout_s = resolve_task_timeout_s(task, _DEFAULT_DEVELOPER_TIMEOUT_S)
+        if timeout_s is None:
+            timeout_s = _DEFAULT_DEVELOPER_TIMEOUT_S
+    else:
+        max_turns = spec_max_turns
+        timeout_s = None  # adapter applies its own default (600s in claude_code)
+
     inv = AgentInvocation(
         role=role,
         prompt="\n".join(parts),
         cwd=orch.cwd,
         model=spec.model,
         allowed_tools=list(spec.tools) if spec.tools else None,
-        max_turns=spec.max_turns or 1,
+        max_turns=max_turns,
         effort=effort,
+        timeout_s=timeout_s,
     )
 
     # Inline adapter: check for existing response (resume shortcut) or inject

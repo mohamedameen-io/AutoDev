@@ -184,13 +184,19 @@ class InlineAdapter(PlatformAdapter):
         # Build allowed tools list from registry spec if available.
         allowed = inv.allowed_tools or []
 
+        # ``inv.timeout_s`` became ``int | None`` in v0.8.0; apply the same
+        # 600s default as the Claude Code adapter when the orchestrator did
+        # not supply a per-task override (preserves pre-v0.8.0 behavior).
+        effective_timeout_s: int = (
+            inv.timeout_s if inv.timeout_s is not None else 600
+        )
         content = _render_delegation_file(
             inv=inv,
             task_id=task_id,
             role=inv.role,
             response_path=resp_path_rel.as_posix(),
             allowed_tools=allowed,
-            timeout_s=inv.timeout_s,
+            timeout_s=effective_timeout_s,
         )
         del_path.write_text(content, encoding="utf-8")
         return del_path
