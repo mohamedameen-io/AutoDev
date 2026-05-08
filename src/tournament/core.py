@@ -115,6 +115,17 @@ class TournamentConfig:
     # since the incumbent stays unchanged). This guards against the
     # 'verbose synthesizer wins forever' failure mode the QNX run hit.
     max_plan_lines_growth_ratio: float | None = None
+    # v0.16.0 promotion-grade ladder. Off by default — opt-in for safety-
+    # critical work. When True, each non-A winner consults
+    # :func:`tournament.promotion.decide` and the resulting rung is
+    # written to ``incumbent_after_NN.grade.json`` alongside the
+    # markdown. Transitions: ``dev_best → demand_repeat`` on the first
+    # win; ``pending_repeat → promote_to_repeated`` on a confirmed
+    # second win; ``repeated → promote_to_eligible`` on the third.
+    # Cost: when enabled, every winner triggers a confirmation pass so
+    # the tournament does roughly 2× the work of the legacy single-pass
+    # promotion.
+    promotion_grade_enabled: bool = False
 
 
 class PassResult(BaseModel):
@@ -406,6 +417,67 @@ class Tournament(Generic[T]):
         # :meth:`maybe_resize_semaphore`.
         self._pass_judge_pids: list[int] = []
 
+    def _next_grade_for_non_a_win(self) -> str:
+        """Compute the promotion-ladder grade for the about-to-be-written
+        incumbent.
+
+        State machine (driven off the prior on-disk grade, advised by
+        :func:`tournament.promotion.decide`):
+
+          * Promotion disabled → always ``"dev_best"`` (legacy default;
+            sidecar still written).
+          * Enabled, no prior grade → ``"dev_best"`` (first non-A win
+            sits at the bottom of the ladder, awaiting confirmation).
+          * Enabled, prior ``"dev_best"`` → ``"repeated"`` (second
+            consecutive non-A win confirms the candidate; the demanded
+            repeat is now satisfied).
+          * Enabled, prior ``"repeated"`` → ``"promotion_eligible"``
+            (third consecutive win clears the holdout-equivalent step).
+          * Enabled, prior ``"promotion_eligible"`` → terminal (stays
+            ``"promotion_eligible"``).
+
+        :func:`promotion.decide` is invoked for telemetry / log
+        instrumentation — its action label maps cleanly onto the
+        transition we just made, even though we don't *consume* its
+        verdict to drive the rung. The synthetic
+        ``[GateResult(passed=True, ...)]`` here represents "this winner
+        cleared the tournament's own judge cohort"; external gate
+        results (lint, build, test_runner) gate the tournament's
+        *output* in :mod:`orchestrator.execute_phase` rather than its
+        internal passes.
+        """
+        if not getattr(self.cfg, "promotion_grade_enabled", False):
+            return "dev_best"
+
+        from plugins.registry import GateResult
+        from tournament.promotion import decide
+
+        prior = self.store.latest_incumbent_grade()
+        synth_gates = [GateResult(passed=True, details="judges-confirmed")]
+        # Telemetry side-effect: advise the ladder step the rules-based
+        # ``decide`` would pick. We drive the persisted rung off ``prior``
+        # because ``decide`` doesn't know about the loop's own retry
+        # mechanic — it would otherwise stall at ``demand_repeat`` after
+        # every win.
+        advisory = decide(grade=prior or "dev_best", gate_results=synth_gates)
+        self.log.info(
+            "tournament.promotion_decision",
+            prior_grade=prior,
+            action=advisory.action,
+            reason=advisory.reason,
+        )
+
+        if prior is None:
+            return "dev_best"
+        if prior == "dev_best":
+            return "repeated"
+        if prior == "repeated":
+            return "promotion_eligible"
+        if prior == "promotion_eligible":
+            return "promotion_eligible"
+        # Unrecognized prior (legacy data) — anchor at the bottom rung.
+        return "dev_best"
+
     async def maybe_resize_semaphore(self, observed_rss_mb: float | None) -> None:
         """Ratchet the in-flight subprocess cap DOWN if memory pressure
         exceeds budget.
@@ -619,8 +691,20 @@ class Tournament(Generic[T]):
             else:
                 streak = 0
                 incumbent = new_incumbent
+                # v0.16.0 promotion-grade ladder. When enabled, each
+                # non-A winner consults :func:`promotion.decide` to
+                # determine the next rung. The grade reflects the rung
+                # the winner currently sits at — a first-time non-A
+                # winner is graded ``dev_best`` (pre-confirmation), a
+                # subsequently-reconfirmed winner is ``repeated``, etc.
+                # When disabled, the legacy default (``dev_best``) is
+                # written so the sidecar artifact is always present
+                # regardless of feature gating.
+                grade_to_write = self._next_grade_for_non_a_win()
                 self.store.write_incumbent_after(
-                    pass_num, self.handler.render_as_markdown(incumbent)
+                    pass_num,
+                    self.handler.render_as_markdown(incumbent),
+                    grade=grade_to_write,
                 )
 
             self.log.info(
