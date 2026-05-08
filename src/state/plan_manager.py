@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from errors import PlanConcurrentModificationError
 from autologging import get_logger
@@ -23,6 +24,10 @@ from state.ledger import (
 from state.lockfile import plan_lock
 from state.paths import plan_path
 from state.schemas import Plan, Task, TaskStatus
+
+
+if TYPE_CHECKING:
+    from orchestrator.escalation_ladder import StuckState
 
 logger = get_logger(__name__)
 
@@ -60,6 +65,11 @@ class PlanManager:
         # the underlying tasks in their pre-flight ``pending`` /
         # ``in_progress`` status; the resume path picks them up cleanly.
         self._in_flight: set[str] = set()
+        # v0.15.0: in-memory per-task stuck state for the escalation
+        # ladder. Mirrors ``_in_flight``: NOT persisted to plan.json or
+        # the ledger; a crash mid-flight resets to defaults. The
+        # cross-run lessons memory holds the durable signal.
+        self._stuck_state: dict[str, "StuckState"] = {}
 
     @property
     def cwd(self) -> Path:
@@ -442,6 +452,83 @@ class PlanManager:
                 blocked_count=len(blocked_ids),
             )
             return blocked_ids
+
+    # --- v0.15.0: stuck-state tracking (in-memory per task) -----------
+
+    async def get_stuck_state(self, task_id: str) -> "StuckState":
+        """Return the current :class:`StuckState` for ``task_id``.
+
+        Returns a fresh zero-valued state when the task is unknown
+        (mirrors the in-memory-only design — no ledger op fires).
+        """
+        from orchestrator.escalation_ladder import StuckState
+
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            existing = self._stuck_state.get(task_id)
+            if existing is None:
+                return StuckState()
+            # Return a copy so callers can't accidentally mutate our state.
+            return StuckState(
+                discard_count=existing.discard_count,
+                pivot_count=existing.pivot_count,
+                last_event=existing.last_event,
+            )
+
+    async def increment_discard(self, task_id: str) -> "StuckState":
+        """Bump ``discard_count`` for ``task_id`` and return the updated state.
+
+        Held under :func:`plan_lock` so concurrent workers cannot race on
+        the same task. State is in-memory only — no ledger op is appended.
+        """
+        from orchestrator.escalation_ladder import StuckState
+
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            existing = self._stuck_state.get(task_id)
+            if existing is None:
+                existing = StuckState()
+            updated = StuckState(
+                discard_count=existing.discard_count + 1,
+                pivot_count=existing.pivot_count,
+                last_event="discard",
+            )
+            self._stuck_state[task_id] = updated
+            return StuckState(
+                discard_count=updated.discard_count,
+                pivot_count=updated.pivot_count,
+                last_event=updated.last_event,
+            )
+
+    async def increment_pivot(self, task_id: str) -> "StuckState":
+        """Bump ``pivot_count`` for ``task_id`` and return the updated state.
+
+        Held under :func:`plan_lock`. State is in-memory only.
+        """
+        from orchestrator.escalation_ladder import StuckState
+
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            existing = self._stuck_state.get(task_id)
+            if existing is None:
+                existing = StuckState()
+            updated = StuckState(
+                discard_count=existing.discard_count,
+                pivot_count=existing.pivot_count + 1,
+                last_event="pivot",
+            )
+            self._stuck_state[task_id] = updated
+            return StuckState(
+                discard_count=updated.discard_count,
+                pivot_count=updated.pivot_count,
+                last_event=updated.last_event,
+            )
+
+    async def reset_stuck_state(self, task_id: str) -> None:
+        """Zero the stuck-state counters for ``task_id`` (idempotent on unknown id).
+
+        Called on successful task completion so future episodes start
+        clean. Held under :func:`plan_lock`.
+        """
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            self._stuck_state.pop(task_id, None)
 
     async def mark_task_retry(self, task_id: str) -> int:
         """Increment a task's ``retry_count``. Returns the new count.
