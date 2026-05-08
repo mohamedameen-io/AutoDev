@@ -227,6 +227,147 @@ def _indent_block(text: str, prefix: str = "  ") -> str:
     return "\n".join(prefix + line for line in text.splitlines())
 
 
+# Maximum number of "rewrite" rounds before forcing abandon. Caps the
+# critic-developer ping-pong so a misbehaving critic cannot loop
+# indefinitely.
+_CONFLICT_REWRITE_RETRY_CAP = 2
+
+
+async def _apply_with_conflict_escalation(
+    orch: "Orchestrator",
+    task: Task,
+    worktree: Path,
+    worktree_mgr: WorktreeManager,
+) -> bool:
+    """Apply the worktree diff to main with critic-escalation on conflict.
+
+    Returns ``True`` if the diff was applied (cleanly OR via 3-way
+    merge or after a rewrite round), ``False`` if the task was
+    abandoned. On ``False`` the caller transitions the task to
+    ``blocked`` (caller-side update_task_status, this helper records
+    the blocked reason via the worker contract).
+
+    Branches on the critic's RESOLUTION directive:
+
+    * ``rebase-and-retry`` → re-attempt apply with ``three_way=True``.
+      If the 3-way also fails, escalate again (capped by retry cap).
+    * ``abandon-task`` → block + cascade-block descendants, return False.
+    * ``rewrite`` → re-invoke the developer with the merge guidance
+      injected as ``extra_context`` and retry the apply.
+
+    The cap of two rewrite rounds prevents critic-developer ping-pong
+    on pathological cases.
+    """
+    rewrite_rounds = 0
+    while True:
+        try:
+            await worktree_mgr.apply_patch_to_main(worktree, base_ref="HEAD")
+            return True
+        except WorktreeError as exc:
+            logger.warning(
+                "execute_phase.apply_patch_conflict",
+                task_id=task.id,
+                err=str(exc),
+            )
+
+            try:
+                conflict_diff = await worktree_mgr.get_diff_vs_base(worktree)
+            except WorktreeError:
+                conflict_diff = ""
+            resolution = await _escalate_conflict_to_critic(
+                orch,
+                task,
+                worktree,
+                conflict_diff=conflict_diff,
+                already_applied_diff="",
+                conflict_files=list(task.files),
+            )
+
+            if resolution.action == "rebase-and-retry":
+                # Try 3-way apply. If THIS also fails, fall through to
+                # abandon (no infinite loop on persistent conflicts).
+                try:
+                    await worktree_mgr.apply_patch_to_main(
+                        worktree, base_ref="HEAD", three_way=True
+                    )
+                    logger.info(
+                        "execute_phase.conflict_resolved_3way",
+                        task_id=task.id,
+                    )
+                    return True
+                except WorktreeError as exc2:
+                    logger.warning(
+                        "execute_phase.conflict_3way_failed",
+                        task_id=task.id,
+                        err=str(exc2),
+                    )
+                    await orch.plan_manager.update_task_status(
+                        task.id,
+                        "blocked",
+                        meta={
+                            "blocked_reason": f"conflict_escalation:3way_failed: {exc2}"
+                        },
+                    )
+                    return False
+
+            if resolution.action == "abandon-task":
+                await orch.plan_manager.update_task_status(
+                    task.id,
+                    "blocked",
+                    meta={
+                        "blocked_reason": "conflict_escalation:abandon"
+                    },
+                )
+                return False
+
+            # rewrite: re-invoke developer with guidance, capped retries.
+            if rewrite_rounds >= _CONFLICT_REWRITE_RETRY_CAP:
+                logger.warning(
+                    "execute_phase.conflict_rewrite_cap_exceeded",
+                    task_id=task.id,
+                    cap=_CONFLICT_REWRITE_RETRY_CAP,
+                )
+                await orch.plan_manager.update_task_status(
+                    task.id,
+                    "blocked",
+                    meta={
+                        "blocked_reason": "conflict_escalation:rewrite_cap_exceeded"
+                    },
+                )
+                return False
+
+            rewrite_rounds += 1
+            developer_env = _developer_envelope(
+                task, extra_issues=[resolution.rewrite_guidance]
+            )
+            try:
+                await delegate(
+                    orch,
+                    "developer",
+                    developer_env,
+                    extra_context=resolution.rewrite_guidance,
+                    retry_count=task.retry_count,
+                    last_issues=[resolution.rewrite_guidance],
+                    task=task,
+                    cwd_override=worktree,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.conflict_rewrite_developer_failed",
+                    task_id=task.id,
+                    err=str(exc),
+                )
+                await orch.plan_manager.update_task_status(
+                    task.id,
+                    "blocked",
+                    meta={
+                        "blocked_reason": f"conflict_escalation:rewrite_developer_failed: {exc}"
+                    },
+                )
+                return False
+            # Loop and retry apply with the developer's new diff.
+
+
 async def run_execute_phase(
     orch: "Orchestrator", task_id: str | None = None
 ) -> list[Task]:
@@ -1087,25 +1228,16 @@ async def _execute_one(
             # diff to the main repo BEFORE marking complete. This is
             # the convergence step that makes parallel execution safe:
             # only after a successful apply do dependent tasks see the
-            # change. Apply failures route into the conflict-escalation
-            # path (commit 14 wires this in).
+            # change. Apply failures route into critic-escalation:
+            # critic_sounding_board is invoked in CONFLICT ESCALATION
+            # MODE and its RESOLUTION directive determines the next
+            # step (rebase-and-retry / abandon-task / rewrite).
             if worktree_mgr is not None and worktree is not None:
-                try:
-                    await worktree_mgr.apply_patch_to_main(worktree, base_ref="HEAD")
-                except WorktreeError as exc:
-                    logger.warning(
-                        "execute_phase.apply_patch_failed",
-                        task_id=task.id,
-                        err=str(exc),
-                    )
-                    task = await orch.plan_manager.update_task_status(
-                        task.id,
-                        "blocked",
-                        meta={
-                            "blocked_reason": f"apply_patch_failed: {exc}"
-                        },
-                    )
-                    return task
+                applied = await _apply_with_conflict_escalation(
+                    orch, task, worktree, worktree_mgr
+                )
+                if not applied:
+                    return await orch.plan_manager.get_task(task.id) or task
 
             # Step 8: complete.
             task = await orch.plan_manager.update_task_status(

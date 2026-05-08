@@ -270,3 +270,198 @@ def test_conflict_resolution_default_action_is_abandon() -> None:
     out = ConflictResolution()
     assert out.action == "abandon-task"
     assert out.rewrite_guidance == ""
+
+
+# ---------------------------------------------------------------------------
+# _apply_with_conflict_escalation — wired into apply_patch_to_main failure
+# ---------------------------------------------------------------------------
+
+
+class FakeWorktreeMgr:
+    """Stub WorktreeManager that simulates apply behavior for tests."""
+
+    def __init__(
+        self,
+        apply_fail_first: bool = True,
+        three_way_succeeds: bool = True,
+        rewrite_succeeds_round: int = 1,
+    ):
+        self._apply_fail_first = apply_fail_first
+        self._three_way_succeeds = three_way_succeeds
+        self._rewrite_succeeds_round = rewrite_succeeds_round
+        self.apply_calls: list[tuple[bool, int]] = []  # (three_way, attempt_idx)
+        self.attempt = 0
+
+    async def apply_patch_to_main(
+        self, worktree, base_ref: str = "HEAD", three_way: bool = False
+    ) -> None:
+        from orchestrator.worktree import WorktreeError
+
+        self.attempt += 1
+        self.apply_calls.append((three_way, self.attempt))
+        if three_way:
+            if self._three_way_succeeds:
+                return
+            raise WorktreeError("3way apply also failed")
+        # First attempt: optionally fail.
+        if self.attempt == 1:
+            if self._apply_fail_first:
+                raise WorktreeError("first apply failed (conflict)")
+            return
+        # Subsequent attempts (rewrite round retries): succeed on the
+        # configured round count. ``rewrite_succeeds_round`` is the
+        # number of rewrite rounds before success (1 = succeed after
+        # 1 rewrite, i.e. attempt 2).
+        if self.attempt >= self._rewrite_succeeds_round + 1:
+            return
+        raise WorktreeError(f"apply attempt {self.attempt} still conflicts")
+
+    async def get_diff_vs_base(self, worktree, base_ref: str = "HEAD") -> str:
+        return "diff --git a/foo b/foo\n+conflict\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_with_conflict_escalation_rebase_and_retry(
+    tmp_path: Path,
+) -> None:
+    """rebase-and-retry directive triggers a three_way=True apply."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan([Task(id="1.1", phase_id="1", title="t", description="d")])
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch._captured["next_response"] = "RESOLUTION: rebase-and-retry\n"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    fake_wm = FakeWorktreeMgr(apply_fail_first=True, three_way_succeeds=True)
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is True
+    # First call was non-3way (conflict); second was 3way.
+    assert fake_wm.apply_calls[0] == (False, 1)
+    assert fake_wm.apply_calls[1] == (True, 2)
+
+
+@pytest.mark.asyncio
+async def test_apply_with_conflict_escalation_abandon(tmp_path: Path) -> None:
+    """abandon-task directive blocks the task."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan([Task(id="1.1", phase_id="1", title="t", description="d")])
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch._captured["next_response"] = "RESOLUTION: abandon-task\n"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    fake_wm = FakeWorktreeMgr(apply_fail_first=True)
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is False
+    t = await pm.get_task("1.1")
+    assert t is not None and t.status == "blocked"
+    assert t.blocked_reason and "conflict_escalation:abandon" in t.blocked_reason
+
+
+@pytest.mark.asyncio
+async def test_apply_with_conflict_escalation_rewrite_succeeds(
+    tmp_path: Path,
+) -> None:
+    """rewrite directive re-invokes developer; subsequent apply succeeds."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan([Task(id="1.1", phase_id="1", title="t", description="d")])
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch._captured["next_response"] = (
+        "Use lazy import.\n\nRESOLUTION: rewrite\n"
+    )
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    fake_wm = FakeWorktreeMgr(
+        apply_fail_first=True, rewrite_succeeds_round=1
+    )
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is True
+    # Three apply attempts: initial conflict, rewrite-loop retry succeeds.
+    assert len(fake_wm.apply_calls) >= 2
+
+
+@pytest.mark.asyncio
+async def test_apply_with_conflict_escalation_rewrite_cap_exceeded(
+    tmp_path: Path,
+) -> None:
+    """If rewrite never succeeds, abandon after the cap."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan([Task(id="1.1", phase_id="1", title="t", description="d")])
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch._captured["next_response"] = "Try again.\n\nRESOLUTION: rewrite\n"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    # Rewrite succeeds on round 99 (never within cap).
+    fake_wm = FakeWorktreeMgr(
+        apply_fail_first=True, rewrite_succeeds_round=99
+    )
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is False
+    t = await pm.get_task("1.1")
+    assert t is not None and t.status == "blocked"
+    assert t.blocked_reason and "rewrite_cap_exceeded" in t.blocked_reason
+
+
+@pytest.mark.asyncio
+async def test_apply_with_conflict_escalation_3way_also_fails(
+    tmp_path: Path,
+) -> None:
+    """If the 3-way apply also fails, the task is blocked."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan([Task(id="1.1", phase_id="1", title="t", description="d")])
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch._captured["next_response"] = "RESOLUTION: rebase-and-retry\n"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    fake_wm = FakeWorktreeMgr(
+        apply_fail_first=True, three_way_succeeds=False
+    )
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is False
+    t = await pm.get_task("1.1")
+    assert t is not None and t.status == "blocked"
+    assert t.blocked_reason and "3way_failed" in t.blocked_reason
+
+
+@pytest.mark.asyncio
+async def test_apply_with_conflict_escalation_clean_apply_no_critic(
+    tmp_path: Path,
+) -> None:
+    """When the initial apply succeeds, the critic is NOT invoked."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan([Task(id="1.1", phase_id="1", title="t", description="d")])
+    )
+    orch = _make_orch(tmp_path, pm)
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    fake_wm = FakeWorktreeMgr(apply_fail_first=False)
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is True
+    assert orch._captured["prompts"] == []  # no critic call
