@@ -12,8 +12,6 @@ can call into them without coupling to the orchestrator.
 
 from __future__ import annotations
 
-import pytest
-
 
 def test_extract_findings_none() -> None:
     from tournament.core import extract_explorer_findings
