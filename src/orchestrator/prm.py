@@ -43,9 +43,11 @@ Usage:
 
 from __future__ import annotations
 
+import json as _json
+import re as _re
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Literal
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Deque, Literal, Protocol
 
 
 # Severity ordering for course-correction priority. Patterns with higher
@@ -368,11 +370,6 @@ def detect_context_thrash(events: list[TrajectoryEvent]) -> Pattern | None:
 # ---------------------------------------------------------------------------
 # v0.20.0 A1: LLM-based PRM classifier (augments rule-based detectors)
 # ---------------------------------------------------------------------------
-
-import json as _json
-import re as _re
-from typing import Awaitable, Callable, Protocol
-
 
 # A pure-text completion function; pluggable so tests can stub deterministically
 # without depending on a live API. The orchestrator wires a Haiku-class
