@@ -6,12 +6,15 @@ import pytest
 
 from orchestrator.dag import (
     DagValidationError,
+    EditScopeViolation,
     find_blocked_descendants,
     find_file_overlaps,
+    is_in_scope,
     topological_levels,
+    validate_edit_scope,
     validate_phase_dag,
 )
-from state.schemas import Phase, Task
+from state.schemas import Phase, Plan, Task
 
 
 def _t(tid: str, deps: list[str] | None = None, files: list[str] | None = None) -> Task:
@@ -272,3 +275,121 @@ def test_find_file_overlaps_includes_all_task_ids_as_keys() -> None:
     tasks = [_t("1.1"), _t("1.2", files=["x.py"])]
     out = find_file_overlaps(tasks)
     assert set(out.keys()) == {"1.1", "1.2"}
+
+
+# ---------------------------------------------------------------------------
+# v0.14.0 — validate_edit_scope + is_in_scope
+# ---------------------------------------------------------------------------
+
+
+def _make_plan(
+    edit_scope: list[str] | None = None,
+    phases: list[Phase] | None = None,
+) -> Plan:
+    if phases is None:
+        phases = [_phase([_t("1.1", files=["src/foo.py"])])]
+    return Plan(
+        plan_id="plan-test",
+        spec_hash="abcdef0123456789",
+        phases=phases,
+        edit_scope=edit_scope or [],
+        created_at="2025-01-01T00:00:00+00:00",
+        updated_at="2025-01-01T00:00:00+00:00",
+    )
+
+
+def test_validate_edit_scope_empty_is_noop() -> None:
+    """Plan.edit_scope == [] (legacy) → no-op regardless of task files."""
+    plan = _make_plan(
+        edit_scope=[],
+        phases=[_phase([_t("1.1", files=["src/foo.py", "wherever/else.py"])])],
+    )
+    # Should not raise — empty scope means whole-repo allowed.
+    validate_edit_scope(plan)
+
+
+def test_validate_edit_scope_passes_when_all_files_in_scope() -> None:
+    """Every task's files lie under the configured scope → validates."""
+    plan = _make_plan(
+        edit_scope=["src", "tests"],
+        phases=[_phase([_t("1.1", files=["src/foo.py", "tests/test_foo.py"])])],
+    )
+    validate_edit_scope(plan)
+
+
+def test_validate_edit_scope_raises_on_out_of_scope_file() -> None:
+    """A file outside the scope raises EditScopeViolation with task + file + scope details."""
+    plan = _make_plan(
+        edit_scope=["src/"],
+        phases=[
+            _phase([
+                _t("1.1", files=["src/ok.py"]),
+                _t("1.2", files=["docs/out_of_scope.md"]),
+            ])
+        ],
+    )
+    with pytest.raises(EditScopeViolation) as excinfo:
+        validate_edit_scope(plan)
+    msg = str(excinfo.value)
+    assert "1.2" in msg
+    assert "docs/out_of_scope.md" in msg
+
+
+def test_validate_edit_scope_phase_override_takes_precedence() -> None:
+    """When ``Phase.edit_scope`` is non-None, it overrides Plan.edit_scope.
+
+    Plan scope is broad (``src/``), but the phase narrows to ``src/foo/``.
+    A task touching ``src/bar.py`` is in plan-scope but out of
+    phase-scope — must raise.
+    """
+    plan = _make_plan(
+        edit_scope=["src"],
+        phases=[
+            Phase(
+                id="1",
+                title="Narrow",
+                tasks=[_t("1.1", files=["src/bar.py"])],
+                edit_scope=["src/foo"],
+            )
+        ],
+    )
+    with pytest.raises(EditScopeViolation):
+        validate_edit_scope(plan)
+
+
+def test_validate_edit_scope_phase_empty_list_means_whole_repo_for_phase() -> None:
+    """``Phase.edit_scope == []`` (explicit empty list, not None) means the
+    phase opts into legacy whole-repo behavior even if the plan narrows."""
+    plan = _make_plan(
+        edit_scope=["src"],
+        phases=[
+            Phase(
+                id="1",
+                title="Wide",
+                tasks=[_t("1.1", files=["docs/anything.md"])],
+                edit_scope=[],
+            )
+        ],
+    )
+    # Should not raise — phase explicitly opts back into whole-repo.
+    validate_edit_scope(plan)
+
+
+def test_is_in_scope_prefix_match() -> None:
+    """``is_in_scope`` does prefix matching against repo-relative paths."""
+    assert is_in_scope("src/foo.py", ["src"]) is True
+    assert is_in_scope("src/foo.py", ["src/"]) is True  # caller may pass un-normalized
+    assert is_in_scope("src/sub/deep.py", ["src/sub"]) is True
+    assert is_in_scope("docs/foo.md", ["src"]) is False
+
+
+def test_is_in_scope_empty_scope_returns_true() -> None:
+    """Empty scope → no constraint → every path is in scope."""
+    assert is_in_scope("anywhere/at/all.py", []) is True
+
+
+def test_is_in_scope_does_not_partial_match_filename_prefix() -> None:
+    """Scope ``src`` should match ``src/x.py`` but NOT ``srcfoo.py`` (sibling
+    starting with same letters)."""
+    assert is_in_scope("src/x.py", ["src"]) is True
+    assert is_in_scope("srcfoo.py", ["src"]) is False

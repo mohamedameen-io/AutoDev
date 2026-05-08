@@ -32,7 +32,7 @@ module surface as plain :class:`ValueError` (per project convention).
 from __future__ import annotations
 
 from errors import AutodevError
-from state.schemas import Phase, Task
+from state.schemas import Phase, Plan, Task
 
 
 class DagValidationError(AutodevError):
@@ -41,6 +41,17 @@ class DagValidationError(AutodevError):
     Carries a human-readable message that names the offending task ids
     and (for cycles) the full cycle path, so the user can fix the
     architect markdown directly without re-running the plan phase.
+    """
+
+
+class EditScopeViolation(AutodevError):
+    """A task declares ``files`` outside the plan/phase ``edit_scope``.
+
+    Raised by :func:`validate_edit_scope` (run-time pre-flight) and by
+    :meth:`worktree.WorktreeManager.apply_patch_to_main` (post-write
+    diff hunk check). Carries the offending task id, the file, and the
+    resolved scope so the user can fix the plan markdown without
+    inspecting the orchestrator log.
     """
 
 
@@ -233,10 +244,84 @@ def find_file_overlaps(tasks: list[Task]) -> dict[str, set[str]]:
     return out
 
 
+def is_in_scope(file_path: str, scope: list[str]) -> bool:
+    """Return ``True`` iff ``file_path`` lies under any prefix in ``scope``.
+
+    Empty ``scope`` is the legacy "whole repo allowed" sentinel — every
+    path is in scope. Non-empty scope is treated as a list of repo-relative
+    path prefixes (e.g. ``["src", "tests"]``); a path is in scope if it
+    equals a prefix exactly OR starts with a prefix followed by ``/``.
+
+    Trailing slashes on the scope entries are tolerated (the validator on
+    :class:`state.schemas.Plan.edit_scope` strips them, but callers may
+    pass un-normalized values from raw input).
+
+    The "followed by ``/``" rule prevents partial-filename matches:
+    scope ``"src"`` matches ``"src/x.py"`` but NOT ``"srcfoo.py"``.
+    """
+    if not scope:
+        return True
+    for raw_prefix in scope:
+        prefix = raw_prefix.rstrip("/")
+        if file_path == prefix:
+            return True
+        if file_path.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def validate_edit_scope(plan: Plan) -> None:
+    """Verify every task in ``plan`` declares ``files`` within its scope.
+
+    Resolution rule:
+
+    * ``Phase.edit_scope`` non-None → use as the scope for that phase
+      (including the explicit empty list, which means "phase opts into
+      legacy whole-repo behavior even if the plan narrows").
+    * ``Phase.edit_scope is None`` → inherit ``plan.edit_scope``.
+    * Resolved scope is empty list → no-op (legacy behavior; every task
+      is implicitly in scope regardless of files).
+
+    For each task, every entry in ``Task.files`` must satisfy
+    :func:`is_in_scope` against the resolved scope. The first violation
+    raises :class:`EditScopeViolation` with phase id, task id, file
+    path, and the resolved scope embedded in the message.
+
+    Tasks with empty ``files`` lists never violate (no claims, no
+    constraint to enforce). Architects can leave ``files`` empty for
+    documentation-only tasks.
+    """
+    plan_scope = plan.edit_scope or []
+
+    for phase in plan.phases:
+        # ``None`` means inherit; an empty list is an explicit per-phase
+        # override that resets to whole-repo. Distinguish carefully.
+        if phase.edit_scope is None:
+            resolved = plan_scope
+        else:
+            resolved = phase.edit_scope
+
+        # No-op shortcut: empty resolved scope means no constraint.
+        if not resolved:
+            continue
+
+        for task in phase.tasks:
+            for file_path in task.files:
+                if not is_in_scope(file_path, resolved):
+                    raise EditScopeViolation(
+                        f"task {task.id!r} (phase {phase.id!r}) declares file "
+                        f"{file_path!r} outside the resolved edit_scope "
+                        f"{resolved!r}"
+                    )
+
+
 __all__ = [
     "DagValidationError",
+    "EditScopeViolation",
     "find_blocked_descendants",
     "find_file_overlaps",
+    "is_in_scope",
     "topological_levels",
+    "validate_edit_scope",
     "validate_phase_dag",
 ]
