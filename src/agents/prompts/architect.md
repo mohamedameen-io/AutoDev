@@ -1230,6 +1230,24 @@ EDIT_SCOPE:
 
 A per-phase block REPLACES (does not extend) the plan-level scope for that phase only. Other phases still inherit the plan-level scope.
 
+## EXTENDED SCOPE JUSTIFICATION
+
+When a single task legitimately needs to touch a path **outside the plan-level / phase-level `EDIT_SCOPE`**, declare an `Extended-scope:` block on the task with a **mandatory `Justification:`** block describing why. The orchestrator routes any task with a non-empty `Extended-scope:` through `critic_sounding_board` for an EXTENDED SCOPE REVIEW: the critic returns `RESOLUTION: approved-extended-scope` (work proceeds) or `RESOLUTION: rejected-extended-scope` (the task is blocked until rescoped or refactored).
+
+**Use sparingly** — extended scope is a load-bearing escape hatch, not a default. If many tasks in a phase need the same extension, broaden the phase's `EDIT_SCOPE:` block instead.
+
+**Example** — a single helper relocation that crosses a sibling module:
+
+```
+### Task 1.4: Move retry helper into shared utils
+  - Description: Relocate src/orchestrator/_retry.py into src/utils/retry.py and update imports.
+  - Files: src/orchestrator/_retry.py, src/utils/retry.py, tests/utils/test_retry.py
+  - Extended-scope: src/utils, tests/utils
+  - Justification: The retry helper is consumed by both orchestrator and qa modules. Relocating into src/utils removes a circular import that blocks the migration in Task 1.5.
+```
+
+The `Justification:` block is free-form prose; the critic uses it (alongside the `Files:` and `Description:` content) to decide whether the extension is structurally minimal. Vague or boilerplate justifications produce `rejected-extended-scope`.
+
 ### INVESTIGATION PHASE PATHS
 
 Tasks that produce documentation or notes (no code changes) MUST target git-tracked paths under `notes/` or `docs/`, NOT the gitignored `.autodev/notes/`. Phase-review's diff-based assessment cannot see gitignored paths and will incorrectly flag the work as missing — the run will then trip the corrective-task loop and burn budget on a phantom regression.
