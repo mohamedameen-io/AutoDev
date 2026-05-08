@@ -290,6 +290,7 @@ class WorktreeManager:
         worktree: Path,
         base_ref: str = "HEAD",
         three_way: bool = False,
+        edit_scope: list[str] | None = None,
     ) -> None:
         """Apply the worktree's diff to the main repo's working tree.
 
@@ -302,11 +303,31 @@ class WorktreeManager:
         conflicts fall back to git's merge machinery instead of patch.
         Used by the conflict-escalation path after ``critic_sounding_board``
         returns ``RESOLUTION: rebase-and-retry``.
+
+        v0.14.0: ``edit_scope`` is an optional list of repo-relative path
+        prefixes. When non-empty, every diff hunk's target path MUST lie
+        under one of the prefixes; if any path is out-of-scope, the apply
+        is aborted with :class:`orchestrator.dag.EditScopeViolation`
+        BEFORE any ``git apply`` runs (so main is never half-patched).
+        ``None`` / empty list preserves legacy whole-repo behavior.
         """
         diff_text = await self.get_diff_vs_base(worktree, base_ref=base_ref)
         if not diff_text.strip():
             self._log.info("worktree.apply_patch.empty_diff")
             return
+
+        # v0.14.0: pre-flight scope check before any git apply runs.
+        if edit_scope:
+            from adapters.git_utils import extract_files_from_diff
+            from orchestrator.dag import EditScopeViolation, is_in_scope
+
+            files_in_diff = extract_files_from_diff(diff_text)
+            for fp in files_in_diff:
+                if not is_in_scope(fp, edit_scope):
+                    raise EditScopeViolation(
+                        f"diff hunk targets out-of-scope file {fp!r}; "
+                        f"resolved edit_scope = {edit_scope!r}"
+                    )
 
         check_args = ["apply", "--check"]
         apply_args = ["apply"]

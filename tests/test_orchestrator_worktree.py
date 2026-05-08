@@ -166,3 +166,103 @@ async def test_apply_patch_three_way_succeeds_on_clean(tmp_path: Path) -> None:
     assert (repo / "README.md").read_text() == "# updated by worker\n"
 
     await mgr.cleanup_all()
+
+
+# ---------------------------------------------------------------------------
+# v0.14.0 — apply_patch_to_main(edit_scope=...) hunk validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_to_main_passes_when_scope_empty(tmp_path: Path) -> None:
+    """``edit_scope=None`` (default) preserves legacy whole-repo behavior:
+    patches anywhere in the worktree apply cleanly to main."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    wt_dir = tmp_path / "execute_worktrees"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+
+    wt = await mgr.create_per_task("1.1")
+    # Touch a file outside any "scope" — apply must succeed because no
+    # scope is provided.
+    (wt / "anywhere.py").write_text("x = 1\n")
+
+    await mgr.apply_patch_to_main(wt, edit_scope=None)
+    assert (repo / "anywhere.py").read_text() == "x = 1\n"
+
+    await mgr.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_to_main_passes_when_all_hunks_in_scope(
+    tmp_path: Path,
+) -> None:
+    """``edit_scope=['src']`` with all diff hunks under ``src/`` applies."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    # Establish src/ tracked-file baseline so the diff has src/ paths.
+    (repo / "src").mkdir()
+    (repo / "src" / "foo.py").write_text("x = 0\n")
+    subprocess.run(
+        ["git", "add", "."], cwd=str(repo), check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "src baseline"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+
+    wt_dir = tmp_path / "execute_worktrees"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+    wt = await mgr.create_per_task("1.1")
+    (wt / "src" / "foo.py").write_text("x = 42\n")
+
+    await mgr.apply_patch_to_main(wt, edit_scope=["src"])
+    assert (repo / "src" / "foo.py").read_text() == "x = 42\n"
+
+    await mgr.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_to_main_rejects_out_of_scope_hunk_when_scope_set(
+    tmp_path: Path,
+) -> None:
+    """A hunk targeting a path outside the configured scope aborts the
+    apply with EditScopeViolation BEFORE any change lands on main."""
+    from orchestrator.dag import EditScopeViolation
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    (repo / "src").mkdir()
+    (repo / "src" / "foo.py").write_text("x = 0\n")
+    subprocess.run(
+        ["git", "add", "."], cwd=str(repo), check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "src baseline"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+
+    wt_dir = tmp_path / "execute_worktrees"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+    wt = await mgr.create_per_task("1.1")
+    # Two hunks: one in scope, one out.
+    (wt / "src" / "foo.py").write_text("x = 42\n")
+    (wt / "docs_out.md").write_text("forbidden write\n")
+
+    with pytest.raises(EditScopeViolation):
+        await mgr.apply_patch_to_main(wt, edit_scope=["src"])
+
+    # main repo state is unchanged: src/foo.py still at baseline,
+    # docs_out.md never created.
+    assert (repo / "src" / "foo.py").read_text() == "x = 0\n"
+    assert not (repo / "docs_out.md").exists()
+
+    await mgr.cleanup_all()
