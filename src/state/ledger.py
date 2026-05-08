@@ -116,6 +116,27 @@ LedgerOp = Literal[
     # actual ``WEB_CONTEXT:`` splice into the next critic prompt is the
     # caller's responsibility; this op is forensics.
     "web_search_invoked",
+    # v0.18.0 A2: multi-branch phase-review fan-out audit ops. All three
+    # are observability-only — they do NOT mutate plan state. Replay
+    # treats them as no-ops.
+    # - ``multi_branch_phase_review_start``:
+    #   ``{phase_id, n_branches, lanes: list[str | None]}``.
+    # - ``multi_branch_phase_review_meta_merge_complete``:
+    #   ``{phase_id, n_survivors, n_branches, accept_votes, reject_votes,
+    #     majority_accept}``.
+    # - ``multi_branch_phase_review_complete``:
+    #   ``{phase_id, n_branches, n_survivors, winner, accept_phase}``.
+    "multi_branch_phase_review_start",
+    "multi_branch_phase_review_meta_merge_complete",
+    "multi_branch_phase_review_complete",
+    # v0.18.0 B2: plateau detector telemetry. Audit-only — advisory.
+    # - ``plateau_detected``:
+    #   ``{family | None, window, kind: "per_family" | "cross_family",
+    #     event_count: int, winner_promoted_count: int}``.
+    # - ``plateau_forced_lane_change``:
+    #   ``{branch_index, prior_lane, new_lane, family | None}``.
+    "plateau_detected",
+    "plateau_forced_lane_change",
 ]
 
 
