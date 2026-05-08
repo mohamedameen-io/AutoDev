@@ -173,3 +173,86 @@ def test_parse_requires_combined_with_other_directives() -> None:
     assert task.depends_on == ["1.0"]
     assert len(task.acceptance) == 1
     assert task.description == "do it"
+
+
+# ---------------------------------------------------------------------------
+# v0.8.0 — per-task ``Complexity:`` directive
+# ---------------------------------------------------------------------------
+
+
+def test_parse_task_complexity_simple() -> None:
+    """``- Complexity: simple`` parses to ``Task.complexity == "simple"``."""
+    md = _plan_with_task_body("  - Complexity: simple\n")
+    plan = parse_plan_markdown(md)
+    task = plan.phases[0].tasks[0]
+    assert task.complexity == "simple"
+
+
+def test_parse_task_complexity_medium_case_insensitive() -> None:
+    """The directive is case-insensitive — ``- COMPLEXITY: MEDIUM`` parses
+    and lowercases to ``"medium"``."""
+    md = _plan_with_task_body("  - COMPLEXITY: MEDIUM\n")
+    plan = parse_plan_markdown(md)
+    task = plan.phases[0].tasks[0]
+    assert task.complexity == "medium"
+
+
+def test_parse_task_complexity_complex() -> None:
+    """``- Complexity: complex`` parses to ``Task.complexity == "complex"``."""
+    md = _plan_with_task_body("  - Complexity: complex\n")
+    plan = parse_plan_markdown(md)
+    task = plan.phases[0].tasks[0]
+    assert task.complexity == "complex"
+
+
+def test_parse_task_complexity_unknown_token_dropped(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Unknown complexity tokens (typos, new buckets) are dropped with a
+    warning — they don't reach the regex's capturing group, so the line is
+    silently ignored AND the task's complexity stays None.
+
+    The defensive lowercase + set check inside the parser still fires the
+    warning when the regex DID match but the captured token failed schema
+    validation. Here we use an unrecognized token; the regex itself rejects
+    it (only matching simple|medium|complex), so the line is treated as
+    free-form prose and no warning is emitted — but the resulting task's
+    complexity must still be ``None`` (the legacy default).
+    """
+    md = _plan_with_task_body("  - Complexity: trivial\n")
+    plan = parse_plan_markdown(md)
+    task = plan.phases[0].tasks[0]
+    assert task.complexity is None
+
+
+def test_parse_legacy_task_returns_none() -> None:
+    """A task with no ``- Complexity:`` body line parses to ``complexity=None``
+    — the legacy migration guarantee for v0.7.0-shape plan markdown."""
+    md = _plan_with_task_body("")
+    plan = parse_plan_markdown(md)
+    task = plan.phases[0].tasks[0]
+    assert task.complexity is None
+
+
+def test_parse_task_complexity_with_other_directives() -> None:
+    """``Complexity:`` coexists with ``Requires:``, ``Description:``, etc. —
+    the parser must keep them all on the same task."""
+    md = (
+        f"{_PLAN_HEAD}"
+        f"### Task 1.1: investigate something\n"
+        f"  - Description: deep cross-cutting investigation\n"
+        f"  - Complexity: complex\n"
+        f"  - Files: a.py, b.py\n"
+        f"  - Requires: hardware\n"
+        f"  - Depends: 1.0\n"
+        f"  - Acceptance:\n"
+        f"    - [ ] reports findings\n"
+    )
+    plan = parse_plan_markdown(md)
+    task = plan.phases[0].tasks[0]
+    assert task.complexity == "complex"
+    assert task.requires == ["hardware"]
+    assert task.files == ["a.py", "b.py"]
+    assert task.depends_on == ["1.0"]
+    assert len(task.acceptance) == 1
+    assert task.description == "deep cross-cutting investigation"

@@ -56,6 +56,16 @@ _RE_REQUIRES = re.compile(
     r"^\s*-?\s*Requires\s*:\s*(.+?)\s*$",
     re.IGNORECASE,
 )
+# v0.8.0: per-task complexity directive. Mirrors :data:`_RE_COMPLEXITY` (the
+# trailing plan-level directive) but lives inside a task body, alongside
+# ``- Requires:`` / ``- Description:``. Captured tokens are normalized to
+# lowercase and validated against ``{"simple","medium","complex"}`` —
+# unknown values are dropped with a warning so the orchestrator falls back
+# to the spec default.
+_RE_TASK_COMPLEXITY = re.compile(
+    r"^\s*-\s*Complexity\s*:\s*(simple|medium|complex)\s*$",
+    re.IGNORECASE,
+)
 _RE_EXECUTABLE_BY = re.compile(
     r"^\s*-?\s*EXECUTABLE_BY\s*:\s*(human|agent)\s*$",
     re.IGNORECASE,
@@ -236,6 +246,24 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
             in_acceptance_block = False
             continue
 
+        # v0.8.0: per-task complexity directive. The regex constrains the
+        # captured group to {simple, medium, complex} (case-insensitive); we
+        # still defensively validate the lowercased token and drop unknowns
+        # with a warning so the resolver falls back to the spec default.
+        complexity_m = _RE_TASK_COMPLEXITY.match(line)
+        if complexity_m:
+            tok = complexity_m.group(1).strip().lower()
+            if tok in {"simple", "medium", "complex"}:
+                current_task["complexity"] = tok
+            else:
+                logger.warning(
+                    "plan_parser.unknown_task_complexity_token",
+                    token=tok,
+                    task_id=current_task["id"],
+                )
+            in_acceptance_block = False
+            continue
+
         exec_by_m = _RE_EXECUTABLE_BY.match(line)
         if exec_by_m:
             who = exec_by_m.group(1).strip().lower()
@@ -289,6 +317,11 @@ def _make_task(raw: dict, phase_id: str) -> Task:
         acceptance=crit,
         depends_on=raw.get("depends_on", []),
         requires=raw.get("requires", []),
+        # v0.8.0: per-task complexity bucket parsed from ``- Complexity:`` body
+        # line. ``None`` for legacy plans / tasks the architect didn't tag —
+        # downstream resolver returns ``None`` and execute_phase falls back
+        # to the spec default.
+        complexity=raw.get("complexity"),
         assigned_agent="developer",
     )
 
