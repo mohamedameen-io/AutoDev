@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
-from adapters.git_utils import _git_rev_parse_head
+from adapters.git_utils import _git_rev_parse_head, extract_files_from_diff
 from adapters.inline import InlineAdapter
 from adapters.inline_types import DelegationPendingSignal
 from adapters.types import AgentInvocation, AgentResult
@@ -1076,7 +1076,11 @@ async def _execute_one(
             task = await orch.plan_manager.update_task_status(task.id, "coded")
 
             # Step 3: auto-gates (syntax/lint/build/test_runner/secretscan).
-            gate_failure = await _run_qa_gates(orch, task)
+            # v0.13.0: pass developer_result so secretscan can scope to the
+            # diff (skip pre-existing repo state).
+            gate_failure = await _run_qa_gates(
+                orch, task, developer_result=developer_result
+            )
             if gate_failure is not None:
                 logger.warning(
                     "execute_phase.qa_gate_failed",
@@ -1567,20 +1571,52 @@ def _parse_test_counts(text: str) -> tuple[int, int, int]:
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
-async def _run_qa_gates(orch: "Orchestrator", task: "Task") -> str | None:
-    """Run enabled QA gates. Returns the first failure detail string, or None if all pass."""
+def _files_changed_for_secretscan(
+    developer_result: AgentResult | None,
+) -> list[Path] | None:
+    """Extract repo-relative paths from a developer ``AgentResult`` for the
+    v0.13.0 diff-scoped secretscan.
+
+    Returns:
+        * ``None`` when the result is missing or has no diff text — the
+          caller falls back to the legacy full-walk behavior.
+        * ``[]`` when the diff is non-empty but contains no parseable
+          ``+++ b/`` headers (e.g. error output) — caller may choose to
+          skip the gate entirely (empty list scans nothing).
+        * ``list[Path]`` of repo-relative paths in first-seen, deduped
+          order.
+    """
+    if developer_result is None or not developer_result.diff:
+        return None
+    return [Path(p) for p in extract_files_from_diff(developer_result.diff)]
+
+
+async def _run_qa_gates(
+    orch: "Orchestrator",
+    task: "Task",
+    developer_result: AgentResult | None = None,
+) -> str | None:
+    """Run enabled QA gates. Returns the first failure detail string, or None if all pass.
+
+    v0.13.0: ``developer_result`` is the optional output of the most recent
+    developer delegation. When supplied, the secretscan gate is invoked
+    with ``paths=`` extracted from its diff so only the executor's just-
+    introduced changes are scanned. None preserves legacy whole-tree walk.
+    """
     from plugins.registry import QAContext
 
     cfg = orch.cfg.qa_gates
     cwd = orch.cwd
     language = detect_language(cwd)
 
+    secretscan_paths = _files_changed_for_secretscan(developer_result)
+
     gates: list[tuple[bool, Callable[[], Awaitable[GateResult]]]] = [
         (cfg.syntax_check, lambda: run_syntax_check(cwd, language)),
         (cfg.lint, lambda: run_lint(cwd, language)),
         (cfg.build_check, lambda: run_build_check(cwd, language)),
         (cfg.test_runner, lambda: run_tests(cwd)),
-        (cfg.secretscan, lambda: run_secretscan(cwd)),
+        (cfg.secretscan, lambda: run_secretscan(cwd, paths=secretscan_paths)),
     ]
 
     for enabled, gate_fn in gates:
