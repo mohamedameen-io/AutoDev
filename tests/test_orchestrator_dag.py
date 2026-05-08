@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator.dag import DagValidationError, validate_phase_dag
+from orchestrator.dag import (
+    DagValidationError,
+    find_blocked_descendants,
+    topological_levels,
+    validate_phase_dag,
+)
 from state.schemas import Phase, Task
 
 
@@ -99,3 +104,113 @@ def test_validate_dag_cycle_message_includes_full_path() -> None:
         assert "1.3" in msg
     else:
         raise AssertionError("expected DagValidationError")
+
+
+# ---------------------------------------------------------------------------
+# topological_levels
+# ---------------------------------------------------------------------------
+
+
+def test_topological_levels_empty_phase() -> None:
+    """No tasks → no levels."""
+    assert topological_levels(_phase([])) == []
+
+
+def test_topological_levels_single_task_no_deps_returns_one_level() -> None:
+    """Single task → one level containing that task."""
+    t = _t("1.1")
+    levels = topological_levels(_phase([t]))
+    assert len(levels) == 1
+    assert [x.id for x in levels[0]] == ["1.1"]
+
+
+def test_topological_levels_chain_returns_levels_per_task() -> None:
+    """A → B → C → 3 levels, one task each."""
+    phase = _phase(
+        [_t("1.1"), _t("1.2", ["1.1"]), _t("1.3", ["1.2"])]
+    )
+    levels = topological_levels(phase)
+    assert [[x.id for x in lv] for lv in levels] == [
+        ["1.1"],
+        ["1.2"],
+        ["1.3"],
+    ]
+
+
+def test_topological_levels_diamond_correct_grouping() -> None:
+    """Diamond: A → {B, C} → D forms 3 levels with B, C in level 1."""
+    phase = _phase(
+        [
+            _t("1.1"),
+            _t("1.2", ["1.1"]),
+            _t("1.3", ["1.1"]),
+            _t("1.4", ["1.2", "1.3"]),
+        ]
+    )
+    levels = topological_levels(phase)
+    assert [{x.id for x in lv} for lv in levels] == [
+        {"1.1"},
+        {"1.2", "1.3"},
+        {"1.4"},
+    ]
+
+
+def test_topological_levels_independent_tasks_one_level() -> None:
+    """Tasks with no inter-deps all land in level 0."""
+    phase = _phase([_t("1.1"), _t("1.2"), _t("1.3")])
+    levels = topological_levels(phase)
+    assert len(levels) == 1
+    assert {x.id for x in levels[0]} == {"1.1", "1.2", "1.3"}
+
+
+# ---------------------------------------------------------------------------
+# find_blocked_descendants
+# ---------------------------------------------------------------------------
+
+
+def test_find_blocked_descendants_walks_reverse_edges() -> None:
+    """Failing 1.1 → blocks 1.2 (depends on 1.1) and 1.3 (depends on 1.2)."""
+    phase = _phase(
+        [_t("1.1"), _t("1.2", ["1.1"]), _t("1.3", ["1.2"])]
+    )
+    desc = find_blocked_descendants(phase, {"1.1"})
+    assert {t.id for t in desc} == {"1.2", "1.3"}
+
+
+def test_find_blocked_descendants_does_not_include_failed_id() -> None:
+    """The failed task id itself is NOT returned as a descendant."""
+    phase = _phase([_t("1.1"), _t("1.2", ["1.1"])])
+    desc = find_blocked_descendants(phase, {"1.1"})
+    assert "1.1" not in {t.id for t in desc}
+
+
+def test_find_blocked_descendants_diamond_blocks_both_arms() -> None:
+    """Fork: failing root blocks both children (and any merged grandchild)."""
+    phase = _phase(
+        [
+            _t("1.1"),
+            _t("1.2", ["1.1"]),
+            _t("1.3", ["1.1"]),
+            _t("1.4", ["1.2", "1.3"]),
+        ]
+    )
+    desc = find_blocked_descendants(phase, {"1.1"})
+    assert {t.id for t in desc} == {"1.2", "1.3", "1.4"}
+
+
+def test_find_blocked_descendants_independent_task_not_blocked() -> None:
+    """Failing 1.1 does NOT block a sibling that doesn't depend on 1.1."""
+    phase = _phase([_t("1.1"), _t("1.2"), _t("1.3", ["1.1"])])
+    desc = find_blocked_descendants(phase, {"1.1"})
+    assert {t.id for t in desc} == {"1.3"}
+
+
+def test_find_blocked_descendants_empty_failed_set_returns_empty() -> None:
+    """No failures → no descendants."""
+    phase = _phase([_t("1.1"), _t("1.2", ["1.1"])])
+    assert find_blocked_descendants(phase, set()) == []
+
+
+def test_find_blocked_descendants_empty_phase() -> None:
+    """No tasks → no descendants regardless of failed set."""
+    assert find_blocked_descendants(_phase([]), {"x.y"}) == []
