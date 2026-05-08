@@ -363,6 +363,12 @@ def validate_edit_scope(
     no-op (no claims to validate). Without ``tracked_files``, glob
     entries are validated literally — the validator's worst-case
     behavior matches the pre-v0.17.0 surface.
+
+    v0.20.0 C1: ``Task.extended_scope`` extends the per-task allow-list.
+    A task's files are checked against the union of the resolved scope
+    + ``task.extended_scope``. Empty ``extended_scope`` (default)
+    preserves v0.17.0 behavior — no extension, only the resolved scope
+    matters.
     """
     plan_scope = plan.edit_scope or []
 
@@ -374,11 +380,18 @@ def validate_edit_scope(
         else:
             resolved = phase.edit_scope
 
-        # No-op shortcut: empty resolved scope means no constraint.
+        # No-op shortcut: empty resolved scope means no constraint —
+        # but only if no task has an extended_scope (which would still
+        # be a non-empty constraint to honor). When the resolved scope
+        # is empty, every path is implicitly in scope anyway, so the
+        # extended_scope is harmless. Skip is safe.
         if not resolved:
             continue
 
         for task in phase.tasks:
+            # v0.20.0 C1: union resolved scope with per-task extended_scope.
+            extended = list(getattr(task, "extended_scope", []) or [])
+            effective_scope = list(resolved) + extended
             for file_path in task.files:
                 # v0.17.0 S5: glob expansion. With a tracked-files cache,
                 # validate every expanded file individually; without one,
@@ -386,19 +399,19 @@ def validate_edit_scope(
                 if _is_glob(file_path) and tracked_files is not None:
                     expanded = _expand_files([file_path], tracked_files)
                     for matched in expanded:
-                        if not is_in_scope(matched, resolved):
+                        if not is_in_scope(matched, effective_scope):
                             raise EditScopeViolation(
                                 f"task {task.id!r} (phase {phase.id!r}) declares "
                                 f"glob {file_path!r} which expands to "
                                 f"{matched!r} outside the resolved edit_scope "
-                                f"{resolved!r}"
+                                f"{resolved!r} (extended_scope={extended!r})"
                             )
                     continue
-                if not is_in_scope(file_path, resolved):
+                if not is_in_scope(file_path, effective_scope):
                     raise EditScopeViolation(
                         f"task {task.id!r} (phase {phase.id!r}) declares file "
                         f"{file_path!r} outside the resolved edit_scope "
-                        f"{resolved!r}"
+                        f"{resolved!r} (extended_scope={extended!r})"
                     )
 
 
