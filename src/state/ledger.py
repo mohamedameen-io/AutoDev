@@ -97,6 +97,12 @@ LedgerOp = Literal[
     "stuck_pivot",
     "soft_blocker_handoff",
     "course_correction_emitted",
+    # v0.16.0: drift-verifier complete. Audit-only — does NOT mutate plan
+    # state. Payload shape: ``{phase_id, passed, drift_findings: list[str],
+    # evidence_path}``. Replay treats it as a no-op; the actual outcome
+    # override (accept_phase=False with corrective_direction) is recorded
+    # via the regular ``append_corrective_tasks`` op emitted alongside.
+    "drift_verifier_complete",
 ]
 
 
@@ -405,6 +411,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # ``plan_tournament_complete`` ops, and the meta-merged final
         # markdown is consumed downstream into ``init_plan``. These ops
         # are forensics for "how did we get the merged plan", not state.
+        return plan
+
+    if op == "drift_verifier_complete":
+        # v0.16.0: audit-only breadcrumb appended after the drift
+        # verifier completes. Plan mutations (accept_phase override,
+        # corrective tasks) flow through the regular phase-review ops
+        # so this op never touches plan state.
         return plan
 
     if op in (

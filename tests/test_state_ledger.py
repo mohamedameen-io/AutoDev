@@ -740,6 +740,72 @@ async def test_soft_blocker_handoff_op_replays_correctly(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_drift_verifier_complete_op_replays_correctly(tmp_path: Path) -> None:
+    """``drift_verifier_complete`` is audit-only — does NOT mutate plan state.
+
+    Replay returns the unchanged plan and the entry tally matches the
+    appended ops; the drift findings live in evidence files, not in
+    plan state.
+    """
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="drift_verifier_complete",
+            payload={
+                "phase_id": "1",
+                "passed": False,
+                "drift_findings": ["task 1.1: DRIFTED — implemented Y not X"],
+                "evidence_path": ".autodev/evidence/1-drift-verifier.json",
+            },
+            session_id="s1",
+        )
+
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    assert len(entries) == 2
+    # Plan state untouched.
+    assert out.phases[0].tasks[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_drift_verifier_complete_replays_with_passed_true(
+    tmp_path: Path,
+) -> None:
+    """A ``passed=True`` payload also replays cleanly."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="drift_verifier_complete",
+            payload={
+                "phase_id": "1",
+                "passed": True,
+                "drift_findings": [],
+                "evidence_path": ".autodev/evidence/1-drift-verifier.json",
+            },
+            session_id="s1",
+        )
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    assert len(entries) == 2
+
+
+@pytest.mark.asyncio
 async def test_course_correction_emitted_op_replays_correctly(tmp_path: Path) -> None:
     plan = _mk_plan()
     async with plan_lock(tmp_path):

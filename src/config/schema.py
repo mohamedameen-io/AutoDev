@@ -172,6 +172,13 @@ class TournamentPhaseConfig(BaseModel):
     # incumbent quality matters most) while staying off for the impl
     # tournament (where the cost doubling would be punitive).
     promotion_grade_enabled: bool = False
+    # v0.16.0: drift-verifier final-defense gate. Off by default so a
+    # missing ``critic_drift_verifier`` agent spec or unstubbed test
+    # adapter doesn't surprise legacy callers. When True (and used on
+    # ``cfg.tournaments.phase_review``), :func:`run_phase_review_tournament`
+    # invokes :func:`orchestrator.drift_verifier.run_drift_verifier`
+    # after an A-winner outcome and may flip ``accept_phase`` to False.
+    drift_verifier_enabled: bool = False
 
     @model_validator(mode="after")
     def _validate_branches(self) -> "TournamentPhaseConfig":

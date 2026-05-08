@@ -350,6 +350,82 @@ async def run_phase_review_tournament(
     if not accept_phase and final_bundle.direction_text:
         corrective_direction = final_bundle.direction_text
 
+    # v0.16.0: drift-verifier as a final-defense gate. Only fires on
+    # A-winners (non-A already failed phase review and produced a
+    # corrective_direction). If drift findings are detected, the
+    # outcome is flipped to ``accept_phase=False`` with a synthesized
+    # corrective_direction so the orchestrator's phase-review handler
+    # injects a corrective task. The drift-verifier is opt-in via
+    # ``cfg.tournaments.phase_review.drift_verifier_enabled`` (default
+    # off for backward compat) — projects opt in once their stub
+    # adapters / production registries reliably surface a
+    # ``critic_drift_verifier`` response.
+    drift_verdict = None
+    drift_enabled = getattr(cfg, "drift_verifier_enabled", False)
+    if accept_phase and drift_enabled:
+        drift_evidence_dir = autodev_root(orch.cwd) / "evidence"
+        try:
+            from orchestrator.drift_verifier import run_drift_verifier
+
+            drift_verdict = await run_drift_verifier(
+                orch=orch,
+                phase=phase,
+                evidence_dir=drift_evidence_dir,
+                diff_text=diff_text,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Drift-verifier failures must never block phase promotion;
+            # log and continue with the tournament's verdict. Telemetry
+            # surfaces the error for follow-up.
+            logger.warning(
+                "drift_verifier.invocation_failed",
+                phase_id=phase.id,
+                err=str(exc),
+            )
+            drift_verdict = None
+
+        if drift_verdict is not None and not drift_verdict.passed:
+            accept_phase = False
+            findings_text = "\n".join(
+                f"- {f}" for f in drift_verdict.drift_findings
+            ) or "- drift detected (no specific findings parsed)"
+            corrective_direction = (
+                "Drift verifier detected divergence between the phase spec "
+                "and the as-implemented diff:\n" + findings_text
+            )
+            logger.info(
+                "drift_verifier.override_to_corrective",
+                phase_id=phase.id,
+                n_findings=len(drift_verdict.drift_findings),
+            )
+
+        # v0.16.0: ledger breadcrumb so post-hoc analysis can replay the
+        # drift-verifier's verdict without re-reading the evidence file.
+        # Audit-only — does NOT mutate plan state. Best-effort: a
+        # ledger-append failure must never block phase promotion.
+        if drift_verdict is not None:
+            try:
+                evidence_rel = (
+                    str(drift_verdict.evidence_path.relative_to(orch.cwd))
+                    if drift_verdict.evidence_path.is_relative_to(orch.cwd)
+                    else str(drift_verdict.evidence_path)
+                )
+                await orch.plan_manager.ledger_append(
+                    op="drift_verifier_complete",
+                    payload={
+                        "phase_id": phase.id,
+                        "passed": drift_verdict.passed,
+                        "drift_findings": drift_verdict.drift_findings,
+                        "evidence_path": evidence_rel,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "drift_verifier.ledger_append_failed",
+                    phase_id=phase.id,
+                    err=str(exc),
+                )
+
     converged = bool(history) and (
         len(history) < tcfg.max_rounds
         or (
