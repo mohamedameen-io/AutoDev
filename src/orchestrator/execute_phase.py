@@ -1403,6 +1403,34 @@ async def delegate(
         parts.append("\n\n")
         parts.append(lessons)
 
+    # v0.14.0: inject EDIT SCOPE addendum for the developer role when the
+    # plan/phase declares a non-empty scope. Resolution mirrors
+    # :func:`orchestrator.dag.validate_edit_scope`: phase-level override
+    # (when non-None) wins over plan-level. The developer sees the
+    # narrowest applicable boundary as a single line in their system
+    # prompt addendum so they can self-police edits before writing.
+    if role == "developer" and orch.plan_manager is not None and task is not None:
+        try:
+            existing_plan_for_scope = await orch.plan_manager.load()
+        except Exception:  # noqa: BLE001
+            existing_plan_for_scope = None
+        if existing_plan_for_scope is not None:
+            resolved_scope: list[str] = []
+            for ph in existing_plan_for_scope.phases:
+                if ph.id == task.phase_id:
+                    if ph.edit_scope is not None:
+                        resolved_scope = list(ph.edit_scope)
+                    else:
+                        resolved_scope = list(existing_plan_for_scope.edit_scope)
+                    break
+            else:
+                # task.phase_id not matched (defensive — shouldn't happen
+                # in production); fall back to plan-level scope.
+                resolved_scope = list(existing_plan_for_scope.edit_scope)
+            if resolved_scope:
+                parts.append("\n\n")
+                parts.append(f"EDIT SCOPE: {', '.join(resolved_scope)}")
+
     # Resolve per-role effort using the parsed plan complexity. Once the
     # execute phase begins, the architect has run and ``Plan.complexity`` is
     # set (or None on legacy/pre-upgrade plans, which gracefully falls back
