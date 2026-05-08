@@ -61,6 +61,20 @@ class StubAdapter(PlatformAdapter):
                     text="VERDICT: APPROVED\n",
                     duration_s=0.01,
                 )
+            # v0.20.0 C2: extended-scope critic review. When a stub
+            # adapter test triggers an EXTENDED_SCOPE_REVIEW (recognized
+            # by the constraint substring in the prompt), default to
+            # approval so existing tests don't need to stub the role.
+            # Negative tests stub critic_sounding_board explicitly.
+            if (
+                inv.role == "critic_sounding_board"
+                and "EXTENDED_SCOPE_REVIEW" in (inv.prompt or "")
+            ):
+                return AgentResult(
+                    success=True,
+                    text="RESOLUTION: approved-extended-scope\n",
+                    duration_s=0.01,
+                )
             return AgentResult(
                 success=True,
                 text=f"[stub:{inv.role}] default-ok",
