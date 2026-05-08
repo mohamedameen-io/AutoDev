@@ -375,6 +375,7 @@ async def run_plan_tournament(
             final_md=final_md,
             initial_md=initial_md,
             branch_index=branch_index,
+            branch_config=branch_config,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -407,6 +408,7 @@ async def _emit_plan_tournament_lessons(
     final_md: str,
     initial_md: str,
     branch_index: int | None,
+    branch_config: "BranchConfig | None" = None,
 ) -> None:
     """Emit cross-run lessons from a completed plan tournament.
 
@@ -421,11 +423,16 @@ async def _emit_plan_tournament_lessons(
 
     All errors are bubbled to the caller, which logs and swallows them
     — see :func:`run_plan_tournament`'s wrapping ``try/except``.
+
+    v0.18.0 B1: when ``branch_config`` is supplied, every emitted event
+    is tagged with ``branch_config.lane`` so :meth:`KnowledgeStore.inject_block`
+    can filter by lane during future tournament passes.
     """
     family = "plan-tournament"
     branch_tag = (
         f" branch={branch_index}" if branch_index is not None else ""
     )
+    lane = branch_config.lane if branch_config is not None else None
 
     for pr in history:
         pass_num = getattr(pr, "pass_num", "?")
@@ -450,6 +457,7 @@ async def _emit_plan_tournament_lessons(
                     ),
                     evidence=evidence,
                     rollback_reason=f"borda-loss-to-{winner_label}",
+                    lane=lane,
                 )
             )
 
@@ -476,6 +484,7 @@ async def _emit_plan_tournament_lessons(
                 "future passes on this spec should prefer the converged "
                 "structure over alternatives in the same family"
             ),
+            lane=lane,
         )
     )
 
