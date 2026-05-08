@@ -683,13 +683,36 @@ async def run_multi_branch_plan_tournament(
             triggered: bool = False
             kind: str = ""
 
+            # v0.20.0 A2: consult ``cfg.plateau_detector.strategy`` to
+            # choose between rule-based (legacy v0.18.0) and regression
+            # (statistical) plateau detection. Default ``"rules"`` is
+            # byte-identical to v0.19.0 behavior.
+            plateau_cfg = getattr(orch.cfg, "plateau_detector", None)
+            strategy = getattr(plateau_cfg, "strategy", "rules")
+            slope_threshold = getattr(
+                plateau_cfg, "plateau_slope_threshold", 0.1
+            )
+            regression_window = getattr(
+                plateau_cfg, "regression_window", 10
+            )
+
             if getattr(plan_cfg, "plateau_detection_enabled", False):
                 window = getattr(plan_cfg, "plateau_window", 4)
                 # Walk each branch's family looking for a plateau.
                 for bc in branch_configs:
-                    if bc.family is not None and await pd.detect_plateau(
-                        bc.family, window=window
-                    ):
+                    if bc.family is None:
+                        continue
+                    if strategy == "regression":
+                        plateaued = await pd.detect_plateau_regression(
+                            bc.family,
+                            window=regression_window,
+                            slope_threshold=slope_threshold,
+                        )
+                    else:
+                        plateaued = await pd.detect_plateau(
+                            bc.family, window=window
+                        )
+                    if plateaued:
                         plateaued_family = bc.family
                         triggered = True
                         kind = "per_family"
@@ -699,7 +722,16 @@ async def run_multi_branch_plan_tournament(
                 plan_cfg, "cross_family_plateau_enabled", False
             ):
                 window = getattr(plan_cfg, "cross_family_plateau_window", 10)
-                if await pd.detect_cross_family_plateau(window=window):
+                if strategy == "regression":
+                    plateaued_x = await pd.detect_cross_family_plateau_regression(
+                        window=regression_window,
+                        slope_threshold=slope_threshold,
+                    )
+                else:
+                    plateaued_x = await pd.detect_cross_family_plateau(
+                        window=window
+                    )
+                if plateaued_x:
                     triggered = True
                     kind = "cross_family"
 
