@@ -14,6 +14,7 @@ from cli.commands import (
     prune,
     reset,
     resume,
+    secretscan_baseline,
     status,
     tournament,
 )
@@ -32,3 +33,4 @@ def register_commands(group: click.Group) -> None:
     group.add_command(reset.reset)
     group.add_command(prune.prune)
     group.add_command(plugins.plugins)
+    group.add_command(secretscan_baseline.secretscan)

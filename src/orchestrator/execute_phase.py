@@ -2250,7 +2250,15 @@ async def _run_qa_gates(
         (cfg.lint, lambda: run_lint(cwd, language)),
         (cfg.build_check, lambda: run_build_check(cwd, language)),
         (cfg.test_runner, lambda: run_tests(cwd)),
-        (cfg.secretscan, lambda: run_secretscan(cwd, paths=secretscan_paths)),
+        (
+            cfg.secretscan,
+            lambda: run_secretscan(
+                cwd,
+                paths=secretscan_paths,
+                per_extension_thresholds=cfg.secretscan_per_extension_thresholds,
+                baseline_enabled=cfg.secretscan_baseline_enabled,
+            ),
+        ),
         (
             hallucination_guard_enabled,
             lambda: run_hallucination_guard(cwd, paths=secretscan_paths),

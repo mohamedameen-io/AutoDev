@@ -181,6 +181,7 @@ async def run_secretscan(
     paths: list[Path] | None = None,
     edit_scope: list[str] | None = None,
     per_extension_thresholds: dict[str, float] | None = None,
+    baseline_enabled: bool = False,
 ) -> GateResult:
     """Scan *cwd* for hard-coded secrets.
 
@@ -262,6 +263,12 @@ async def run_secretscan(
             findings.append(
                 f"{rel}: high-entropy string ({_shannon_entropy(suspect):.2f} bits) — {suspect[:8]}…"
             )
+
+    # v0.19.0: per-repo baseline filter — drop findings already accepted.
+    if baseline_enabled and findings:
+        from qa.secretscan_baseline import filter_against_baseline
+
+        findings = await filter_against_baseline(findings, cwd)
 
     if findings:
         detail = "potential secrets found:\n" + "\n".join(findings[:20])
