@@ -664,6 +664,88 @@ async def run_multi_branch_plan_tournament(
                     },
                 )
 
+    # v0.18.0 B2: pre-gather plateau detection. When the operator has
+    # opted in (``cfg.tournaments.plan.plateau_detection_enabled`` or the
+    # cross-family equivalent), consult the plateau detector. If a
+    # plateau is detected, mutate one branch's lane to ``"distant-scout"``
+    # so the cohort breaks out of the local minimum. Errors are
+    # swallowed: advisory only, never blocks dispatch.
+    plan_cfg = orch.cfg.tournaments.plan
+    if branch_configs is not None and (
+        getattr(plan_cfg, "plateau_detection_enabled", False)
+        or getattr(plan_cfg, "cross_family_plateau_enabled", False)
+    ):
+        try:
+            from orchestrator.plateau_detector import PlateauDetector
+
+            pd = PlateauDetector(orch.knowledge)
+            plateaued_family: str | None = None
+            triggered: bool = False
+            kind: str = ""
+
+            if getattr(plan_cfg, "plateau_detection_enabled", False):
+                window = getattr(plan_cfg, "plateau_window", 4)
+                # Walk each branch's family looking for a plateau.
+                for bc in branch_configs:
+                    if bc.family is not None and await pd.detect_plateau(
+                        bc.family, window=window
+                    ):
+                        plateaued_family = bc.family
+                        triggered = True
+                        kind = "per_family"
+                        break
+
+            if not triggered and getattr(
+                plan_cfg, "cross_family_plateau_enabled", False
+            ):
+                window = getattr(plan_cfg, "cross_family_plateau_window", 10)
+                if await pd.detect_cross_family_plateau(window=window):
+                    triggered = True
+                    kind = "cross_family"
+
+            if triggered:
+                logger.info(
+                    "multi_branch.plateau_detected",
+                    plateaued_family=plateaued_family,
+                    kind=kind,
+                )
+                await orch.plan_manager.ledger_append(
+                    op="plateau_detected",
+                    payload={
+                        "family": plateaued_family,
+                        "kind": kind,
+                        "n_branches": n_branches,
+                    },
+                )
+                # Pick the branch whose lane will be flipped + record the
+                # prior lane for forensics.
+                target_idx = 0
+                if plateaued_family is not None:
+                    for i, bc in enumerate(branch_configs):
+                        if bc.family == plateaued_family:
+                            target_idx = i
+                            break
+                prior_lane = branch_configs[target_idx].lane
+                # Mutate the branch_configs list (replace target with
+                # distant-scout copy).
+                branch_configs = await pd.force_distant_scout(
+                    branch_configs, plateaued_family=plateaued_family
+                )
+                await orch.plan_manager.ledger_append(
+                    op="plateau_forced_lane_change",
+                    payload={
+                        "branch_index": target_idx,
+                        "prior_lane": prior_lane,
+                        "new_lane": "distant-scout",
+                        "family": plateaued_family,
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 — advisory only
+            logger.warning(
+                "multi_branch.plateau_check_failed",
+                error=str(exc),
+            )
+
     # Step 1: gather N parallel branches with return_exceptions so a single
     # branch failure does NOT cancel siblings.
     coros = [
