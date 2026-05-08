@@ -68,12 +68,31 @@ class WorktreeManager:
 
     # ── Creation / removal ─────────────────────────────────────────────────
 
-    async def create(self, label: str, base_ref: str = "HEAD") -> Path:
+    async def create(
+        self,
+        label: str,
+        base_ref: str = "HEAD",
+        sparse_paths: list[str] | None = None,
+    ) -> Path:
         """Create a new git worktree at ``tournament_dir/<label>``.
 
         Uses ``git worktree add --detach <path> <base_ref>`` so the worktree
         is not associated with any branch (matches short-lived use — nothing
         to conflict on branch names across parallel tournaments).
+
+        v0.17.0 S6: ``sparse_paths`` is an optional list of repo-relative
+        path prefixes. When non-empty AND git ≥2.25 is available:
+
+        1. ``git worktree add --no-checkout`` skips the initial materialization.
+        2. ``git sparse-checkout init --cone`` enables cone-mode (faster +
+           well-tested vs. legacy non-cone mode).
+        3. ``git sparse-checkout set <prefixes>`` narrows the working set.
+        4. ``git checkout`` materializes the narrowed files on disk.
+
+        Falls back to a full checkout (with a warning) when:
+
+        * ``sparse_paths`` is None or empty (caller opted out).
+        * git is older than 2.25 (cone-mode unavailable).
 
         Returns the worktree path. Raises :class:`WorktreeError` on failure.
         """
@@ -83,6 +102,66 @@ class WorktreeManager:
             raise WorktreeError(
                 f"worktree path {wt} already exists; call remove() first"
             )
+
+        # v0.17.0 S6: sparse-checkout pre-flight.
+        # Empty list is treated as None (defensive — callers may forward
+        # phase.edit_scope which is sometimes legitimately empty).
+        use_sparse = bool(sparse_paths)
+        if use_sparse:
+            ver = await _get_git_version(self._main)
+            if ver < (2, 25, 0):
+                self._log.warning(
+                    "worktree.sparse_checkout.git_too_old",
+                    version=".".join(str(p) for p in ver),
+                    fallback="full checkout",
+                )
+                use_sparse = False
+
+        if use_sparse:
+            # Step 1: create worktree without materializing files.
+            rc, out, err = await _run_git(
+                self._main,
+                ["worktree", "add", "--no-checkout", "--detach", str(wt), base_ref],
+            )
+            if rc != 0:
+                raise WorktreeError(
+                    f"git worktree add --no-checkout failed (rc={rc}): "
+                    f"{err.strip() or out.strip()}"
+                )
+            # Step 2: enable cone-mode sparse-checkout in the new worktree.
+            rc, out, err = await _run_git(
+                wt, ["sparse-checkout", "init", "--cone"]
+            )
+            if rc != 0:
+                raise WorktreeError(
+                    f"git sparse-checkout init --cone failed (rc={rc}): "
+                    f"{err.strip() or out.strip()}"
+                )
+            # Step 3: narrow to the requested prefixes.
+            assert sparse_paths is not None  # narrowed by ``use_sparse`` above
+            rc, out, err = await _run_git(
+                wt, ["sparse-checkout", "set", *sparse_paths]
+            )
+            if rc != 0:
+                raise WorktreeError(
+                    f"git sparse-checkout set failed (rc={rc}): "
+                    f"{err.strip() or out.strip()}"
+                )
+            # Step 4: materialize the narrowed working set.
+            rc, out, err = await _run_git(wt, ["checkout"])
+            if rc != 0:
+                raise WorktreeError(
+                    f"git checkout (sparse) failed (rc={rc}): "
+                    f"{err.strip() or out.strip()}"
+                )
+            self._log.info(
+                "worktree.created_sparse",
+                label=label,
+                path=str(wt),
+                paths=sparse_paths,
+            )
+            return wt
+
         rc, out, err = await _run_git(
             self._main,
             ["worktree", "add", "--detach", str(wt), base_ref],
@@ -95,7 +174,10 @@ class WorktreeManager:
         return wt
 
     async def create_per_task(
-        self, task_id: str, base_ref: str = "HEAD"
+        self,
+        task_id: str,
+        base_ref: str = "HEAD",
+        sparse_paths: list[str] | None = None,
     ) -> Path:
         """Create a per-task worktree at ``tournament_dir/tasks/<task_id>``.
 
@@ -107,10 +189,9 @@ class WorktreeManager:
         * impl tournament: ``tournament_dir/{a,b,ab}``
         * per-task isolation: ``tournament_dir/tasks/{task_id}``
 
-        Reuses :meth:`create` machinery — same git invocation, same
-        error semantics. Caller is responsible for calling
-        :meth:`remove_per_task` (or letting :meth:`cleanup_all` handle
-        it on phase exit).
+        v0.17.0 S6: ``sparse_paths`` is forwarded into the same
+        sparse-checkout machinery used by :meth:`create`. ``None`` (or
+        an empty list) preserves legacy full-checkout behavior.
         """
         wt = self._dir / "tasks" / task_id
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -120,6 +201,48 @@ class WorktreeManager:
                 f"per-task worktree path {wt} already exists; "
                 "call remove_per_task() first"
             )
+
+        use_sparse = bool(sparse_paths)
+        if use_sparse:
+            ver = await _get_git_version(self._main)
+            if ver < (2, 25, 0):
+                self._log.warning(
+                    "worktree.sparse_checkout.git_too_old",
+                    task_id=task_id,
+                    version=".".join(str(p) for p in ver),
+                    fallback="full checkout",
+                )
+                use_sparse = False
+
+        if use_sparse:
+            rc, out, err = await _run_git(
+                self._main,
+                ["worktree", "add", "--no-checkout", "--detach", str(wt), base_ref],
+            )
+            if rc != 0:
+                raise WorktreeError(
+                    f"git worktree add --no-checkout failed (rc={rc}): "
+                    f"{err.strip() or out.strip()}"
+                )
+            for cmd in (
+                ["sparse-checkout", "init", "--cone"],
+                ["sparse-checkout", "set", *(sparse_paths or [])],
+                ["checkout"],
+            ):
+                rc, out, err = await _run_git(wt, cmd)
+                if rc != 0:
+                    raise WorktreeError(
+                        f"git {' '.join(cmd)} failed (rc={rc}): "
+                        f"{err.strip() or out.strip()}"
+                    )
+            self._log.info(
+                "worktree.created_per_task_sparse",
+                task_id=task_id,
+                path=str(wt),
+                paths=sparse_paths,
+            )
+            return wt
+
         rc, out, err = await _run_git(
             self._main,
             ["worktree", "add", "--detach", str(wt), base_ref],
@@ -363,6 +486,37 @@ class WorktreeManager:
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
+
+
+async def _get_git_version(cwd: Path) -> tuple[int, int, int]:
+    """Return the local ``git`` binary's version as ``(major, minor, patch)``.
+
+    Used by :meth:`WorktreeManager.create` to gate the sparse-checkout
+    cone-mode path: the ``--cone`` flag only landed in git 2.25.
+
+    Returns ``(0, 0, 0)`` on any parse / launch failure — callers
+    should treat that as "older than the threshold" and fall back to
+    the full-checkout path.
+    """
+    try:
+        rc, out, _ = await _run_git(cwd, ["--version"])
+    except WorktreeError:
+        return (0, 0, 0)
+    if rc != 0:
+        return (0, 0, 0)
+    # Output looks like ``git version 2.40.1`` (or ``git version 2.40.1.windows.1``).
+    text = out.strip()
+    parts = text.split()
+    if len(parts) < 3:
+        return (0, 0, 0)
+    nums = parts[2].split(".")
+    try:
+        major = int(nums[0])
+        minor = int(nums[1]) if len(nums) > 1 else 0
+        patch = int(nums[2]) if len(nums) > 2 else 0
+        return (major, minor, patch)
+    except (ValueError, IndexError):
+        return (0, 0, 0)
 
 
 async def _run_git(
