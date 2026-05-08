@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
+    from runtime.repo_probe import RepoCapacity
     from state.schemas import Task
 
 
@@ -56,7 +57,11 @@ TASK_TIMEOUT_S_DEFAULTS: dict[str, int] = {
 }
 
 
-def resolve_task_max_turns(task: "Task", spec_default: int | None) -> int | None:
+def resolve_task_max_turns(
+    task: "Task",
+    spec_default: int | None,
+    capacity: "RepoCapacity | None" = None,
+) -> int | None:
     """Return the per-task ``max_turns`` override or ``None``.
 
     ``spec_default`` is currently unused inside the resolver (the caller
@@ -64,10 +69,25 @@ def resolve_task_max_turns(task: "Task", spec_default: int | None) -> int | None
     accepted for symmetry with the future possibility of a multiplier-style
     resolution (e.g. ``2 * spec_default`` for medium). Including it now
     keeps the call sites stable.
+
+    v0.13.0: optional ``capacity`` argument enables repo-size-aware scaling.
+    When ``capacity.is_huge`` is True, the looked-up bucket value is
+    multiplied per :data:`runtime.repo_probe._HUGE_MULTIPLIER` so genuinely
+    complex tasks have runway on Unity-class repos. When ``capacity`` is
+    None (legacy callers) or ``is_huge`` is False, behavior is unchanged.
     """
     if task.complexity is None:
         return None
-    return TASK_MAX_TURNS_DEFAULTS.get(task.complexity)
+    base = TASK_MAX_TURNS_DEFAULTS.get(task.complexity)
+    if base is None:
+        return None
+    if capacity is not None and capacity.is_huge:
+        # Local import: avoid a static cycle with runtime.repo_probe (which
+        # imports ``TASK_MAX_TURNS_DEFAULTS`` from this module).
+        from runtime.repo_probe import _HUGE_MULTIPLIER
+
+        return int(round(base * _HUGE_MULTIPLIER))
+    return base
 
 
 def resolve_task_timeout_s(task: "Task", spec_default: int | None) -> int | None:

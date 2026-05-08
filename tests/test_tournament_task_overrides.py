@@ -100,3 +100,55 @@ def test_max_turns_table_keys_match_complexity_literal() -> None:
 
 def test_timeout_s_table_keys_match_complexity_literal() -> None:
     assert set(TASK_TIMEOUT_S_DEFAULTS.keys()) == {"simple", "medium", "complex"}
+
+
+# ---------------------------------------------------------------------------
+# v0.13.0: resolve_task_max_turns with optional capacity argument
+#
+# When ``capacity.is_huge`` is True, the resolver applies the same
+# multiplier as ``runtime.repo_probe.resolve_max_turns``. When capacity is
+# None or not huge, behavior is identical to the legacy resolver.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_task_max_turns_with_huge_capacity_applies_multiplier() -> None:
+    """``capacity.is_huge=True`` doubles the per-complexity bucket."""
+    from runtime.repo_probe import RepoCapacity
+
+    cap = RepoCapacity(
+        file_count=25_000, total_bytes=10_000_000_000, depth_max=10, is_huge=True
+    )
+    assert resolve_task_max_turns(_task("simple"), spec_default=10, capacity=cap) == 20
+    assert resolve_task_max_turns(_task("medium"), spec_default=10, capacity=cap) == 40
+    assert resolve_task_max_turns(_task("complex"), spec_default=10, capacity=cap) == 80
+
+
+def test_resolve_task_max_turns_capacity_none_preserves_legacy_behavior() -> None:
+    """``capacity=None`` (default) reproduces the v0.12.0 lookup table."""
+    assert resolve_task_max_turns(_task("simple"), spec_default=10, capacity=None) == 10
+    assert resolve_task_max_turns(_task("medium"), spec_default=10, capacity=None) == 20
+    assert resolve_task_max_turns(_task("complex"), spec_default=10, capacity=None) == 40
+
+
+def test_resolve_task_max_turns_capacity_not_huge_preserves_lookup() -> None:
+    """``capacity.is_huge=False`` is identical to the legacy lookup."""
+    from runtime.repo_probe import RepoCapacity
+
+    cap = RepoCapacity(
+        file_count=1_000, total_bytes=10_000_000, depth_max=5, is_huge=False
+    )
+    assert resolve_task_max_turns(_task("simple"), spec_default=10, capacity=cap) == 10
+    assert resolve_task_max_turns(_task("medium"), spec_default=10, capacity=cap) == 20
+
+
+def test_resolve_task_max_turns_huge_with_none_complexity_returns_none() -> None:
+    """``complexity=None`` still short-circuits to None even with huge cap.
+
+    The caller's spec default kicks in — the multiplier never reaches it.
+    """
+    from runtime.repo_probe import RepoCapacity
+
+    cap = RepoCapacity(
+        file_count=25_000, total_bytes=10_000_000_000, depth_max=10, is_huge=True
+    )
+    assert resolve_task_max_turns(_task(None), spec_default=10, capacity=cap) is None
