@@ -375,3 +375,136 @@ def test_plan_tournament_id_branch_index_none_explicit_equals_legacy() -> None:
     assert ptr._plan_tournament_id(_SPEC_HASH, branch_index=None) == ptr._plan_tournament_id(
         _SPEC_HASH
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.12.0 — run_plan_tournament branch_index/branch_seed parameters
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_plan_tournament_legacy_dir_when_no_branch_index(
+    tmp_path: Path,
+    capture_tournament: type[_CapturingTournament],
+) -> None:
+    """No ``branch_index`` → legacy ``tournaments/plan-{hash}/`` dir."""
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = _make_orch(tmp_path, adapter)
+    md = _plan_md("medium")
+
+    await ptr.run_plan_tournament(orch, md, "spec text", spec_hash=_SPEC_HASH)
+
+    captured = capture_tournament.captured_artifact_dir
+    assert captured is not None
+    # Legacy single-branch path under tournaments/plan-{hash}/
+    parts = captured.parts
+    assert "tournaments" in parts
+    assert any(p.startswith("plan-") for p in parts)
+    assert not any(p.startswith("multi-") for p in parts)
+
+
+@pytest.mark.asyncio
+async def test_run_plan_tournament_multi_dir_when_branch_index_set(
+    tmp_path: Path,
+    capture_tournament: type[_CapturingTournament],
+) -> None:
+    """``branch_index=2`` → ``tournaments/multi-{hash}/branch-2/`` dir."""
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = _make_orch(tmp_path, adapter)
+    md = _plan_md("medium")
+
+    await ptr.run_plan_tournament(
+        orch,
+        md,
+        "spec text",
+        spec_hash=_SPEC_HASH,
+        branch_index=2,
+        branch_seed=42,
+    )
+
+    captured = capture_tournament.captured_artifact_dir
+    assert captured is not None
+    parts = captured.parts
+    assert "tournaments" in parts
+    assert f"multi-{_SPEC_HASH[:8]}" in parts
+    assert "branch-2" in parts
+
+
+@pytest.mark.asyncio
+async def test_run_plan_tournament_branch_seed_diverges_rng(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different ``branch_seed`` values → different RNG seeds.
+
+    Captures the ``rng`` argument passed to the Tournament constructor,
+    asserts that two distinct ``branch_seed`` values produce RNG instances
+    whose first-draw output differs.
+    """
+    captured_rngs: list[Any] = []
+
+    class _CaptureRng:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_rngs.append(kwargs.get("rng"))
+
+        async def run(self, *, task_prompt: str, initial: str) -> tuple[str, list]:
+            return initial, []
+
+    monkeypatch.setattr(ptr, "Tournament", _CaptureRng)
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = _make_orch(tmp_path, adapter)
+    md = _plan_md("medium")
+
+    await ptr.run_plan_tournament(
+        orch, md, "spec", spec_hash=_SPEC_HASH, branch_index=0, branch_seed=100
+    )
+    await ptr.run_plan_tournament(
+        orch, md, "spec", spec_hash=_SPEC_HASH, branch_index=1, branch_seed=200
+    )
+
+    assert len(captured_rngs) == 2
+    rng_a, rng_b = captured_rngs
+    assert rng_a is not None and rng_b is not None
+    # Distinct seeds → distinct first draws.
+    a_draw = rng_a.random()
+    b_draw = rng_b.random()
+    assert a_draw != b_draw, (
+        "Distinct branch_seed values should yield divergent RNG streams; "
+        f"both seeds drew {a_draw}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_plan_tournament_branch_seed_none_uses_spec_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``branch_seed=None`` preserves v0.11.x behavior: seed from spec_hash.
+
+    Two runs with the same ``spec_hash`` and no ``branch_seed`` produce
+    RNG instances whose first draws match (deterministic legacy seeding).
+    """
+    captured_rngs: list[Any] = []
+
+    class _CaptureRng:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_rngs.append(kwargs.get("rng"))
+
+        async def run(self, *, task_prompt: str, initial: str) -> tuple[str, list]:
+            return initial, []
+
+    monkeypatch.setattr(ptr, "Tournament", _CaptureRng)
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = _make_orch(tmp_path, adapter)
+    md = _plan_md("medium")
+
+    await ptr.run_plan_tournament(orch, md, "spec", spec_hash=_SPEC_HASH)
+    await ptr.run_plan_tournament(orch, md, "spec", spec_hash=_SPEC_HASH)
+
+    assert len(captured_rngs) == 2
+    rng_a, rng_b = captured_rngs
+    assert rng_a is not None and rng_b is not None
+    a_draw = rng_a.random()
+    b_draw = rng_b.random()
+    # Same spec_hash + same default seeding path → identical streams.
+    assert a_draw == b_draw

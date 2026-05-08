@@ -167,7 +167,13 @@ def _is_auto_disabled(model: str | None, auto_disable: list[str]) -> bool:
 
 
 async def run_plan_tournament(
-    orch: "Orchestrator", initial_md: str, spec: str, spec_hash: str
+    orch: "Orchestrator",
+    initial_md: str,
+    spec: str,
+    spec_hash: str,
+    *,
+    branch_index: int | None = None,
+    branch_seed: int | None = None,
 ) -> str:
     """Run the plan tournament and return the refined plan markdown.
 
@@ -180,6 +186,17 @@ async def run_plan_tournament(
             in the same artifact dir and can resume) and to seed the
             tournament RNG (so judge presentation order and synthesizer X/Y
             ordering are reproducible across runs).
+        branch_index: v0.12.0 — optional branch index for multi-branch
+            tournaments. When ``None`` (default), the runner uses the
+            legacy single-branch tournament id and ``tournaments/plan-{hash}/``
+            artifact dir. When set, uses the branch-namespaced id and
+            ``tournaments/multi-{spec_hash[:8]}/branch-N/`` artifact dir
+            so concurrent branches don't collide on disk.
+        branch_seed: v0.12.0 — optional explicit RNG seed. When ``None``
+            (default), seeds from ``int(spec_hash, 16)`` (existing
+            behavior). When set, seeds from this value directly so the
+            multi-branch dispatcher can pass divergent seeds (e.g.
+            ``int(spec_hash, 16) + branch_index``) per branch.
 
     Behavior:
         - If any relevant role resolves to an auto-disabled model, returns
@@ -204,8 +221,20 @@ async def run_plan_tournament(
         "Tournament runners must use subprocess adapters, not InlineAdapter"
     )
 
-    tournament_id = _plan_tournament_id(spec_hash)
-    artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
+    tournament_id = _plan_tournament_id(spec_hash, branch_index=branch_index)
+    if branch_index is None:
+        # Legacy single-branch path: tournaments/plan-{hash}/
+        artifact_dir = autodev_root(orch.cwd) / "tournaments" / tournament_id
+    else:
+        # v0.12.0 multi-branch path: tournaments/multi-{hash}/branch-N/
+        # The parent ``multi-{hash}/`` dir keeps branch artifacts grouped
+        # without colliding with legacy single-branch dirs.
+        artifact_dir = (
+            autodev_root(orch.cwd)
+            / "tournaments"
+            / f"multi-{spec_hash[:8]}"
+            / f"branch-{branch_index}"
+        )
 
     # Extract the architect's COMPLEXITY: classification directly from the
     # markdown the tournament is about to refine. The parsed Plan isn't
@@ -274,7 +303,10 @@ async def run_plan_tournament(
         if orch.plugin_registry is not None
         else []
     )
-    rng = random.Random(int(spec_hash, 16))
+    # v0.12.0: when ``branch_seed`` is provided (multi-branch dispatch),
+    # use it directly so each branch's RNG diverges from its siblings.
+    # Otherwise preserve v0.11.x behavior of seeding from the spec hash.
+    rng = random.Random(branch_seed if branch_seed is not None else int(spec_hash, 16))
     tournament = Tournament(
         handler=PlanContentHandler(),
         client=client,
