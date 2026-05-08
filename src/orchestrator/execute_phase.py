@@ -41,6 +41,7 @@ from qa import (
     run_build_check,
     run_lint,
     run_hallucination_guard,
+    run_mutation_test,
     run_secretscan,
     run_syntax_check,
     run_tests,
@@ -2262,6 +2263,14 @@ async def _run_qa_gates(
         (
             hallucination_guard_enabled,
             lambda: run_hallucination_guard(cwd, paths=secretscan_paths),
+        ),
+        (
+            cfg.mutation_test_enabled,
+            lambda: run_mutation_test(
+                cwd,
+                paths=secretscan_paths,
+                kill_rate_threshold=cfg.mutation_test_threshold,
+            ),
         ),
     ]
 
