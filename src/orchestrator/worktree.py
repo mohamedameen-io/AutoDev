@@ -19,6 +19,7 @@ All git invocations go through :func:`asyncio.create_subprocess_exec`.
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 from pathlib import Path
 from typing import Iterable
@@ -353,6 +354,67 @@ class WorktreeManager:
         await _run_git(self._main, ["worktree", "prune"])
         self._log.info("worktree.cleanup_complete")
 
+    async def expand_sparse_paths(
+        self, worktree: Path, additional_paths: list[str]
+    ) -> None:
+        """v0.20.0 C3: dynamically widen a sparse-checkout worktree.
+
+        Invokes ``git -C <worktree> sparse-checkout add <prefixes>`` then
+        ``git -C <worktree> checkout`` to materialize the newly admitted
+        paths. Idempotent — paths already in the sparse set are no-ops
+        for git's add subcommand.
+
+        Used by :func:`orchestrator.execute_phase` when a developer
+        reports a missing-file error: if the missing path is covered by
+        ``task.extended_scope`` / ``phase.edit_scope`` / ``plan.edit_scope``
+        but the sparse worktree never materialized it, expand and retry
+        once.
+
+        Silently no-ops when:
+
+        * ``additional_paths`` is empty / falsy.
+        * the worktree is not a sparse-checkout (``sparse-checkout add``
+          will fail with a benign warning).
+        * git is older than 2.25 (cone-mode unsupported).
+        """
+        if not additional_paths:
+            return
+        if not worktree.exists():
+            raise WorktreeError(
+                f"cannot expand sparse paths in missing worktree {worktree}"
+            )
+        # Pre-flight: only run on git >=2.25 (cone-mode requirement).
+        ver = await _get_git_version(self._main)
+        if ver < (2, 25, 0):
+            self._log.warning(
+                "worktree.sparse_expand.git_too_old",
+                version=".".join(str(p) for p in ver),
+            )
+            return
+        rc, out, err = await _run_git(
+            worktree, ["sparse-checkout", "add", *additional_paths]
+        )
+        if rc != 0:
+            # Non-fatal: log and bail (best-effort widen).
+            self._log.warning(
+                "worktree.sparse_expand.add_failed",
+                paths=additional_paths,
+                rc=rc,
+                err=err.strip() or out.strip(),
+            )
+            return
+        rc2, out2, err2 = await _run_git(worktree, ["checkout"])
+        if rc2 != 0:
+            self._log.warning(
+                "worktree.sparse_expand.checkout_failed",
+                rc=rc2,
+                err=err2.strip() or out2.strip(),
+            )
+            return
+        self._log.info(
+            "worktree.sparse_expanded", paths=additional_paths, worktree=str(worktree)
+        )
+
     # ── Diffing / patching ─────────────────────────────────────────────────
 
     async def get_diff_vs_base(
@@ -488,6 +550,53 @@ class WorktreeManager:
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 
+_MISSING_FILE_PATTERNS = (
+    # python: "FileNotFoundError: [Errno 2] No such file or directory: '<path>'"
+    # Quoted form must come BEFORE the bare-path pattern below — otherwise
+    # the bare pattern eats the closing quote as part of the path.
+    re.compile(
+        r"No such file or directory:\s*['\"]([^'\"\n]+)['\"]",
+    ),
+    # generic: "cannot open '<path>'"
+    re.compile(r"cannot open\s+['\"]([^'\"\n]+)['\"]", re.IGNORECASE),
+    # cat / head / bash style: "<context: >?<path>: No such file or directory"
+    # ``bash: src/foo/bar.py: No such file or directory`` — match the
+    # token immediately preceding the colon-No-such-file substring.
+    re.compile(
+        r"(?:^|\s)([^\s:'\"]+):\s*No such file or directory",
+        re.IGNORECASE,
+    ),
+)
+
+
+def detect_missing_paths(text: str) -> list[str]:
+    """v0.20.0 C3: extract repo-relative-looking paths from adapter output.
+
+    Pattern-matches several common shapes for "file not found" errors
+    that bubble up through CLI tooling. Returns a deduplicated list
+    preserving first-seen order. Absolute paths and ``.``/``..``
+    segments are filtered out — only repo-relative-looking paths flow
+    through (they're the only ones the sparse-checkout add can act on).
+    """
+    if not text:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for pattern in _MISSING_FILE_PATTERNS:
+        for match in pattern.finditer(text):
+            path = match.group(1).strip()
+            if not path or path in seen:
+                continue
+            if path.startswith("/"):
+                continue
+            parts = path.split("/")
+            if any(p == ".." for p in parts):
+                continue
+            seen.add(path)
+            found.append(path)
+    return found
+
+
 async def _get_git_version(cwd: Path) -> tuple[int, int, int]:
     """Return the local ``git`` binary's version as ``(major, minor, patch)``.
 
@@ -562,4 +671,4 @@ async def _run_git(
     )
 
 
-__all__ = ["WorktreeError", "WorktreeManager"]
+__all__ = ["WorktreeError", "WorktreeManager", "detect_missing_paths"]
