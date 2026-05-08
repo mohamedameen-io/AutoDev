@@ -295,6 +295,7 @@ async def test_plan_phase_falls_back_to_latest_incumbent_on_tournament_error(
     )
     cfg = default_config()
     cfg.tournaments.plan.enabled = True
+    cfg.tournaments.plan.num_branches = 1  # legacy single-branch path
     cfg.tournaments.impl.enabled = False
     registry = build_registry(cfg)
     orch = Orchestrator(
@@ -349,6 +350,7 @@ async def test_plan_phase_falls_back_to_original_when_no_incumbents(
     )
     cfg = default_config()
     cfg.tournaments.plan.enabled = True
+    cfg.tournaments.plan.num_branches = 1  # legacy single-branch path
     cfg.tournaments.impl.enabled = False
     registry = build_registry(cfg)
     orch = Orchestrator(
@@ -368,3 +370,138 @@ async def test_plan_phase_falls_back_to_original_when_no_incumbents(
     assert plan is not None
     # The legacy path: architect's CANONICAL_PLAN_MD title.
     assert plan.metadata["title"] == "Add subtract(a, b)"
+
+
+# ---------------------------------------------------------------------------
+# v0.12.0 — plan_phase dispatch on cfg.tournaments.plan.num_branches
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_phase_dispatches_to_multi_branch_when_num_branches_gt_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``cfg.tournaments.plan.num_branches > 1`` → dispatch to
+    :func:`run_multi_branch_plan_tournament`. Legacy
+    :func:`run_plan_tournament` is NOT called on this path."""
+    from orchestrator import plan_phase as plan_phase_mod
+
+    multi_called = {"count": 0, "n_branches": None}
+    single_called = {"count": 0}
+
+    async def fake_multi(
+        orch: object,
+        plan_md: str,
+        intent: str,
+        spec_hash: str,
+        *,
+        n_branches: int,
+    ) -> object:
+        multi_called["count"] += 1
+        multi_called["n_branches"] = n_branches
+        # Return a synthetic outcome.
+        from orchestrator.multi_branch_tournament import (
+            BranchOutcome,
+            MultiBranchOutcome,
+        )
+
+        return MultiBranchOutcome(
+            branches=[
+                BranchOutcome(
+                    branch_index=i,
+                    success=True,
+                    final_md=CANONICAL_PLAN_MD,
+                    error=None,
+                )
+                for i in range(n_branches)
+            ],
+            final_md=CANONICAL_PLAN_MD,
+            meta_history=[],
+        )
+
+    async def fake_single(*args: object, **kwargs: object) -> str:
+        single_called["count"] += 1
+        return CANONICAL_PLAN_MD
+
+    monkeypatch.setattr(
+        plan_phase_mod, "run_multi_branch_plan_tournament", fake_multi
+    )
+    monkeypatch.setattr(plan_phase_mod, "run_plan_tournament", fake_single)
+
+    adapter = StubAdapter(
+        {
+            "explorer": ok("ok"),
+            "domain_expert": ok("ok"),
+            "architect": ok(CANONICAL_PLAN_MD),
+        }
+    )
+    cfg = default_config()
+    cfg.tournaments.plan.enabled = True
+    cfg.tournaments.plan.num_branches = 3  # multi-branch path
+    cfg.tournaments.impl.enabled = False
+    registry = build_registry(cfg)
+    orch = Orchestrator(
+        cwd=tmp_path,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id="sess-test-multi-dispatch",
+    )
+
+    plan = await orch.plan("Add subtract(a, b)")
+    assert plan is not None
+    assert multi_called["count"] == 1
+    assert multi_called["n_branches"] == 3
+    # Legacy single-branch path was NOT taken.
+    assert single_called["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_phase_dispatches_to_single_branch_when_num_branches_eq_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``cfg.tournaments.plan.num_branches == 1`` → legacy single-branch
+    path; multi-branch entry-point NOT invoked. Regression for v0.11.x
+    callers who haven't enabled fan-out."""
+    from orchestrator import plan_phase as plan_phase_mod
+
+    multi_called = {"count": 0}
+    single_called = {"count": 0}
+
+    async def fake_multi(*args: object, **kwargs: object) -> object:
+        multi_called["count"] += 1
+        raise AssertionError("multi-branch path should not be invoked when num_branches=1")
+
+    async def fake_single(*args: object, **kwargs: object) -> str:
+        single_called["count"] += 1
+        return CANONICAL_PLAN_MD
+
+    monkeypatch.setattr(
+        plan_phase_mod, "run_multi_branch_plan_tournament", fake_multi
+    )
+    monkeypatch.setattr(plan_phase_mod, "run_plan_tournament", fake_single)
+
+    adapter = StubAdapter(
+        {
+            "explorer": ok("ok"),
+            "domain_expert": ok("ok"),
+            "architect": ok(CANONICAL_PLAN_MD),
+        }
+    )
+    cfg = default_config()
+    cfg.tournaments.plan.enabled = True
+    cfg.tournaments.plan.num_branches = 1  # single-branch path
+    cfg.tournaments.impl.enabled = False
+    registry = build_registry(cfg)
+    orch = Orchestrator(
+        cwd=tmp_path,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id="sess-test-single-dispatch",
+    )
+
+    plan = await orch.plan("Add subtract(a, b)")
+    assert plan is not None
+    assert single_called["count"] == 1
+    assert multi_called["count"] == 0

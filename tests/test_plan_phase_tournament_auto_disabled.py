@@ -49,6 +49,8 @@ def _orch_with_judge_model(
     cfg.tournaments.plan.num_judges = 1
     cfg.tournaments.plan.convergence_k = 1
     cfg.tournaments.plan.max_rounds = 3
+    # v0.12.0: this fixture tests auto-disable on the single-branch path.
+    cfg.tournaments.plan.num_branches = 1
     if auto_disable is not None:
         cfg.tournaments.auto_disable_for_models = auto_disable
     cfg.tournaments.impl.enabled = False

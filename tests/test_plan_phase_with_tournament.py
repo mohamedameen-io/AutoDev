@@ -191,6 +191,10 @@ def _make_orch(cwd: Path, adapter: PlatformAdapter) -> Orchestrator:
     cfg.tournaments.plan.num_judges = 1
     cfg.tournaments.plan.convergence_k = 1  # converge after first non-A pass
     cfg.tournaments.plan.max_rounds = 3
+    # v0.12.0: this fixture exercises the legacy single-branch path. The
+    # default ships ``num_branches=3``; pin to 1 so dispatch lands on
+    # ``run_plan_tournament`` (not the multi-branch orchestrator).
+    cfg.tournaments.plan.num_branches = 1
     # Disable auto-disable for this test (default includes "opus" and
     # registry judge model defaults to "sonnet" so it wouldn't trigger;
     # explicitly clear to be safe).

@@ -30,6 +30,10 @@ from orchestrator.plan_parser import (
     PlanParseError,
     parse_plan_markdown,
 )
+from orchestrator.multi_branch_tournament import (
+    multi_branch_parent_dir,
+    run_multi_branch_plan_tournament,
+)
 from orchestrator.plan_tournament_runner import (
     _plan_tournament_id,
     run_plan_tournament,
@@ -42,7 +46,10 @@ from state.schemas import (
     SMEEvidence,
 )
 from tournament.effort import resolve_role_effort
-from tournament.state import TournamentArtifactStore
+from tournament.state import (
+    TournamentArtifactStore,
+    latest_incumbent_md_across_branches,
+)
 
 
 if TYPE_CHECKING:
@@ -180,33 +187,76 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
             plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
 
         if orch.cfg.tournaments.plan.enabled:
+            num_branches = orch.cfg.tournaments.plan.num_branches
             try:
-                refined_md = await run_plan_tournament(
-                    orch, plan_md, intent, spec_hash
-                )
+                if num_branches > 1:
+                    # v0.12.0 multi-branch path.
+                    outcome = await run_multi_branch_plan_tournament(
+                        orch,
+                        plan_md,
+                        intent,
+                        spec_hash,
+                        n_branches=num_branches,
+                    )
+                    refined_md = outcome.final_md
+                    logger.info(
+                        "plan_phase.multi_branch_tournament_done",
+                        n_branches=num_branches,
+                        n_survivors=sum(1 for b in outcome.branches if b.success),
+                        meta_passes=len(outcome.meta_history),
+                    )
+                else:
+                    # Legacy single-branch path (v0.11.x and earlier).
+                    refined_md = await run_plan_tournament(
+                        orch, plan_md, intent, spec_hash
+                    )
             except TournamentError as exc:
                 logger.warning("plan_phase.tournament_failed", err=str(exc))
-                # Salvage path (v0.6.0 / Issue 2): on a tournament error,
-                # try to recover the latest persisted ``incumbent_after_NN.md``
-                # rather than dropping every refinement that already landed
-                # on disk. Falling through to ``refined_md = plan_md`` if
-                # the recovery fails preserves legacy behavior.
+                # Salvage path (v0.6.0 / Issue 2 + v0.12.0 multi-branch
+                # extension): on a tournament error, try to recover the
+                # latest persisted ``incumbent_after_NN.md`` rather than
+                # dropping every refinement that already landed on disk.
+                # For multi-branch runs, walk all per-branch dirs and
+                # pick the highest-pass-num incumbent across them.
+                # Falling through to ``refined_md = plan_md`` if recovery
+                # fails preserves legacy behavior.
                 refined_md = plan_md
                 try:
-                    artifact_dir = (
-                        autodev_root(orch.cwd)
-                        / "tournaments"
-                        / _plan_tournament_id(spec_hash)
-                    )
-                    store = TournamentArtifactStore(artifact_dir)
-                    recovered = store.latest_incumbent_md()
-                    if recovered:
-                        refined_md = recovered
-                        logger.info(
-                            "plan_phase.tournament_recovered_from_disk",
-                            pass_num=store.latest_incumbent_pass_num(),
-                            bytes=len(recovered),
+                    if num_branches > 1:
+                        # Multi-branch salvage walk.
+                        parent = multi_branch_parent_dir(orch.cwd, spec_hash)
+                        recovered_tuple = latest_incumbent_md_across_branches(
+                            parent
                         )
+                        if recovered_tuple is not None:
+                            recovered_md, branch_idx, pass_num = recovered_tuple
+                            refined_md = recovered_md
+                            logger.info(
+                                "plan_phase.multi_branch_recovered_from_disk",
+                                branch_index=branch_idx,
+                                pass_num=pass_num,
+                                bytes=len(recovered_md),
+                            )
+                        else:
+                            logger.info(
+                                "plan_phase.multi_branch_no_incumbent_on_disk"
+                            )
+                    else:
+                        # Legacy single-branch salvage.
+                        artifact_dir = (
+                            autodev_root(orch.cwd)
+                            / "tournaments"
+                            / _plan_tournament_id(spec_hash)
+                        )
+                        store = TournamentArtifactStore(artifact_dir)
+                        recovered = store.latest_incumbent_md()
+                        if recovered:
+                            refined_md = recovered
+                            logger.info(
+                                "plan_phase.tournament_recovered_from_disk",
+                                pass_num=store.latest_incumbent_pass_num(),
+                                bytes=len(recovered),
+                            )
                 except Exception as recovery_exc:  # noqa: BLE001
                     logger.warning(
                         "plan_phase.tournament_recovery_failed",
