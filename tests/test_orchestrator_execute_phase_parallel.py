@@ -411,3 +411,88 @@ async def test_run_execute_phase_undefined_dep_blocks_phase(
     # Both pending tasks blocked.
     for tid in ("1.1", "1.2"):
         assert by_id[tid].status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# v0.14.0 commit 3 — edit_scope validator hook in run_execute_phase
+# ---------------------------------------------------------------------------
+
+
+def _mk_plan_with_scope(
+    tasks: list[Task],
+    plan_scope: list[str] | None = None,
+    phase_scope: list[str] | None = None,
+) -> Plan:
+    return Plan(
+        plan_id="p-edit-scope",
+        spec_hash="beef",
+        phases=[
+            Phase(
+                id="1",
+                title="scoped",
+                tasks=tasks,
+                edit_scope=phase_scope,
+            )
+        ],
+        edit_scope=plan_scope or [],
+        created_at=_iso(),
+        updated_at=_iso(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_execute_phase_blocks_tasks_on_edit_scope_violation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan with edit_scope=['src/'] but a task touching docs/ blocks
+    the run with reason=edit_scope_violation before any task dispatches."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan_with_scope(
+            tasks=[
+                _t("1.1", files=["src/ok.py"]),
+                _t("1.2", files=["docs/out.md"]),
+            ],
+            plan_scope=["src"],
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    _patch_execute_one(monkeypatch)
+
+    await ep.run_execute_phase(orch)
+
+    plan = await pm.load()
+    assert plan is not None
+    by_id = {t.id: t for t in plan.phases[0].tasks}
+    # Both pending tasks blocked because the validation runs before dispatch.
+    for tid in ("1.1", "1.2"):
+        assert by_id[tid].status == "blocked"
+        assert (
+            by_id[tid].blocked_reason is not None
+            and "edit_scope" in by_id[tid].blocked_reason
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_execute_phase_empty_edit_scope_is_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan without edit_scope (legacy) lets every task through —
+    no validation runs."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan_with_scope(
+            tasks=[_t("1.1", files=["anywhere/at/all.py"])],
+            plan_scope=[],
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    _patch_execute_one(monkeypatch)
+
+    await ep.run_execute_phase(orch)
+
+    plan = await pm.load()
+    assert plan is not None
+    by_id = {t.id: t for t in plan.phases[0].tasks}
+    # No blocking — task ran (status transitioned away from pending).
+    assert by_id["1.1"].status != "blocked"

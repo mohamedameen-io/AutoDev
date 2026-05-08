@@ -431,9 +431,46 @@ async def run_execute_phase(
         )
 
     try:
-        # Validate every phase's DAG up-front. A bad DAG short-circuits
-        # the entire run rather than propagating mid-execute.
-        from orchestrator.dag import DagValidationError, validate_phase_dag
+        # v0.14.0: validate edit_scope first — a plan that declares a
+        # narrowed scope but lists out-of-scope task files is a fail-fast
+        # condition. We block every pending task in offending phases (so
+        # the run terminates cleanly) and emit a structured warning that
+        # includes the offending task id, file, and resolved scope. When
+        # ``Plan.edit_scope`` is empty (legacy / no scope declared), the
+        # validator is a no-op and the loop proceeds unchanged.
+        from orchestrator.dag import (
+            DagValidationError,
+            EditScopeViolation,
+            validate_edit_scope,
+            validate_phase_dag,
+        )
+
+        try:
+            validate_edit_scope(plan)
+        except EditScopeViolation as exc:
+            logger.warning(
+                "execute_phase.edit_scope_violation",
+                err=str(exc),
+            )
+            # Block every pending task in every phase: an edit_scope
+            # violation typically points at a structural plan error
+            # (architect declared too-narrow scope, or a task slipped
+            # in with the wrong files), and partial execution past the
+            # violation is unsafe.
+            for phase in plan.phases:
+                for t in phase.tasks:
+                    if t.status == "pending":
+                        try:
+                            await orch.plan_manager.update_task_status(
+                                t.id,
+                                "blocked",
+                                meta={
+                                    "blocked_reason": f"edit_scope_violation: {exc}"
+                                },
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+            return processed
 
         for phase in plan.phases:
             try:
