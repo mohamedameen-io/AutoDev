@@ -115,7 +115,14 @@ class TournamentsConfig(BaseModel):
     phase_review: TournamentPhaseConfig = Field(
         default_factory=_default_phase_review_cfg
     )
-    max_parallel_subprocesses: int = 3
+    # v0.10.0: widened ``int`` → ``int | None``. ``None`` means
+    # "auto-resolve at tournament startup via
+    # :func:`runtime.resource_probe.resolve_parallelism`" — a host-aware
+    # value derived from CPU count, available memory, and judge cohort
+    # size. An explicit int still passes through unchanged for
+    # backward-compat with pre-v0.10.0 configs (and as an escape hatch
+    # for hosts where psutil mis-reports capacity).
+    max_parallel_subprocesses: int | None = None
     auto_disable_for_models: list[str] = Field(default_factory=lambda: ["opus"])
 
 

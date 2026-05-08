@@ -332,3 +332,19 @@ def test_phase_review_default_max_rounds_2() -> None:
     after the initial review pass."""
     cfg = default_config()
     assert cfg.tournaments.phase_review.max_rounds == 2
+
+
+# ---------------------------------------------------------------------------
+# v0.10.0 — max_parallel_subprocesses default flips to None (auto-resolve)
+# ---------------------------------------------------------------------------
+
+
+def test_default_max_parallel_subprocesses_is_none() -> None:
+    """v0.10.0: the default flips ``3`` → ``None``. ``None`` means
+    'auto-resolve via runtime.resource_probe.resolve_parallelism' at
+    tournament startup, replacing the fixed cap with a host-aware value.
+    Existing user configs that pin an explicit int still work
+    (backward-compat preserved).
+    """
+    cfg = default_config()
+    assert cfg.tournaments.max_parallel_subprocesses is None

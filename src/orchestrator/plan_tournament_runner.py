@@ -224,12 +224,17 @@ async def run_plan_tournament(
         role_timeout_s=role_timeout_s,
     )
 
+    # v0.10.0: ``max_parallel_subprocesses`` is now ``int | None`` in the
+    # config schema; ``None`` is replaced by host-aware
+    # :func:`runtime.resource_probe.resolve_parallelism` in the next
+    # commit. Until then, keep the legacy literal default (3) when None.
+    _legacy_parallelism = orch.cfg.tournaments.max_parallel_subprocesses or 3
     tcfg = TournamentConfig(
         num_judges=effective_num_judges,
         convergence_k=cfg.convergence_k,
         max_rounds=cfg.max_rounds,
         model=model,
-        max_parallel_subprocesses=orch.cfg.tournaments.max_parallel_subprocesses,
+        max_parallel_subprocesses=_legacy_parallelism,
         score_stability_window=cfg.score_stability_window,
         score_stability_max_delta=cfg.score_stability_max_delta,
         winner_stability_window=cfg.winner_stability_window,

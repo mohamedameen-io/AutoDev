@@ -172,7 +172,12 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 max_plan_lines_growth_ratio=None,
                 complex_plan_num_judges_override=None,
             ),
-            max_parallel_subprocesses=3,
+            # v0.10.0: default flips 3 → None (auto-resolve via
+            # ``runtime.resource_probe.resolve_parallelism`` at tournament
+            # startup). Operators can still pin an explicit int in their
+            # config to bypass the probe (e.g. on hosts where psutil
+            # mis-reports capacity, or to force a known-stable value).
+            max_parallel_subprocesses=None,
             auto_disable_for_models=["opus"],
         ),
         qa_gates=QAGatesConfig(),

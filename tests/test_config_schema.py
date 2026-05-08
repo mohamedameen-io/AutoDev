@@ -243,3 +243,57 @@ def test_legacy_config_without_phase_review_loads_via_default(tmp_path: Path) ->
     reloaded = load_config(path)
     assert reloaded.tournaments.phase_review.enabled is True
     assert reloaded.tournaments.phase_review.num_judges == 3
+
+
+# ---------------------------------------------------------------------------
+# v0.10.0 — TournamentsConfig.max_parallel_subprocesses: int | None
+# ---------------------------------------------------------------------------
+
+
+def test_max_parallel_subprocesses_accepts_none() -> None:
+    """v0.10.0: ``max_parallel_subprocesses`` accepts ``None`` (auto-resolve
+    via :func:`runtime.resource_probe.resolve_parallelism`)."""
+    from config.schema import TournamentPhaseConfig, TournamentsConfig
+
+    base_phase = TournamentPhaseConfig(
+        enabled=True, num_judges=5, convergence_k=2, max_rounds=15
+    )
+    cfg = TournamentsConfig(
+        plan=base_phase,
+        impl=base_phase,
+        max_parallel_subprocesses=None,
+    )
+    assert cfg.max_parallel_subprocesses is None
+    # Round-trip: None survives serialize + reload.
+    reloaded = TournamentsConfig.model_validate(cfg.model_dump())
+    assert reloaded.max_parallel_subprocesses is None
+
+
+def test_max_parallel_subprocesses_accepts_int() -> None:
+    """An explicit int passes validation unchanged (backward-compat)."""
+    from config.schema import TournamentPhaseConfig, TournamentsConfig
+
+    base_phase = TournamentPhaseConfig(
+        enabled=True, num_judges=5, convergence_k=2, max_rounds=15
+    )
+    cfg = TournamentsConfig(
+        plan=base_phase,
+        impl=base_phase,
+        max_parallel_subprocesses=8,
+    )
+    assert cfg.max_parallel_subprocesses == 8
+    reloaded = TournamentsConfig.model_validate(cfg.model_dump())
+    assert reloaded.max_parallel_subprocesses == 8
+
+
+def test_legacy_config_with_max_parallel_int_still_loads(tmp_path: Path) -> None:
+    """A pre-v0.10.0 config with ``max_parallel_subprocesses: 3`` keeps loading
+    cleanly after the type widens to ``int | None``."""
+    cfg = default_config()
+    data = cfg.model_dump(mode="json")
+    # Force a legacy explicit int (overrides v0.10.0's default of None).
+    data["tournaments"]["max_parallel_subprocesses"] = 3
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    reloaded = load_config(path)
+    assert reloaded.tournaments.max_parallel_subprocesses == 3

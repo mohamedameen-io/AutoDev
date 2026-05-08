@@ -768,12 +768,18 @@ async def _run_plan_tournament_cli(
         judge_cfg = cfg.agents.get("judge")
         model = judge_cfg.model if judge_cfg else None
 
+    # v0.10.0: ``max_parallel_subprocesses`` is ``int | None`` in the schema.
+    # The CLI surfaces don't yet wire through ``resolve_parallelism`` (the
+    # orchestrator runners do — see plan_tournament_runner /
+    # impl_tournament_runner / phase_review_runner). Use the legacy default
+    # (3) when None to preserve existing CLI behavior.
+    _legacy_parallelism = cfg.tournaments.max_parallel_subprocesses or 3
     tcfg = TournamentConfig(
         num_judges=effective_num_judges,
         convergence_k=plan_cfg.convergence_k,
         max_rounds=effective_max_rounds,
         model=model,
-        max_parallel_subprocesses=cfg.tournaments.max_parallel_subprocesses,
+        max_parallel_subprocesses=_legacy_parallelism,
         score_stability_window=plan_cfg.score_stability_window,
         score_stability_max_delta=plan_cfg.score_stability_max_delta,
         winner_stability_window=plan_cfg.winner_stability_window,
@@ -878,12 +884,16 @@ async def _run_impl_tournament_cli(
         judge_cfg = cfg.agents.get("judge")
         model = judge_cfg.model if judge_cfg else None
 
+    # v0.10.0: see plan_cfg construction above for the rationale on the
+    # ``or 3`` literal — CLI surfaces use the legacy default until they
+    # pick up ``resolve_parallelism`` in a follow-up release.
+    _legacy_parallelism = cfg.tournaments.max_parallel_subprocesses or 3
     tcfg = TournamentConfig(
         num_judges=impl_cfg.num_judges,
         convergence_k=impl_cfg.convergence_k,
         max_rounds=effective_max_rounds,
         model=model,
-        max_parallel_subprocesses=cfg.tournaments.max_parallel_subprocesses,
+        max_parallel_subprocesses=_legacy_parallelism,
         score_stability_window=impl_cfg.score_stability_window,
         score_stability_max_delta=impl_cfg.score_stability_max_delta,
         winner_stability_window=impl_cfg.winner_stability_window,

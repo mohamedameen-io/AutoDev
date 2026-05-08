@@ -150,6 +150,12 @@ def test_resolve_parallelism_logs_resolution(
 
     Structlog uses ``PrintLoggerFactory`` so events land on stdout, not
     via stdlib logging — capture via ``capsys`` rather than ``caplog``.
+
+    The emitted format depends on whether stdout-JSON or console-rendering
+    is configured (autologging.configure swaps the renderer). Both
+    representations contain the field name + value as substrings, so we
+    accept either ``role_mix=impl`` (console) or ``"role_mix": "impl"``
+    (JSON).
     """
     from runtime.resource_probe import HostCapacity, resolve_parallelism
 
@@ -160,9 +166,10 @@ def test_resolve_parallelism_logs_resolution(
     assert resolved >= 1
     out = capsys.readouterr().out
     assert "tournament.parallelism_resolved" in out
-    assert "role_mix=impl" in out
-    assert "num_judges=3" in out
-    assert "cpus=8" in out
+    # Accept either console-renderer or JSON-renderer formatting.
+    assert ("role_mix=impl" in out) or ('"role_mix": "impl"' in out)
+    assert ("num_judges=3" in out) or ('"num_judges": 3' in out)
+    assert ("cpus=8" in out) or ('"cpus": 8' in out)
 
 
 def test_resolve_parallelism_role_mix_phase_review_accepted() -> None:
