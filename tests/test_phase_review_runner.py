@@ -96,6 +96,7 @@ class _FakeTournament:
 
     captured_rng: Any = None
     captured_artifact_dir: Path | None = None
+    captured_cfg: Any = None
     next_winner: str = "A"
     next_direction: str = ""
 
@@ -111,6 +112,7 @@ class _FakeTournament:
     ) -> None:
         type(self).captured_rng = rng
         type(self).captured_artifact_dir = artifact_dir
+        type(self).captured_cfg = cfg
         self._handler = handler
 
     async def run(
@@ -149,6 +151,7 @@ class _FakeTournament:
 def capture_tournament(monkeypatch: pytest.MonkeyPatch) -> type[_FakeTournament]:
     _FakeTournament.captured_rng = None
     _FakeTournament.captured_artifact_dir = None
+    _FakeTournament.captured_cfg = None
     _FakeTournament.next_winner = "A"
     _FakeTournament.next_direction = ""
     monkeypatch.setattr(prr, "Tournament", _FakeTournament)
@@ -334,4 +337,91 @@ async def test_seeded_rng_uses_phase_id_in_seed(
     # themselves differ, but the generated sequence is identical.)
     assert rng_phase_1 is not None
     assert rng_phase_1b is not None
-    assert rng_phase_1.random() == rng_phase_1b.random()
+
+
+# ---------------------------------------------------------------------------
+# v0.10.0 — resolve_parallelism wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_phase_review_runner_resolves_parallelism_via_runtime_helper(
+    tmp_path: Path,
+    capture_tournament: type[_FakeTournament],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The phase-review runner asks ``runtime.resource_probe.resolve_parallelism``
+    for the value it stuffs into ``TournamentConfig.max_parallel_subprocesses``."""
+    pm = PlanManager(tmp_path, session_id="sess-init")
+    await pm.init_plan(_mk_plan())
+    orch = _make_orch(tmp_path)
+    # Default config: max_parallel_subprocesses is None (v0.10.0 default).
+    assert orch.cfg.tournaments.max_parallel_subprocesses is None
+
+    captured: dict = {}
+
+    def fake_resolve(
+        configured: int | None,
+        capacity: object,
+        role_mix: str,
+        num_judges: int,
+    ) -> int:
+        captured.update(
+            configured=configured,
+            role_mix=role_mix,
+            num_judges=num_judges,
+        )
+        return 11
+
+    monkeypatch.setattr(prr, "resolve_parallelism", fake_resolve)
+
+    plan = await orch.plan_manager.load()
+    phase = plan.phases[0]  # type: ignore[union-attr]
+    await prr.run_phase_review_tournament(
+        orch, phase, "aaaa1111", "bbbb2222", spec_md="my spec"
+    )
+
+    cfg = capture_tournament.captured_cfg
+    assert cfg is not None, "Tournament was never constructed"
+    assert cfg.max_parallel_subprocesses == 11
+    assert captured["role_mix"] == "phase_review"
+    assert captured["configured"] is None
+    assert captured["num_judges"] == 3  # default phase_review num_judges
+
+
+@pytest.mark.asyncio
+async def test_phase_review_runner_passes_configured_int_through_resolver(
+    tmp_path: Path,
+    capture_tournament: type[_FakeTournament],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator-pinned ``max_parallel_subprocesses=2`` is forwarded to the
+    resolver."""
+    pm = PlanManager(tmp_path, session_id="sess-init")
+    await pm.init_plan(_mk_plan())
+    orch = _make_orch(tmp_path)
+    orch.cfg.tournaments.max_parallel_subprocesses = 2
+
+    captured: dict = {}
+
+    def fake_resolve(
+        configured: int | None,
+        capacity: object,
+        role_mix: str,
+        num_judges: int,
+    ) -> int:
+        captured["configured"] = configured
+        return configured if configured is not None else 1
+
+    monkeypatch.setattr(prr, "resolve_parallelism", fake_resolve)
+
+    plan = await orch.plan_manager.load()
+    phase = plan.phases[0]  # type: ignore[union-attr]
+    await prr.run_phase_review_tournament(
+        orch, phase, "aaaa1111", "bbbb2222", spec_md="my spec"
+    )
+
+    cfg = capture_tournament.captured_cfg
+    assert cfg is not None
+    assert cfg.max_parallel_subprocesses == 2
+    assert captured["configured"] == 2

@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Literal
 from adapters import InlineAdapter
 from adapters.git_utils import _git_diff_range
 from autologging import get_logger
+from runtime.resource_probe import probe_host, resolve_parallelism
 from state.evidence import write_evidence
 from state.paths import autodev_root
 from state.schemas import TournamentEvidence
@@ -280,17 +281,22 @@ async def run_phase_review_tournament(
         role_timeout_s=role_timeout_s,
     )
 
-    # v0.10.0: ``max_parallel_subprocesses`` is now ``int | None`` in the
-    # config schema; ``None`` is replaced by host-aware
-    # :func:`runtime.resource_probe.resolve_parallelism` in the next
-    # commit. Until then, keep the legacy literal default (3) when None.
-    _legacy_parallelism = orch.cfg.tournaments.max_parallel_subprocesses or 3
+    # v0.10.0: resolve subprocess parallelism via the runtime probe.
+    # See :mod:`orchestrator.plan_tournament_runner` for the rationale.
+    # Phase-review tournaments default to a 3-judge cohort so the resolver
+    # typically lands on min(3, ...) on dev hardware.
+    resolved_parallelism = resolve_parallelism(
+        configured=orch.cfg.tournaments.max_parallel_subprocesses,
+        capacity=probe_host(),
+        role_mix="phase_review",
+        num_judges=cfg.num_judges,
+    )
     tcfg = TournamentConfig(
         num_judges=cfg.num_judges,
         convergence_k=cfg.convergence_k,
         max_rounds=cfg.max_rounds,
         model=model,
-        max_parallel_subprocesses=_legacy_parallelism,
+        max_parallel_subprocesses=resolved_parallelism,
         score_stability_window=cfg.score_stability_window,
         score_stability_max_delta=cfg.score_stability_max_delta,
         winner_stability_window=cfg.winner_stability_window,
