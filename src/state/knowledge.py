@@ -58,7 +58,7 @@ from typing import Any, AsyncIterator, Literal
 from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field
 
-from config.schema import AutodevConfig, KnowledgeConfig
+from config.schema import AutodevConfig, DecayCurveConfig, KnowledgeConfig
 from autologging import get_logger
 from state.lockfile import plan_lock
 from state.paths import (
@@ -221,15 +221,49 @@ def _timestamp_to_epoch(ts: str) -> float:
         return 0.0
 
 
-def _recency_factor(ts_iso: str, now_epoch: float) -> float:
-    """Linear decay from 1.0 (now) to 0.5 (30d old), floor at 0.5."""
+def _recency_factor(
+    ts_iso: str,
+    now_epoch: float,
+    *,
+    curve: "DecayCurveConfig | None" = None,
+) -> float:
+    """Decay factor for a lesson's confidence based on its age.
+
+    Default behavior (when ``curve`` is None): linear decay from 1.0
+    (now) to 0.5 (30d old), floor at 0.5. This is the byte-identical
+    legacy curve and MUST remain unchanged for backward-compat.
+
+    v0.20.0 B1: when a :class:`config.schema.DecayCurveConfig` is
+    supplied, the curve is parameterized by ``half_life_days`` and
+    ``floor``. The implementation chooses a piecewise-linear decay so
+    the curve hits ``floor + (1 - floor) / 2`` at exactly
+    ``half_life_days`` and reaches ``floor`` at ``2 * half_life_days``,
+    after which it stays at the floor.
+
+    With ``half_life_days=15`` and ``floor=0.5`` (the default
+    :class:`DecayCurveConfig` values), the curve is byte-identical to
+    the legacy linear decay — the half-life of 15d (where the legacy
+    curve passes through 0.75) puts the new curve through the same
+    point, and ``2 * 15 = 30`` matches the legacy 30-day window.
+    """
     ts_epoch = _timestamp_to_epoch(ts_iso)
+    if curve is None:
+        # Legacy path: byte-identical to pre-v0.20.0 behavior.
+        if ts_epoch <= 0.0:
+            return 0.5
+        age = max(0.0, now_epoch - ts_epoch)
+        if age >= _RECENCY_WINDOW_S:
+            return 0.5
+        return 1.0 - 0.5 * (age / _RECENCY_WINDOW_S)
+
+    floor = float(curve.floor)
     if ts_epoch <= 0.0:
-        return 0.5
+        return floor
     age = max(0.0, now_epoch - ts_epoch)
-    if age >= _RECENCY_WINDOW_S:
-        return 0.5
-    return 1.0 - 0.5 * (age / _RECENCY_WINDOW_S)
+    window = float(curve.half_life_days) * 2.0 * 86400.0
+    if window <= 0.0 or age >= window:
+        return floor
+    return 1.0 - (1.0 - floor) * (age / window)
 
 
 def _bigrams(s: str) -> set[tuple[str, str]]:
@@ -773,10 +807,42 @@ class KnowledgeStore:
         return self._rank_with_ts(entry, time.time())
 
     def _rank_with_ts(self, entry: KnowledgeEntry, now_epoch: float) -> float:
-        """``confidence * recency_factor * (1 + log(applied_count + 1))``."""
-        recency = _recency_factor(entry.timestamp, now_epoch)
+        """``confidence * recency_factor * (1 + log(applied_count + 1))``.
+
+        v0.20.0 B1: when :attr:`KnowledgeConfig.decay_curves` is set,
+        looks up an entry-type-specific curve via
+        ``entry.metadata["event_type"]`` and forwards it to
+        :func:`_recency_factor`. When the map is None (default), the
+        entry has no ``event_type``, or the type has no matching curve,
+        the legacy 30-day linear decay applies (byte-identical to the
+        pre-v0.20.0 path).
+        """
+        curve = self._decay_curve_for(entry)
+        recency = _recency_factor(entry.timestamp, now_epoch, curve=curve)
         applied_boost = 1.0 + math.log(max(0, entry.applied_count) + 1)
         return float(entry.confidence) * recency * applied_boost
+
+    def _decay_curve_for(
+        self, entry: KnowledgeEntry
+    ) -> "DecayCurveConfig | None":
+        """Resolve the per-event-type decay curve, if any.
+
+        Returns ``None`` (legacy path) when:
+
+        * :attr:`KnowledgeConfig.decay_curves` is not configured;
+        * ``entry.metadata`` lacks an ``event_type`` key;
+        * the configured map has no entry for that ``event_type``.
+        """
+        kcfg = self.knowledge_config
+        curves = getattr(kcfg, "decay_curves", None)
+        if not curves:
+            return None
+        if not entry.metadata:
+            return None
+        event_type = entry.metadata.get("event_type")
+        if not isinstance(event_type, str):
+            return None
+        return curves.get(event_type)
 
     def _evict_to_cap(
         self, entries: list[KnowledgeEntry], cap: int
