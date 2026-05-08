@@ -51,6 +51,21 @@ _RE_FILES = re.compile(r"^\s*-\s*Files?\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _RE_DESC = re.compile(r"^\s*-\s*Description\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _RE_ACCEPT_HEADER = re.compile(r"^\s*-\s*Acceptance\s*:?\s*$", re.IGNORECASE)
 _RE_ACCEPT_ITEM = re.compile(r"^\s*-\s*\[\s*[ xX]?\s*\]\s*(.+?)\s*$")
+# v0.9.0: phase-level acceptance block. Same shape as the task-level
+# ``_RE_ACCEPT_HEADER`` but recognized only between a ``## Phase`` heading
+# and the first ``### Task`` heading inside that phase. The accumulator
+# state in :func:`parse_plan_markdown` keys phase-acceptance vs.
+# task-acceptance from the current cursor position rather than a separate
+# regex — items are still matched by ``_RE_ACCEPT_ITEM``.
+_RE_PHASE_ACCEPTANCE_HEADER = re.compile(
+    r"^\s*-\s*Acceptance\s*:?\s*$", re.IGNORECASE
+)
+# v0.9.0: track whether an acceptance line is met (``[x]`` / ``[X]``) so
+# the phase-review judge can render "X met / Y unmet" summaries. Item-level
+# bookkeeping; the regex matches both ticked and unticked checkboxes.
+_RE_ACCEPT_ITEM_TICKED = re.compile(
+    r"^\s*-\s*\[\s*[xX]\s*\]\s*(.+?)\s*$"
+)
 _RE_DEPENDS = re.compile(r"^\s*-\s*Depends(?:_on|On)?\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _RE_REQUIRES = re.compile(
     r"^\s*-?\s*Requires\s*:\s*(.+?)\s*$",
@@ -135,6 +150,10 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
     current_phase: dict | None = None
     current_task: dict | None = None
     in_acceptance_block = False
+    # v0.9.0: track whether the current acceptance block belongs to the
+    # phase header (no current_task) vs. a specific task. Same cursor —
+    # only the destination dict differs.
+    in_phase_acceptance_block = False
 
     def _finalize_task() -> None:
         nonlocal current_task, in_acceptance_block
@@ -151,6 +170,18 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
         _finalize_task()
         if not current_phase["tasks"]:
             raise PlanParseError(f"phase {current_phase['id']!r} has no tasks")
+        # v0.9.0: synthesize phase-level AcceptanceCriterion objects from the
+        # accumulated phase acceptance bullets. Each entry is a dict
+        # {"description": str, "met": bool}; we map to the schema model here
+        # so the parser stays the only producer of AcceptanceCriterion.
+        phase_acc = [
+            AcceptanceCriterion(
+                id=f"ph-ac-{i + 1}",
+                description=item["description"],
+                met=item["met"],
+            )
+            for i, item in enumerate(current_phase.get("acceptance", []))
+        ]
         phases.append(
             Phase(
                 id=current_phase["id"],
@@ -159,6 +190,7 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
                 tasks=[
                     _make_task(t, current_phase["id"]) for t in current_phase["tasks"]
                 ],
+                acceptance=phase_acc,
             )
         )
         current_phase = None
@@ -168,6 +200,7 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
         if not line.strip():
             # Blank line ends an acceptance block but keeps the task open.
             in_acceptance_block = False
+            in_phase_acceptance_block = False
             continue
 
         phase_m = _RE_PHASE.match(line)
@@ -178,9 +211,14 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
                 "title": phase_m.group(2).strip(),
                 "description": "",
                 "tasks": [],
+                # v0.9.0: phase-level acceptance accumulator. Stays open until
+                # the first ``### Task`` heading in the phase (or the next
+                # ``## Phase`` / EOF).
+                "acceptance": [],
             }
             current_task = None
             in_acceptance_block = False
+            in_phase_acceptance_block = False
             continue
 
         task_m = _RE_TASK.match(line)
@@ -200,7 +238,33 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
                 "requires": [],
             }
             in_acceptance_block = False
+            # v0.9.0: a Task heading definitively ends the phase-acceptance
+            # accumulator — subsequent ``- [x] ...`` items belong to the
+            # task, not the phase.
+            in_phase_acceptance_block = False
             continue
+
+        # v0.9.0: phase-level acceptance handling. Only fires BEFORE the
+        # first task in a phase (when ``current_task is None``). The
+        # ``- Acceptance:`` header opens the block; subsequent ``- [ ] ...``
+        # items accumulate into ``current_phase["acceptance"]``.
+        if current_phase is not None and current_task is None:
+            if _RE_PHASE_ACCEPTANCE_HEADER.match(line):
+                in_phase_acceptance_block = True
+                in_acceptance_block = False
+                continue
+            if in_phase_acceptance_block:
+                item_m = _RE_ACCEPT_ITEM.match(line)
+                if item_m:
+                    is_ticked = bool(_RE_ACCEPT_ITEM_TICKED.match(line))
+                    current_phase["acceptance"].append(
+                        {
+                            "description": item_m.group(1).strip(),
+                            "met": is_ticked,
+                        }
+                    )
+                    continue
+                in_phase_acceptance_block = False
 
         if current_task is None:
             continue

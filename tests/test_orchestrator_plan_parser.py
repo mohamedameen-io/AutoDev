@@ -256,3 +256,84 @@ def test_parse_task_complexity_with_other_directives() -> None:
     assert task.depends_on == ["1.0"]
     assert len(task.acceptance) == 1
     assert task.description == "deep cross-cutting investigation"
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0 — Phase-level ``- Acceptance:`` block
+# ---------------------------------------------------------------------------
+
+
+def test_parse_phase_acceptance_block() -> None:
+    """A phase header followed by an indented ``- Acceptance:`` block
+    populates ``Phase.acceptance``."""
+    md = (
+        "# Plan: Demo\n\n"
+        "## Phase 1: Implement\n"
+        "  - Acceptance:\n"
+        "    - [ ] all unit tests pass\n"
+        "    - [ ] no new lint errors\n\n"
+        "### Task 1.1: do the thing\n"
+        "  - Description: x\n"
+    )
+    plan = parse_plan_markdown(md)
+    phase = plan.phases[0]
+    assert len(phase.acceptance) == 2
+    assert phase.acceptance[0].description == "all unit tests pass"
+    assert phase.acceptance[1].description == "no new lint errors"
+    # Ids are stably synthesised so judges can refer to them.
+    assert phase.acceptance[0].id == "ph-ac-1"
+    assert phase.acceptance[1].id == "ph-ac-2"
+
+
+def test_parse_phase_acceptance_before_tasks() -> None:
+    """Phase acceptance items must NOT bleed into the first task's
+    acceptance — the ``### Task`` heading closes the phase block."""
+    md = (
+        "# Plan: Demo\n\n"
+        "## Phase 1: Implement\n"
+        "  - Acceptance:\n"
+        "    - [ ] phase-level: rollout complete\n\n"
+        "### Task 1.1: do the thing\n"
+        "  - Description: x\n"
+        "  - Acceptance:\n"
+        "    - [ ] task-level: function exists\n"
+    )
+    plan = parse_plan_markdown(md)
+    phase = plan.phases[0]
+    assert len(phase.acceptance) == 1
+    assert "rollout complete" in phase.acceptance[0].description
+    assert len(phase.tasks[0].acceptance) == 1
+    assert "function exists" in phase.tasks[0].acceptance[0].description
+
+
+def test_phase_acceptance_optional_legacy() -> None:
+    """A phase WITHOUT an Acceptance block parses cleanly — ``acceptance == []``.
+
+    The migration guarantee for v0.8.0 plans that don't carry the directive.
+    """
+    md = (
+        "# Plan: Demo\n\n"
+        "## Phase 1: Implement\n\n"
+        "### Task 1.1: do the thing\n"
+        "  - Description: x\n"
+    )
+    plan = parse_plan_markdown(md)
+    assert plan.phases[0].acceptance == []
+
+
+def test_phase_acceptance_with_xed_checkbox() -> None:
+    """Items emitted as ``[x]`` are flagged as met, ``[ ]`` are unmet."""
+    md = (
+        "# Plan: Demo\n\n"
+        "## Phase 1: Implement\n"
+        "  - Acceptance:\n"
+        "    - [x] already met\n"
+        "    - [ ] not yet\n\n"
+        "### Task 1.1: do the thing\n"
+        "  - Description: x\n"
+    )
+    plan = parse_plan_markdown(md)
+    items = plan.phases[0].acceptance
+    assert len(items) == 2
+    assert items[0].met is True
+    assert items[1].met is False
