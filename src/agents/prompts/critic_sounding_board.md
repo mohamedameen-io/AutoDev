@@ -109,3 +109,70 @@ RESOLUTION: rewrite
 Defaults: if you cannot decide, pick `RESOLUTION: abandon-task` — the
 orchestrator can re-attempt the task in a future run when the conflict
 context has changed.
+
+## STUCK RECOVERY MODE
+
+When the input contains a `STUCK_CONTEXT:` block, you are being asked to recover a task that has hit the v0.15.0 stuck-recovery escalation ladder. The orchestrator has counted enough discards (or pivots) on this task that ordinary retries are unlikely to help; your job is to choose ONE of three graduated responses.
+
+INPUT FORMAT (in addition to the standard TASK / CONTEXT lines):
+```
+STUCK_CONTEXT:
+failing_task_id: <task id whose retries have stalled>
+discard_count: <integer — number of consecutive discards>
+pivot_count: <integer — number of pivot escalations already attempted>
+last_event: <"discard" | "pivot" | "refine">
+ladder_step: <"REFINE" | "PIVOT" | "SOFT_BLOCKER">
+prior_attempts:
+  - <one-line summary of the most recent attempts>
+recent_evidence: |
+  <freshest excerpt of error / reviewer / test output>
+```
+
+YOUR RESPONSE MUST END WITH EXACTLY ONE of these directives on its own line:
+
+- `RESOLUTION: refine` — instructs the orchestrator to re-invoke the developer with a small adjustment. Pick this when the failure pattern looks like a missing detail or a small misinterpretation that a sharper prompt can fix. Provide the refinement guidance text on the lines IMMEDIATELY BEFORE the `RESOLUTION: refine` directive.
+- `RESOLUTION: pivot` — instructs the orchestrator to re-invoke the developer with a radical redirect (different approach / different tool / different decomposition). Pick this when the current trajectory is exhausted and a small adjustment will not unblock the task. Provide the pivot direction text on the lines IMMEDIATELY BEFORE the `RESOLUTION: pivot` directive.
+- `RESOLUTION: soft-blocker` — instructs the orchestrator to mark the task blocked and hand off to the human. Pick this when you have evidence the task requires a decision the orchestrator cannot make alone (e.g. an ambiguous product/business choice, a missing-credential blocker, a hardware dependency). State on the preceding lines what specific question/decision the human needs to resolve.
+
+Worked example (refine):
+
+```
+The reviewer keeps flagging missing type hints on the new function. The
+developer's last three diffs each fixed a different lint warning but never
+the type-hint one. Tell the developer explicitly: "Add a `-> None` return
+annotation to `apply_patch_safely` and a type hint on the `paths` parameter."
+
+RESOLUTION: refine
+```
+
+Worked example (pivot):
+
+```
+Three discards in a row tried to call into `subprocess.run` with shell=True
+to bypass a quoting issue. Each attempt either broke escaping or tripped a
+secrets-scan false positive. Pivot direction: stop using shell=True. Build
+the argv list explicitly and pass it as a list to subprocess.run. Update
+the developer prompt to forbid shell=True and require argv-list invocation.
+
+RESOLUTION: pivot
+```
+
+Worked example (soft-blocker):
+
+```
+The task asks the developer to "match the production GLES driver behavior",
+but the repo has no captured reference for that behavior and no test
+fixture. The architect has not specified which hardware target to model.
+The orchestrator cannot make this choice; the human needs to either supply
+the captured reference traces or pick a target hardware family.
+
+What the human needs to decide: Which target hardware family should be the
+reference for "production GLES driver behavior" — Adreno 6xx, Mali G7x, or
+PowerVR Series 9?
+
+RESOLUTION: soft-blocker
+```
+
+Defaults: if you cannot decide, pick `RESOLUTION: refine` — it is the least
+disruptive of the three and will trigger one more developer attempt before
+the ladder advances on its own.
