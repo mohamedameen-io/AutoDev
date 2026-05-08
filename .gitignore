@@ -48,6 +48,8 @@ Thumbs.db
 .autodev/tournaments/*/a/
 .autodev/tournaments/*/b/
 .autodev/tournaments/*/ab/
+# v0.21.0 A1: warm-start worktree pool — recycled per execute phase.
+.autodev/execute_worktrees_pool/
 
 # Swarm files
 .swarm/
