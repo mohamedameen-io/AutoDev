@@ -94,6 +94,66 @@ class WorktreeManager:
         self._log.info("worktree.created", label=label, path=str(wt))
         return wt
 
+    async def create_per_task(
+        self, task_id: str, base_ref: str = "HEAD"
+    ) -> Path:
+        """Create a per-task worktree at ``tournament_dir/tasks/<task_id>``.
+
+        v0.11.0 convenience for the parallel execute_phase dispatcher.
+        Routes the worktree under a ``tasks/`` subdirectory so the
+        layout is unambiguous when both impl-tournament variant
+        worktrees AND per-task isolation worktrees coexist on disk:
+
+        * impl tournament: ``tournament_dir/{a,b,ab}``
+        * per-task isolation: ``tournament_dir/tasks/{task_id}``
+
+        Reuses :meth:`create` machinery — same git invocation, same
+        error semantics. Caller is responsible for calling
+        :meth:`remove_per_task` (or letting :meth:`cleanup_all` handle
+        it on phase exit).
+        """
+        wt = self._dir / "tasks" / task_id
+        self._dir.mkdir(parents=True, exist_ok=True)
+        (self._dir / "tasks").mkdir(parents=True, exist_ok=True)
+        if wt.exists():
+            raise WorktreeError(
+                f"per-task worktree path {wt} already exists; "
+                "call remove_per_task() first"
+            )
+        rc, out, err = await _run_git(
+            self._main,
+            ["worktree", "add", "--detach", str(wt), base_ref],
+        )
+        if rc != 0:
+            raise WorktreeError(
+                f"git worktree add failed (rc={rc}): {err.strip() or out.strip()}"
+            )
+        self._log.info("worktree.created_per_task", task_id=task_id, path=str(wt))
+        return wt
+
+    async def remove_per_task(self, task_id: str, force: bool = True) -> None:
+        """Remove a per-task worktree (created by :meth:`create_per_task`).
+
+        Defaults to ``force=True`` — workers commonly leave dirty
+        worktrees (uncommitted helpful files, .pytest_cache/, etc.) and
+        the per-task isolation contract is "delete unconditionally on
+        worker exit".
+        """
+        wt = self._dir / "tasks" / task_id
+        if not wt.exists():
+            await _run_git(self._main, ["worktree", "prune"])
+            return
+
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(str(wt))
+        rc, _, _ = await _run_git(self._main, args)
+        if rc != 0:
+            await self._force_remove(wt)
+            return
+        self._log.info("worktree.removed_per_task", task_id=task_id)
+
     async def remove(self, label: str, force: bool = False) -> None:
         """Remove a worktree and its on-disk directory.
 
@@ -226,7 +286,10 @@ class WorktreeManager:
         return [line for line in out.splitlines() if line.strip()]
 
     async def apply_patch_to_main(
-        self, worktree: Path, base_ref: str = "HEAD"
+        self,
+        worktree: Path,
+        base_ref: str = "HEAD",
+        three_way: bool = False,
     ) -> None:
         """Apply the worktree's diff to the main repo's working tree.
 
@@ -234,16 +297,27 @@ class WorktreeManager:
         ``git apply`` from the main repo. Raises :class:`WorktreeError` on
         any apply conflict so the caller can surface a helpful error rather
         than leave the main repo half-patched.
+
+        v0.11.0: ``three_way=True`` adds ``--3way`` to ``git apply`` so
+        conflicts fall back to git's merge machinery instead of patch.
+        Used by the conflict-escalation path after ``critic_sounding_board``
+        returns ``RESOLUTION: rebase-and-retry``.
         """
         diff_text = await self.get_diff_vs_base(worktree, base_ref=base_ref)
         if not diff_text.strip():
             self._log.info("worktree.apply_patch.empty_diff")
             return
 
+        check_args = ["apply", "--check"]
+        apply_args = ["apply"]
+        if three_way:
+            check_args.append("--3way")
+            apply_args.append("--3way")
+
         # Pre-flight: ``git apply --check`` so we fail fast on conflicts.
         check_rc, _, check_err = await _run_git(
             self._main,
-            ["apply", "--check"],
+            check_args,
             stdin=diff_text,
         )
         if check_rc != 0:
@@ -253,7 +327,7 @@ class WorktreeManager:
             )
         apply_rc, _, apply_err = await _run_git(
             self._main,
-            ["apply"],
+            apply_args,
             stdin=diff_text,
         )
         if apply_rc != 0:
@@ -263,6 +337,7 @@ class WorktreeManager:
         self._log.info(
             "worktree.apply_patch.success",
             diff_bytes=len(diff_text),
+            three_way=three_way,
         )
 
 
