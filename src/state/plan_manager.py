@@ -368,6 +368,133 @@ class PlanManager:
                     break
             return sum(1 for tid in self._in_flight if tid in phase_task_ids)
 
+    async def revert_task_to_pending(
+        self,
+        task_id: str,
+        *,
+        reason: str = "",
+    ) -> Task:
+        """v0.21.0 B2: forcibly revert a task back to ``"pending"``.
+
+        Bypasses the FSM ``assert_transition`` check used by
+        :meth:`update_task_status`. Used exclusively by the speculative-
+        execution rollback path: when a speculative task started but
+        its parent later failed, the speculative work is invalidated
+        and the task must re-queue from scratch (running a fresh
+        attempt against the parent's eventual successful state).
+
+        Persists via the standard lock + ledger + snapshot pipeline
+        and emits a regular ``update_task_status`` op so replay
+        reconstructs the transition exactly. ``reason`` is recorded
+        as ``blocked_reason`` for forensics.
+        """
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            plan = self._load_sync()
+            if plan is None:
+                raise PlanConcurrentModificationError(
+                    "no plan initialized; call init_plan first"
+                )
+            task = _find_task(plan, task_id)
+            if task is None:
+                raise PlanConcurrentModificationError(
+                    f"task_id={task_id!r} not found in current plan"
+                )
+
+            payload: dict = {"task_id": task_id, "status": "pending"}
+            if reason:
+                payload["blocked_reason"] = reason
+
+            await append_entry(
+                self._cwd,
+                op="update_task_status",
+                payload=payload,
+                session_id=self._session_id,
+            )
+
+            task.status = "pending"
+            if reason:
+                task.blocked_reason = reason
+            # Reset retry / escalation bookkeeping — the next dispatch
+            # treats this as a fresh attempt.
+            task.retry_count = 0
+            task.escalated = False
+
+            plan = plan.model_copy(update={"updated_at": _iso_now()})
+            await snapshot_plan(self._cwd, plan, session_id=self._session_id)
+            self._log.info(
+                "task.reverted_to_pending",
+                task_id=task_id,
+                reason=reason,
+            )
+            return task
+
+    async def speculable_candidate(
+        self,
+        in_flight_task_id: str,
+    ) -> Task | None:
+        """v0.21.0 B2: return a child task safe to start speculatively.
+
+        Returns a single :class:`Task` that depends on ``in_flight_task_id``
+        and is eligible to run speculatively, or ``None`` when no
+        candidate qualifies. Conditions checked here:
+
+        * the parent task (``in_flight_task_id``) is itself in-flight
+          (status ``"in_progress"`` or post-developer non-terminal),
+        * the parent's ``retry_count == 0`` (first attempt only — if
+          the parent is already on a retry, speculative work would
+          compound risk),
+        * the dependent task has a SINGLE ``depends_on`` entry pointing
+          at the parent (not a multi-dep diamond — diamonds get
+          materially more complex rollbacks),
+        * the dependent's files are disjoint with EVERY currently in-
+          flight task's files (file-overlap guard preserved),
+        * the dependent is currently ``"pending"``.
+
+        The dispatcher decides whether to actually start it, and how
+        many speculative tasks to allow concurrently (cap of 1 per
+        phase per the v0.21.0 plan).
+        """
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            plan = self._load_sync()
+            if plan is None:
+                return None
+
+            # Locate the parent task.
+            parent: Task | None = _find_task(plan, in_flight_task_id)
+            if parent is None:
+                return None
+            if parent.retry_count != 0:
+                return None
+            # Verify parent is in-flight (pre-terminal).
+            if parent.status in _TERMINAL_TASK_STATUSES:
+                return None
+
+            # Build in-flight files set (excluding parent's files —
+            # the speculative task can't share files with the parent
+            # because the parent is in flight too, but it can share
+            # files with a hypothetically-completed parent. Use the
+            # actual in-flight set from PlanManager.)
+            in_flight_ids = set(self._in_flight)
+            in_flight_files: set[str] = set()
+            for ph in plan.phases:
+                for t in ph.tasks:
+                    if t.id in in_flight_ids:
+                        in_flight_files.update(t.files)
+
+            # Walk all phases looking for a child of in_flight_task_id.
+            for ph in plan.phases:
+                for t in ph.tasks:
+                    if t.status != "pending":
+                        continue
+                    # Single parent only (diamond avoidance).
+                    if t.depends_on != [in_flight_task_id]:
+                        continue
+                    # File-disjointness with every in-flight task.
+                    if any(f in in_flight_files for f in t.files):
+                        continue
+                    return t
+            return None
+
     async def in_flight_files(self) -> set[str]:
         """Return the union of ``Task.files`` for all in-flight tasks.
 

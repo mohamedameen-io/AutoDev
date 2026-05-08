@@ -1018,6 +1018,16 @@ async def _execute_cross_phase_dag(
     in_flight_phase_id: dict[str, str] = {}  # task_id → phase_id
     processed: list[Task] = []
 
+    # v0.21.0 B2: speculative-execution bookkeeping. Maps speculative
+    # task_id → parent task_id so the rollback path can find the
+    # parent on failure. Capped at 1 active speculative task per
+    # phase per the v0.21.0 plan.
+    speculative_parents: dict[str, str] = {}
+    speculative_phase: set[str] = set()  # phases with active speculative
+    speculative_enabled = getattr(
+        orch.cfg, "speculative_execution_enabled", False
+    )
+
     async def _all_terminal_across_plan() -> bool:
         plan = await orch.plan_manager.load()
         if plan is None:
@@ -1055,6 +1065,45 @@ async def _execute_cross_phase_dag(
                 )
                 in_flight_phase_id[t.id] = t.phase_id
 
+            # v0.21.0 B2: after dispatching pending tasks, opportunistically
+            # speculate ONE child task per phase whose parent is in-flight.
+            # Conditions are fully enforced by ``speculable_candidate``;
+            # we just gate at "max 1 speculative per phase" here.
+            if speculative_enabled and len(in_flight) < parallelism:
+                # Pick one in-flight task that doesn't already have a
+                # speculative child running in its phase.
+                for parent_id in list(in_flight.keys()):
+                    parent_phase = in_flight_phase_id.get(parent_id, "")
+                    if parent_phase in speculative_phase:
+                        continue
+                    candidate = await orch.plan_manager.speculable_candidate(
+                        parent_id
+                    )
+                    if candidate is None:
+                        continue
+                    if candidate.id in in_flight:
+                        continue
+                    await orch.plan_manager.mark_in_flight(candidate.id)
+                    await orch.plan_manager.ledger_append(
+                        op="speculative_started",
+                        payload={
+                            "task_id": candidate.id,
+                            "parent_task_id": parent_id,
+                        },
+                    )
+                    in_flight[candidate.id] = asyncio.create_task(
+                        _execute_one_worker(orch, candidate, worktree_mgr)
+                    )
+                    in_flight_phase_id[candidate.id] = candidate.phase_id
+                    speculative_parents[candidate.id] = parent_id
+                    speculative_phase.add(candidate.phase_id)
+                    logger.info(
+                        "execute_phase.speculative_started",
+                        task_id=candidate.id,
+                        parent_task_id=parent_id,
+                    )
+                    break  # max 1 speculative per polling round
+
         if not in_flight:
             # Nothing dispatchable but not all terminal — likely waiting
             # on a different worker; brief sleep then re-poll.
@@ -1068,6 +1117,9 @@ async def _execute_cross_phase_dag(
             list(in_flight.values()), return_when=asyncio.FIRST_COMPLETED
         )
         finished_phases: set[str] = set()
+        # v0.21.0 B2: track failed parents so we can roll back any
+        # speculative children that depended on them in this round.
+        failed_parents: set[str] = set()
         for d in done:
             finished_id = next(
                 (tid for tid, h in in_flight.items() if h is d), None
@@ -1077,9 +1129,24 @@ async def _execute_cross_phase_dag(
             finished_phase_id = in_flight_phase_id.pop(finished_id, "")
             del in_flight[finished_id]
             await orch.plan_manager.clear_in_flight(finished_id)
+            # If this was a speculative task, pop its bookkeeping.
+            if finished_id in speculative_parents:
+                speculative_parents.pop(finished_id, None)
+                speculative_phase.discard(finished_phase_id)
             try:
                 completed_task = d.result()
                 processed.append(completed_task)
+                # If this task was non-speculative AND it failed (status
+                # blocked) AND a speculative child was tracked, mark
+                # the parent as failed so the rollback runs after the
+                # main loop body.
+                if (
+                    completed_task.status == "blocked"
+                    and finished_id not in speculative_parents.values()
+                ):
+                    pass  # caught by the speculative_parents check below
+                if completed_task.status == "blocked":
+                    failed_parents.add(finished_id)
             except DelegationPendingSignal:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -1088,6 +1155,7 @@ async def _execute_cross_phase_dag(
                     task_id=finished_id,
                     err=str(exc),
                 )
+                failed_parents.add(finished_id)
                 if finished_phase_id:
                     try:
                         await orch.plan_manager.mark_blocked_descendants(
@@ -1102,6 +1170,61 @@ async def _execute_cross_phase_dag(
                         )
             if finished_phase_id:
                 finished_phases.add(finished_phase_id)
+
+        # v0.21.0 B2: roll back any speculative children whose parents
+        # just failed. Walk a copy of speculative_parents so we can
+        # mutate the dict mid-iteration.
+        if speculative_enabled and failed_parents:
+            from orchestrator.speculative import rollback_speculative_task
+
+            for spec_id, parent_id in list(speculative_parents.items()):
+                if parent_id not in failed_parents:
+                    continue
+                # Look up the speculative task.
+                plan = await orch.plan_manager.load()
+                if plan is None:
+                    continue
+                spec_task = next(
+                    (
+                        t
+                        for ph in plan.phases
+                        for t in ph.tasks
+                        if t.id == spec_id
+                    ),
+                    None,
+                )
+                if spec_task is None:
+                    continue
+                # If the speculative task is still in flight here, we
+                # can't roll back yet — wait until next round.
+                if spec_id in in_flight:
+                    continue
+                try:
+                    await rollback_speculative_task(
+                        orch,
+                        spec_task,
+                        parent_task_id=parent_id,
+                        reason="parent_blocked",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.speculative_rollback_failed",
+                        task_id=spec_id,
+                        err=str(exc),
+                    )
+                speculative_parents.pop(spec_id, None)
+                # Phase may now be free for another speculative attempt.
+                phase_id_of_spec = next(
+                    (
+                        ph.id
+                        for ph in plan.phases
+                        for t in ph.tasks
+                        if t.id == spec_id
+                    ),
+                    None,
+                )
+                if phase_id_of_spec is not None:
+                    speculative_phase.discard(phase_id_of_spec)
 
         # After draining, fire phase-review for any phase that just
         # observed all-terminal. ``_maybe_run_phase_review`` is
