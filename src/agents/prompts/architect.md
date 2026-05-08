@@ -1183,6 +1183,76 @@ These criteria are PHASE-LEVEL, not task-level. They describe what "the phase is
 
 This block is REQUIRED on every phase. Each bullet starts with `- [ ]` (or `- [x]` for items already met). Do not nest the block inside a task body — it lives between the `## Phase` heading and the first `### Task` heading. Task-level `- Acceptance:` blocks (under each `### Task`) remain unchanged; the two are independent. Omitting the phase-level block is a soft failure: the phase parses cleanly with `phase.acceptance == []` but the phase-review judges have weaker grounding to score against.
 
+## EDIT SCOPE
+
+Declare an `EDIT_SCOPE:` block at the **top of the plan** (between the `# Plan:` heading and the first `## Phase`) listing the **minimum-sufficient set of repo-relative path prefixes** every task may modify. The orchestrator parses this block into `Plan.edit_scope` and enforces it pre-flight: any task whose `- Files:` line lists a path outside these prefixes blocks the entire run with `edit_scope_violation` before any work dispatches. Empty / missing block = legacy whole-repo behavior (no constraint, but you forfeit the structural focus signal).
+
+**Positive example** (narrow scope, all tasks compliant):
+
+```
+# Plan: Add subtract function to math module
+
+EDIT_SCOPE:
+  - src/math
+  - tests/math
+
+## Phase 1: Implement
+  - Acceptance:
+    - [ ] subtract(a, b) implemented and exercised by a unit test
+
+### Task 1.1: Add subtract
+  - Description: Implement subtract(a, b) in src/math/__init__.py.
+  - Complexity: simple
+  - Files: src/math/__init__.py, tests/math/test_subtract.py
+```
+
+**Negative example** (over-broad scope — anti-pattern):
+
+```
+EDIT_SCOPE:
+  - .
+```
+
+A scope of `.` defeats the constraint's purpose. Only emit a top-level scope when you can name 1-3 concrete prefixes; otherwise omit the block.
+
+**Per-phase override**: when a phase legitimately spans subsystems, emit a phase-level `EDIT_SCOPE:` block immediately after the `## Phase` heading (before the phase-acceptance block):
+
+```
+## Phase 2: Cross-cut migration
+EDIT_SCOPE:
+  - src/math
+  - src/cache
+  - tests/math
+  - tests/cache
+  - Acceptance:
+    - [ ] migration script runs cleanly
+```
+
+A per-phase block REPLACES (does not extend) the plan-level scope for that phase only. Other phases still inherit the plan-level scope.
+
+### INVESTIGATION PHASE PATHS
+
+Tasks that produce documentation or notes (no code changes) MUST target git-tracked paths under `notes/` or `docs/`, NOT the gitignored `.autodev/notes/`. Phase-review's diff-based assessment cannot see gitignored paths and will incorrectly flag the work as missing — the run will then trip the corrective-task loop and burn budget on a phantom regression.
+
+**Positive example** (visible to phase-review):
+
+```
+### Task 1.1: Document architect prompt drift findings
+  - Description: Capture findings from the prompt-drift investigation in notes/.
+  - Complexity: medium
+  - Files: notes/2026-05-08-architect-prompt-drift.md
+```
+
+**Negative example** (invisible to phase-review — anti-pattern):
+
+```
+### Task 1.1: Document findings
+  - Description: Capture findings.
+  - Files: .autodev/notes/findings.md      # NEVER — .autodev/ is gitignored.
+```
+
+When in doubt, run `git check-ignore <path>` mentally: if the path is ignored, the phase-review judge will see no diff and mark the task incomplete.
+
 ## OUTPUT REQUIREMENT — PLAN COMPLEXITY
 
 After your plan body, on a final standalone line at the very end of your output, emit exactly one of:
