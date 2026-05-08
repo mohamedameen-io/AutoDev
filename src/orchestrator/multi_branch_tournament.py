@@ -55,6 +55,7 @@ import time
 from autologging import get_logger
 from errors import TournamentError
 from orchestrator.plan_tournament_runner import run_plan_tournament
+from state.knowledge import TournamentEvent
 from state.paths import autodev_root
 from tournament import (
     AdapterLLMClient,
@@ -705,6 +706,29 @@ async def run_multi_branch_plan_tournament(
         },
     )
 
+    # v0.15.0: emit cross-run lessons from the meta-merge boundary.
+    # ``winner_promoted`` for the final markdown and one ``discard`` per
+    # failed (raised) branch — the per-branch successful tournaments
+    # already emit their own per-pass lessons through
+    # ``plan_tournament_runner._emit_plan_tournament_lessons``. Errors
+    # are swallowed so a knowledge failure can't sink the dispatch.
+    try:
+        await _emit_meta_merge_lessons(
+            orch,
+            spec_hash=spec_hash,
+            n_branches=n_branches,
+            survivors=survivors,
+            failed=[b for b in branches if not b.success],
+            final_md=final_md,
+            meta_passes=len(meta_history),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "multi_branch.lessons_emit_failed",
+            spec_hash=spec_hash,
+            error=str(exc),
+        )
+
     logger.info(
         "multi_branch.done",
         spec_hash=spec_hash,
@@ -716,6 +740,68 @@ async def run_multi_branch_plan_tournament(
         branches=branches,
         final_md=final_md,
         meta_history=meta_history,
+    )
+
+
+async def _emit_meta_merge_lessons(
+    orch: "Orchestrator",
+    *,
+    spec_hash: str,
+    n_branches: int,
+    survivors: list[BranchOutcome],
+    failed: list[BranchOutcome],
+    final_md: str,
+    meta_passes: int,
+) -> None:
+    """Emit cross-run lessons from a completed multi-branch meta-merge.
+
+    For each failed branch, one ``discard`` lesson tagged with the branch
+    index + the captured error so future runs see *why* the branch
+    failed (e.g. a recurring crash signature is a strong hint to skip
+    that lane). After all discards, one ``winner_promoted`` lesson
+    summarizing the meta-merged final.
+
+    Errors propagate to the caller (which logs + swallows).
+    """
+    family = "multi-branch-meta-merge"
+
+    for f in failed:
+        evidence = (
+            f"spec_hash={spec_hash} branch={f.branch_index} "
+            f"of={n_branches} error={f.error or '<unknown>'}"
+        )
+        await orch.knowledge.record_tournament_event(
+            TournamentEvent(
+                event_type="discard",
+                family=family,
+                hypothesis=(
+                    f"branch {f.branch_index} of {n_branches} failed during "
+                    f"per-branch plan tournament"
+                ),
+                evidence=evidence,
+                rollback_reason="branch-tournament-raised",
+            )
+        )
+
+    final_fingerprint = (
+        f"spec_hash={spec_hash} n_survivors={len(survivors)} of={n_branches} "
+        f"meta_passes={meta_passes} final_hash={_short_hash(final_md)} "
+        f"line_count={len(final_md.splitlines())}"
+    )
+    await orch.knowledge.record_tournament_event(
+        TournamentEvent(
+            event_type="winner_promoted",
+            family=family,
+            hypothesis=(
+                f"meta-merge over {len(survivors)} survivors produced final "
+                f"plan; spec_hash={spec_hash}"
+            ),
+            evidence=final_fingerprint,
+            next_action_hint=(
+                "future multi-branch runs on this spec should prefer the "
+                "lane(s) that survived"
+            ),
+        )
     )
 
 
