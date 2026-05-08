@@ -232,3 +232,85 @@ def test_walk_handles_deleted_branch_dir(tmp_path: Path) -> None:
     indices = [pair[0] for pair in result]
     # Only branches 0 and 2 surface; branch 1 is naturally absent.
     assert indices == [0, 2]
+
+
+# ---------------------------------------------------------------------------
+# v0.12.0 commit 12 — focused edge tests for latest_incumbent_md_across_branches
+# ---------------------------------------------------------------------------
+
+
+def test_latest_incumbent_signature_returns_three_tuple(tmp_path: Path) -> None:
+    """Helper returns ``(md, branch_index, pass_num)`` shape (or None).
+
+    Sanity check the signature contract — callers in plan_phase rely
+    on the 3-tuple unpacking.
+    """
+    parent = tmp_path / "multi"
+    parent.mkdir()
+    s = _setup_branch_dir(parent, 0)
+    s.write_incumbent_after(pass_num=1, a_md="# A\n")
+    result = latest_incumbent_md_across_branches(parent)
+    assert result is not None
+    md, idx, pass_num = result
+    assert isinstance(md, str)
+    assert isinstance(idx, int)
+    assert isinstance(pass_num, int)
+
+
+def test_latest_incumbent_skips_pass_num_zero(tmp_path: Path) -> None:
+    """``incumbent_after_00.md`` shouldn't normally exist (pass 1 is the
+    first pass), but if it does, the regex/scan still picks higher passes
+    over it."""
+    parent = tmp_path / "multi"
+    parent.mkdir()
+    s0 = _setup_branch_dir(parent, 0)
+    # Synthesize a pass-0 file (degenerate but valid filename).
+    (s0.artifact_dir / "incumbent_after_00.md").write_text(
+        "# pass 0 oddity\n", encoding="utf-8"
+    )
+    s0.write_incumbent_after(pass_num=2, a_md="# pass 2\n")
+    result = latest_incumbent_md_across_branches(parent)
+    assert result is not None
+    _, _, pass_num = result
+    assert pass_num == 2
+
+
+def test_latest_incumbent_high_pass_numbers(tmp_path: Path) -> None:
+    """Pass numbers like 100+ work correctly (no fixed-width assumptions)."""
+    parent = tmp_path / "multi"
+    parent.mkdir()
+    s0 = _setup_branch_dir(parent, 0)
+    # write_incumbent_after uses ``f"{pass_num:02d}"`` formatter; for
+    # large numbers the file name becomes incumbent_after_100.md.
+    s0.write_incumbent_after(pass_num=100, a_md="# big\n")
+    result = latest_incumbent_md_across_branches(parent)
+    assert result is not None
+    _, _, pass_num = result
+    assert pass_num == 100
+
+
+def test_latest_incumbent_corrupt_file_skipped_gracefully(tmp_path: Path) -> None:
+    """An unreadable ``incumbent_after_NN.md`` is skipped (not a crash).
+
+    Validates the OSError catch in
+    :func:`latest_incumbent_md_across_branches` — important because
+    crashes in salvage paths must NEVER mask the underlying tournament
+    error from the operator.
+    """
+    parent = tmp_path / "multi"
+    parent.mkdir()
+    s0 = _setup_branch_dir(parent, 0)
+    # Create a directory at the path of the file so reading fails as
+    # IsADirectoryError (subclass of OSError).
+    (s0.artifact_dir / "incumbent_after_05.md").mkdir()
+
+    s1 = _setup_branch_dir(parent, 1)
+    s1.write_incumbent_after(pass_num=2, a_md="# fallback\n")
+
+    result = latest_incumbent_md_across_branches(parent)
+    # The corrupt branch-0 entry was skipped; branch-1's pass-2 won.
+    assert result is not None
+    md, idx, pass_num = result
+    assert idx == 1
+    assert pass_num == 2
+    assert md == "# fallback\n"
