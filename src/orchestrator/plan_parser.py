@@ -89,6 +89,19 @@ _RE_COMPLEXITY = re.compile(
     r"^COMPLEXITY:\s*(simple|medium|complex)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
+# v0.14.0: ``EDIT_SCOPE:`` block header. Top-level (between ``# Plan:`` and the
+# first ``## Phase``) → ``Plan.edit_scope``. Per-phase (between ``## Phase``
+# and the first ``### Task`` in that phase) → ``Phase.edit_scope`` override.
+# Items are individual ``- <path>`` lines; the parser scans them sequentially
+# until the next non-matching line. Trailing ``# comment`` segments on each
+# item are stripped.
+_RE_EDIT_SCOPE_HEADER = re.compile(
+    r"^\s*EDIT_SCOPE\s*:?\s*$",
+    re.IGNORECASE,
+)
+_RE_EDIT_SCOPE_ITEM = re.compile(
+    r"^\s*-\s*([^#\n]+?)\s*(?:#.*)?$",
+)
 
 
 def _iso_now() -> str:
@@ -154,6 +167,12 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
     # phase header (no current_task) vs. a specific task. Same cursor —
     # only the destination dict differs.
     in_phase_acceptance_block = False
+    # v0.14.0: EDIT_SCOPE accumulator. Top-level scope lands on
+    # ``plan_edit_scope``; per-phase scope on ``current_phase["edit_scope"]``.
+    # ``in_edit_scope_block`` tracks whether we're inside a block (either
+    # top-level or phase-level — disambiguated by ``current_phase``).
+    plan_edit_scope: list[str] = []
+    in_edit_scope_block = False
 
     def _finalize_task() -> None:
         nonlocal current_task, in_acceptance_block
@@ -191,6 +210,11 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
                     _make_task(t, current_phase["id"]) for t in current_phase["tasks"]
                 ],
                 acceptance=phase_acc,
+                # v0.14.0: ``None`` (default, inherit from plan) when no
+                # per-phase EDIT_SCOPE block was emitted. A non-None list
+                # is the explicit override (including the empty list,
+                # which opts the phase into legacy whole-repo behavior).
+                edit_scope=current_phase.get("edit_scope"),
             )
         )
         current_phase = None
@@ -201,6 +225,7 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
             # Blank line ends an acceptance block but keeps the task open.
             in_acceptance_block = False
             in_phase_acceptance_block = False
+            in_edit_scope_block = False
             continue
 
         phase_m = _RE_PHASE.match(line)
@@ -215,10 +240,16 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
                 # the first ``### Task`` heading in the phase (or the next
                 # ``## Phase`` / EOF).
                 "acceptance": [],
+                # v0.14.0: per-phase EDIT_SCOPE override accumulator.
+                # ``None`` means "no per-phase block emitted" (inherit
+                # plan scope). A non-None list — including the empty list
+                # — is an explicit override.
+                "edit_scope": None,
             }
             current_task = None
             in_acceptance_block = False
             in_phase_acceptance_block = False
+            in_edit_scope_block = False
             continue
 
         task_m = _RE_TASK.match(line)
@@ -242,7 +273,45 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
             # accumulator — subsequent ``- [x] ...`` items belong to the
             # task, not the phase.
             in_phase_acceptance_block = False
+            # v0.14.0: a Task heading also closes a per-phase EDIT_SCOPE
+            # block — subsequent ``- <path>`` items inside the task body
+            # are NOT scope overrides.
+            in_edit_scope_block = False
             continue
+
+        # v0.14.0: EDIT_SCOPE block recognition. The header opens a block
+        # of ``- <path>`` items. The destination is determined by cursor:
+        # before any phase heading → plan_edit_scope; inside a phase
+        # before the first task → current_phase["edit_scope"].
+        if _RE_EDIT_SCOPE_HEADER.match(line):
+            in_edit_scope_block = True
+            in_acceptance_block = False
+            in_phase_acceptance_block = False
+            # Initialize per-phase override list if we're inside a phase
+            # (so an empty block still produces an explicit empty-list
+            # override, distinct from "block absent" → None inherit).
+            if current_phase is not None and current_task is None:
+                current_phase["edit_scope"] = []
+            continue
+
+        if in_edit_scope_block:
+            item_m = _RE_EDIT_SCOPE_ITEM.match(line)
+            if item_m:
+                entry = item_m.group(1).strip().rstrip("/")
+                if entry:
+                    if current_phase is None:
+                        plan_edit_scope.append(entry)
+                    elif current_task is None:
+                        # We initialized to [] when the header opened —
+                        # safe to .append.
+                        scope_list = current_phase.get("edit_scope")
+                        if scope_list is None:
+                            scope_list = []
+                            current_phase["edit_scope"] = scope_list
+                        scope_list.append(entry)
+                continue
+            # Non-item line ends the block.
+            in_edit_scope_block = False
 
         # v0.9.0: phase-level acceptance handling. Only fires BEFORE the
         # first task in a phase (when ``current_task is None``). The
@@ -362,6 +431,11 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
         phases=phases,
         metadata={"title": plan_title},
         complexity=complexity,
+        # v0.14.0: top-level EDIT_SCOPE block flows here. Empty list when
+        # the block was absent — the schema validator passes through, and
+        # downstream consumers (validate_edit_scope) treat empty as the
+        # legacy whole-repo no-op.
+        edit_scope=plan_edit_scope,
         created_at=now,
         updated_at=now,
     )
