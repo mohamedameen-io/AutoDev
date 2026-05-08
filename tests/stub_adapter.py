@@ -75,6 +75,23 @@ class StubAdapter(PlatformAdapter):
                     text="RESOLUTION: approved-extended-scope\n",
                     duration_s=0.01,
                 )
+            # v0.21.0 A2: synthesizer with diff input → diff output. The
+            # multi-branch impl meta-merge calls the synthesizer role
+            # with N candidate diffs and expects a fenced ``diff`` block
+            # back. Default fallback emits a no-op merged diff so tests
+            # that don't explicitly stub synthesizer don't crash.
+            if inv.role == "synthesizer" and "CANDIDATE 1" in (
+                inv.prompt or ""
+            ):
+                return AgentResult(
+                    success=True,
+                    text=(
+                        "Stub synthesizer fallback merged diff:\n\n"
+                        "```diff\ndiff --git a/stub.txt b/stub.txt\n"
+                        "@@\n+stub-merged\n```\n"
+                    ),
+                    duration_s=0.01,
+                )
             return AgentResult(
                 success=True,
                 text=f"[stub:{inv.role}] default-ok",
