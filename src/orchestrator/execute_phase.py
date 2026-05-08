@@ -577,12 +577,38 @@ async def run_execute_phase(
     # Build a worktree manager rooted under the autodev root. Skip
     # worktree-isolation when the repo is not git-initialized — tests
     # commonly use bare tmp dirs and the legacy serial path applies.
+    #
+    # v0.21.0 A1: when ``cfg.worktree_pool_enabled`` is True, substitute
+    # a :class:`WorktreePool` for the :class:`WorktreeManager`. The pool
+    # implements the same ``create_per_task`` / ``remove_per_task`` /
+    # ``get_diff_vs_base`` / ``apply_patch_to_main`` surface so the
+    # worker (``_execute_one``) is unaware of the substitution. Cold-
+    # start happens here so the upfront cost is amortized over the
+    # entire phase.
     worktree_mgr: WorktreeManager | None = None
     if _is_git_repo(orch.cwd):
-        worktree_mgr = WorktreeManager(
-            main_repo=orch.cwd,
-            tournament_dir=autodev_root(orch.cwd) / "execute_worktrees",
-        )
+        if getattr(orch.cfg, "worktree_pool_enabled", False):
+            from orchestrator.worktree_pool import WorktreePool
+
+            pool = WorktreePool(
+                main_repo=orch.cwd,
+                pool_dir=autodev_root(orch.cwd) / "execute_worktrees_pool",
+                size=parallelism,
+            )
+            try:
+                await pool.cold_start()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.worktree_pool_cold_start_failed",
+                    err=str(exc),
+                )
+            # Duck-type as WorktreeManager (it exposes the same surface).
+            worktree_mgr = pool  # type: ignore[assignment]
+        else:
+            worktree_mgr = WorktreeManager(
+                main_repo=orch.cwd,
+                tournament_dir=autodev_root(orch.cwd) / "execute_worktrees",
+            )
 
     try:
         # v0.14.0: validate edit_scope first — a plan that declares a

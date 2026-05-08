@@ -200,6 +200,31 @@ async def test_cleanup_all_removes_pool_dir(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pool_compatible_facade_create_remove_per_task(
+    tmp_path: Path,
+) -> None:
+    """``create_per_task`` / ``remove_per_task`` on the pool match manager API."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    pool = WorktreePool(
+        main_repo=repo,
+        pool_dir=tmp_path / "pool",
+        size=1,  # size=1 forces deterministic recycle path
+    )
+    await pool.cold_start()
+    p = await pool.create_per_task("t-alpha")
+    assert p.exists()
+    # remove_per_task → release lifecycle (queue or remove for overflow).
+    await pool.remove_per_task("t-alpha")
+    # Re-claim should give us back the same pool slot.
+    p2 = await pool.create_per_task("t-beta")
+    assert p2 == p
+    await pool.cleanup_all()
+
+
+@pytest.mark.asyncio
 async def test_cold_start_zero_size_skips(tmp_path: Path) -> None:
     """``cold_start`` with size=0 captures baseline but creates nothing."""
     repo = tmp_path / "repo"

@@ -296,6 +296,95 @@ class WorktreePool:
             task_id=task_id,
         )
 
+    # ── WorktreeManager-compatible facade ────────────────────────────────
+    #
+    # The execute-phase worker calls ``create_per_task(task_id, sparse_paths=...)``
+    # and ``remove_per_task(task_id)`` directly on the manager. The pool
+    # exposes the same surface so the dispatcher can substitute a pool
+    # for a manager without touching the worker. ``sparse_paths`` is
+    # accepted but ignored at claim time — pool worktrees are full
+    # checkouts (the cold-start budget assumes upfront cost is paid
+    # once and recycled). Tests requiring sparse-checkout should keep
+    # ``worktree_pool_enabled=False`` so the legacy lazy-create path
+    # runs.
+
+    async def create_per_task(
+        self,
+        task_id: str,
+        base_ref: str = "HEAD",
+        sparse_paths: list[str] | None = None,
+    ) -> Path:
+        """:class:`WorktreeManager`-compatible facade — delegates to claim().
+
+        ``base_ref`` and ``sparse_paths`` are accepted for API parity but
+        not honored: the pool returns a recycled worktree at the cold-
+        start baseline, which makes ``base_ref`` and sparse-paths
+        meaningless after the first cold-start. Operators who require
+        sparse-checkout per task should disable the pool so the legacy
+        lazy-create path runs.
+        """
+        del base_ref, sparse_paths  # API-parity only; not used by pool
+        return await self.claim(task_id=task_id)
+
+    async def remove_per_task(self, task_id: str, force: bool = True) -> None:
+        """:class:`WorktreeManager`-compatible facade — delegates to release().
+
+        The release path locates the worktree via the per-claim mapping
+        kept in :attr:`_claim_task`. If the task isn't currently claimed
+        (e.g. because the worker raised before claim), this is a no-op.
+        """
+        del force
+        # Find the path owned by ``task_id`` and release it.
+        path_str = next(
+            (p for p, tid in self._claim_task.items() if tid == task_id),
+            None,
+        )
+        if path_str is None:
+            return
+        await self.release(Path(path_str), task_id=task_id)
+
+    async def get_diff_vs_base(
+        self, worktree: Path, base_ref: str = "HEAD"
+    ) -> str:
+        """Forward to the underlying :class:`WorktreeManager`.
+
+        The execute-phase worker calls ``get_diff_vs_base`` to extract
+        a unified diff from the per-task worktree before applying it
+        to main. The pool delegates to its inner manager so the diff
+        machinery is identical to the lazy-create path.
+        """
+        # Reset baseline is already at cold-start SHA; ``base_ref`` is
+        # threaded through for API parity but the worker passes "HEAD"
+        # which is correct against pool-baseline since we never advance
+        # HEAD inside a pool worktree.
+        return await self._mgr.get_diff_vs_base(worktree, base_ref=base_ref)
+
+    async def apply_patch_to_main(
+        self,
+        worktree: Path,
+        base_ref: str = "HEAD",
+        three_way: bool = False,
+        edit_scope: list[str] | None = None,
+    ) -> None:
+        """Forward to the underlying :class:`WorktreeManager`."""
+        await self._mgr.apply_patch_to_main(
+            worktree,
+            base_ref=base_ref,
+            three_way=three_way,
+            edit_scope=edit_scope,
+        )
+
+    async def expand_sparse_paths(
+        self, worktree: Path, additional_paths: list[str]
+    ) -> None:
+        """Forward to the underlying :class:`WorktreeManager`.
+
+        v0.20.0 C3 dynamic sparse-path expansion. No-op for pool
+        worktrees (which are full checkouts) but the underlying
+        manager handles that gracefully.
+        """
+        await self._mgr.expand_sparse_paths(worktree, additional_paths)
+
     async def cleanup_all(self) -> None:
         """Remove every worktree (pooled + overflow) and the pool dir.
 
