@@ -426,11 +426,14 @@ def tournament() -> None:
     Subcommands:
 
       \b
-      run      Run a plan or implementation tournament against a file (the
-               legacy flat-flag form ``tournament --phase=plan ...`` still
-               works as a synonym).
-      promote  Salvage an incumbent from a previously-run tournament's
-               on-disk artifacts and write it to the local plan.json.
+      run            Run a plan or implementation tournament against a file
+                     (the legacy flat-flag form ``tournament --phase=plan ...``
+                     still works as a synonym).
+      promote        Salvage an incumbent from a previously-run tournament's
+                     on-disk artifacts and write it to the local plan.json.
+      phase-review   Re-run a v0.9.0 per-phase code-review tournament against
+                     a phase's implementation diff. Useful after manual
+                     corrections.
     """
 
 
@@ -547,6 +550,149 @@ def promote_subcommand(tournament_id: str, pass_num: int | None) -> None:
         f"[cyan]{tournament_id}[/cyan] pass={pass_label} "
         f"({len(recovered)} bytes) to .autodev/plan.json"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0: ``tournament phase-review`` subcommand
+# ---------------------------------------------------------------------------
+
+
+@tournament.command("phase-review")
+@click.option(
+    "--phase",
+    "phase_id",
+    required=True,
+    type=str,
+    help="Phase id to review (must exist in .autodev/plan.json).",
+)
+@click.option(
+    "--baseline",
+    "baseline_sha",
+    default=None,
+    type=str,
+    help=(
+        "Override the baseline SHA for the diff range. Defaults to "
+        "Phase.baseline_commit recorded by the orchestrator at phase entry."
+    ),
+)
+@click.option(
+    "--tip",
+    "tip_sha",
+    default=None,
+    type=str,
+    help="Override the tip SHA. Defaults to current HEAD.",
+)
+def phase_review_subcommand(
+    phase_id: str,
+    baseline_sha: str | None,
+    tip_sha: str | None,
+) -> None:
+    """Re-run the per-phase code-review tournament for an existing phase.
+
+    Loads the plan via PlanManager, finds the phase by id, and invokes the
+    runner with either the architect-recorded baseline_commit or the
+    explicit ``--baseline`` override. The new tournament writes a new
+    artifact dir, fresh evidence, and a new ``phase_review_complete``
+    ledger breadcrumb.
+
+    Useful after manual corrections to a phase's implementation: the
+    re-run picks up the new HEAD and re-evaluates against the same phase
+    acceptance criteria.
+    """
+    console = Console()
+    cwd = Path.cwd()
+    cfg_path = config_path(cwd)
+    if not cfg_path.exists():
+        console.print(
+            f"[red]autodev tournament phase-review:[/red] {cfg_path} not "
+            "found. Run [bold]autodev init[/bold] first."
+        )
+        sys.exit(2)
+
+    cfg = load_config(cfg_path)
+
+    async def _run() -> None:
+        from adapters.detect import get_adapter
+        from adapters.git_utils import _git_rev_parse_head
+        from agents import build_registry
+        from orchestrator import Orchestrator
+        from orchestrator.phase_review_runner import (
+            run_phase_review_tournament,
+        )
+        from state.paths import autodev_root, spec_path
+
+        adapter = await get_adapter(cfg.platform)
+        registry = build_registry(cfg)
+        orch = Orchestrator(
+            cwd=cwd,
+            cfg=cfg,
+            adapter=adapter,
+            registry=registry,
+            session_id="cli-tournament-phase-review",
+        )
+
+        plan = await orch.plan_manager.load()
+        if plan is None:
+            console.print(
+                "[red]autodev tournament phase-review:[/red] no plan in "
+                ".autodev/plan.json. Run [bold]autodev plan[/bold] first."
+            )
+            sys.exit(2)
+
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            console.print(
+                f"[red]autodev tournament phase-review:[/red] phase id "
+                f"{phase_id!r} not found in plan."
+            )
+            sys.exit(2)
+
+        baseline = baseline_sha or phase.baseline_commit
+        if not baseline:
+            console.print(
+                "[red]autodev tournament phase-review:[/red] no baseline "
+                "commit recorded for this phase and --baseline not "
+                "provided. Pass --baseline=<sha> explicitly."
+            )
+            sys.exit(2)
+
+        tip = tip_sha or _git_rev_parse_head(cwd) or ""
+        if not tip:
+            console.print(
+                "[red]autodev tournament phase-review:[/red] could not "
+                "resolve HEAD; pass --tip=<sha> explicitly."
+            )
+            sys.exit(2)
+
+        sp = spec_path(cwd)
+        spec_md = sp.read_text(encoding="utf-8") if sp.exists() else ""
+
+        outcome = await run_phase_review_tournament(
+            orch, phase, baseline, tip, spec_md
+        )
+
+        console.print(
+            f"[bold cyan]autodev tournament phase-review[/bold cyan] "
+            f"phase={phase_id} winner={outcome.winner} "
+            f"accept_phase={outcome.accept_phase} "
+            f"passes={len(outcome.history)}"
+        )
+        if outcome.corrective_direction:
+            console.print(
+                f"[yellow]Corrective direction:[/yellow]\n"
+                f"{outcome.corrective_direction}"
+            )
+        # Indicate where artifacts live for follow-up inspection.
+        artifact_root = autodev_root(cwd) / "tournaments"
+        console.print(f"[dim]Artifacts under:[/dim] {artifact_root}")
+
+    try:
+        asyncio.run(_run())
+    except AutodevError as exc:
+        console.print(
+            f"[red]autodev tournament phase-review failed:[/red] {exc}"
+        )
+        sys.exit(2)
 
 
 async def _run_plan_tournament_cli(
