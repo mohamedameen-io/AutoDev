@@ -35,6 +35,18 @@ class ClaudeCodeAdapter(PlatformAdapter):
 
     def __init__(self, binary: str = "claude") -> None:
         self.binary = binary
+        # v0.10.0: most recently spawned subprocess PID. Read by the
+        # tournament's per-pass adaptive ratcheting to feed
+        # :func:`runtime.resource_probe.measure_subprocess_rss`. Defaults
+        # to ``None`` until the first ``execute`` call lands. With
+        # concurrent calls, this is the PID of the *last subprocess
+        # whose ``create_subprocess_exec`` resolved* — by design a
+        # single-slot pulse, not a per-call list. The downstream RSS
+        # probe is robust to dead PIDs (returns ``None`` on
+        # ``NoSuchProcess`` / ``AccessDenied``), so a stale-by-the-time-
+        # we-read-it value gracefully degrades to "no measurement this
+        # pass" rather than a crash.
+        self.last_pid: int | None = None
 
     def _build_command(self, inv: AgentInvocation) -> list[str]:
         cmd: list[str] = [
@@ -98,6 +110,11 @@ class ClaudeCodeAdapter(PlatformAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            # v0.10.0: record the spawned PID for downstream RSS probing.
+            # Set BEFORE communicate() so we capture it even if the call
+            # times out or fails (per-pass probing wants peak-time PIDs,
+            # not just success-path ones).
+            self.last_pid = proc.pid
             try:
                 stdout_b, stderr_b = await asyncio.wait_for(
                     proc.communicate(),

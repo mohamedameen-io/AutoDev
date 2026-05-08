@@ -20,10 +20,12 @@ def _fake_proc(
     stderr: str = "",
     returncode: int = 0,
     hang: bool = False,
+    pid: int = 12345,
 ) -> AsyncMock:
     """Create an AsyncMock that mimics asyncio.subprocess.Process."""
     proc = AsyncMock()
     proc.returncode = returncode
+    proc.pid = pid
     if hang:
         async def _never(*_a, **_kw):  # pragma: no cover - timing path
             await asyncio.sleep(3600)
@@ -604,3 +606,72 @@ async def test_execute_returns_empty_tool_calls_phase2(tmp_path: Path) -> None:
         result = await adapter.execute(inv)
     assert result.success is True
     assert result.tool_calls == []
+
+
+# ---------------------------------------------------------------------------
+# v0.10.0 — last_pid tracking for per-pass adaptive ratcheting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_records_last_pid_on_success(tmp_path: Path) -> None:
+    """v0.10.0: after ``create_subprocess_exec`` returns, ``adapter.last_pid``
+    holds the spawned process's PID. Used by tournament code to feed
+    :func:`runtime.resource_probe.measure_subprocess_rss` for per-pass
+    adaptive semaphore ratcheting."""
+    adapter = ClaudeCodeAdapter()
+    assert adapter.last_pid is None  # Initial state.
+
+    inv = AgentInvocation(role="echo", prompt="p", cwd=tmp_path)
+    fake = _fake_proc(stdout=_good_claude_blob("ok"), returncode=0, pid=98765)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is True
+    assert adapter.last_pid == 98765
+
+
+@pytest.mark.asyncio
+async def test_execute_records_last_pid_on_failure(tmp_path: Path) -> None:
+    """``last_pid`` is recorded even when the subprocess exits with rc!=0.
+
+    This matters because per-pass RSS probing happens AFTER all judges in
+    a pass complete — including failed ones (whose RSS at peak still
+    counts toward the pass's resource usage). Setting last_pid only on
+    success would systematically under-sample under failure-heavy passes.
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="echo", prompt="p", cwd=tmp_path)
+    fake = _fake_proc(stdout="", stderr="boom", returncode=1, pid=11111)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        await adapter.execute(inv)
+    assert adapter.last_pid == 11111
+
+
+@pytest.mark.asyncio
+async def test_execute_overwrites_last_pid_across_calls(tmp_path: Path) -> None:
+    """Each ``execute`` call overwrites ``last_pid`` with the most recent
+    subprocess's PID — by design (per-call snapshot, not cumulative)."""
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="echo", prompt="p", cwd=tmp_path)
+
+    fake_first = _fake_proc(stdout=_good_claude_blob("ok"), returncode=0, pid=100)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake_first),
+    ):
+        await adapter.execute(inv)
+    assert adapter.last_pid == 100
+
+    fake_second = _fake_proc(stdout=_good_claude_blob("ok"), returncode=0, pid=200)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake_second),
+    ):
+        await adapter.execute(inv)
+    assert adapter.last_pid == 200
