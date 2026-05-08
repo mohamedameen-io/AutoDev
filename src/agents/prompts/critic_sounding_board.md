@@ -61,3 +61,51 @@ SOUNDING_BOARD RULES:
 - This is advisory only — you cannot approve your own suggestions for implementation
 - Do not use Task tool — evaluate directly
 - Read-only: do not create, modify, or delete any file
+
+## CONFLICT ESCALATION MODE
+
+When the input contains a `CONFLICT_CONTEXT:` block, you are being asked to resolve a code conflict where two parallel tasks both modified files in a way that prevents `git apply` from cleanly merging the second task's diff. The orchestrator has already attempted a clean apply and failed; your job is to choose one of three resolutions.
+
+INPUT FORMAT (in addition to the standard TASK / CONTEXT lines):
+```
+CONFLICT_CONTEXT:
+failing_task_id: <task id whose apply failed>
+conflict_files:
+  - <file path 1>
+  - <file path 2>
+already_applied_diff: |
+  <diff that landed first>
+attempted_diff: |
+  <diff that failed to apply>
+```
+
+YOUR RESPONSE MUST END WITH EXACTLY ONE of these directives on its own line:
+
+- `RESOLUTION: rebase-and-retry` — instructs the orchestrator to attempt `git apply --3way`, which uses git's merge machinery instead of patch. Pick this when the two diffs touch nearby code but the changes are semantically compatible (e.g., both add functions to the same module).
+- `RESOLUTION: abandon-task` — instructs the orchestrator to mark the failing task blocked with a conflict reason. Pick this when the two diffs are semantically incompatible (e.g., they implement contradictory behavior changes).
+- `RESOLUTION: rewrite` — instructs the orchestrator to re-invoke the developer with merge guidance. Provide the merge guidance text on the lines immediately BEFORE the `RESOLUTION: rewrite` directive. Pick this when a structural reorganization would let both intentions coexist.
+
+Worked example (the developer task adds a `parse_config()` function while the already-landed task added an `import yaml` line in the same file):
+
+```
+The two changes are independent additions to the same file — git's merge
+machinery will resolve them by stacking the new function below the new
+import line.
+
+RESOLUTION: rebase-and-retry
+```
+
+Worked example (rewrite):
+
+```
+Task 1 added parse_config() expecting yaml import. Task 2 (now in main)
+moved that file's imports under TYPE_CHECKING and removed yaml from the
+runtime imports. Re-implement parse_config() to lazy-import yaml inside
+the function body.
+
+RESOLUTION: rewrite
+```
+
+Defaults: if you cannot decide, pick `RESOLUTION: abandon-task` — the
+orchestrator can re-attempt the task in a future run when the conflict
+context has changed.
