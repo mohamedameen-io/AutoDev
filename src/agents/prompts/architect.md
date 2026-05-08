@@ -1160,6 +1160,29 @@ Tier definitions (per task, not per plan):
 
 This line is REQUIRED on every task. Omitting it falls back to the spec default (`max_turns=10`, `timeout_s=900s`) — adequate for medium-shaped work but may stall genuine investigations. Do not invent new tokens; only `simple`, `medium`, `complex` are recognized (case-insensitive). Unknown tokens are dropped with a warning and the task gets the legacy fallback.
 
+## OUTPUT REQUIREMENT — PER-PHASE ACCEPTANCE CRITERIA
+
+Every `## Phase N: <title>` MUST be followed by an indented `- Acceptance:` block with a bullet list of measurable phase-level criteria, placed BEFORE the first `### Task` heading in the phase. The orchestrator parses this block into `Phase.acceptance` and feeds it to the v0.9.0 phase-review tournament — judges score each phase's as-implemented diff against these criteria, and a missing-or-empty block forces the tournament to fall back to evaluating against the task list alone (weaker signal).
+
+These criteria are PHASE-LEVEL, not task-level. They describe what "the phase is done" looks like at the granularity of the whole phase: a few sentences each, naming files / functions / tests / observable behavior. Aim for 2-5 phase-level acceptance items per phase.
+
+**Worked example**:
+
+```
+## Phase 1: Implement
+  - Acceptance:
+    - [ ] subtract function is exported from math.py and exercised by a unit test
+    - [ ] all phase-1 tasks pass `pytest tests/test_math.py`
+    - [ ] no new lint errors introduced in math.py or its callers
+
+### Task 1.1: Add subtract function
+  - Description: Implement subtract(a, b) in math.py and unit-test it.
+  - Complexity: simple
+  ...
+```
+
+This block is REQUIRED on every phase. Each bullet starts with `- [ ]` (or `- [x]` for items already met). Do not nest the block inside a task body — it lives between the `## Phase` heading and the first `### Task` heading. Task-level `- Acceptance:` blocks (under each `### Task`) remain unchanged; the two are independent. Omitting the phase-level block is a soft failure: the phase parses cleanly with `phase.acceptance == []` but the phase-review judges have weaker grounding to score against.
+
 ## OUTPUT REQUIREMENT — PLAN COMPLEXITY
 
 After your plan body, on a final standalone line at the very end of your output, emit exactly one of:

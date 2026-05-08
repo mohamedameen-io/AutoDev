@@ -197,3 +197,31 @@ def test_architect_prompt_contains_per_task_complexity_directive() -> None:
         assert f"Complexity: {tier}" in architect_prompt, (
             f"architect prompt must include the ``{tier}`` tier in its example"
         )
+
+
+# ── v0.9.0: Architect prompt PER-PHASE ACCEPTANCE CRITERIA directive ─────
+
+
+def test_architect_prompt_contains_per_phase_acceptance_directive() -> None:
+    """The architect's rendered prompt must include the PER-PHASE ACCEPTANCE
+    CRITERIA section AND mention the ``- Acceptance:`` block placement so
+    each emitted phase carries the criteria the v0.9.0 phase-review
+    tournament's judges score against."""
+    specs = build_registry(default_config())
+    architect_prompt = specs["architect"].prompt
+
+    assert (
+        "## OUTPUT REQUIREMENT — PER-PHASE ACCEPTANCE CRITERIA"
+        in architect_prompt
+    ), (
+        "architect prompt is missing the PER-PHASE ACCEPTANCE CRITERIA "
+        "section header"
+    )
+    # The directive must mention the ``- Acceptance:`` body line and the
+    # placement (between the phase heading and the first task heading).
+    assert "- Acceptance:" in architect_prompt
+    # Worked example must include checkbox items.
+    assert "- [ ]" in architect_prompt
+    # The directive must explicitly position the block before the first
+    # ``### Task`` heading.
+    assert "### Task" in architect_prompt
