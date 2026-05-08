@@ -79,6 +79,20 @@ class TournamentPhaseConfig(BaseModel):
     # ships with ``7``. Impl tournaments leave this ``None`` because impl
     # complexity isn't extracted from a plan markdown.
     complex_plan_num_judges_override: int | None = None
+    # v0.12.0: number of independent RNG-seeded tournament branches to run
+    # in parallel. ``1`` (default) preserves single-branch behavior. When
+    # ``>1``, the plan-tournament dispatch fans out N tournaments (each in
+    # its own ``tournaments/multi-{hash}/branch-N/`` artifact dir) and
+    # then meta-merges the survivors via the existing
+    # :class:`~tournament.plan_tournament.PlanContentHandler` synthesizer.
+    # Validation: clamped to [1, 5] — 1 disables fan-out, 5 is a hard
+    # ceiling on cost (5× LLM call volume vs. single-branch). Defaults
+    # to 1 across plan / impl / phase_review; the plan-tournament default
+    # in :mod:`config.defaults` overrides to 3 for "maximum diversity"
+    # per the v0.12.0 user-locked-in setting. Impl + phase_review leave
+    # ``num_branches=1`` because branch fan-out isn't wired into those
+    # runners in this release.
+    num_branches: int = Field(default=1, ge=1, le=5)
 
 
 def _default_phase_review_cfg() -> "TournamentPhaseConfig":

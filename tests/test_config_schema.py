@@ -346,3 +346,98 @@ def test_legacy_config_with_max_parallel_int_still_loads(tmp_path: Path) -> None
     path.write_text(json.dumps(data), encoding="utf-8")
     reloaded = load_config(path)
     assert reloaded.tournaments.max_parallel_subprocesses == 3
+
+
+# ---------------------------------------------------------------------------
+# v0.12.0 — TournamentPhaseConfig.num_branches: int = 1, range [1,5]
+# ---------------------------------------------------------------------------
+
+
+def test_num_branches_default_1() -> None:
+    """v0.12.0: ``num_branches`` defaults to 1 (single-branch — no fan-out).
+
+    The plan-tournament default in :mod:`config.defaults` overrides this to
+    3 for parallel-branch fan-out per the v0.12.0 user-locked-in design.
+    """
+    from config.schema import TournamentPhaseConfig
+
+    cfg = TournamentPhaseConfig(
+        enabled=True, num_judges=5, convergence_k=2, max_rounds=15
+    )
+    assert cfg.num_branches == 1
+    reloaded = TournamentPhaseConfig.model_validate(cfg.model_dump())
+    assert reloaded.num_branches == 1
+
+
+@pytest.mark.parametrize("n", [2, 3, 4, 5])
+def test_num_branches_accepts_2_through_5(n: int) -> None:
+    """``num_branches`` accepts any integer in ``[2, 5]`` (the cost-bounded
+    fan-out range; 5 is the hard ceiling for branch concurrency)."""
+    from config.schema import TournamentPhaseConfig
+
+    cfg = TournamentPhaseConfig(
+        enabled=True,
+        num_judges=5,
+        convergence_k=2,
+        max_rounds=15,
+        num_branches=n,
+    )
+    assert cfg.num_branches == n
+    reloaded = TournamentPhaseConfig.model_validate(cfg.model_dump())
+    assert reloaded.num_branches == n
+
+
+def test_num_branches_negative_rejected() -> None:
+    """Negative ``num_branches`` is rejected (validation failure)."""
+    from config.schema import TournamentPhaseConfig
+
+    with pytest.raises(ValidationError):
+        TournamentPhaseConfig(
+            enabled=True,
+            num_judges=5,
+            convergence_k=2,
+            max_rounds=15,
+            num_branches=-1,
+        )
+
+
+def test_num_branches_zero_rejected() -> None:
+    """``num_branches=0`` is rejected (must be ≥1; 1 is the disable-fan-out
+    sentinel)."""
+    from config.schema import TournamentPhaseConfig
+
+    with pytest.raises(ValidationError):
+        TournamentPhaseConfig(
+            enabled=True,
+            num_judges=5,
+            convergence_k=2,
+            max_rounds=15,
+            num_branches=0,
+        )
+
+
+def test_num_branches_above_ceiling_rejected() -> None:
+    """``num_branches=6`` is rejected (>5 ceiling)."""
+    from config.schema import TournamentPhaseConfig
+
+    with pytest.raises(ValidationError):
+        TournamentPhaseConfig(
+            enabled=True,
+            num_judges=5,
+            convergence_k=2,
+            max_rounds=15,
+            num_branches=6,
+        )
+
+
+def test_legacy_config_without_num_branches_loads() -> None:
+    """A pre-v0.12.0 config dict without ``num_branches`` validates and
+    defaults the field to 1 (backward-compat)."""
+    from config.schema import TournamentPhaseConfig
+
+    legacy = TournamentPhaseConfig(
+        enabled=True, num_judges=5, convergence_k=2, max_rounds=15
+    ).model_dump()
+    legacy.pop("num_branches", None)
+    reloaded = TournamentPhaseConfig.model_validate(legacy)
+    assert reloaded.num_branches == 1
