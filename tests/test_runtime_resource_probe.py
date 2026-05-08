@@ -83,6 +83,19 @@ def test_resolve_parallelism_explicit_int_passes_through() -> None:
     assert out == 8
 
 
+def test_resolve_parallelism_accepts_execute_role_mix() -> None:
+    """v0.11.0: ``role_mix='execute'`` is a valid value (per-task workers
+    in execute_phase). Same algorithm — just a new caller identifier
+    that the runner forwards through for forensic logging."""
+    from runtime.resource_probe import HostCapacity, resolve_parallelism
+
+    cap = HostCapacity(cpu_count=8, available_mem_gb=16.0)
+    out = resolve_parallelism(None, cap, role_mix="execute", num_judges=16)
+    # cpu_cap = 6, mem_cap = (16 - 4) / 1.5 = 8, num_judges = 16, ceiling 16.
+    # min = 6.
+    assert out == 6
+
+
 def test_resolve_parallelism_explicit_int_floors_at_1() -> None:
     """A configured value <= 0 is clamped up to 1 (avoid divide-by-zero
     on the semaphore + always-on parallelism contract)."""

@@ -286,6 +286,55 @@ def test_max_parallel_subprocesses_accepts_int() -> None:
     assert reloaded.max_parallel_subprocesses == 8
 
 
+# ---------------------------------------------------------------------------
+# v0.11.0 — TournamentsConfig.execute_max_parallel_tasks: int | None
+# ---------------------------------------------------------------------------
+
+
+def test_execute_max_parallel_tasks_accepts_none() -> None:
+    """v0.11.0: ``execute_max_parallel_tasks`` defaults to None (auto-resolve)."""
+    from config.schema import TournamentPhaseConfig, TournamentsConfig
+
+    base_phase = TournamentPhaseConfig(
+        enabled=True, num_judges=5, convergence_k=2, max_rounds=15
+    )
+    cfg = TournamentsConfig(plan=base_phase, impl=base_phase)
+    assert cfg.execute_max_parallel_tasks is None
+    reloaded = TournamentsConfig.model_validate(cfg.model_dump())
+    assert reloaded.execute_max_parallel_tasks is None
+
+
+def test_execute_max_parallel_tasks_accepts_int() -> None:
+    """An explicit int passes validation unchanged."""
+    from config.schema import TournamentPhaseConfig, TournamentsConfig
+
+    base_phase = TournamentPhaseConfig(
+        enabled=True, num_judges=5, convergence_k=2, max_rounds=15
+    )
+    cfg = TournamentsConfig(
+        plan=base_phase,
+        impl=base_phase,
+        execute_max_parallel_tasks=4,
+    )
+    assert cfg.execute_max_parallel_tasks == 4
+    reloaded = TournamentsConfig.model_validate(cfg.model_dump())
+    assert reloaded.execute_max_parallel_tasks == 4
+
+
+def test_legacy_config_without_execute_max_parallel_tasks_loads() -> None:
+    """A config dict missing ``execute_max_parallel_tasks`` validates and
+    defaults the field to ``None`` (backward-compat)."""
+    from config.schema import TournamentPhaseConfig, TournamentsConfig
+
+    base_phase = TournamentPhaseConfig(
+        enabled=True, num_judges=5, convergence_k=2, max_rounds=15
+    )
+    legacy_payload = TournamentsConfig(plan=base_phase, impl=base_phase).model_dump()
+    legacy_payload.pop("execute_max_parallel_tasks", None)
+    reloaded = TournamentsConfig.model_validate(legacy_payload)
+    assert reloaded.execute_max_parallel_tasks is None
+
+
 def test_legacy_config_with_max_parallel_int_still_loads(tmp_path: Path) -> None:
     """A pre-v0.10.0 config with ``max_parallel_subprocesses: 3`` keeps loading
     cleanly after the type widens to ``int | None``."""

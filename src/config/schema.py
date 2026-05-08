@@ -123,6 +123,15 @@ class TournamentsConfig(BaseModel):
     # backward-compat with pre-v0.10.0 configs (and as an escape hatch
     # for hosts where psutil mis-reports capacity).
     max_parallel_subprocesses: int | None = None
+    # v0.11.0: max number of execute_phase task workers running in
+    # parallel. ``None`` (default) means "auto-resolve via
+    # :func:`runtime.resource_probe.resolve_parallelism` with
+    # ``role_mix='execute'``". An explicit int bypasses the probe.
+    # This is distinct from ``max_parallel_subprocesses`` — that field
+    # caps judge cohort fan-out inside one tournament; this field caps
+    # task-worker fan-out inside execute_phase. Both can be set
+    # independently.
+    execute_max_parallel_tasks: int | None = None
     auto_disable_for_models: list[str] = Field(default_factory=lambda: ["opus"])
 
 

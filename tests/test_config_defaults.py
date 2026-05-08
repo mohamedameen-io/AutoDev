@@ -348,3 +348,16 @@ def test_default_max_parallel_subprocesses_is_none() -> None:
     """
     cfg = default_config()
     assert cfg.tournaments.max_parallel_subprocesses is None
+
+
+# ---------------------------------------------------------------------------
+# v0.11.0 — execute_max_parallel_tasks default is None (auto-resolve)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_max_parallel_tasks_default_none() -> None:
+    """v0.11.0: ``execute_max_parallel_tasks`` defaults to None so the
+    parallel execute_phase dispatcher resolves it via the resource probe
+    at run_execute_phase entry (role_mix='execute')."""
+    cfg = default_config()
+    assert cfg.tournaments.execute_max_parallel_tasks is None

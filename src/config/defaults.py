@@ -178,6 +178,11 @@ def default_config(platform: str = "auto") -> AutodevConfig:
             # config to bypass the probe (e.g. on hosts where psutil
             # mis-reports capacity, or to force a known-stable value).
             max_parallel_subprocesses=None,
+            # v0.11.0: max parallel execute_phase task workers. ``None``
+            # auto-resolves via the same resource_probe at run_execute_phase
+            # entry. Distinct from max_parallel_subprocesses (which caps
+            # the judge cohort fan-out inside one tournament).
+            execute_max_parallel_tasks=None,
             auto_disable_for_models=["opus"],
         ),
         qa_gates=QAGatesConfig(),

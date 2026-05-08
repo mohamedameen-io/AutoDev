@@ -98,7 +98,7 @@ _CPU_RESERVE = 2
 def resolve_parallelism(
     configured: int | None,
     capacity: HostCapacity,
-    role_mix: Literal["plan", "impl", "phase_review"],
+    role_mix: Literal["plan", "impl", "phase_review", "execute"],
     num_judges: int,
 ) -> int:
     """Resolve a safe ``max_parallel_subprocesses`` for the next tournament.
@@ -122,20 +122,30 @@ def resolve_parallelism(
 
     Args:
         configured: Operator-supplied int from
-            ``cfg.tournaments.max_parallel_subprocesses``. ``None`` means
-            "auto-resolve from capacity"; an int means "use this value".
+            ``cfg.tournaments.max_parallel_subprocesses`` (or
+            ``cfg.tournaments.execute_max_parallel_tasks`` for the
+            ``role_mix="execute"`` case). ``None`` means "auto-resolve
+            from capacity"; an int means "use this value".
         capacity: Snapshot from :func:`probe_host`.
-        role_mix: Tournament role identifier (``plan``, ``impl``, or
-            ``phase_review``). Currently logged for forensics; reserved
-            for v0.10.1's per-role weighted parallelism (DEFERRED in
-            this release).
-        num_judges: Effective judge cohort size for this tournament. The
-            resolver never returns more workers than there are judges
-            because excess workers would idle.
+        role_mix: Caller identifier. ``plan`` / ``impl`` /
+            ``phase_review`` correspond to tournament judge cohorts.
+            ``execute`` (v0.11.0) is for per-task subprocess workers in
+            execute_phase — the ``num_judges`` arg in that case is
+            interpreted as "max concurrent task ceiling" (the runner
+            passes the configured ``execute_max_parallel_tasks`` value
+            or the absolute ceiling 16). Currently logged for
+            forensics; reserved for v0.10.1's per-role weighted
+            parallelism (DEFERRED).
+        num_judges: For tournament roles: effective judge cohort size
+            (resolver never returns more workers than judges). For
+            ``role_mix="execute"``: max concurrent task ceiling (the
+            dispatcher polls greedily, so this just sets the upper
+            bound — typically ``16``).
 
     Returns:
         A positive int suitable as ``cfg.max_parallel_subprocesses`` for
-        :class:`tournament.core.TournamentConfig`. Always >= 1.
+        :class:`tournament.core.TournamentConfig` (or as the worker-pool
+        cap in ``run_execute_phase``). Always >= 1.
     """
     if configured is not None:
         chosen = max(1, configured)
