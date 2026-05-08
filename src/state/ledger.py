@@ -84,6 +84,19 @@ LedgerOp = Literal[
     "multi_branch_plan_tournament_start",
     "multi_branch_meta_merge_complete",
     "multi_branch_plan_tournament_complete",
+    # v0.15.0: stuck-recovery escalation ladder + PRM ops. All four are
+    # observability-only — they do NOT mutate plan state. The
+    # task.status / blocked_reason mutations live in the regular
+    # ``update_task_status`` op emitted alongside.
+    # - ``stuck_refine``:  payload ``{task_id, reason, critic_response_excerpt}``.
+    # - ``stuck_pivot``:   same payload shape.
+    # - ``soft_blocker_handoff``: same payload shape.
+    # - ``course_correction_emitted``: payload
+    #   ``{task_id, taxonomy, pattern, suggestion}`` from PRM detector.
+    "stuck_refine",
+    "stuck_pivot",
+    "soft_blocker_handoff",
+    "course_correction_emitted",
 ]
 
 
@@ -392,6 +405,20 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # ``plan_tournament_complete`` ops, and the meta-merged final
         # markdown is consumed downstream into ``init_plan``. These ops
         # are forensics for "how did we get the merged plan", not state.
+        return plan
+
+    if op in (
+        "stuck_refine",
+        "stuck_pivot",
+        "soft_blocker_handoff",
+        "course_correction_emitted",
+    ):
+        # v0.15.0: audit-only breadcrumbs for the stuck-recovery
+        # escalation ladder + PRM. The task.status / blocked_reason
+        # changes are recorded by the regular ``update_task_status``
+        # op emitted alongside; these ops are forensics for "what
+        # path did the ladder/PRM take" so a human can reconstruct
+        # the decision after the fact.
         return plan
 
     if plan is None:

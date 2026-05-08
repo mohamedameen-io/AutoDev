@@ -809,6 +809,16 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
         # the per-branch breadcrumbs; these three are aggregate forensics.
         return plan
 
+    if op in (
+        "stuck_refine",
+        "stuck_pivot",
+        "soft_blocker_handoff",
+        "course_correction_emitted",
+    ):
+        # v0.15.0: ladder + PRM audit ops do not mutate plan state. Status
+        # transitions are recorded by ``update_task_status`` separately.
+        return plan
+
     if op == "mark_blocked_descendants":
         # v0.11.0: cascade-block. Walk descendants and set
         # status="blocked" with a structured reason.

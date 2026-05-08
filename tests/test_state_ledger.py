@@ -647,3 +647,152 @@ async def test_missing_seq_hash_fields_raises(tmp_path: Path) -> None:
                 payload={"task_id": "1.1", "status": "in_progress"},
                 session_id="s1",
             )
+
+
+# ---------------------------------------------------------------------------
+# v0.15.0 — stuck-ladder + course-correction ledger ops are audit-only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stuck_refine_op_replays_correctly(tmp_path: Path) -> None:
+    """``stuck_refine`` is audit-only — does NOT mutate plan state."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="stuck_refine",
+            payload={
+                "task_id": "1.1",
+                "reason": "reviewer NEEDS_CHANGES x3",
+                "critic_response_excerpt": "add type hints to signature",
+            },
+            session_id="s1",
+        )
+
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    assert len(entries) == 2
+    assert out.phases[0].tasks[0].status == "pending"  # not mutated
+
+
+@pytest.mark.asyncio
+async def test_stuck_pivot_op_replays_correctly(tmp_path: Path) -> None:
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="stuck_pivot",
+            payload={
+                "task_id": "1.1",
+                "reason": "5 discards on same approach",
+                "critic_response_excerpt": "stop using shell=True; use argv list",
+            },
+            session_id="s1",
+        )
+
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    assert len(entries) == 2
+    assert out.phases[0].tasks[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_soft_blocker_handoff_op_replays_correctly(tmp_path: Path) -> None:
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="soft_blocker_handoff",
+            payload={
+                "task_id": "1.1",
+                "reason": "3 pivots failed; human decision required",
+                "critic_response_excerpt": "decide hardware target family",
+            },
+            session_id="s1",
+        )
+
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    assert len(entries) == 2
+    assert out.phases[0].tasks[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_course_correction_emitted_op_replays_correctly(tmp_path: Path) -> None:
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="course_correction_emitted",
+            payload={
+                "task_id": "1.1",
+                "taxonomy": "reasoning_error",
+                "pattern": "repetition_loop",
+                "suggestion": "vary the approach; you've made the same edit 3x",
+            },
+            session_id="s1",
+        )
+
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    assert len(entries) == 2
+    assert out.phases[0].tasks[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_v0150_ops_can_appear_before_init_plan(tmp_path: Path) -> None:
+    """All four v0.15.0 ops are audit-only and must replay safely even
+    when they appear before ``init_plan`` (e.g. lessons emitted during
+    plan-tournament BEFORE the executor's plan is persisted)."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="course_correction_emitted",
+            payload={
+                "task_id": "1.1",
+                "taxonomy": "reasoning_error",
+                "pattern": "repetition_loop",
+                "suggestion": "...",
+            },
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    assert len(entries) == 2
