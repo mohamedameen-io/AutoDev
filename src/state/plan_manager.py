@@ -819,6 +819,10 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
         # transitions are recorded by ``update_task_status`` separately.
         return plan
 
+    if op == "hypothesis_repeat_detected":
+        # v0.17.0 S4: advisory repeat-hypothesis tag (forensics only).
+        return plan
+
     if op == "mark_blocked_descendants":
         # v0.11.0: cascade-block. Walk descendants and set
         # status="blocked" with a structured reason.

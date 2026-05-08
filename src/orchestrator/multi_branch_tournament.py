@@ -45,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -94,12 +94,18 @@ class BranchOutcome:
     during its tournament (captured into ``error``); ``final_md`` will
     be ``None``. Used by :func:`run_multi_branch_plan_tournament` to
     decide which survivors feed into the meta-merge step.
+
+    v0.17.0 S4: ``metadata`` carries advisory tags from the
+    repeated-hypothesis detector (``{"hypothesis_repeat": True}``) and
+    future per-branch annotations. Free-form dict so additions are
+    backward-compatible.
     """
 
     branch_index: int
     success: bool
     final_md: str | None
     error: str | None
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -615,6 +621,49 @@ async def run_multi_branch_plan_tournament(
         n_branches=n_branches,
     )
 
+    # v0.17.0 S4: pre-gather repeated-hypothesis advisory check. For each
+    # branch, derive a hypothesis from ``branch_config.family`` (when set)
+    # or fall back to the first 500 chars of ``initial_md``. Tag branches
+    # whose hypothesis matches a recent (≤14d) discard so downstream
+    # forensics + the future plateau detector can weigh structurally
+    # repeated approaches. Advisory ONLY — does not skip branches.
+    repeat_tags: list[bool] = [False] * n_branches
+    if orch.cfg.repeated_hypothesis_threshold > 0:
+        from orchestrator.repeat_detector import RepeatedHypothesisDetector
+
+        detector = RepeatedHypothesisDetector(orch.knowledge)
+        threshold = orch.cfg.repeated_hypothesis_threshold
+        for i in range(n_branches):
+            bc = branch_configs[i] if branch_configs is not None else None
+            family = bc.family if bc is not None else None
+            hypothesis = family if family else initial_md[:500]
+            try:
+                is_rep = await detector.is_repeat(
+                    hypothesis, family=family, threshold=threshold
+                )
+            except Exception as exc:  # noqa: BLE001 — advisory: never block
+                logger.warning(
+                    "multi_branch.repeat_check_failed",
+                    branch_index=i,
+                    error=str(exc),
+                )
+                is_rep = False
+            if is_rep:
+                repeat_tags[i] = True
+                logger.warning(
+                    "multi_branch.hypothesis_repeat",
+                    branch_index=i,
+                    family=family or "<none>",
+                )
+                await orch.plan_manager.ledger_append(
+                    op="hypothesis_repeat_detected",
+                    payload={
+                        "spec_hash": spec_hash,
+                        "branch_index": i,
+                        "family": family,
+                    },
+                )
+
     # Step 1: gather N parallel branches with return_exceptions so a single
     # branch failure does NOT cancel siblings.
     coros = [
@@ -635,6 +684,10 @@ async def run_multi_branch_plan_tournament(
 
     branches: list[BranchOutcome] = []
     for i, r in enumerate(raw_results):
+        # v0.17.0 S4: thread the advisory repeat tag into per-branch metadata.
+        meta: dict[str, object] = {}
+        if repeat_tags[i]:
+            meta["hypothesis_repeat"] = True
         if isinstance(r, BaseException):
             branches.append(
                 BranchOutcome(
@@ -642,6 +695,7 @@ async def run_multi_branch_plan_tournament(
                     success=False,
                     final_md=None,
                     error=str(r),
+                    metadata=meta,
                 )
             )
             logger.warning(
@@ -656,6 +710,7 @@ async def run_multi_branch_plan_tournament(
                     success=True,
                     final_md=r,
                     error=None,
+                    metadata=meta,
                 )
             )
 

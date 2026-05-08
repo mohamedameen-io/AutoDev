@@ -377,6 +377,28 @@ class AutodevConfig(BaseModel):
     # gate entirely (e.g. for projects that mostly use untyped dynamic
     # imports and would generate too much noise).
     hallucination_guard: bool = True
+    # v0.17.0 S4: bigram-Jaccard threshold for the multi-branch
+    # repeated-hypothesis detector. The detector walks past 14 days of
+    # ``discard`` events and tags branches whose hypothesis matches a
+    # prior failure at or above this similarity. Advisory only (does
+    # NOT block branch execution). Set to ``0`` to disable the check
+    # entirely. Default ``0.6`` mirrors :attr:`KnowledgeConfig.dedup_threshold`.
+    repeated_hypothesis_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    # v0.17.0 S2: opt-in web-search escalation step in the stuck-recovery
+    # ladder. When True, the executor consults a web-search adapter at
+    # ``pivot_count >= 2 AND search_count < 3`` (per-task cooldown) and
+    # splices the top-3 results into the next critic_sounding_board
+    # prompt as a ``WEB_CONTEXT:`` block. Default False (privacy-preserving
+    # opt-in) — sites are queried only when explicitly enabled.
+    web_search_enabled: bool = False
+    # v0.17.0 S6: opt-in worktree sparse-checkout. When True, the
+    # per-task worktree creation calls
+    # ``git worktree add --no-checkout`` then narrows the working tree to
+    # ``phase.edit_scope or plan.edit_scope`` via ``sparse-checkout
+    # set``. Falls back to a full checkout (with a warning) if git is
+    # older than 2.25. Default False — sparse-checkout speeds up huge
+    # repos but breaks tasks that need files outside the declared scope.
+    worktree_sparse_checkout_enabled: bool = False
 
     def require_all_roles(self) -> None:
         """Raise ValueError if any required role is missing from `agents`."""

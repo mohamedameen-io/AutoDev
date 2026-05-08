@@ -103,6 +103,13 @@ LedgerOp = Literal[
     # override (accept_phase=False with corrective_direction) is recorded
     # via the regular ``append_corrective_tasks`` op emitted alongside.
     "drift_verifier_complete",
+    # v0.17.0 S4: repeated-hypothesis detector tagged a multi-branch
+    # branch. Audit-only — advisory; does NOT mutate plan state. Payload
+    # shape: ``{spec_hash, branch_index, family, similarity}`` where
+    # ``similarity`` is the rounded bigram-Jaccard score that triggered
+    # the match. Used by forensics + future plateau detection to
+    # reconstruct "we tried this same approach before".
+    "hypothesis_repeat_detected",
 ]
 
 
@@ -432,6 +439,12 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # op emitted alongside; these ops are forensics for "what
         # path did the ladder/PRM take" so a human can reconstruct
         # the decision after the fact.
+        return plan
+
+    if op == "hypothesis_repeat_detected":
+        # v0.17.0 S4: advisory tag. Multi-branch dispatcher logged a
+        # repeat-hypothesis match against prior discards. Plan state is
+        # unaffected — the branch still runs; the tag is forensics only.
         return plan
 
     if plan is None:
