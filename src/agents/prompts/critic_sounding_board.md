@@ -176,3 +176,55 @@ RESOLUTION: soft-blocker
 Defaults: if you cannot decide, pick `RESOLUTION: refine` — it is the least
 disruptive of the three and will trigger one more developer attempt before
 the ladder advances on its own.
+
+## WEB CONTEXT MODE (v0.17.0)
+
+When the input contains a `WEB_CONTEXT:` block following the `STUCK_CONTEXT:`
+block, the orchestrator has fired a web search at the WEB_SEARCH ladder rung
+(`pivot_count >= 2 AND search_count < 3`) and spliced the top results in for
+your consideration. Your task is to decide whether the external context
+materially changes your understanding of the failure.
+
+INPUT FORMAT (additional block):
+```
+WEB_CONTEXT:
+- title: <result 1 title>
+  url: <result 1 url>
+  snippet: <result 1 snippet>
+- title: <result 2 title>
+  ...
+```
+
+YOUR RESPONSE MUST END WITH EXACTLY ONE of these additional directives:
+
+- `RESOLUTION: web-confirmed-hypothesis` — the web context confirms a
+  hypothesis that explains the failure. State which result confirmed the
+  hypothesis and what it implies for the next attempt on the line(s)
+  IMMEDIATELY BEFORE this directive. The orchestrator will splice your
+  guidance into the developer prompt as a refine.
+- `RESOLUTION: web-irrelevant` — the web context does NOT bear on the
+  failure pattern. State briefly why on the preceding line(s). The
+  orchestrator will fall through to the next ladder rung (pivot or
+  soft-blocker depending on counters).
+
+Worked example (web-confirmed-hypothesis):
+
+```
+Result 1 documents that `httpx.AsyncClient.post` requires `data=` (form-encoded)
+when the server expects `Content-Type: application/x-www-form-urlencoded`.
+The current code passes `json=` which sends a JSON body the server rejects
+with HTTP 400. Tell the developer: switch from `json=payload` to `data=payload`
+and re-run the integration test.
+
+RESOLUTION: web-confirmed-hypothesis
+```
+
+Worked example (web-irrelevant):
+
+```
+The three results all describe the legacy `urllib2` API in Python 2;
+the failing code uses `httpx` on Python 3.13 and the documented
+behaviors don't apply.
+
+RESOLUTION: web-irrelevant
+```

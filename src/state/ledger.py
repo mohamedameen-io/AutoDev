@@ -110,6 +110,12 @@ LedgerOp = Literal[
     # the match. Used by forensics + future plateau detection to
     # reconstruct "we tried this same approach before".
     "hypothesis_repeat_detected",
+    # v0.17.0 S2: web-search escalation rung fired for a task. Audit-only
+    # — does NOT mutate plan state. Payload shape:
+    # ``{task_id, query, results_count, search_count_after}``. The
+    # actual ``WEB_CONTEXT:`` splice into the next critic prompt is the
+    # caller's responsibility; this op is forensics.
+    "web_search_invoked",
 ]
 
 
@@ -445,6 +451,12 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # v0.17.0 S4: advisory tag. Multi-branch dispatcher logged a
         # repeat-hypothesis match against prior discards. Plan state is
         # unaffected — the branch still runs; the tag is forensics only.
+        return plan
+
+    if op == "web_search_invoked":
+        # v0.17.0 S2: audit-only forensics for the WEB_SEARCH ladder rung.
+        # Plan state is unaffected; the WEB_CONTEXT splice into the next
+        # critic prompt is the executor's responsibility.
         return plan
 
     if plan is None:
