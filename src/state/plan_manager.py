@@ -712,6 +712,16 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
         # set is in-memory and rebuilt on resume from scratch.
         return plan
 
+    if op in (
+        "multi_branch_plan_tournament_start",
+        "multi_branch_meta_merge_complete",
+        "multi_branch_plan_tournament_complete",
+    ):
+        # v0.12.0: multi-branch audit ops do not mutate plan state. The
+        # individual branches' ``plan_tournament_complete`` ops handle
+        # the per-branch breadcrumbs; these three are aggregate forensics.
+        return plan
+
     if op == "mark_blocked_descendants":
         # v0.11.0: cascade-block. Walk descendants and set
         # status="blocked" with a structured reason.

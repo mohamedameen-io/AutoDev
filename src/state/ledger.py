@@ -71,6 +71,19 @@ LedgerOp = Literal[
     "mark_in_flight",
     "clear_in_flight",
     "mark_blocked_descendants",
+    # v0.12.0: multi-branch plan-tournament audit ops. All three are
+    # observability-only — they do NOT mutate plan state. Replay treats
+    # them as no-ops. Payload contents:
+    # - ``multi_branch_plan_tournament_start``:
+    #   ``{spec_hash, n_branches, branch_seeds: list[str]}`` (seeds
+    #   stringified because ``int(spec_hash, 16)`` exceeds JSON safe int).
+    # - ``multi_branch_meta_merge_complete``:
+    #   ``{spec_hash, n_survivors, n_steps, meta_passes}``.
+    # - ``multi_branch_plan_tournament_complete``:
+    #   ``{spec_hash, n_branches, n_survivors, final_hash}``.
+    "multi_branch_plan_tournament_start",
+    "multi_branch_meta_merge_complete",
+    "multi_branch_plan_tournament_complete",
 ]
 
 
@@ -367,6 +380,18 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # In-flight is in-memory on the PlanManager; resumes do NOT
         # restore it (by design — a crash mid-flight rolls back the
         # underlying task and resume picks it up fresh).
+        return plan
+
+    if op in (
+        "multi_branch_plan_tournament_start",
+        "multi_branch_meta_merge_complete",
+        "multi_branch_plan_tournament_complete",
+    ):
+        # v0.12.0: audit-only breadcrumbs for the multi-branch dispatcher.
+        # Plan state is unaffected — branches each carry their own
+        # ``plan_tournament_complete`` ops, and the meta-merged final
+        # markdown is consumed downstream into ``init_plan``. These ops
+        # are forensics for "how did we get the merged plan", not state.
         return plan
 
     if plan is None:
