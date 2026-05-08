@@ -67,6 +67,15 @@ class Task(BaseModel):
             "Non-empty values cause execute_phase to skip the task."
         ),
     )
+    # Architect-emitted per-task complexity bucket parsed from the body line
+    # ``- Complexity: simple|medium|complex`` (see plan_parser._RE_TASK_COMPLEXITY).
+    # ``None`` for legacy plans (no Complexity line) or when the architect
+    # hasn't emitted it for a task — the orchestrator's task_overrides
+    # resolver returns ``None`` and execute_phase falls back to the spec
+    # default. Distinct enum from :class:`Plan.complexity` (plan-level rollup
+    # used for tournament effort) which uses the same three buckets but is
+    # set from the trailing ``COMPLEXITY:`` directive.
+    complexity: Literal["simple", "medium", "complex"] | None = None
     retry_count: int = 0
     escalated: bool = False
     assigned_agent: str | None = None  # usually "developer"

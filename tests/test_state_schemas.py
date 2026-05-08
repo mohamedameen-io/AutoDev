@@ -124,3 +124,89 @@ def test_task_requires_round_trip_via_model_dump() -> None:
     assert dumped["requires"] == ["hardware", "human"]
     restored = Task.model_validate(dumped)
     assert restored.requires == ["hardware", "human"]
+
+
+# ---------------------------------------------------------------------------
+# v0.8.0 — ``Task.complexity`` field
+# ---------------------------------------------------------------------------
+
+
+def test_task_complexity_field_simple() -> None:
+    """The ``simple`` Literal is accepted and round-trips."""
+    task = Task(
+        id="1.1",
+        phase_id="1",
+        title="t",
+        description="d",
+        complexity="simple",
+    )
+    assert task.complexity == "simple"
+
+
+def test_task_complexity_field_medium() -> None:
+    """The ``medium`` Literal is accepted and round-trips."""
+    task = Task(
+        id="1.1",
+        phase_id="1",
+        title="t",
+        description="d",
+        complexity="medium",
+    )
+    assert task.complexity == "medium"
+
+
+def test_task_complexity_field_complex() -> None:
+    """The ``complex`` Literal is accepted and round-trips."""
+    task = Task(
+        id="1.1",
+        phase_id="1",
+        title="t",
+        description="d",
+        complexity="complex",
+    )
+    assert task.complexity == "complex"
+
+
+def test_task_complexity_default_none() -> None:
+    """Constructing a Task without ``complexity`` defaults to ``None`` —
+    the legacy-plan migration semantics for plans that don't carry the
+    architect-emitted per-task directive.
+    """
+    task = Task(
+        id="1.1",
+        phase_id="1",
+        title="t",
+        description="d",
+    )
+    assert task.complexity is None
+
+
+def test_task_complexity_invalid_token_raises() -> None:
+    """Any token outside the three Literal values raises ValidationError —
+    schema-level guard against architect typos like ``"trivial"`` slipping
+    into the plan dict.
+    """
+    with pytest.raises(ValidationError):
+        Task(
+            id="1.1",
+            phase_id="1",
+            title="t",
+            description="d",
+            complexity="trivial",  # type: ignore[arg-type]
+        )
+
+
+def test_task_load_legacy_without_complexity_returns_none() -> None:
+    """A v0.7.0-shape Task dict (no ``complexity`` key) must parse with
+    ``complexity == None`` — the on-disk migration guarantee: existing
+    plan.json files written by v0.7.0 keep loading after v0.8.0.
+    """
+    legacy_payload = {
+        "id": "1.1",
+        "phase_id": "1",
+        "title": "Add subtract",
+        "description": "Implement subtract(a, b)",
+        "status": "pending",
+    }
+    task = Task.model_validate(legacy_payload)
+    assert task.complexity is None
