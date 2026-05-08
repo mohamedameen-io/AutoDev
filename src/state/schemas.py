@@ -70,6 +70,22 @@ TaskStatus = Literal[
 """Allowed states for a :class:`Task`. See :mod:`orchestrator.task_state`."""
 
 
+class CriterionVote(BaseModel):
+    """A single judge vote on an acceptance criterion (v0.18.0 C2).
+
+    Recorded by the impl-tournament runner when ``voting_strategy=veto``
+    so post-hoc analysis can see how each judge evaluated each criterion
+    across passes — the criterion-evolution log.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    judge_role: str
+    verdict: Literal["APPROVE", "REJECT", "ABSTAIN"]
+    justification: str = ""
+    timestamp: str = ""
+
+
 class AcceptanceCriterion(BaseModel):
     """A single check-box acceptance criterion attached to a task."""
 
@@ -78,6 +94,12 @@ class AcceptanceCriterion(BaseModel):
     id: str
     description: str
     met: bool = False
+    # v0.18.0 C2: optional per-criterion vote history. The impl-tournament
+    # runner appends one :class:`CriterionVote` per judge per pass when
+    # ``voting_strategy=veto``. Used as the criterion-evolution log for
+    # forensics and as a Tier-1 input for future per-criterion model
+    # routing (v0.20.0+). Empty list (default) preserves prior behavior.
+    vote_history: list[CriterionVote] = Field(default_factory=list)
 
 
 class Task(BaseModel):
@@ -361,6 +383,7 @@ to round-trip a ``dict`` into the correct subclass.
 __all__ = [
     "AcceptanceCriterion",
     "CoderEvidence",
+    "CriterionVote",
     "CriticEvidence",
     "Evidence",
     "ExploreEvidence",

@@ -86,6 +86,18 @@ def tournaments_dir(cwd: Path) -> Path:
     return autodev_root(cwd) / TOURNAMENTS_DIR
 
 
+def council_criteria_path(cwd: Path, task_id: str) -> Path:
+    """Return ``.autodev/tournaments/council-{task_id}.json`` (v0.18.0 C2).
+
+    Sidecar JSON file persisting the council acceptance criteria for an
+    impl-tournament running with ``voting_strategy=veto``. Persisted at
+    tournament start so the criteria are available for forensics + the
+    per-criterion vote tracking emitted on each pass.
+    """
+    safe_task_id = task_id.replace("/", "_").replace(" ", "_")
+    return autodev_root(cwd) / TOURNAMENTS_DIR / f"council-{safe_task_id}.json"
+
+
 def debug_dir(cwd: Path) -> Path:
     """Return ``.autodev/debug/`` (created on demand by callers)."""
     return autodev_root(cwd) / DEBUG_DIR
@@ -154,6 +166,7 @@ __all__ = [
     "TOURNAMENTS_DIR",
     "autodev_root",
     "config_path",
+    "council_criteria_path",
     "debug_dir",
     "delegation_path",
     "delegations_dir",
