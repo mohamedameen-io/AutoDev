@@ -1385,8 +1385,14 @@ async def delegate(
     # constant defaults take over.
     spec_max_turns = spec.max_turns or 1
     if task is not None:
+        # v0.13.0: thread the orchestrator's repo-size snapshot through so
+        # tasks on Unity-class repos get the doubled per-complexity budget.
+        # ``_repo_capacity`` may be None on the orchestrator stub used in
+        # some unit tests (back-compat). Fall back to legacy behavior in
+        # that case.
+        repo_capacity = getattr(orch, "_repo_capacity", None)
         max_turns = (
-            resolve_task_max_turns(task, spec.max_turns)
+            resolve_task_max_turns(task, spec.max_turns, capacity=repo_capacity)
             or spec.max_turns
             or 1
         )
