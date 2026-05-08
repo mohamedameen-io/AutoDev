@@ -606,3 +606,147 @@ async def test_update_phase_meta_unknown_phase_raises(tmp_path: Path) -> None:
     await pm.init_plan(_mk_plan())
     with pytest.raises(PlanConcurrentModificationError):
         await pm.update_phase_meta("999", baseline_commit="abc")
+
+
+# ---------------------------------------------------------------------------
+# v0.11.0 — next_pending_tasks (DAG-aware multi-task selector)
+# ---------------------------------------------------------------------------
+
+
+def _mk_dag_plan() -> Plan:
+    """Build a plan whose first phase has a DAG: 1.1 → 1.2 ; 1.3 (independent)."""
+    return Plan(
+        plan_id="p-dag",
+        spec_hash="dead",
+        phases=[
+            Phase(
+                id="1",
+                title="parallel-fixture",
+                tasks=[
+                    Task(
+                        id="1.1",
+                        phase_id="1",
+                        title="root",
+                        description="r",
+                        files=["src/a.py"],
+                    ),
+                    Task(
+                        id="1.2",
+                        phase_id="1",
+                        title="dependent",
+                        description="d",
+                        depends_on=["1.1"],
+                        files=["src/b.py"],
+                    ),
+                    Task(
+                        id="1.3",
+                        phase_id="1",
+                        title="independent",
+                        description="i",
+                        files=["src/c.py"],
+                    ),
+                ],
+            ),
+        ],
+        created_at=_iso(),
+        updated_at=_iso(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_next_pending_tasks_returns_up_to_limit(tmp_path: Path) -> None:
+    """limit=2 returns at most two pending tasks (1.1 and 1.3 — 1.2 deps unmet)."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    out = await pm.next_pending_tasks(limit=2)
+    ids = [t.id for t in out]
+    assert ids == ["1.1", "1.3"]
+
+
+@pytest.mark.asyncio
+async def test_next_pending_tasks_excludes_unmet_deps(tmp_path: Path) -> None:
+    """1.2 (depends on 1.1) is NOT returned while 1.1 is still pending."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    out = await pm.next_pending_tasks(limit=10)
+    assert "1.2" not in {t.id for t in out}
+
+
+@pytest.mark.asyncio
+async def test_next_pending_tasks_excludes_overlapping_files(
+    tmp_path: Path,
+) -> None:
+    """exclude_files={'src/a.py'} hides 1.1 (whose files include src/a.py)."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    out = await pm.next_pending_tasks(limit=10, exclude_files={"src/a.py"})
+    assert "1.1" not in {t.id for t in out}
+    # 1.3 has files=['src/c.py'] — unaffected.
+    assert "1.3" in {t.id for t in out}
+
+
+@pytest.mark.asyncio
+async def test_next_pending_tasks_returns_dependent_after_parent_terminal(
+    tmp_path: Path,
+) -> None:
+    """Once 1.1 is complete, 1.2's depends_on is satisfied and it's selectable."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    # Walk 1.1 to complete via FSM.
+    for s in ("in_progress", "coded", "auto_gated", "reviewed", "tested", "tournamented", "complete"):
+        await pm.update_task_status("1.1", s)
+    out = await pm.next_pending_tasks(limit=10)
+    assert "1.2" in {t.id for t in out}
+
+
+@pytest.mark.asyncio
+async def test_next_pending_tasks_treats_blocked_dep_as_terminal(
+    tmp_path: Path,
+) -> None:
+    """A blocked parent satisfies the depends_on (terminal) — child becomes selectable."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    # Move 1.1 to in_progress then to blocked.
+    await pm.update_task_status("1.1", "in_progress")
+    await pm.update_task_status(
+        "1.1", "blocked", meta={"blocked_reason": "test"}
+    )
+    out = await pm.next_pending_tasks(limit=10)
+    assert "1.2" in {t.id for t in out}
+
+
+@pytest.mark.asyncio
+async def test_next_pending_tasks_empty_when_no_pending(tmp_path: Path) -> None:
+    """No pending tasks → empty list (not None)."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    # Block all three.
+    for tid in ("1.1", "1.2", "1.3"):
+        await pm.update_task_status(tid, "in_progress")
+        await pm.update_task_status(
+            tid, "blocked", meta={"blocked_reason": "x"}
+        )
+    out = await pm.next_pending_tasks(limit=10)
+    assert out == []
+
+
+@pytest.mark.asyncio
+async def test_next_pending_tasks_limit_zero_normalized_to_one(
+    tmp_path: Path,
+) -> None:
+    """limit=0 is normalized to 1 (defensive — dispatcher should clamp first)."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    out = await pm.next_pending_tasks(limit=0)
+    assert len(out) == 1
+
+
+@pytest.mark.asyncio
+async def test_next_pending_task_legacy_shim_returns_first(
+    tmp_path: Path,
+) -> None:
+    """next_pending_task() returns the first task that next_pending_tasks would."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    one = await pm.next_pending_task()
+    assert one is not None and one.id == "1.1"

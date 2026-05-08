@@ -27,6 +27,14 @@ from state.schemas import Plan, Task, TaskStatus
 logger = get_logger(__name__)
 
 
+# Terminal statuses for depends_on satisfaction checks (v0.11.0). Mirrors
+# the constant in :mod:`orchestrator.execute_phase` but kept local to
+# avoid a state→orchestrator import cycle.
+_TERMINAL_TASK_STATUSES: frozenset[str] = frozenset(
+    {"complete", "blocked", "skipped"}
+)
+
+
 def _iso_now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
@@ -151,16 +159,78 @@ class PlanManager:
             return _find_task(plan, task_id)
 
     async def next_pending_task(self) -> Task | None:
-        """Return the first task with status ``pending`` (phase-major order)."""
+        """Return the first task with status ``pending`` (phase-major order).
+
+        Backward-compat shim around :meth:`next_pending_tasks` for
+        callers that still expect a single optional task. New callers
+        in v0.11.0+ should use :meth:`next_pending_tasks` directly when
+        running multiple workers concurrently.
+        """
+        tasks = await self.next_pending_tasks(limit=1)
+        return tasks[0] if tasks else None
+
+    async def next_pending_tasks(
+        self,
+        limit: int = 1,
+        exclude_files: set[str] | None = None,
+    ) -> list[Task]:
+        """Return up to ``limit`` runnable pending tasks in phase-major order.
+
+        v0.11.0: replaces the serial ``next_pending_task`` walk with a
+        DAG-aware multi-task selector. A task is "runnable" iff:
+
+        * ``status == "pending"``
+        * every id in ``depends_on`` resolves to a task whose status is
+          terminal (``"complete" | "blocked" | "skipped"``) — pending or
+          in-flight deps make the task wait
+        * no ``files`` entry intersects ``exclude_files`` — the
+          dispatcher passes the union of in-flight task files to defer
+          would-be conflicts upfront
+
+        Walks phases sequentially (phase-major scheduling); within a
+        phase, walks tasks in declaration order so the dispatcher's
+        emission is stable and reproducible across runs given the same
+        plan. Stops as soon as ``limit`` tasks are collected.
+
+        ``exclude_files=None`` is treated as the empty set. ``limit < 1``
+        is normalized to 1 (the dispatcher should clamp before calling).
+        """
+        if limit < 1:
+            limit = 1
+        excluded = exclude_files or set()
+
         async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
             plan = self._load_sync()
             if plan is None:
-                return None
+                return []
+
+            # Build a phase-major status map for cheap depends_on checks.
+            status_by_id: dict[str, str] = {}
             for phase in plan.phases:
                 for task in phase.tasks:
-                    if task.status == "pending":
-                        return task
-        return None
+                    status_by_id[task.id] = task.status
+
+            picked: list[Task] = []
+            for phase in plan.phases:
+                for task in phase.tasks:
+                    if len(picked) >= limit:
+                        return picked
+                    if task.status != "pending":
+                        continue
+                    # depends_on: every dep must be terminal.
+                    deps_ok = True
+                    for dep in task.depends_on:
+                        dep_status = status_by_id.get(dep)
+                        if dep_status not in _TERMINAL_TASK_STATUSES:
+                            deps_ok = False
+                            break
+                    if not deps_ok:
+                        continue
+                    # exclude_files: must not intersect.
+                    if excluded and any(f in excluded for f in task.files):
+                        continue
+                    picked.append(task)
+            return picked
 
     async def update_task_status(
         self,
