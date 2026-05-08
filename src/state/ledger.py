@@ -61,6 +61,16 @@ LedgerOp = Literal[
     "phase_review_complete",
     "append_corrective_tasks",
     "update_phase_meta",
+    # v0.11.0: parallel execute_phase ops.
+    # ``mark_in_flight`` / ``clear_in_flight`` are observability-only —
+    # the in-flight set is in-memory on the PlanManager and resumes
+    # rebuild it from scratch (NOT replayed). ``mark_blocked_descendants``
+    # is a single-entry batch cascade-block carrying the phase_id, the
+    # failed task id, and the list of newly-blocked task ids; replay
+    # walks the list and applies status="blocked" + blocked_reason.
+    "mark_in_flight",
+    "clear_in_flight",
+    "mark_blocked_descendants",
 ]
 
 
@@ -352,6 +362,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # plan state.
         return plan
 
+    if op in ("mark_in_flight", "clear_in_flight"):
+        # v0.11.0: audit-only breadcrumbs for the parallel dispatcher.
+        # In-flight is in-memory on the PlanManager; resumes do NOT
+        # restore it (by design — a crash mid-flight rolls back the
+        # underlying task and resume picks it up fresh).
+        return plan
+
     if plan is None:
         raise LedgerCorruptError(
             f"entry seq={entry.seq} op={op} applied before any init_plan"
@@ -472,6 +489,39 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         if "review_status" in payload:
             val = payload["review_status"]
             phase.review_status = val if isinstance(val, str) else None  # type: ignore[assignment]
+        return plan
+
+    if op == "mark_blocked_descendants":
+        # v0.11.0: cascade-block emitted when a worker fails. Single
+        # ledger entry carries the failed task id, the reason, and the
+        # full list of descendant task ids that were transitioned from
+        # ``pending`` to ``blocked``. Replay walks each id and applies
+        # status="blocked" with a structured ``blocked_reason``.
+        phase_id = payload.get("phase_id")
+        failed_task_id = payload.get("failed_task_id")
+        reason = payload.get("reason", "")
+        blocked_ids = payload.get("blocked_task_ids") or []
+        if not isinstance(phase_id, str) or not isinstance(failed_task_id, str):
+            raise LedgerCorruptError(
+                f"entry seq={entry.seq} mark_blocked_descendants malformed"
+            )
+        if not isinstance(blocked_ids, list):
+            raise LedgerCorruptError(
+                f"entry seq={entry.seq} mark_blocked_descendants malformed list"
+            )
+        phase = _find_phase(plan, phase_id)
+        if phase is None:
+            return plan
+        for tid in blocked_ids:
+            if not isinstance(tid, str):
+                continue
+            for t in phase.tasks:
+                if t.id == tid:
+                    t.status = "blocked"
+                    t.blocked_reason = (
+                        f"upstream-failure:{failed_task_id}:{reason}"
+                    )
+                    break
         return plan
 
     # Unknown op — fail loudly rather than silently produce wrong state.

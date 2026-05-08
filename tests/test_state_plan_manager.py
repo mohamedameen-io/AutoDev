@@ -750,3 +750,148 @@ async def test_next_pending_task_legacy_shim_returns_first(
     await pm.init_plan(_mk_dag_plan())
     one = await pm.next_pending_task()
     assert one is not None and one.id == "1.1"
+
+
+# ---------------------------------------------------------------------------
+# v0.11.0 — in-flight tracking
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_in_flight_appends_ledger_op(tmp_path: Path) -> None:
+    """mark_in_flight writes a ``mark_in_flight`` ledger entry."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    lp = ledger_path(tmp_path)
+    before = len(lp.read_text().strip().splitlines())
+    await pm.mark_in_flight("1.1")
+    after = len(lp.read_text().strip().splitlines())
+    assert after == before + 1
+
+
+@pytest.mark.asyncio
+async def test_clear_in_flight_appends_ledger_op(tmp_path: Path) -> None:
+    """clear_in_flight writes a ``clear_in_flight`` ledger entry."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    await pm.mark_in_flight("1.1")
+    lp = ledger_path(tmp_path)
+    before = len(lp.read_text().strip().splitlines())
+    await pm.clear_in_flight("1.1")
+    after = len(lp.read_text().strip().splitlines())
+    assert after == before + 1
+
+
+@pytest.mark.asyncio
+async def test_phase_in_flight_count_zero_initially(tmp_path: Path) -> None:
+    """No tasks are in-flight before mark_in_flight runs."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    assert await pm.phase_in_flight_count("1") == 0
+
+
+@pytest.mark.asyncio
+async def test_phase_in_flight_count_after_mark(tmp_path: Path) -> None:
+    """phase_in_flight_count reflects current in-memory in-flight set."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    await pm.mark_in_flight("1.1")
+    await pm.mark_in_flight("1.3")
+    assert await pm.phase_in_flight_count("1") == 2
+    await pm.clear_in_flight("1.1")
+    assert await pm.phase_in_flight_count("1") == 1
+
+
+@pytest.mark.asyncio
+async def test_in_flight_files_unions_correctly(tmp_path: Path) -> None:
+    """in_flight_files returns the union of in-flight tasks' Task.files."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    await pm.mark_in_flight("1.1")  # files=src/a.py
+    await pm.mark_in_flight("1.3")  # files=src/c.py
+    files = await pm.in_flight_files()
+    assert files == {"src/a.py", "src/c.py"}
+
+
+@pytest.mark.asyncio
+async def test_in_flight_set_not_persisted_across_resume(
+    tmp_path: Path,
+) -> None:
+    """A fresh PlanManager rebuilds an empty in_flight set even if
+    the ledger contains mark_in_flight entries (in-memory only)."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    await pm.mark_in_flight("1.1")
+    await pm.mark_in_flight("1.3")
+    assert await pm.phase_in_flight_count("1") == 2
+
+    # Construct a fresh manager (simulating resume).
+    pm2 = PlanManager(tmp_path, session_id="s2")
+    # Load works — ledger ops mark_in_flight were no-ops on plan state.
+    plan = await pm2.load()
+    assert plan is not None
+    # And the new manager observes zero in-flight.
+    assert await pm2.phase_in_flight_count("1") == 0
+    assert await pm2.in_flight_files() == set()
+
+
+# ---------------------------------------------------------------------------
+# v0.11.0 — mark_blocked_descendants
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_blocked_descendants_marks_chain(tmp_path: Path) -> None:
+    """Failing 1.1 cascade-blocks 1.2 with structured blocked_reason."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    blocked = await pm.mark_blocked_descendants(
+        phase_id="1", failed_task_id="1.1", reason="adapter failure"
+    )
+    assert blocked == ["1.2"]
+    t = await pm.get_task("1.2")
+    assert t is not None and t.status == "blocked"
+    assert t.blocked_reason is not None
+    assert "upstream-failure:1.1:adapter failure" in t.blocked_reason
+
+
+@pytest.mark.asyncio
+async def test_mark_blocked_descendants_does_not_block_independent(
+    tmp_path: Path,
+) -> None:
+    """Failing 1.1 does NOT block 1.3 (independent — no depends_on)."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    await pm.mark_blocked_descendants("1", "1.1", "x")
+    t = await pm.get_task("1.3")
+    assert t is not None and t.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_mark_blocked_descendants_skips_already_terminal(
+    tmp_path: Path,
+) -> None:
+    """An already-complete descendant is not re-blocked by the cascade."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    # Walk 1.2 to complete artificially via FSM (depends_on doesn't gate FSM).
+    for s in ("in_progress", "coded", "auto_gated", "reviewed", "tested", "tournamented", "complete"):
+        await pm.update_task_status("1.2", s)
+    blocked = await pm.mark_blocked_descendants("1", "1.1", "x")
+    assert blocked == []
+    t = await pm.get_task("1.2")
+    assert t is not None and t.status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_mark_blocked_descendants_persists_across_resume(
+    tmp_path: Path,
+) -> None:
+    """The cascade persists via the ledger and survives a fresh PlanManager."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_dag_plan())
+    await pm.mark_blocked_descendants("1", "1.1", "test")
+    pm2 = PlanManager(tmp_path, session_id="s2")
+    t = await pm2.get_task("1.2")
+    assert t is not None and t.status == "blocked"
+    assert t.blocked_reason and "upstream-failure:1.1:test" in t.blocked_reason

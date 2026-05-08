@@ -55,6 +55,11 @@ class PlanManager:
         self._session_id = session_id
         self._lock_timeout_s = lock_timeout_s
         self._log = get_logger(component="plan_manager", session_id=session_id)
+        # v0.11.0: in-memory set of task ids currently being executed by
+        # a worker. NOT persisted — by design. A crash mid-flight leaves
+        # the underlying tasks in their pre-flight ``pending`` /
+        # ``in_progress`` status; the resume path picks them up cleanly.
+        self._in_flight: set[str] = set()
 
     @property
     def cwd(self) -> Path:
@@ -290,6 +295,141 @@ class PlanManager:
                 escalated=task.escalated,
             )
             return task
+
+    # --- v0.11.0: in-flight tracking ---------------------------------
+
+    async def mark_in_flight(self, task_id: str) -> None:
+        """Record that a worker has started executing ``task_id``.
+
+        In-memory only — persisted as an audit-only ledger op
+        (``mark_in_flight``) for forensics. The set is reset on
+        :class:`PlanManager` construction; resumes do NOT recover the
+        live in-flight set.
+        """
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            self._in_flight.add(task_id)
+            await append_entry(
+                self._cwd,
+                op="mark_in_flight",
+                payload={"task_id": task_id},
+                session_id=self._session_id,
+            )
+
+    async def clear_in_flight(self, task_id: str) -> None:
+        """Remove ``task_id`` from the in-flight set (idempotent)."""
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            self._in_flight.discard(task_id)
+            await append_entry(
+                self._cwd,
+                op="clear_in_flight",
+                payload={"task_id": task_id},
+                session_id=self._session_id,
+            )
+
+    async def phase_in_flight_count(self, phase_id: str) -> int:
+        """Return the count of in-flight tasks belonging to ``phase_id``.
+
+        Used by the phase-review trigger to defer firing until every
+        worker for the phase has finished. The plan_lock is held only
+        long enough to read a consistent snapshot — the count is point-
+        in-time so callers must re-check after they observe other state
+        changes (double-checked locking).
+        """
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            plan = self._load_sync()
+            if plan is None:
+                return 0
+            phase_task_ids: set[str] = set()
+            for phase in plan.phases:
+                if phase.id == phase_id:
+                    phase_task_ids = {t.id for t in phase.tasks}
+                    break
+            return sum(1 for tid in self._in_flight if tid in phase_task_ids)
+
+    async def in_flight_files(self) -> set[str]:
+        """Return the union of ``Task.files`` for all in-flight tasks.
+
+        Passed to :meth:`next_pending_tasks` as ``exclude_files`` so the
+        dispatcher refuses to start a new task whose files overlap any
+        currently-executing task.
+        """
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            plan = self._load_sync()
+            if plan is None:
+                return set()
+            files: set[str] = set()
+            in_flight = set(self._in_flight)
+            for phase in plan.phases:
+                for task in phase.tasks:
+                    if task.id in in_flight:
+                        files.update(task.files)
+            return files
+
+    async def mark_blocked_descendants(
+        self,
+        phase_id: str,
+        failed_task_id: str,
+        reason: str,
+    ) -> list[str]:
+        """Cascade-block every pending descendant of ``failed_task_id``.
+
+        Walks reverse ``depends_on`` edges via :func:`orchestrator.dag.
+        find_blocked_descendants` and transitions each pending one to
+        ``"blocked"`` with ``blocked_reason="upstream-failure:{failed}:
+        {reason}"``. Single ledger op (``mark_blocked_descendants``)
+        carries the full id list so replay reproduces the cascade
+        atomically — no half-applied state.
+
+        Returns the list of task ids that were actually transitioned
+        (i.e. were ``pending`` before the call). Already-terminal
+        descendants are left alone so this method is safe to call
+        multiple times for the same failed task.
+        """
+        from orchestrator.dag import find_blocked_descendants
+
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            plan = self._load_sync()
+            if plan is None:
+                return []
+            phase = next((p for p in plan.phases if p.id == phase_id), None)
+            if phase is None:
+                return []
+            descendants = find_blocked_descendants(phase, {failed_task_id})
+            blocked_ids: list[str] = []
+            for t in descendants:
+                if t.status == "pending":
+                    blocked_ids.append(t.id)
+            if not blocked_ids:
+                return []
+
+            # Apply in-memory.
+            structured_reason = f"upstream-failure:{failed_task_id}:{reason}"
+            for t in phase.tasks:
+                if t.id in blocked_ids:
+                    t.status = "blocked"  # type: ignore[assignment]
+                    t.blocked_reason = structured_reason
+
+            # Single ledger op + snapshot.
+            await append_entry(
+                self._cwd,
+                op="mark_blocked_descendants",
+                payload={
+                    "phase_id": phase_id,
+                    "failed_task_id": failed_task_id,
+                    "reason": reason,
+                    "blocked_task_ids": blocked_ids,
+                },
+                session_id=self._session_id,
+            )
+            plan = plan.model_copy(update={"updated_at": _iso_now()})
+            await snapshot_plan(self._cwd, plan, session_id=self._session_id)
+            self._log.info(
+                "task.cascade_blocked",
+                phase_id=phase_id,
+                failed_task_id=failed_task_id,
+                blocked_count=len(blocked_ids),
+            )
+            return blocked_ids
 
     async def mark_task_retry(self, task_id: str) -> int:
         """Increment a task's ``retry_count``. Returns the new count.
@@ -553,6 +693,37 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
         # v0.9.0: audit-only breadcrumb appended after the phase-review
         # tournament completes. Plan mutations live in ``update_phase_meta``
         # / ``append_corrective_tasks``.
+        return plan
+
+    if op in ("mark_in_flight", "clear_in_flight"):
+        # v0.11.0: in-flight breadcrumbs do not mutate plan state — the
+        # set is in-memory and rebuilt on resume from scratch.
+        return plan
+
+    if op == "mark_blocked_descendants":
+        # v0.11.0: cascade-block. Walk descendants and set
+        # status="blocked" with a structured reason.
+        phase_id = payload.get("phase_id")
+        failed_task_id = payload.get("failed_task_id")
+        reason = payload.get("reason", "")
+        blocked_ids = payload.get("blocked_task_ids") or []
+        if not isinstance(phase_id, str) or not isinstance(failed_task_id, str):
+            return plan
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            return plan
+        if not isinstance(blocked_ids, list):
+            return plan
+        for tid in blocked_ids:
+            if not isinstance(tid, str):
+                continue
+            for t in phase.tasks:
+                if t.id == tid:
+                    t.status = "blocked"  # type: ignore[assignment]
+                    t.blocked_reason = (
+                        f"upstream-failure:{failed_task_id}:{reason}"
+                    )
+                    break
         return plan
 
     if op == "append_corrective_tasks":
