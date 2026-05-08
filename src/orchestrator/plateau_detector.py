@@ -98,6 +98,78 @@ class PlateauDetector:
                 return False
         return True
 
+    async def detect_plateau_regression(
+        self,
+        family: str,
+        window: int = 10,
+        slope_threshold: float = 0.1,
+    ) -> bool:
+        """v0.20.0 A2: regression-based per-family plateau detection.
+
+        Builds a sliding window of the trailing ``window`` events for
+        ``family`` (most-recent-last to match plotting intuition) and
+        runs a least-squares regression of cumulative
+        ``winner_promoted`` count vs event index. The slope is the
+        average rate of new wins per event:
+
+        * Slope ``>= slope_threshold`` → cohort is making progress; not
+          a plateau.
+        * Slope ``< slope_threshold`` → cohort has stalled; plateau.
+
+        A pure-Python ordinary-least-squares implementation avoids a
+        numpy dependency. Cold-start: <3 events → False (insufficient
+        data to fit).
+        """
+        all_entries = await self.knowledge.read_all(tier="swarm")
+        family_entries = [
+            e for e in all_entries
+            if e.metadata.get("family") == family
+        ]
+        # Most-recent-first for windowing, then reverse to chronological
+        # order for the regression.
+        family_entries.sort(key=lambda e: e.timestamp, reverse=True)
+        recent = list(reversed(family_entries[:window]))
+        if len(recent) < 3:
+            return False
+        # Build cumulative winner_promoted count.
+        cumulative: list[int] = []
+        wins = 0
+        for entry in recent:
+            if entry.metadata.get("event_type") == "winner_promoted":
+                wins += 1
+            cumulative.append(wins)
+        slope = _ols_slope(cumulative)
+        return slope < slope_threshold
+
+    async def detect_cross_family_plateau_regression(
+        self,
+        window: int = 10,
+        slope_threshold: float = 0.1,
+    ) -> bool:
+        """v0.20.0 A2/D2: regression-based cross-family plateau detection.
+
+        Sister to :meth:`detect_plateau_regression` — operates over the
+        full project event stream (filtered to tournament events) and
+        flags when the cumulative-winner slope falls below threshold.
+        """
+        all_entries = await self.knowledge.read_all(tier="swarm")
+        tournament_entries = [
+            e for e in all_entries
+            if e.metadata.get("event_type") is not None
+        ]
+        tournament_entries.sort(key=lambda e: e.timestamp, reverse=True)
+        recent = list(reversed(tournament_entries[:window]))
+        if len(recent) < 3:
+            return False
+        cumulative: list[int] = []
+        wins = 0
+        for entry in recent:
+            if entry.metadata.get("event_type") == "winner_promoted":
+                wins += 1
+            cumulative.append(wins)
+        slope = _ols_slope(cumulative)
+        return slope < slope_threshold
+
     async def force_distant_scout(
         self,
         branch_configs: "list[BranchConfig]",
@@ -129,6 +201,31 @@ class PlateauDetector:
         original = new_list[target_idx]
         new_list[target_idx] = original.model_copy(update={"lane": "distant-scout"})
         return new_list
+
+
+def _ols_slope(ys: list[int] | list[float]) -> float:
+    """Pure-Python ordinary-least-squares slope of ``ys`` vs index 0..n-1.
+
+    No numpy dependency. Returns 0.0 when ``len(ys) < 2`` (degenerate)
+    or when the x-variance is zero (impossible for distinct integer
+    indices but defensively guarded anyway).
+
+    Formula: slope = sum((x_i - x_mean)(y_i - y_mean)) / sum((x_i - x_mean)^2)
+    """
+    n = len(ys)
+    if n < 2:
+        return 0.0
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(ys) / n
+    num = 0.0
+    den = 0.0
+    for i, y in enumerate(ys):
+        dx = i - x_mean
+        num += dx * (y - y_mean)
+        den += dx * dx
+    if den == 0.0:
+        return 0.0
+    return num / den
 
 
 __all__ = ["PlateauDetector"]
