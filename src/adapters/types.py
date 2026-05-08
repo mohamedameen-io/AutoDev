@@ -33,7 +33,6 @@ class AgentInvocation(BaseModel):
     prompt: str
     cwd: Path
     model: str | None = None
-    timeout_s: int = 600
     allowed_tools: list[str] | None = None
     max_turns: int = 1
     # Per-invocation Claude Code ``--effort`` hint. Plain ``str`` (not
@@ -43,6 +42,14 @@ class AgentInvocation(BaseModel):
     # ``None`` = the adapter omits the ``--effort`` flag and inherits the
     # user-global default in ``~/.claude/settings.json``.
     effort: str | None = None
+    # Per-invocation subprocess timeout in seconds. Adapters consume this
+    # via ``asyncio.wait_for(..., timeout=inv.timeout_s)`` after applying a
+    # default fallback when ``None`` (e.g. 600s in the Claude Code adapter).
+    # v0.8.0 added per-task scaling via :func:`tournament.task_overrides
+    # .resolve_task_timeout_s` keyed off ``Task.complexity``; the resolver
+    # returns ``None`` when no override applies and the caller falls back
+    # to its own default (e.g. ``_DEFAULT_DEVELOPER_TIMEOUT_S``).
+    timeout_s: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

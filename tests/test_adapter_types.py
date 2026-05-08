@@ -55,7 +55,11 @@ def test_agent_invocation_coerces_string_cwd() -> None:
 def test_agent_invocation_defaults() -> None:
     inv = AgentInvocation(role="r", prompt="p", cwd=Path("/x"))
     assert inv.model is None
-    assert inv.timeout_s == 600
+    # v0.8.0: ``timeout_s`` switched from ``int = 600`` to ``int | None = None``
+    # so per-task complexity overrides can flow through unset (the orchestrator
+    # falls back to ``_DEFAULT_DEVELOPER_TIMEOUT_S``). Adapters apply their own
+    # default (600s in claude_code) when the field is ``None``.
+    assert inv.timeout_s is None
     assert inv.allowed_tools is None
     assert inv.max_turns == 1
     assert inv.metadata == {}
@@ -161,3 +165,29 @@ def test_agent_invocation_accepts_effort_string(tmp_path: Path) -> None:
     dumped = inv.model_dump(mode="json")
     reloaded = AgentInvocation.model_validate(dumped)
     assert reloaded.effort == "xhigh"
+
+
+# ---------------------------------------------------------------------------
+# v0.8.0 — ``AgentInvocation.timeout_s`` per-invocation override
+# ---------------------------------------------------------------------------
+
+
+def test_agent_invocation_timeout_s_default_none(tmp_path: Path) -> None:
+    """Default is ``None`` post-v0.8.0 — per-task complexity resolver returns
+    ``None`` when no override applies and the orchestrator falls back to
+    ``_DEFAULT_DEVELOPER_TIMEOUT_S``. The adapter applies its own default
+    (600s in claude_code) when the field is unset.
+    """
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path)
+    assert inv.timeout_s is None
+
+
+def test_agent_invocation_timeout_s_round_trip(tmp_path: Path) -> None:
+    """An explicit per-invocation timeout (e.g. 1800s for ``complex`` tasks)
+    persists through ``model_dump`` / ``model_validate``.
+    """
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, timeout_s=1800)
+    assert inv.timeout_s == 1800
+    dumped = inv.model_dump(mode="json")
+    reloaded = AgentInvocation.model_validate(dumped)
+    assert reloaded.timeout_s == 1800

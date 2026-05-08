@@ -75,6 +75,11 @@ class ClaudeCodeAdapter(PlatformAdapter):
 
     async def execute(self, inv: AgentInvocation) -> AgentResult:
         cmd = self._build_command(inv)
+        # ``inv.timeout_s`` became ``int | None`` in v0.8.0 to support per-task
+        # complexity overrides resolved at the orchestrator boundary. Apply the
+        # adapter-level default (600s) when the field is ``None`` — the legacy
+        # behavior pre-dating the type change.
+        effective_timeout_s: int = inv.timeout_s if inv.timeout_s is not None else 600
         logger.info(
             "claude_code.execute",
             role=inv.role,
@@ -96,7 +101,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
             try:
                 stdout_b, stderr_b = await asyncio.wait_for(
                     proc.communicate(),
-                    timeout=inv.timeout_s,
+                    timeout=effective_timeout_s,
                 )
             except asyncio.TimeoutError:
                 with suppress(ProcessLookupError):
@@ -135,7 +140,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
                     success=False,
                     text="",
                     duration_s=duration,
-                    error=f"timeout after {inv.timeout_s}s",
+                    error=f"timeout after {effective_timeout_s}s",
                     raw_stdout=stdout,
                     raw_stderr=stderr,
                 )
