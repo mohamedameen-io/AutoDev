@@ -1291,6 +1291,35 @@ async def _execute_one(
                     task_id=task.id,
                     err=developer_result.error,
                 )
+                # v0.20.0 C3: dynamic scope expansion on missing-file
+                # error. Inspect the adapter output for paths that look
+                # like sparse-checkout misses; if any are covered by the
+                # task's extended_scope / phase / plan edit_scope, widen
+                # the worktree and retry once. This is a one-shot
+                # repair — repeat misses fall through to normal retry.
+                if (
+                    worktree is not None
+                    and worktree_mgr is not None
+                    and not task.metadata.get("dynamic_scope_expansion_used")
+                ):
+                    expanded = await _maybe_expand_sparse_for_missing(
+                        orch=orch,
+                        task=task,
+                        worktree=worktree,
+                        worktree_mgr=worktree_mgr,
+                        adapter_text=(
+                            (developer_result.text or "")
+                            + "\n"
+                            + (developer_result.error or "")
+                        ),
+                    )
+                    if expanded:
+                        # Mark + retry once.
+                        task.metadata["dynamic_scope_expansion_used"] = True
+                        last_issues = [
+                            developer_result.error or "missing-file; sparse-expanded"
+                        ]
+                        continue
                 task = await _try_retry_or_escalate(
                     orch, task, retry_limit, reason="coder adapter failure"
                 )
@@ -1501,6 +1530,90 @@ async def _execute_one(
                     task_id=task.id,
                     err=str(exc),
                 )
+
+
+async def _maybe_expand_sparse_for_missing(
+    orch: "Orchestrator",
+    task: Task,
+    worktree: Path,
+    worktree_mgr: WorktreeManager,
+    adapter_text: str,
+) -> bool:
+    """v0.20.0 C3: parse missing-file errors and dynamically widen sparse-checkout.
+
+    Returns True iff at least one path was admitted via
+    :meth:`WorktreeManager.expand_sparse_paths`. Returns False when:
+
+    * no missing-file paths are detected in ``adapter_text``;
+    * none of the detected paths fall under the task's
+      ``extended_scope`` / phase ``edit_scope`` / plan ``edit_scope`` —
+      we never widen beyond the architect-declared envelope.
+    """
+    from orchestrator.dag import is_in_scope
+    from orchestrator.worktree import detect_missing_paths
+
+    missing = detect_missing_paths(adapter_text)
+    if not missing:
+        return False
+    # Resolve the broadest legitimate scope: extended_scope ∪ phase
+    # edit_scope ∪ plan edit_scope. If a missing path is covered by
+    # any of these, admit it.
+    scope: list[str] = list(task.extended_scope or [])
+    if orch.plan_manager is not None:
+        try:
+            plan = await orch.plan_manager.load()
+        except Exception:  # noqa: BLE001
+            plan = None
+        if plan is not None:
+            scope.extend(plan.edit_scope or [])
+            for ph in plan.phases:
+                if ph.id == task.phase_id and ph.edit_scope is not None:
+                    scope.extend(ph.edit_scope)
+                    break
+    if not scope:
+        # No scope to honor → skip dynamic expansion (safety: never
+        # blindly admit arbitrary missing paths).
+        return False
+    to_admit: list[str] = []
+    for path in missing:
+        if is_in_scope(path, scope):
+            # Admit the parent directory (sparse-checkout takes prefixes;
+            # adding the file directly works under cone-mode but adding
+            # the parent is more idempotent / future-friendly).
+            parent = "/".join(path.split("/")[:-1])
+            if parent and parent not in to_admit:
+                to_admit.append(parent)
+            elif not parent and path not in to_admit:
+                to_admit.append(path)
+    if not to_admit:
+        return False
+    try:
+        await worktree_mgr.expand_sparse_paths(worktree, to_admit)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.dynamic_scope_expand_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return False
+    logger.info(
+        "execute_phase.dynamic_scope_expanded",
+        task_id=task.id,
+        admitted=to_admit,
+    )
+    if orch.plan_manager is not None:
+        try:
+            await orch.plan_manager.ledger_append(
+                op="sparse_checkout_expanded",
+                payload={
+                    "task_id": task.id,
+                    "missing_paths": missing,
+                    "admitted_prefixes": to_admit,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return True
 
 
 async def _try_retry_or_escalate(
