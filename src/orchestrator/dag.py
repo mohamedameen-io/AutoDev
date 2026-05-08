@@ -1,5 +1,13 @@
 """DAG validation and scheduling helpers for execute_phase parallelism.
 
+v0.17.0 S5 adds glob support to ``Task.files``. The architect can declare
+``files: ["src/qa/*.py"]`` to claim a glob; downstream consumers
+(``find_file_overlaps``, ``validate_edit_scope``) expand these against a
+caller-provided ``tracked_files`` set. Without a tracked-files cache,
+glob entries are treated literally for backward compatibility.
+
+
+
 v0.11.0 introduces parallel task execution within a phase. Tasks declare
 ``depends_on`` (other task ids in the same phase) and ``files`` (paths
 they will modify). The scheduler reads these two surfaces to decide
@@ -31,8 +39,47 @@ module surface as plain :class:`ValueError` (per project convention).
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 from errors import AutodevError
 from state.schemas import Phase, Plan, Task
+
+
+# v0.17.0 S5: characters that mark a Task.files entry as a glob pattern.
+# When ANY of these appears in an entry, downstream consumers expand the
+# entry against a tracked-files cache instead of treating it as a literal
+# path. Mirrors :mod:`fnmatch` / :mod:`pathlib.PurePath.match` semantics.
+_GLOB_CHARS: frozenset[str] = frozenset("*?[")
+
+
+def _is_glob(entry: str) -> bool:
+    """Return True iff ``entry`` contains any glob meta-character."""
+    return any(c in _GLOB_CHARS for c in entry)
+
+
+def _expand_files(
+    entries: list[str], tracked_files: set[str] | None
+) -> set[str]:
+    """Expand ``entries`` (mix of literal + glob) against ``tracked_files``.
+
+    Each glob entry is matched via :meth:`PurePosixPath.match` against
+    every tracked file; the union of matches replaces the glob in the
+    output. Literal entries pass through unchanged.
+
+    When ``tracked_files`` is ``None``, glob entries pass through as
+    literals — preserves backward compatibility for callers (e.g. tests,
+    legacy code paths) that don't plumb a cache through.
+    """
+    out: set[str] = set()
+    for entry in entries:
+        if not _is_glob(entry) or tracked_files is None:
+            out.add(entry)
+            continue
+        # Glob with cache: expand.
+        for tracked in tracked_files:
+            if PurePosixPath(tracked).match(entry):
+                out.add(tracked)
+    return out
 
 
 class DagValidationError(AutodevError):
@@ -215,7 +262,10 @@ def find_blocked_descendants(
     return descendants
 
 
-def find_file_overlaps(tasks: list[Task]) -> dict[str, set[str]]:
+def find_file_overlaps(
+    tasks: list[Task],
+    tracked_files: set[str] | None = None,
+) -> dict[str, set[str]]:
     """Map each task id to the set of OTHER task ids sharing >=1 ``files`` entry.
 
     The relation is symmetric: if A overlaps B, B overlaps A. Tasks with
@@ -229,16 +279,28 @@ def find_file_overlaps(tasks: list[Task]) -> dict[str, set[str]]:
     The dispatcher uses this map to refuse to start a task whose files
     intersect any in-flight task's files — apply-to-main conflict
     avoidance up-front rather than recover-after.
+
+    v0.17.0 S5: glob entries in ``Task.files`` (e.g. ``"src/qa/*.py"``)
+    are expanded against ``tracked_files`` before intersection. Without a
+    tracked-files cache, glob entries are treated as literal strings —
+    preserves backward compatibility for legacy callers (the dispatcher
+    plumbs the cache through when available).
     """
     out: dict[str, set[str]] = {t.id: set() for t in tasks}
+    # Pre-expand each task's files once (avoids quadratic re-expansion in
+    # the inner loop).
+    expanded: dict[str, set[str]] = {
+        t.id: _expand_files(t.files, tracked_files) for t in tasks
+    }
     for i, a in enumerate(tasks):
-        a_files = set(a.files)
+        a_files = expanded[a.id]
         if not a_files:
             continue
         for b in tasks[i + 1:]:
-            if not b.files:
+            b_files = expanded[b.id]
+            if not b_files:
                 continue
-            if a_files & set(b.files):
+            if a_files & b_files:
                 out[a.id].add(b.id)
                 out[b.id].add(a.id)
     return out
@@ -270,7 +332,10 @@ def is_in_scope(file_path: str, scope: list[str]) -> bool:
     return False
 
 
-def validate_edit_scope(plan: Plan) -> None:
+def validate_edit_scope(
+    plan: Plan,
+    tracked_files: set[str] | None = None,
+) -> None:
     """Verify every task in ``plan`` declares ``files`` within its scope.
 
     Resolution rule:
@@ -290,6 +355,14 @@ def validate_edit_scope(plan: Plan) -> None:
     Tasks with empty ``files`` lists never violate (no claims, no
     constraint to enforce). Architects can leave ``files`` empty for
     documentation-only tasks.
+
+    v0.17.0 S5: glob entries in ``Task.files`` (e.g. ``"src/qa/*.py"``)
+    are expanded against ``tracked_files`` before scope-validation. Each
+    expanded file must individually pass :func:`is_in_scope`; a single
+    out-of-scope expansion raises. A glob with zero expansions is a
+    no-op (no claims to validate). Without ``tracked_files``, glob
+    entries are validated literally — the validator's worst-case
+    behavior matches the pre-v0.17.0 surface.
     """
     plan_scope = plan.edit_scope or []
 
@@ -307,6 +380,20 @@ def validate_edit_scope(plan: Plan) -> None:
 
         for task in phase.tasks:
             for file_path in task.files:
+                # v0.17.0 S5: glob expansion. With a tracked-files cache,
+                # validate every expanded file individually; without one,
+                # validate the glob string literally (legacy behavior).
+                if _is_glob(file_path) and tracked_files is not None:
+                    expanded = _expand_files([file_path], tracked_files)
+                    for matched in expanded:
+                        if not is_in_scope(matched, resolved):
+                            raise EditScopeViolation(
+                                f"task {task.id!r} (phase {phase.id!r}) declares "
+                                f"glob {file_path!r} which expands to "
+                                f"{matched!r} outside the resolved edit_scope "
+                                f"{resolved!r}"
+                            )
+                    continue
                 if not is_in_scope(file_path, resolved):
                     raise EditScopeViolation(
                         f"task {task.id!r} (phase {phase.id!r}) declares file "

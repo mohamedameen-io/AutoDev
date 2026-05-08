@@ -599,7 +599,14 @@ async def run_execute_phase(
         )
 
         try:
-            validate_edit_scope(plan)
+            # v0.17.0 S5: pass the orchestrator's tracked-files cache so
+            # glob entries in ``Task.files`` are expanded before scope
+            # validation. Empty set / missing cache preserves legacy
+            # literal-string behavior. ``getattr`` tolerates legacy
+            # OrchStub fixtures that pre-date the cache.
+            validate_edit_scope(
+                plan, tracked_files=getattr(orch, "tracked_files", None)
+            )
         except EditScopeViolation as exc:
             logger.warning(
                 "execute_phase.edit_scope_violation",

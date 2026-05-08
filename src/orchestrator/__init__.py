@@ -74,6 +74,12 @@ class Orchestrator:
         # for pattern detection. In-memory only (mirrors the rest of
         # v0.15.0's ladder design).
         self._trajectory_store = TrajectoryStore()
+        # v0.17.0 S5: lazy-init slot for the project's tracked-files set.
+        # Populated on first access via ``git ls-files``. ``None`` means
+        # "not yet probed". Used by :func:`orchestrator.dag.find_file_overlaps`
+        # and :func:`orchestrator.dag.validate_edit_scope` for glob
+        # expansion of ``Task.files`` entries.
+        self._tracked_files: set[str] | None = None
 
         # Wire AgentExtensionPlugins: merge their specs into the agent registry.
         if plugin_registry is not None:
@@ -161,6 +167,43 @@ class Orchestrator:
     @property
     def disable_impl_tournament(self) -> bool:
         return self._disable_impl_tournament
+
+    @property
+    def tracked_files(self) -> set[str]:
+        """Return the cached set of repo-relative tracked files.
+
+        v0.17.0 S5: lazy-populated via ``git ls-files`` on first access.
+        Used by :func:`orchestrator.dag.find_file_overlaps` and
+        :func:`orchestrator.dag.validate_edit_scope` to expand glob entries
+        in ``Task.files`` against the project's actual file set.
+
+        Empty set on first access if the repo has no tracked files (e.g.
+        a fresh ``git init`` with nothing committed). The probe is
+        idempotent: subsequent accesses return the same set object so
+        callers can rely on identity-based caching.
+
+        Refresh strategy: cached for the orchestrator's lifetime. New
+        files added mid-session are NOT visible until the next session
+        — by design, mirrors how :attr:`repo_capacity` snapshots the
+        probe at orchestrator construction time.
+        """
+        if self._tracked_files is None:
+            import subprocess
+
+            try:
+                proc = subprocess.run(
+                    ["git", "ls-files"],
+                    cwd=self._cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                lines = proc.stdout.splitlines()
+                self._tracked_files = {ln for ln in lines if ln}
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                # Not a git repo, or git unavailable — empty set.
+                self._tracked_files = set()
+        return self._tracked_files
 
     @property
     def repo_capacity(self) -> RepoCapacity:
