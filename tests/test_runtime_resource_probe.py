@@ -61,3 +61,116 @@ def test_probe_host_handles_psutil_cpu_count_none(
 
     cap = resource_probe.probe_host()
     assert cap.cpu_count == 4
+
+
+# ---------------------------------------------------------------------------
+# resolve_parallelism: explicit-int passes through unchanged
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_parallelism_explicit_int_passes_through() -> None:
+    """An explicitly configured int bypasses the resource probe entirely.
+
+    Backward-compat: pre-v0.10.0 configs with ``max_parallel_subprocesses=3``
+    keep that exact value, no clamping based on host capacity.
+    """
+    from runtime.resource_probe import HostCapacity, resolve_parallelism
+
+    cap = HostCapacity(cpu_count=2, available_mem_gb=2.0)
+    out = resolve_parallelism(
+        configured=8, capacity=cap, role_mix="plan", num_judges=5
+    )
+    assert out == 8
+
+
+def test_resolve_parallelism_explicit_int_floors_at_1() -> None:
+    """A configured value <= 0 is clamped up to 1 (avoid divide-by-zero
+    on the semaphore + always-on parallelism contract)."""
+    from runtime.resource_probe import HostCapacity, resolve_parallelism
+
+    cap = HostCapacity(cpu_count=8, available_mem_gb=16.0)
+    assert resolve_parallelism(0, cap, "plan", 5) == 1
+    assert resolve_parallelism(-3, cap, "plan", 5) == 1
+
+
+# ---------------------------------------------------------------------------
+# resolve_parallelism: None auto-resolves via capacity probe
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_parallelism_none_clamps_to_min_constraint() -> None:
+    """Low-mem host: memory-headroom constraint dominates and resolves to a
+    small int (here, 1).
+
+    Memory model: ``(available - 4.0 GB headroom) / 1.5 GB-per-subprocess``.
+    With 5GB free → ((5 - 4) / 1.5) = 0.66 → max(1, int(0.66)) = 1.
+    """
+    from runtime.resource_probe import HostCapacity, resolve_parallelism
+
+    cap = HostCapacity(cpu_count=16, available_mem_gb=5.0)
+    out = resolve_parallelism(None, cap, "plan", num_judges=7)
+    assert out == 1
+
+
+def test_resolve_parallelism_clamps_to_judge_cohort() -> None:
+    """High-mem, high-CPU host with 5 judges → caps at 5, not at the 16
+    absolute ceiling. No point spawning more workers than judges."""
+    from runtime.resource_probe import HostCapacity, resolve_parallelism
+
+    cap = HostCapacity(cpu_count=32, available_mem_gb=64.0)
+    out = resolve_parallelism(None, cap, "plan", num_judges=5)
+    assert out == 5
+
+
+def test_resolve_parallelism_absolute_ceiling_16() -> None:
+    """Massive-spec host with 64 judges still caps at the absolute 16
+    ceiling (defends against pathological cohort sizes / runaway forks)."""
+    from runtime.resource_probe import HostCapacity, resolve_parallelism
+
+    cap = HostCapacity(cpu_count=128, available_mem_gb=512.0)
+    out = resolve_parallelism(None, cap, "plan", num_judges=64)
+    assert out == 16
+
+
+def test_resolve_parallelism_cpu_constraint_dominates() -> None:
+    """Sufficient memory but only 4 cores → clamps to ``cpu_count - 2 = 2``
+    (leave 2 cores for the OS / parent process)."""
+    from runtime.resource_probe import HostCapacity, resolve_parallelism
+
+    cap = HostCapacity(cpu_count=4, available_mem_gb=64.0)
+    out = resolve_parallelism(None, cap, "plan", num_judges=7)
+    assert out == 2
+
+
+def test_resolve_parallelism_logs_resolution(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The resolver emits ``tournament.parallelism_resolved`` with the
+    structured fields {chosen, cpus, memory_gb, num_judges, role_mix}.
+
+    Structlog uses ``PrintLoggerFactory`` so events land on stdout, not
+    via stdlib logging — capture via ``capsys`` rather than ``caplog``.
+    """
+    from runtime.resource_probe import HostCapacity, resolve_parallelism
+
+    cap = HostCapacity(cpu_count=8, available_mem_gb=16.0)
+    resolved = resolve_parallelism(
+        configured=None, capacity=cap, role_mix="impl", num_judges=3
+    )
+    assert resolved >= 1
+    out = capsys.readouterr().out
+    assert "tournament.parallelism_resolved" in out
+    assert "role_mix=impl" in out
+    assert "num_judges=3" in out
+    assert "cpus=8" in out
+
+
+def test_resolve_parallelism_role_mix_phase_review_accepted() -> None:
+    """All three role_mix literals (``plan``, ``impl``, ``phase_review``)
+    are accepted by the resolver."""
+    from runtime.resource_probe import HostCapacity, resolve_parallelism
+
+    cap = HostCapacity(cpu_count=8, available_mem_gb=16.0)
+    for role in ("plan", "impl", "phase_review"):
+        out = resolve_parallelism(None, cap, role, 3)  # type: ignore[arg-type]
+        assert out >= 1
