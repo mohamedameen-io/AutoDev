@@ -18,15 +18,32 @@ distinct from the rule-based demand_repeat so ``reason`` carries the
 
 The ladder is opt-in via ``cfg.tournaments.plan.promotion_grade_enabled``
 (default off) — see :mod:`config.schema`.
+
+v0.19.0 extensions:
+
+  * Mutation-test integration. ``decide`` accepts an optional
+    ``kill_rate``. When ``grade=='dev_best'`` and ``kill_rate < 0.5``,
+    the ladder demands a repeat with a "test sufficiency questioned"
+    reason, even when all gates passed.
+  * ``is_suspiciously_perfect`` flags ``kill_rate=1.0`` on the gate
+    cohort as suspicious — too-perfect mutation kill rates often
+    indicate the test runner didn't actually exercise the mutated code.
+  * Holdout integration (v0.19.0 C1). ``decide`` accepts an optional
+    ``holdout_result``. When ``grade=='repeated'`` and the holdout
+    failed, the ladder rejects promotion ("holdout test failed");
+    success promotes to ``eligible`` as before.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from plugins.registry import GateResult
+
+if TYPE_CHECKING:
+    from tournament.holdout import HoldoutResult  # type: ignore[import-untyped]
 
 
 PromotionAction = Literal[
@@ -80,15 +97,26 @@ def _all_gates_passed(gate_results: list[GateResult]) -> bool:
     return all(g.passed for g in gate_results)
 
 
-def is_suspiciously_perfect(gate_results: list[GateResult]) -> bool:
+def is_suspiciously_perfect(
+    gate_results: list[GateResult],
+    kill_rate: float | None = None,
+) -> bool:
     """Flag tournament gate cohorts that look "too clean to be real".
 
-    Returns True when ALL gates passed AND any gate's ``details`` matches
-    a suspicious-clean substring pattern. Empty cohorts are NOT suspicious
-    (no signal at all is different from suspiciously clean signal).
+    Returns True when ALL gates passed AND any of:
+
+      * Any gate's ``details`` matches a suspicious-clean substring
+        pattern.
+      * ``kill_rate`` is provided and equals 1.0 — perfect mutation
+        coverage is rare and often indicates the runner didn't execute.
+
+    Empty cohorts are NOT suspicious (no signal at all is different from
+    suspiciously clean signal).
     """
     if not _all_gates_passed(gate_results):
         return False
+    if kill_rate is not None and kill_rate >= 1.0:
+        return True
     for gate in gate_results:
         details = gate.details or ""
         for pat in _SUSPICIOUS_PATTERNS:
@@ -98,7 +126,11 @@ def is_suspiciously_perfect(gate_results: list[GateResult]) -> bool:
 
 
 def decide(
-    grade: str, gate_results: list[GateResult]
+    grade: str,
+    gate_results: list[GateResult],
+    *,
+    kill_rate: float | None = None,
+    holdout_result: "HoldoutResult | None" = None,
 ) -> PromotionDecision:
     """Pick the next ladder action for a tournament winner.
 
@@ -106,15 +138,19 @@ def decide(
 
       1. If ``grade`` is unknown → ``no_change`` (safe fallback).
       2. If any gate failed → ``no_change`` (don't ladder a broken winner).
-      3. If ``grade == "dev_best"`` AND the cohort is suspicious-perfect →
-         ``demand_repeat`` with a distinct ``reason``. Distinguished from the
-         rule-based dev_best→demand_repeat below so telemetry can tell which
-         path fired.
-      4. ``dev_best`` (passed gates) → ``demand_repeat``.
-      5. ``pending_repeat`` (passed gates) → ``promote_to_repeated``.
-      6. ``repeated`` (passed gates) → ``promote_to_eligible``.
-      7. Otherwise → ``no_change`` (e.g. ``promotion_eligible`` is a
-         terminal state — the ladder doesn't go higher in v0.16.0).
+      3. v0.19.0: ``dev_best`` AND ``kill_rate < 0.5`` → ``demand_repeat``
+         with "test sufficiency questioned" reason. Catches winners that
+         passed gates but whose tests barely exercise the code.
+      4. If ``grade == "dev_best"`` AND the cohort is suspicious-perfect
+         → ``demand_repeat`` with a distinct ``reason``.
+      5. ``dev_best`` (passed gates) → ``demand_repeat``.
+      6. ``pending_repeat`` (passed gates) → ``promote_to_repeated``.
+      7. v0.19.0: ``repeated`` AND holdout supplied AND ``passed=False``
+         → ``no_change`` ("holdout test failed").
+      8. ``repeated`` (passed gates, holdout absent or passed) →
+         ``promote_to_eligible``.
+      9. Otherwise → ``no_change`` (e.g. ``promotion_eligible`` is a
+         terminal state).
     """
     if grade not in _VALID_GRADES:
         return PromotionDecision(
@@ -125,10 +161,21 @@ def decide(
             action="no_change", reason="one or more gates failed"
         )
 
-    # Rule 3: suspicious-perfect override applies only at the bottom of the
-    # ladder. A ``pending_repeat`` is *already* the demanded repeat, so even
-    # a suspicious cohort just rolls forward to ``repeated``.
-    if grade == "dev_best" and is_suspiciously_perfect(gate_results):
+    # Rule 3 (v0.19.0): mutation-test sufficiency threshold.
+    if grade == "dev_best" and kill_rate is not None and kill_rate < 0.5:
+        return PromotionDecision(
+            action="demand_repeat",
+            reason=(
+                f"test sufficiency questioned — mutation kill rate "
+                f"{kill_rate:.2%} below 50%"
+            ),
+        )
+
+    # Rule 4: suspicious-perfect override applies only at the bottom of the
+    # ladder. A ``pending_repeat`` is *already* the demanded repeat.
+    if grade == "dev_best" and is_suspiciously_perfect(
+        gate_results, kill_rate=kill_rate
+    ):
         return PromotionDecision(
             action="demand_repeat",
             reason="suspicious-perfect gates — demanding repeat for confirmation",
@@ -145,6 +192,15 @@ def decide(
             reason="winner reproduced on repeat — promoted to repeated",
         )
     if grade == "repeated":
+        # Rule 7 (v0.19.0): holdout-set evaluation.
+        if holdout_result is not None and not holdout_result.passed:
+            return PromotionDecision(
+                action="no_change",
+                reason=(
+                    f"holdout test failed: {holdout_result.failure_count}/"
+                    f"{holdout_result.test_count} failed"
+                ),
+            )
         return PromotionDecision(
             action="promote_to_eligible",
             reason="repeated winner cleared holdout — promoted to eligible",
