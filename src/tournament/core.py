@@ -357,6 +357,22 @@ def _describe_skipped(partial: PartialPassState) -> list[str]:
 # ── Tournament ──────────────────────────────────────────────────────────
 
 
+# v0.10.0: per-pass adaptive ratcheting budget.
+#
+# Each subprocess (``claude -p`` invocation) is expected to consume around
+# 1 GB of resident memory at peak. The empirical anchor is the QNX run's
+# observed mean of ~800-1100 MB across judge subprocesses. The ratchet
+# threshold is 1.3 × this value (~1.33 GB) — chosen so a steady-state
+# tournament running normally does NOT trigger a ratchet, but a memory
+# spike (e.g. one judge ballooning to 1.5+ GB on a complex synthesizer
+# pass) DOES drop the in-flight cap by one slot for the rest of the run.
+#
+# Tests parametrize on this constant via ``from tournament.core import
+# EXPECTED_RSS_MB`` so the threshold can move (e.g. v0.10.1 may tune it
+# based on field data) without rewriting every test.
+EXPECTED_RSS_MB: float = 1024.0
+
+
 class Tournament(Generic[T]):
     """Run the self-refinement convergence loop over an arbitrary content type T."""
 
@@ -379,6 +395,66 @@ class Tournament(Generic[T]):
         self._sem = asyncio.Semaphore(max(1, cfg.max_parallel_subprocesses))
         # Optional list of JudgeProviderPlugin instances to supplement LLM judges.
         self._judge_plugins: list[Any] = judge_plugins or []
+
+    async def maybe_resize_semaphore(self, observed_rss_mb: float | None) -> None:
+        """Ratchet the in-flight subprocess cap DOWN if memory pressure
+        exceeds budget.
+
+        v0.10.0 per-pass adaptive sizing: after each pass's judge cohort
+        completes, the runner asks
+        :func:`runtime.resource_probe.measure_subprocess_rss` for the mean
+        RSS across the just-completed batch and forwards it here. If the
+        mean exceeds ``1.3 × EXPECTED_RSS_MB``, the semaphore is recreated
+        at one fewer slot (floored at 1).
+
+        Ratchet semantics:
+
+        * **Down only** — once a slot is released, it stays released for
+          the rest of the tournament's run. Avoids oscillation and the
+          worst case of a transient spike → recovery → spike cycle. The
+          tradeoff is acknowledged in the v0.10.0 plan: a one-shot memory
+          spike permanently degrades parallelism for the rest of the run.
+          v0.10.1 may add "recover after N stable passes" if needed.
+        * **No-op on None** — if no PIDs were reachable for the probe,
+          there's no decision to make.
+        * **No-op on within-budget** — RSS at-or-below the threshold band
+          is the steady state; no resize.
+
+        Implementation note: ``asyncio.Semaphore`` doesn't support live
+        resize. We construct a fresh one at the smaller capacity. Because
+        this method runs at *pass boundaries* (after all previous-pass
+        judges have already completed), there are no holders blocking on
+        the semaphore at the moment of replacement, so the recreation
+        is race-free in practice. (Holders that would have queued during
+        a pass have all returned by pass-end; the next pass's judges
+        acquire the new semaphore from a fresh asyncio.gather.)
+
+        Args:
+            observed_rss_mb: Mean resident-set-size in MB across the most
+                recent batch of subprocesses, or ``None`` if no
+                measurement was possible.
+        """
+        if observed_rss_mb is None:
+            return
+        if observed_rss_mb <= 1.3 * EXPECTED_RSS_MB:
+            return  # within budget; do not resize
+        # Read the internal slot count. ``_value`` is a CPython
+        # implementation detail of asyncio.Semaphore but is the only way
+        # to read the current capacity without a refactor of asyncio
+        # itself. The tests pin this attribute too — if it changes in a
+        # future Python release, both will break together.
+        current = getattr(self._sem, "_value", None)
+        if current is None or current <= 1:
+            return
+        new_capacity = max(1, current - 1)
+        self._sem = asyncio.Semaphore(new_capacity)
+        self.log.warning(
+            "tournament.semaphore_ratchet_down",
+            from_=current,
+            to=new_capacity,
+            observed_rss_mb=round(observed_rss_mb, 1),
+            threshold_mb=round(1.3 * EXPECTED_RSS_MB, 1),
+        )
 
     async def run(self, task_prompt: str, initial: T) -> tuple[T, list[PassResult]]:
         """Run passes 1..max_rounds, converge when streak >= convergence_k.
