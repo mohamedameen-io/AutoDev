@@ -93,6 +93,7 @@ packages = [
     "src/orchestrator",
     "src/plugins",
     "src/qa",
+    "src/runtime",
     "src/state",
     "src/tournament",
 ]
