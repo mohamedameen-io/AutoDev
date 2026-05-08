@@ -9,6 +9,7 @@ that secrets are caught before they reach a reviewer or are committed.
 
 from __future__ import annotations
 
+import fnmatch
 import math
 import re
 from pathlib import Path
@@ -43,8 +44,23 @@ _SKIP_EXTENSIONS: frozenset[str] = frozenset({
     ".lock",  # lock files contain hashes, not secrets
 })
 
-# Entropy threshold for high-entropy string detection.
+# Default entropy threshold for high-entropy string detection.
 _ENTROPY_THRESHOLD = 4.5
+# v0.19.0: per-extension entropy curves. Files with these extensions use a
+# higher threshold to suppress legitimate high-entropy identifiers (Unity-class
+# C++ codebases routinely use long camelCase symbols; YAML build manifests use
+# base64-flavored hashes).
+_DEFAULT_PER_EXTENSION_ENTROPY: dict[str, float] = {
+    ".cpp": 5.0,
+    ".cc": 5.0,
+    ".cxx": 5.0,
+    ".c": 5.0,
+    ".h": 5.0,
+    ".hpp": 5.0,
+    ".hxx": 5.0,
+    ".yaml": 5.5,
+    ".yml": 5.5,
+}
 _MIN_ENTROPY_LEN = 20
 
 
@@ -79,17 +95,92 @@ def _shannon_entropy(text: str) -> float:
     return -sum((c / length) * math.log2(c / length) for c in freq.values())
 
 
-def _high_entropy_strings(content: str) -> list[str]:
-    """Return substrings that look like high-entropy secrets."""
-    # Look for quoted strings or assignment RHS values.
+def _entropy_threshold_for(
+    extension: str | None,
+    per_extension_thresholds: dict[str, float] | None,
+) -> float:
+    """Resolve entropy threshold for a file extension.
+
+    Lookup order (first hit wins):
+      1. Caller-supplied *per_extension_thresholds*.
+      2. Module default :data:`_DEFAULT_PER_EXTENSION_ENTROPY`.
+      3. Global :data:`_ENTROPY_THRESHOLD`.
+    """
+    if extension is None:
+        return _ENTROPY_THRESHOLD
+    if per_extension_thresholds and extension in per_extension_thresholds:
+        return per_extension_thresholds[extension]
+    if extension in _DEFAULT_PER_EXTENSION_ENTROPY:
+        return _DEFAULT_PER_EXTENSION_ENTROPY[extension]
+    return _ENTROPY_THRESHOLD
+
+
+def _high_entropy_strings(
+    content: str,
+    extension: str | None = None,
+    per_extension_thresholds: dict[str, float] | None = None,
+) -> list[str]:
+    """Return substrings that look like high-entropy secrets.
+
+    *extension* is the lowercased file extension (including leading dot),
+    used to look up a per-extension threshold. *per_extension_thresholds*
+    is an optional caller override; it composes with the module defaults.
+    """
+    threshold = _entropy_threshold_for(extension, per_extension_thresholds)
     candidates = re.findall(r'["\']([A-Za-z0-9/+_\-=]{20,})["\']', content)
-    return [c for c in candidates if _shannon_entropy(c) >= _ENTROPY_THRESHOLD]
+    return [c for c in candidates if _shannon_entropy(c) >= threshold]
+
+
+def _load_allowlist(cwd: Path) -> list[str]:
+    """Read ``.autodev/secretscan-allow`` patterns (gitignore-style globs).
+
+    Comment lines (``#`` prefix) and blank lines are ignored. Returns an
+    empty list when the file is missing.
+    """
+    path = cwd / ".autodev" / "secretscan-allow"
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    out: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        out.append(stripped)
+    return out
+
+
+def _matches_allowlist(rel_path: str, patterns: list[str]) -> bool:
+    """True iff *rel_path* matches any gitignore-style glob in *patterns*."""
+    for raw in patterns:
+        pat = raw.rstrip("/")
+        # ``**`` recursive wildcard semantic: ``a/**`` matches ``a/b``, ``a/b/c``.
+        if pat.endswith("/**"):
+            head = pat[: -len("/**")]
+            if rel_path == head or rel_path.startswith(head + "/"):
+                return True
+            continue
+        if "**" in pat:
+            # Fall back to fnmatch on the pattern (lossy but standard).
+            if fnmatch.fnmatch(rel_path, pat.replace("**", "*")):
+                return True
+            continue
+        if fnmatch.fnmatch(rel_path, pat):
+            return True
+        # Bare-prefix match: ``foo`` matches ``foo`` and ``foo/bar``.
+        if rel_path == pat or rel_path.startswith(pat + "/"):
+            return True
+    return False
 
 
 async def run_secretscan(
     cwd: Path,
     paths: list[Path] | None = None,
     edit_scope: list[str] | None = None,
+    per_extension_thresholds: dict[str, float] | None = None,
 ) -> GateResult:
     """Scan *cwd* for hard-coded secrets.
 
@@ -107,6 +198,11 @@ async def run_secretscan(
     in-scope) are scanned. When *paths* is None and *edit_scope* is
     non-empty, the whole-tree walk is filtered to the scope.
 
+    v0.19.0: ``.autodev/secretscan-allow`` (gitignore-style globs) skips
+    matching files. ``per_extension_thresholds`` overrides the entropy
+    threshold per file extension; defaults to the module-level table that
+    raises the threshold for ``.cpp/.h/.yaml``.
+
     Returns ``GateResult(passed=False, ...)`` if any secrets are found,
     ``GateResult(passed=True, ...)`` otherwise.
     """
@@ -117,19 +213,27 @@ async def run_secretscan(
     scope_active = bool(edit_scope)
     scope_prefixes = [p.rstrip("/") for p in (edit_scope or [])]
 
+    allowlist = _load_allowlist(cwd)
+
     for path in _iter_files(cwd, paths=paths):
         # v0.14.0 scope filter: applied after _iter_files so it composes
         # naturally with both walk modes (full-tree and diff-paths).
-        if scope_active:
-            try:
-                rel_for_scope = path.relative_to(cwd).as_posix()
-            except ValueError:
-                # Caller passed an absolute path outside cwd. Without a
-                # repo-relative form we can't decide scope membership;
-                # treat as out-of-scope (conservative).
+        try:
+            rel_for_scope = path.relative_to(cwd).as_posix()
+        except ValueError:
+            # Caller passed an absolute path outside cwd. Without a
+            # repo-relative form we can't decide scope membership;
+            # treat as out-of-scope (conservative).
+            if scope_active:
                 continue
-            if not _path_in_scope(rel_for_scope, scope_prefixes):
-                continue
+            rel_for_scope = path.as_posix()
+
+        if scope_active and not _path_in_scope(rel_for_scope, scope_prefixes):
+            continue
+
+        # v0.19.0 allowlist filter.
+        if allowlist and _matches_allowlist(rel_for_scope, allowlist):
+            continue
 
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
@@ -148,9 +252,16 @@ async def run_secretscan(
             if pattern.search(content):
                 findings.append(f"{rel}: {label}")
 
-        # Entropy scan.
-        for suspect in _high_entropy_strings(content):
-            findings.append(f"{rel}: high-entropy string ({_shannon_entropy(suspect):.2f} bits) — {suspect[:8]}…")
+        # Entropy scan — per-extension threshold lookup.
+        ext = path.suffix.lower()
+        for suspect in _high_entropy_strings(
+            content,
+            extension=ext,
+            per_extension_thresholds=per_extension_thresholds,
+        ):
+            findings.append(
+                f"{rel}: high-entropy string ({_shannon_entropy(suspect):.2f} bits) — {suspect[:8]}…"
+            )
 
     if findings:
         detail = "potential secrets found:\n" + "\n".join(findings[:20])

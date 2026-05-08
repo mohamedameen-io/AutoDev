@@ -317,12 +317,25 @@ class QAGatesConfig(BaseModel):
     build_check: bool = True
     test_runner: bool = True
     secretscan: bool = True
+    # v0.19.0: per-repo secretscan baseline. When True, ``run_secretscan`` is
+    # diff-filtered against ``.autodev/secretscan-baseline.json`` so only
+    # net-new findings vs. the baseline trip the gate. Refresh the baseline
+    # via ``autodev secretscan baseline``.
+    secretscan_baseline_enabled: bool = False
+    # v0.19.0: per-extension entropy override. ``None`` means "use module
+    # default curve" (see ``qa.secretscan._DEFAULT_PER_EXTENSION_ENTROPY``).
+    secretscan_per_extension_thresholds: dict[str, float] | None = None
     # These two fields are NOT dispatched by _run_qa_gates. They are consumed
     # exclusively by agent prompts (e.g. architect.md) to drive security-tier
     # routing decisions at planning time. Dispatching them as actual gates is
     # planned in ADR-008 (see line 104 of this file).
     sast_scan: bool = False
     mutation_test: bool = False
+    # v0.19.0: dispatch toggle for the mutation-test gate. Distinct from
+    # ``mutation_test`` (planning-time advisory): when True, ``mutation_test``
+    # is run as an actual gate via ``qa.mutation_test.run_mutation_test``.
+    mutation_test_enabled: bool = False
+    mutation_test_threshold: float = 0.7
 
 
 class GuardrailsConfig(BaseModel):
