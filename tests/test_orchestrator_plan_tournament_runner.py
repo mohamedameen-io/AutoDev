@@ -508,3 +508,120 @@ async def test_run_plan_tournament_branch_seed_none_uses_spec_hash(
     b_draw = rng_b.random()
     # Same spec_hash + same default seeding path → identical streams.
     assert a_draw == b_draw
+
+
+# ---------------------------------------------------------------------------
+# v0.14.0 — run_plan_tournament branch_config parameter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_plan_tournament_branch_config_overrides_role_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``branch_config.model_overrides`` is set, the AdapterLLMClient
+    constructed for the branch carries those overrides."""
+    from config.schema import BranchConfig
+
+    captured_clients: list[Any] = []
+
+    class _CaptureClientCfg:
+        def __init__(self, *, handler: Any, client: Any, cfg: Any,
+                     artifact_dir: Path, rng: Any = None,
+                     judge_plugins: Any = None) -> None:
+            captured_clients.append(client)
+
+        async def run(self, *, task_prompt: str, initial: str) -> tuple[str, list]:
+            return initial, []
+
+    monkeypatch.setattr(ptr, "Tournament", _CaptureClientCfg)
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = _make_orch(tmp_path, adapter)
+    md = _plan_md("medium")
+    bc = BranchConfig(
+        model_overrides={"developer": "claude-sonnet-4-5", "judge": "claude-haiku-4-5"},
+        lane="distant-scout",
+    )
+
+    await ptr.run_plan_tournament(
+        orch,
+        md,
+        "spec",
+        spec_hash=_SPEC_HASH,
+        branch_index=0,
+        branch_seed=100,
+        branch_config=bc,
+    )
+
+    assert len(captured_clients) == 1
+    client = captured_clients[0]
+    # The client must carry the per-role override map.
+    overrides = getattr(client, "_role_model_overrides", None)
+    assert overrides is not None
+    assert overrides.get("developer") == "claude-sonnet-4-5"
+    assert overrides.get("judge") == "claude-haiku-4-5"
+
+
+@pytest.mark.asyncio
+async def test_run_plan_tournament_branch_config_none_uses_resolve_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``branch_config=None`` (default) → no per-role override map; the
+    client's ``_role_model_overrides`` is None or empty."""
+    captured_clients: list[Any] = []
+
+    class _CaptureClientCfg:
+        def __init__(self, *, handler: Any, client: Any, cfg: Any,
+                     artifact_dir: Path, rng: Any = None,
+                     judge_plugins: Any = None) -> None:
+            captured_clients.append(client)
+
+        async def run(self, *, task_prompt: str, initial: str) -> tuple[str, list]:
+            return initial, []
+
+    monkeypatch.setattr(ptr, "Tournament", _CaptureClientCfg)
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = _make_orch(tmp_path, adapter)
+    md = _plan_md("medium")
+
+    await ptr.run_plan_tournament(orch, md, "spec", spec_hash=_SPEC_HASH)
+
+    assert len(captured_clients) == 1
+    client = captured_clients[0]
+    overrides = getattr(client, "_role_model_overrides", None)
+    # Either None or empty dict — both express "no overrides".
+    assert not overrides
+
+
+@pytest.mark.asyncio
+async def test_run_plan_tournament_branch_config_lane_in_artifact_dir(
+    tmp_path: Path,
+    capture_tournament: type[_CapturingTournament],
+) -> None:
+    """``branch_config.lane`` suffixes the artifact dir name:
+    ``tournaments/multi-{hash[:8]}/branch-{i}-{lane}/``."""
+    from config.schema import BranchConfig
+
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = _make_orch(tmp_path, adapter)
+    md = _plan_md("medium")
+    bc = BranchConfig(lane="distant-scout")
+
+    await ptr.run_plan_tournament(
+        orch,
+        md,
+        "spec",
+        spec_hash=_SPEC_HASH,
+        branch_index=2,
+        branch_seed=42,
+        branch_config=bc,
+    )
+
+    captured = capture_tournament.captured_artifact_dir
+    assert captured is not None
+    parts = captured.parts
+    assert f"multi-{_SPEC_HASH[:8]}" in parts
+    # Lane-suffixed dir name.
+    assert "branch-2-distant-scout" in parts

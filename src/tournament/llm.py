@@ -242,6 +242,7 @@ class AdapterLLMClient:
         role_allowed_tools: dict[str, list[str] | None] | None = None,
         role_effort: dict[str, str] | None = None,
         role_timeout_s: dict[str, int] | None = None,
+        role_model_overrides: dict[str, str] | None = None,
     ) -> None:
         self._adapter = adapter
         self._cwd = cwd
@@ -252,6 +253,11 @@ class AdapterLLMClient:
         self._role_allowed_tools = role_allowed_tools
         self._role_effort = role_effort
         self._role_timeout_s = role_timeout_s
+        # v0.14.0: per-role model override map for hetero-model branches.
+        # When non-None and the role is in the map, the override replaces
+        # the ``model`` arg passed to :meth:`call`. Empty dict / None
+        # preserves legacy single-model-per-tournament behavior.
+        self._role_model_overrides = role_model_overrides
         self._log = get_logger(component="tournament.llm")
 
     def _resolve_max_turns(self, role: str) -> int:
@@ -327,12 +333,23 @@ class AdapterLLMClient:
         consults the failing exception's class on each attempt.
         """
 
+        # v0.14.0: per-role model override for hetero-model branches. The
+        # incoming ``model`` is the cohort default (typically the judge
+        # model resolved in plan_tournament_runner). When the role has a
+        # branch-specific override, swap to it.
+        effective_model = model
+        if (
+            self._role_model_overrides is not None
+            and role in self._role_model_overrides
+        ):
+            effective_model = self._role_model_overrides[role]
+
         inv = _build_invocation(
             role=role,
             system=system,
             user=user,
             cwd=self._cwd,
-            model=model,
+            model=effective_model,
             timeout_s=self._resolve_timeout_s(role),
             max_turns=self._resolve_max_turns(role),
             allowed_tools=self._resolve_allowed_tools(role),

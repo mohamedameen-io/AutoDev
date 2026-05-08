@@ -37,6 +37,7 @@ from tournament.timeouts import resolve_role_timeout_s
 
 
 if TYPE_CHECKING:
+    from config.schema import BranchConfig
     from orchestrator import Orchestrator
 
 
@@ -174,6 +175,7 @@ async def run_plan_tournament(
     *,
     branch_index: int | None = None,
     branch_seed: int | None = None,
+    branch_config: "BranchConfig | None" = None,
 ) -> str:
     """Run the plan tournament and return the refined plan markdown.
 
@@ -197,6 +199,13 @@ async def run_plan_tournament(
             behavior). When set, seeds from this value directly so the
             multi-branch dispatcher can pass divergent seeds (e.g.
             ``int(spec_hash, 16) + branch_index``) per branch.
+        branch_config: v0.14.0 — optional :class:`config.schema.BranchConfig`
+            describing this branch's per-role model overrides plus
+            advisory lane / risk / family tags. When set, the per-role
+            model resolution consults ``branch_config.model_overrides``
+            first; the lane is appended to the artifact dir name as
+            ``branch-{index}-{lane}/``. ``None`` (default) preserves
+            v0.12.0 homogeneous behavior.
 
     Behavior:
         - If any relevant role resolves to an auto-disabled model, returns
@@ -229,11 +238,18 @@ async def run_plan_tournament(
         # v0.12.0 multi-branch path: tournaments/multi-{hash}/branch-N/
         # The parent ``multi-{hash}/`` dir keeps branch artifacts grouped
         # without colliding with legacy single-branch dirs.
+        # v0.14.0: when a branch_config is supplied, the lane is appended
+        # to the dir name (``branch-N-{lane}/``) so the on-disk layout
+        # records each branch's divergent trajectory at a glance.
+        if branch_config is not None:
+            branch_dir_name = f"branch-{branch_index}-{branch_config.lane}"
+        else:
+            branch_dir_name = f"branch-{branch_index}"
         artifact_dir = (
             autodev_root(orch.cwd)
             / "tournaments"
             / f"multi-{spec_hash[:8]}"
-            / f"branch-{branch_index}"
+            / branch_dir_name
         )
 
     # Extract the architect's COMPLEXITY: classification directly from the
@@ -265,6 +281,13 @@ async def run_plan_tournament(
     role_max_turns, role_allowed_tools, role_timeout_s, role_effort = (
         _build_role_overrides(orch, plan_complexity)
     )
+    # v0.14.0: per-branch role-model overrides. Empty dict / None
+    # preserves legacy homogeneous behavior — the global ``model``
+    # passed into ``client.call`` is used for every role.
+    role_model_overrides: dict[str, str] | None = None
+    if branch_config is not None and branch_config.model_overrides:
+        role_model_overrides = dict(branch_config.model_overrides)
+
     client = AdapterLLMClient(
         orch.adapter,
         cwd=orch.cwd,
@@ -272,6 +295,7 @@ async def run_plan_tournament(
         role_allowed_tools=role_allowed_tools,
         role_effort=role_effort,
         role_timeout_s=role_timeout_s,
+        role_model_overrides=role_model_overrides,
     )
 
     # v0.10.0: resolve subprocess parallelism via the runtime probe.
