@@ -121,6 +121,25 @@ class Task(BaseModel):
     description: str
     status: TaskStatus = "pending"
     files: list[str] = Field(default_factory=list)
+    # v0.20.0 C1: per-task additional path prefixes the task may modify on
+    # top of ``Phase.edit_scope`` / ``Plan.edit_scope``. Architects emit
+    # these via the ``Extended-scope:`` block when a task legitimately
+    # needs to touch files outside the declared scope (e.g. a refactor
+    # that crosses a single auxiliary module). Non-empty values are
+    # subject to the v0.20.0 C2 critic-review pre-validation flow before
+    # ``validate_edit_scope`` admits the paths. Empty list (default)
+    # preserves byte-identical v0.19.0 behavior.
+    #
+    # Validators mirror :attr:`Plan.edit_scope` /
+    # :attr:`Phase.edit_scope`: trim trailing ``/``, reject absolute
+    # paths, reject ``..`` segments. Repo-relative path prefixes only.
+    extended_scope: list[str] = Field(default_factory=list)
+
+    @field_validator("extended_scope", mode="after")
+    @classmethod
+    def _validate_extended_scope(cls, v: list[str]) -> list[str]:
+        """v0.20.0 C1: same validators as Plan/Phase ``edit_scope``."""
+        return _validate_edit_scope_paths(v)
 
     @field_validator("files", mode="after")
     @classmethod
