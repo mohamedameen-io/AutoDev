@@ -358,6 +358,29 @@ class GuardrailsConfig(BaseModel):
     cost_budget_usd_per_plan: float | None = None
 
 
+class TaskOverridesConfig(BaseModel):
+    """v0.20.0 D1: per-task overrides for the ``max_turns`` resolver.
+
+    Currently scopes the per-bucket huge-repo multipliers introduced in
+    v0.20.0 D1. ``None`` (default) uses the curve baked into
+    :data:`runtime.repo_probe._HUGE_BUCKET_MULTIPLIERS` (simple 3.0×,
+    medium 2.0×, complex 1.5×). Operator overrides are merged on a
+    per-bucket basis: any bucket missing from the dict falls through to
+    the default.
+
+    Example::
+
+        cfg.task_overrides.huge_repo_multipliers = {
+            "simple":  4.0,   # navigate-heavy huge repo
+            "complex": 1.2,   # already-generous bucket; modest bump
+        }
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    huge_repo_multipliers: dict[str, float] | None = None
+
+
 class HiveConfig(BaseModel):
     """File-level settings for the hive (cross-project) knowledge tier.
 
@@ -475,6 +498,11 @@ class AutodevConfig(BaseModel):
     # which uses {simple, medium, complex}.
     user_complexity: Literal["low", "medium", "high", "max"] = "medium"
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
+    # v0.20.0 D1: per-bucket huge-repo multipliers for ``max_turns``
+    # resolution. Default :class:`TaskOverridesConfig` carries
+    # ``huge_repo_multipliers=None`` — the resolver uses the baked-in
+    # curve (simple 3.0×, medium 2.0×, complex 1.5×).
+    task_overrides: TaskOverridesConfig = Field(default_factory=TaskOverridesConfig)
     hive: HiveConfig
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     # v0.16.0 hallucination-guard top-level toggle. Default True — the
