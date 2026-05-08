@@ -181,6 +181,15 @@ class TournamentPhaseConfig(BaseModel):
     # :func:`orchestrator.drift_verifier.run_drift_verifier` after an
     # A-winner outcome and may flip ``accept_phase`` to False on drift.
     drift_verifier_enabled: bool = True
+    # v0.17.0 S3: anti-slop Explorer specialist judge. When True, the
+    # tournament dispatches an additional Explorer judge alongside the
+    # standard judge ensemble; its ``FINDINGS:`` block is parsed via
+    # :func:`tournament.core.extract_explorer_findings` and emitted as
+    # ``discard``-grade lessons (confidence 0.6) for forensics + future
+    # passes. Default False — opt-in because Explorer uses an extra LLM
+    # call per pass and is most useful on long-form impl outputs where
+    # slop / hallucinated APIs are the dominant failure mode.
+    explorer_enabled: bool = False
 
     @model_validator(mode="after")
     def _validate_branches(self) -> "TournamentPhaseConfig":

@@ -194,6 +194,101 @@ class ResumeState:
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
+# v0.17.0 S3: Anti-slop Explorer specialist judge — recognized finding
+# categories. Findings whose category is not in this set are dropped
+# during extraction (graceful degradation).
+_EXPLORER_FINDING_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "slop_pattern",
+        "hallucinated_api",
+        "lazy_abstraction",
+        "cargo_cult",
+        "spec_drift",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ExplorerFinding:
+    """A single anti-pattern observation by the Explorer judge.
+
+    Emitted by :func:`extract_explorer_findings` and persisted as a
+    ``discard``-grade :class:`~state.knowledge.TournamentEvent` with
+    confidence 0.6 (see :mod:`orchestrator.plan_tournament_runner`).
+
+    Attributes:
+        candidate: The candidate label the finding applies to (``"1"``,
+            ``"2"``, or ``"3"``). The orchestrator maps this back to
+            canonical A/B/AB via the per-judge ``order`` shuffle.
+        category: One of :data:`_EXPLORER_FINDING_CATEGORIES`.
+        description: Short natural-language description of the
+            observed anti-pattern.
+    """
+
+    candidate: str
+    category: str
+    description: str
+
+
+def extract_explorer_findings(raw_response: str) -> list[ExplorerFinding]:
+    """Parse Explorer judge output and return structured findings.
+
+    Looks for a line beginning ``FINDINGS:`` followed by zero or more
+    bullet lines of the form ``- [<candidate>] <category>: <description>``.
+
+    Returns ``[]`` for ``FINDINGS: NONE``, missing block, or all-skipped
+    findings (e.g. unrecognized categories — these are dropped silently).
+
+    The parser tolerates extra whitespace + blank lines but is
+    line-anchored on the ``- [`` prefix to avoid false positives.
+    """
+    if not raw_response:
+        return []
+
+    lines = raw_response.splitlines()
+    in_findings_block = False
+    out: list[ExplorerFinding] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.upper().startswith("FINDINGS:"):
+            payload = stripped[len("FINDINGS:"):].strip()
+            if payload.upper() == "NONE":
+                return []
+            in_findings_block = True
+            continue
+        if not in_findings_block:
+            continue
+        if not stripped or not stripped.startswith("-"):
+            # End of block on first non-bullet line.
+            if stripped:
+                in_findings_block = False
+            continue
+        # Strip leading "- " then expect "[<cand>] <cat>: <desc>".
+        body = stripped.lstrip("-").strip()
+        if not body.startswith("["):
+            continue
+        close = body.find("]")
+        if close == -1:
+            continue
+        candidate = body[1:close].strip()
+        rest = body[close + 1:].strip()
+        if ":" not in rest:
+            continue
+        category_raw, _, description = rest.partition(":")
+        category = category_raw.strip()
+        description = description.strip()
+        if category not in _EXPLORER_FINDING_CATEGORIES:
+            continue
+        out.append(
+            ExplorerFinding(
+                candidate=candidate,
+                category=category,
+                description=description,
+            )
+        )
+    return out
+
+
 def parse_ranking(text: str, valid_labels: str = "123") -> list[str] | None:
     """Parse the last RANKING: line into a list of valid characters.
 
@@ -1234,6 +1329,7 @@ class Tournament(Generic[T]):
 
 __all__ = [
     "ContentHandler",
+    "ExplorerFinding",
     "LLMClient",
     "PartialPassState",
     "PassResult",
@@ -1243,6 +1339,7 @@ __all__ = [
     "TournamentError",
     "WinnerLabel",
     "aggregate_rankings",
+    "extract_explorer_findings",
     "parse_ranking",
     "randomize_for_judge",
 ]
