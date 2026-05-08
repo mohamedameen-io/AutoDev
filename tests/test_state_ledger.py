@@ -488,6 +488,113 @@ async def test_impl_tournament_complete_is_noop(tmp_path: Path) -> None:
     assert out.phases[0].tasks[0].status == "pending"
 
 
+# ---------------------------------------------------------------------------
+# v0.12.0 — multi-branch ledger ops are audit-only (no plan mutation)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_multi_branch_ledger_ops_replay_correctly(tmp_path: Path) -> None:
+    """All three v0.12.0 multi-branch ops are audit-only.
+
+    ``multi_branch_plan_tournament_start``,
+    ``multi_branch_meta_merge_complete``, and
+    ``multi_branch_plan_tournament_complete`` MUST NOT mutate plan
+    state during replay — they are forensics breadcrumbs only. The
+    per-branch ``plan_tournament_complete`` ops carry the per-branch
+    state; these aggregate three ops just record 'a multi-branch run
+    happened with these survivors and final hash'.
+    """
+    plan = _mk_plan()
+    # Append the three multi-branch ops BEFORE init_plan to test the
+    # replay path that survives the "no plan yet" branch.
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="multi_branch_plan_tournament_start",
+            payload={
+                "spec_hash": "deadbeef00000000",
+                "n_branches": 3,
+                "branch_seeds": ["100", "101", "102"],
+            },
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="multi_branch_meta_merge_complete",
+            payload={
+                "spec_hash": "deadbeef00000000",
+                "n_survivors": 3,
+                "n_steps": 2,
+                "meta_passes": 2,
+            },
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="multi_branch_plan_tournament_complete",
+            payload={
+                "spec_hash": "deadbeef00000000",
+                "n_branches": 3,
+                "n_survivors": 3,
+                "final_hash": "abcdef0123456789",
+            },
+            session_id="s1",
+        )
+
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    assert len(entries) == 4
+    # Plan state is unchanged from init_plan — the multi-branch ops did
+    # not mutate any task/phase fields.
+    assert out.plan_id == "p-test"
+    assert out.phases[0].tasks[0].status == "pending"
+    assert out.phases[0].tasks[1].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_multi_branch_start_op_before_init_plan_is_safe(
+    tmp_path: Path,
+) -> None:
+    """``multi_branch_plan_tournament_start`` may legitimately appear
+    BEFORE ``init_plan`` (the plan is built FROM the multi-branch
+    tournament's output). Replay must tolerate this ordering — same
+    invariant as ``plan_tournament_complete``."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="multi_branch_plan_tournament_start",
+            payload={
+                "spec_hash": "deadbeef00000000",
+                "n_branches": 3,
+                "branch_seeds": ["1", "2", "3"],
+            },
+            session_id="s1",
+        )
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    out, entries = replay_ledger(tmp_path)
+    # Replay completed without raising — pre-init_plan multi-branch op
+    # is treated as a no-op like plan_tournament_complete.
+    assert out is not None
+    assert len(entries) == 2
+
+
 @pytest.mark.asyncio
 async def test_corrupt_last_line_raises(tmp_path: Path) -> None:
     """Invalid JSON as the last line triggers LedgerCorruptError on next append."""
