@@ -23,6 +23,7 @@ from adapters.types import AgentSpec
 from config.schema import AutodevConfig
 from guardrails import GuardrailEnforcer, LoopDetector
 from autologging import get_logger
+from orchestrator.prm import TrajectoryStore
 from plugins.registry import PluginRegistry
 from runtime.repo_probe import RepoCapacity, probe_repo
 from state.knowledge import KnowledgeStore
@@ -69,6 +70,10 @@ class Orchestrator:
         # session. ``None`` means "not yet probed"; populated once any of
         # the high-level operations is invoked.
         self._repo_capacity: RepoCapacity | None = None
+        # v0.15.0: PRM trajectory store. Records every delegate dispatch
+        # for pattern detection. In-memory only (mirrors the rest of
+        # v0.15.0's ladder design).
+        self._trajectory_store = TrajectoryStore()
 
         # Wire AgentExtensionPlugins: merge their specs into the agent registry.
         if plugin_registry is not None:
@@ -147,6 +152,11 @@ class Orchestrator:
     @property
     def knowledge(self) -> KnowledgeStore:
         return self._knowledge
+
+    @property
+    def trajectory_store(self) -> TrajectoryStore:
+        """v0.15.0 PRM trajectory store (in-memory, per-orchestrator)."""
+        return self._trajectory_store
 
     @property
     def disable_impl_tournament(self) -> bool:

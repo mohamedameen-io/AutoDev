@@ -1774,6 +1774,76 @@ async def delegate(
         parts.append("\n\n")
         parts.append(lessons)
 
+    # v0.15.0: PRM trajectory pattern detection. Before this dispatch,
+    # consult the trajectory store for any patterns observed since the
+    # last call. If a CourseCorrection is pending for the task AND has
+    # not been emitted yet, splice the markdown block into the prompt
+    # and mark it emitted (cap one correction per fingerprint per task).
+    trajectory_store = getattr(orch, "trajectory_store", None)
+    if trajectory_store is not None and envelope.task_id:
+        try:
+            patterns = trajectory_store.analyze(envelope.task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.prm_analyze_failed",
+                task_id=envelope.task_id,
+                err=str(exc),
+            )
+            patterns = []
+        if patterns:
+            from orchestrator.prm import CourseCorrection
+
+            # Highest-severity pattern first (analyze() pre-sorts).
+            top = patterns[0]
+            cc = CourseCorrection.from_pattern(top)
+            fingerprint = cc.fingerprint()
+            if not trajectory_store.has_emitted(envelope.task_id, fingerprint):
+                parts.append("\n\n")
+                parts.append(cc.format_for_prompt())
+                trajectory_store.mark_emitted(envelope.task_id, fingerprint)
+                # Audit-only ledger op + cross-run lesson.
+                if hasattr(orch, "plan_manager") and orch.plan_manager is not None:
+                    try:
+                        await orch.plan_manager.ledger_append(
+                            op="course_correction_emitted",
+                            payload={
+                                "task_id": envelope.task_id,
+                                "taxonomy": cc.taxonomy,
+                                "pattern": cc.pattern,
+                                "suggestion": cc.suggestion[:500],
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "execute_phase.ledger_append_failed",
+                            op="course_correction_emitted",
+                            err=str(exc),
+                        )
+                try:
+                    from state.knowledge import TournamentEvent
+
+                    await orch.knowledge.record_tournament_event(
+                        TournamentEvent(
+                            event_type="course_correction",
+                            family="prm",
+                            hypothesis=(
+                                f"PRM detected {cc.pattern} on task "
+                                f"{envelope.task_id}"
+                            ),
+                            evidence=cc.suggestion[:500],
+                            next_action_hint=(
+                                f"taxonomy={cc.taxonomy}; review trajectory "
+                                "before next dispatch"
+                            ),
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.knowledge_record_failed",
+                        event="course_correction",
+                        err=str(exc),
+                    )
+
     # v0.14.0: inject EDIT SCOPE addendum for the developer role when the
     # plan/phase declares a non-empty scope. Resolution mirrors
     # :func:`orchestrator.dag.validate_edit_scope`: phase-level override
@@ -1874,6 +1944,9 @@ async def delegate(
         )
 
     orch.guardrails.pre_invocation(envelope.task_id, inv)
+    import time as _time
+
+    _t0 = _time.time()
     try:
         result = await orch.adapter.execute(inv)
     except DelegationPendingSignal as sig:
@@ -1892,6 +1965,34 @@ async def delegate(
     orch.guardrails.post_invocation(envelope.task_id, result)
     if result.success and result.text:
         orch.loop_detector.observe(envelope.task_id, role, result.text)
+
+    # v0.15.0: record this dispatch into the PRM trajectory store so the
+    # NEXT delegate call can run pattern detection against an updated
+    # event log. Pure observation — no decisions are made here; the
+    # injection logic at the top of this function consumes any pending
+    # CourseCorrection from prior analyze() runs.
+    if trajectory_store is not None and envelope.task_id:
+        try:
+            from orchestrator.prm import TrajectoryEvent
+
+            trajectory_store.record(
+                envelope.task_id,
+                TrajectoryEvent(
+                    timestamp=_t0,
+                    role=role,
+                    action=envelope.action or "dispatch",
+                    target_files=tuple(envelope.files or []),
+                    success=bool(result.success),
+                    duration_s=max(0.0, _time.time() - _t0),
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.prm_record_failed",
+                task_id=envelope.task_id,
+                err=str(exc),
+            )
+
     return result
 
 
