@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as _dt
-import json
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +12,7 @@ from click.testing import CliRunner
 from cli.commands.tournament import tournament as tournament_group
 from config.defaults import default_config
 from config.loader import save_config
-from state.paths import config_path, plan_path, autodev_root
+from state.paths import config_path, plan_path
 from state.schemas import (
     AcceptanceCriterion,
     Phase,
