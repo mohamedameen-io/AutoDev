@@ -527,4 +527,114 @@ def _read_partial_pass_state(pass_dir: Path) -> "PartialPassState | None":
     )
 
 
-__all__ = ["TournamentArtifactStore"]
+# ---------------------------------------------------------------------------
+# v0.12.0 — multi-branch resume + salvage helpers
+# ---------------------------------------------------------------------------
+
+
+_BRANCH_DIR_RE = re.compile(r"^branch-(\d+)$")
+
+
+def walk_multi_branch_resume(
+    parent_dir: Path,
+) -> list[tuple[int, "ResumeState | None"]]:
+    """Enumerate per-branch resume state from a multi-branch parent dir.
+
+    For a layout like::
+
+        tournaments/multi-{hash}/
+          branch-0/
+            initial_a.md
+            pass_01/result.json
+            ...
+          branch-1/
+            initial_a.md
+          branch-2/
+            (empty — never started)
+
+    returns ``[(0, ResumeState(...)), (1, ResumeState(...)), (2, None)]``
+    sorted by branch index. ``None`` for a branch index means the branch
+    dir is missing or has no resumable artifacts (start fresh).
+
+    Args:
+        parent_dir: ``.autodev/tournaments/multi-{spec_hash[:8]}/``
+
+    Returns:
+        List of ``(branch_index, resume_state_or_none)`` tuples sorted
+        by branch_index ascending. Empty list if ``parent_dir`` doesn't
+        exist or holds no ``branch-N/`` subdirs.
+    """
+    if not parent_dir.exists() or not parent_dir.is_dir():
+        return []
+
+    indexed: list[tuple[int, "ResumeState | None"]] = []
+    for child in parent_dir.iterdir():
+        if not child.is_dir():
+            continue
+        m = _BRANCH_DIR_RE.match(child.name)
+        if m is None:
+            continue  # skip meta-merge/ and other non-branch dirs
+        try:
+            idx = int(m.group(1))
+        except ValueError:
+            continue
+        store = TournamentArtifactStore(child)
+        try:
+            resume = store.read_resume_state()
+        except Exception:  # noqa: BLE001 — best-effort
+            resume = None
+        indexed.append((idx, resume))
+    indexed.sort(key=lambda pair: pair[0])
+    return indexed
+
+
+def latest_incumbent_md_across_branches(
+    parent_dir: Path,
+) -> tuple[str, int, int] | None:
+    """Walk all ``branch-N/`` subdirs and return the highest-pass-num incumbent.
+
+    For each branch, finds the highest-numbered ``incumbent_after_NN.md``
+    on disk (via :meth:`TournamentArtifactStore.latest_incumbent_pass_num`).
+    Across branches, picks the one with the highest pass number; ties
+    are broken by the LOWEST branch index (deterministic — branch 0 wins
+    over branch 1 when both have the same top pass).
+
+    Returns:
+        ``(md, branch_index, pass_num)`` of the winning incumbent, or
+        ``None`` if no branch has any ``incumbent_after_*.md`` files.
+        Note: this helper deliberately does NOT fall back to
+        ``initial_a.md`` — the caller (plan_phase salvage) wants the
+        highest-pass refinement on disk, not the unrefined draft.
+    """
+    if not parent_dir.exists() or not parent_dir.is_dir():
+        return None
+
+    best: tuple[str, int, int] | None = None  # (md, branch_index, pass_num)
+    # Sort branches ascending so on ties the lowest branch_index wins
+    # (because we use ``>`` for pass_num strictly, the first-seen tie
+    # is preserved).
+    for branch_idx, _ in sorted(
+        walk_multi_branch_resume(parent_dir), key=lambda x: x[0]
+    ):
+        branch_dir = parent_dir / f"branch-{branch_idx}"
+        store = TournamentArtifactStore(branch_dir)
+        pass_num = store.latest_incumbent_pass_num()
+        if pass_num is None:
+            continue
+        # Re-read the markdown for this pass.
+        path = branch_dir / f"incumbent_after_{pass_num:02d}.md"
+        try:
+            md = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        # Strict-greater: lower-indexed branch wins on ties.
+        if best is None or pass_num > best[2]:
+            best = (md, branch_idx, pass_num)
+    return best
+
+
+__all__ = [
+    "TournamentArtifactStore",
+    "latest_incumbent_md_across_branches",
+    "walk_multi_branch_resume",
+]
