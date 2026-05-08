@@ -346,3 +346,32 @@ async def test_plan_runner_passes_configured_int_through_resolver(
     assert cfg is not None
     assert cfg.max_parallel_subprocesses == 8
     assert captured_kwargs["configured"] == 8
+
+
+# ---------------------------------------------------------------------------
+# v0.12.0 — _plan_tournament_id branch_index namespacing
+# ---------------------------------------------------------------------------
+
+
+def test_plan_tournament_id_without_branch_uses_legacy_namespace() -> None:
+    """``_plan_tournament_id(spec_hash)`` with no branch index returns the
+    legacy single-branch id ``f"plan-{spec_hash[:8]}"`` (backward-compat
+    with v0.11.x and earlier)."""
+    assert ptr._plan_tournament_id(_SPEC_HASH) == "plan-01234567"
+
+
+def test_plan_tournament_id_with_branch_index_uses_multi_namespace() -> None:
+    """``_plan_tournament_id(spec_hash, branch_index=N)`` returns the
+    branch-namespaced id ``f"plan-{spec_hash[:8]}-branch{N}"`` for use
+    with v0.12.0 multi-branch tournaments."""
+    assert ptr._plan_tournament_id(_SPEC_HASH, branch_index=0) == "plan-01234567-branch0"
+    assert ptr._plan_tournament_id(_SPEC_HASH, branch_index=1) == "plan-01234567-branch1"
+    assert ptr._plan_tournament_id(_SPEC_HASH, branch_index=2) == "plan-01234567-branch2"
+
+
+def test_plan_tournament_id_branch_index_none_explicit_equals_legacy() -> None:
+    """Explicit ``branch_index=None`` matches the no-arg call (back-compat
+    surface for callers that always pass the kwarg)."""
+    assert ptr._plan_tournament_id(_SPEC_HASH, branch_index=None) == ptr._plan_tournament_id(
+        _SPEC_HASH
+    )

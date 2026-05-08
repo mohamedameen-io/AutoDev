@@ -49,14 +49,34 @@ logger = get_logger(__name__)
 _TOURNAMENT_ROLES: tuple[str, ...] = ("critic_t", "architect_b", "synthesizer", "judge")
 
 
-def _plan_tournament_id(spec_hash: str) -> str:
+def _plan_tournament_id(spec_hash: str, branch_index: int | None = None) -> str:
     """Derive the deterministic plan-tournament id from a spec hash.
 
     Centralised so :mod:`orchestrator.plan_phase` (which reads the salvage
     artifacts on a tournament failure) and the runner itself can never drift
     in their notion of "where this tournament lives on disk."
+
+    Args:
+        spec_hash: 16-hex-char digest of the user spec.
+        branch_index: Optional branch index for v0.12.0 multi-branch
+            tournaments. When ``None`` (default), returns the legacy
+            single-branch id ``f"plan-{spec_hash[:8]}"``. When set,
+            returns the branch-namespaced id
+            ``f"plan-{spec_hash[:8]}-branch{N}"``. Used to construct a
+            distinct ``tournament_id`` per branch so resume state and
+            ledger ops can be correlated.
+
+    Note: the on-disk ``artifact_dir`` for a multi-branch run uses the
+    ``tournaments/multi-{spec_hash[:8]}/branch-N/`` layout (see
+    :func:`run_plan_tournament`); the ``tournament_id`` returned here is
+    used as a logging / ledger correlation key, NOT as the directory
+    name. They differ deliberately: the parent ``multi-{hash}/`` dir
+    keeps branch artifacts grouped, while the per-branch id stays a
+    flat string for breadcrumb compatibility.
     """
-    return f"plan-{spec_hash[:8]}"
+    if branch_index is None:
+        return f"plan-{spec_hash[:8]}"
+    return f"plan-{spec_hash[:8]}-branch{branch_index}"
 
 
 def _build_role_overrides(
