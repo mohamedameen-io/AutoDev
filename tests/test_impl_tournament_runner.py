@@ -306,3 +306,123 @@ async def test_run_impl_tournament_writes_ledger_breadcrumb(tmp_path: Path) -> N
     assert "tournament_id" in entry.payload
     assert "passes" in entry.payload
     assert "winner_last" in entry.payload
+
+
+# ---------------------------------------------------------------------------
+# v0.10.0 — resolve_parallelism wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_impl_runner_resolves_parallelism_via_runtime_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The impl-runner asks ``runtime.resource_probe.resolve_parallelism``
+    for the value it stuffs into ``TournamentConfig.max_parallel_subprocesses``.
+
+    Strategy: intercept ``ImplTournament`` in the runner's namespace with a
+    fake whose ``__init__`` captures the resolved cfg, then run the runner.
+    """
+    _git_init(tmp_path)
+    adapter = _tournament_adapter()
+    orch = _orch_with_judge(
+        tmp_path,
+        adapter,
+        judge_model="sonnet",
+        auto_disable=[],
+    )
+    await orch.plan_manager.init_plan(_mk_plan())
+    task = await orch.plan_manager.get_task("1.1")
+    assert task is not None
+
+    # Default config: max_parallel_subprocesses is None (v0.10.0 default).
+    assert orch.cfg.tournaments.max_parallel_subprocesses is None
+
+    captured: dict = {}
+
+    def fake_resolve(
+        configured: int | None,
+        capacity: object,
+        role_mix: str,
+        num_judges: int,
+    ) -> int:
+        captured.update(
+            configured=configured,
+            role_mix=role_mix,
+            num_judges=num_judges,
+        )
+        return 7
+
+    captured_cfg: list = []
+
+    class _CapturingImplTournament:
+        def __init__(self, *, cfg, **_kwargs) -> None:
+            captured_cfg.append(cfg)
+
+        async def run(self, *, task_prompt, initial):
+            return initial, []
+
+    from orchestrator import impl_tournament_runner as itr
+
+    monkeypatch.setattr(itr, "resolve_parallelism", fake_resolve)
+    monkeypatch.setattr(itr, "ImplTournament", _CapturingImplTournament)
+
+    await run_impl_tournament(orch, task, INITIAL_BUNDLE)
+
+    assert captured_cfg, "ImplTournament was never constructed"
+    cfg = captured_cfg[0]
+    assert cfg.max_parallel_subprocesses == 7
+    assert captured["role_mix"] == "impl"
+    assert captured["configured"] is None
+    assert captured["num_judges"] == 1  # impl default
+
+
+@pytest.mark.asyncio
+async def test_impl_runner_passes_configured_int_through_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the operator pins ``max_parallel_subprocesses=4``, the runner
+    forwards that value into ``resolve_parallelism``."""
+    _git_init(tmp_path)
+    adapter = _tournament_adapter()
+    orch = _orch_with_judge(
+        tmp_path,
+        adapter,
+        judge_model="sonnet",
+        auto_disable=[],
+    )
+    orch.cfg.tournaments.max_parallel_subprocesses = 4
+    await orch.plan_manager.init_plan(_mk_plan())
+    task = await orch.plan_manager.get_task("1.1")
+    assert task is not None
+
+    captured: dict = {}
+
+    def fake_resolve(
+        configured: int | None,
+        capacity: object,
+        role_mix: str,
+        num_judges: int,
+    ) -> int:
+        captured["configured"] = configured
+        return configured if configured is not None else 1
+
+    captured_cfg: list = []
+
+    class _CapturingImplTournament:
+        def __init__(self, *, cfg, **_kwargs) -> None:
+            captured_cfg.append(cfg)
+
+        async def run(self, *, task_prompt, initial):
+            return initial, []
+
+    from orchestrator import impl_tournament_runner as itr
+
+    monkeypatch.setattr(itr, "resolve_parallelism", fake_resolve)
+    monkeypatch.setattr(itr, "ImplTournament", _CapturingImplTournament)
+
+    await run_impl_tournament(orch, task, INITIAL_BUNDLE)
+
+    assert captured_cfg
+    assert captured_cfg[0].max_parallel_subprocesses == 4
+    assert captured["configured"] == 4

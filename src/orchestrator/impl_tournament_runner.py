@@ -29,6 +29,7 @@ from adapters import InlineAdapter
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
 from orchestrator.worktree import WorktreeManager
+from runtime.resource_probe import probe_host, resolve_parallelism
 from state.evidence import write_evidence
 from state.paths import autodev_root
 from state.schemas import TournamentEvidence
@@ -339,17 +340,24 @@ async def run_impl_tournament(
     _impl_complex_override_unused = cfg.complex_plan_num_judges_override
     del _impl_complex_override_unused
 
-    # v0.10.0: ``max_parallel_subprocesses`` is now ``int | None`` in the
-    # config schema; ``None`` is replaced by host-aware
-    # :func:`runtime.resource_probe.resolve_parallelism` in the next
-    # commit. Until then, keep the legacy literal default (3) when None.
-    _legacy_parallelism = orch.cfg.tournaments.max_parallel_subprocesses or 3
+    # v0.10.0: resolve subprocess parallelism via the runtime probe.
+    # See :mod:`orchestrator.plan_tournament_runner` for the rationale.
+    # Note: impl tournaments are single-judge by convention so the
+    # cohort cap is always 1; the resolver still runs to honor explicit
+    # operator pins and to log ``tournament.parallelism_resolved`` for
+    # forensics consistency across the three runner surfaces.
+    resolved_parallelism = resolve_parallelism(
+        configured=orch.cfg.tournaments.max_parallel_subprocesses,
+        capacity=probe_host(),
+        role_mix="impl",
+        num_judges=cfg.num_judges,
+    )
     tcfg = TournamentConfig(
         num_judges=cfg.num_judges,
         convergence_k=cfg.convergence_k,
         max_rounds=cfg.max_rounds,
         model=model,
-        max_parallel_subprocesses=_legacy_parallelism,
+        max_parallel_subprocesses=resolved_parallelism,
         score_stability_window=cfg.score_stability_window,
         score_stability_max_delta=cfg.score_stability_max_delta,
         winner_stability_window=cfg.winner_stability_window,
