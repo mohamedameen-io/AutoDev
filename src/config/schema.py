@@ -389,6 +389,14 @@ class KnowledgeConfig(BaseModel):
             "synthesizer",
         ]
     )
+    # v0.18.0 B1: lane-aware lesson injection toggle. When True (default),
+    # :meth:`KnowledgeStore.inject_block` filters lessons by branch lane
+    # when a ``lane=`` argument is supplied: only lessons whose metadata
+    # lane matches OR have no lane tag (universal) are injected. When
+    # False, lane filtering is disabled — equivalent to v0.17.0 behavior.
+    # Default ON because the cost is negligible (one dict lookup per
+    # entry) and the precision win on multi-branch runs is significant.
+    lane_aware_injection_enabled: bool = True
 
 
 class AutodevConfig(BaseModel):

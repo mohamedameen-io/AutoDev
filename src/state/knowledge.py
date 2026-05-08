@@ -170,6 +170,13 @@ class TournamentEvent:
     evidence: str
     rollback_reason: str | None = None
     next_action_hint: str | None = None
+    # v0.18.0 B1: branch lane label for lane-aware lesson injection. When
+    # set (e.g. ``"distant-scout"``, ``"local-tweak"``), the entry is
+    # tagged so :meth:`KnowledgeStore.inject_block` can filter to lessons
+    # learned in matching lanes (or universal lane-less ones). ``None``
+    # (default) marks the lesson as universal — injected regardless of
+    # the consuming branch's lane.
+    lane: str | None = None
 
     def to_lesson_text(self) -> str:
         """Render the event as a single ASI-style lesson string.
@@ -572,6 +579,11 @@ class KnowledgeStore:
             metadata["rollback_reason"] = event.rollback_reason
         if event.next_action_hint is not None:
             metadata["next_action_hint"] = event.next_action_hint
+        # v0.18.0 B1: persist the optional lane tag so lane-aware injection
+        # (:meth:`inject_block`) can filter universal vs lane-specific
+        # lessons. ``None`` (default) leaves the tag absent → universal.
+        if event.lane is not None:
+            metadata["lane"] = event.lane
         return await self.record(
             text,
             role_source="critic_t",
@@ -645,6 +657,7 @@ class KnowledgeStore:
         limit: int | None = None,
         *,
         task_id: str | None = None,  # preserved for Phase-4 caller compatibility
+        lane: str | None = None,
     ) -> str:
         """Return the compact ``Lessons learned:`` block for a given role.
 
@@ -659,6 +672,13 @@ class KnowledgeStore:
             Lessons learned from prior work:
             - [conf:0.80] <lesson text>
             - [conf:0.75] <lesson text>
+
+        v0.18.0 B1 lane-aware filter: when ``lane`` is provided AND
+        :attr:`KnowledgeConfig.lane_aware_injection_enabled` is True
+        (default), entries are filtered so only lessons whose
+        ``metadata["lane"]`` matches OR whose lane tag is absent (universal)
+        survive. When ``lane`` is None or the toggle is False, no lane
+        filter is applied — the legacy behavior is preserved.
         """
         if not self.enabled:
             return ""
@@ -671,11 +691,27 @@ class KnowledgeStore:
         if cap <= 0:
             return ""
 
+        # v0.18.0 B1: lane filter predicate. Universal lessons (no
+        # ``metadata["lane"]``) are always included; lane-tagged lessons
+        # match only when the consuming branch's lane equals the tag.
+        lane_aware = lane is not None and getattr(
+            kcfg, "lane_aware_injection_enabled", True
+        )
+
+        def _lane_match(entry: KnowledgeEntry) -> bool:
+            if not lane_aware:
+                return True
+            entry_lane = entry.metadata.get("lane") if entry.metadata else None
+            return entry_lane is None or entry_lane == lane
+
         # Rank each tier independently; merge with swarm-first priority.
         swarm = await self.read_all(tier="swarm")
         hive: list[KnowledgeEntry] = []
         if self.hive_enabled:
             hive = await self.read_all(tier="hive")
+        if lane_aware:
+            swarm = [e for e in swarm if _lane_match(e)]
+            hive = [e for e in hive if _lane_match(e)]
 
         now = time.time()
         swarm_ranked = sorted(
