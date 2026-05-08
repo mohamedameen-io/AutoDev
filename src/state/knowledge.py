@@ -50,6 +50,7 @@ import math
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
@@ -105,6 +106,95 @@ class RejectedLesson(BaseModel):
     text: str
     reason: str
     rejected_at: str
+
+
+# v0.15.0: Tournament + escalation event types that drive cross-run lessons.
+# Each event is converted into a structured ASI-style lesson string and
+# persisted via :meth:`KnowledgeStore.record_tournament_event` so future
+# tournament passes (and future runs of the same project) can consult prior
+# wins, discards, escalations, course-corrections, and soft-blockers.
+TournamentEventType = Literal[
+    "winner_promoted",
+    "discard",
+    "escalation",
+    "course_correction",
+    "soft_blocker",
+]
+
+
+# Confidence map per event_type. Higher confidence => higher prompt weight via
+# the existing ranking score. Tuned so winners outrank discards by ~1.7×, and
+# soft-blockers (the strongest "do-not-repeat" signal we have) are highest of
+# the failure events.
+_EVENT_CONFIDENCE: dict[TournamentEventType, float] = {
+    "winner_promoted": 0.85,
+    "discard": 0.5,
+    "escalation": 0.7,
+    "course_correction": 0.6,
+    "soft_blocker": 0.8,
+}
+
+
+@dataclass
+class TournamentEvent:
+    """A single tournament / escalation event suitable for lessons recording.
+
+    The :class:`KnowledgeStore.record_tournament_event` helper converts an
+    instance of this dataclass into a structured ASI-style lesson string
+    and persists it via the regular :meth:`KnowledgeStore.record` write
+    path.
+
+    Attributes:
+        event_type: One of the values in :data:`TournamentEventType` —
+            governs both the structured prefix used in the lesson text
+            and the confidence assigned to the entry.
+        family: Short identifier for the source subsystem
+            (e.g. ``"plan-tournament"``, ``"multi-branch-meta-merge"``,
+            ``"execute-phase"``, ``"prm"``). Surfaces in the rendered
+            lesson so future runs can attribute prior context.
+        hypothesis: Compact natural-language summary of what was
+            tried / found.
+        evidence: Supporting evidence string (e.g. judge counts, file
+            paths, error excerpts). Truncation is handled inside
+            :meth:`KnowledgeStore.record` via ``_truncate``.
+        rollback_reason: Optional rollback / discard reason — populated
+            for ``discard`` events so future passes can avoid the same
+            structural mistake.
+        next_action_hint: Optional natural-language hint for the next
+            attempt — recorded as part of the lesson body.
+    """
+
+    event_type: TournamentEventType
+    family: str
+    hypothesis: str
+    evidence: str
+    rollback_reason: str | None = None
+    next_action_hint: str | None = None
+
+    def to_lesson_text(self) -> str:
+        """Render the event as a single ASI-style lesson string.
+
+        The format is line-oriented and machine-greppable so test scaffolds
+        can assert on stable substrings:
+
+            EVENT: <event_type>
+            FAMILY: <family>
+            HYPOTHESIS: <hypothesis>
+            EVIDENCE: <evidence>
+            ROLLBACK: <rollback_reason>   # optional
+            NEXT: <next_action_hint>      # optional
+        """
+        parts = [
+            f"EVENT: {self.event_type}",
+            f"FAMILY: {self.family}",
+            f"HYPOTHESIS: {self.hypothesis}",
+            f"EVIDENCE: {self.evidence}",
+        ]
+        if self.rollback_reason:
+            parts.append(f"ROLLBACK: {self.rollback_reason}")
+        if self.next_action_hint:
+            parts.append(f"NEXT: {self.next_action_hint}")
+        return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +544,41 @@ class KnowledgeStore:
             self._log.info("knowledge.promoted", id=new.id)
         return new
 
+    async def record_tournament_event(
+        self,
+        event: TournamentEvent,
+    ) -> KnowledgeEntry | None:
+        """Record a :class:`TournamentEvent` as a lesson in the swarm tier.
+
+        Wraps :meth:`record` with structured ASI-style text built by
+        :meth:`TournamentEvent.to_lesson_text`. Confidence is set per
+        :data:`_EVENT_CONFIDENCE`. ``role_source`` is fixed to ``"critic_t"``
+        so the entry surfaces to per-pass critics via the regular
+        :meth:`inject_block` wiring at ``plan_phase.py`` /
+        ``execute_phase.py`` call sites.
+
+        Returns the persisted entry (or merged duplicate), or ``None`` when
+        the store is disabled. Errors propagate to the caller — callers are
+        encouraged to swallow knowledge errors with a WARNING since lessons
+        recording must never block tournament progress.
+        """
+        confidence = _EVENT_CONFIDENCE.get(event.event_type, 0.5)
+        text = event.to_lesson_text()
+        metadata: dict[str, Any] = {
+            "event_type": event.event_type,
+            "family": event.family,
+        }
+        if event.rollback_reason is not None:
+            metadata["rollback_reason"] = event.rollback_reason
+        if event.next_action_hint is not None:
+            metadata["next_action_hint"] = event.next_action_hint
+        return await self.record(
+            text,
+            role_source="critic_t",
+            confidence=confidence,
+            metadata=metadata,
+        )
+
     async def reject(self, lesson_id: str, reason: str) -> None:
         """Remove a lesson from the swarm and append it to rejected_lessons.jsonl."""
         swarm_file = knowledge_path(self._cwd)
@@ -742,5 +867,7 @@ __all__ = [
     "KnowledgeEntry",
     "KnowledgeStore",
     "RejectedLesson",
+    "TournamentEvent",
+    "TournamentEventType",
     "jaccard_bigrams",
 ]
