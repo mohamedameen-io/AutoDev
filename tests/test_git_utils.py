@@ -7,7 +7,13 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 
-from adapters.git_utils import _diff_files, _git_diff, _git_porcelain_set
+from adapters.git_utils import (
+    _diff_files,
+    _git_diff,
+    _git_diff_range,
+    _git_porcelain_set,
+    _git_rev_parse_head,
+)
 
 
 def _init_git_repo(path: Path) -> None:
@@ -223,4 +229,83 @@ def test_git_diff_empty_output(tmp_path: Path) -> None:
     mock_result.stdout = ""
     with patch("subprocess.run", return_value=mock_result):
         result = _git_diff(tmp_path)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0: _git_diff_range and _git_rev_parse_head
+# ---------------------------------------------------------------------------
+
+
+def _commit_file(repo: Path, name: str, content: str, msg: str) -> str:
+    """Add and commit ``name`` with ``content``. Returns the new HEAD SHA."""
+    (repo / name).write_text(content)
+    subprocess.run(
+        ["git", "add", name],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", msg],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.strip()
+
+
+def test_git_diff_range_returns_unified_diff_between_commits(tmp_path: Path) -> None:
+    """``_git_diff_range`` returns the unified diff for ``from_sha..to_sha``."""
+    _init_git_repo(tmp_path)
+    sha_a = _commit_file(tmp_path, "a.txt", "first\n", "init")
+    sha_b = _commit_file(tmp_path, "a.txt", "first\nsecond\n", "add line")
+    diff = _git_diff_range(tmp_path, sha_a, sha_b)
+    assert diff is not None
+    assert "+second" in diff
+    # The diff header references the file changed.
+    assert "a.txt" in diff
+
+
+def test_git_diff_range_handles_invalid_sha_returns_none(tmp_path: Path) -> None:
+    """Bogus shas → git returns non-zero → ``None``."""
+    _init_git_repo(tmp_path)
+    _commit_file(tmp_path, "a.txt", "x\n", "init")
+    diff = _git_diff_range(tmp_path, "deadbeef", "cafebabe")
+    assert diff is None
+
+
+def test_git_diff_range_subprocess_error(tmp_path: Path) -> None:
+    """``OSError`` from subprocess → ``None``."""
+    with patch("subprocess.run", side_effect=OSError("fail")):
+        result = _git_diff_range(tmp_path, "a", "b")
+    assert result is None
+
+
+def test_git_rev_parse_head_returns_sha(tmp_path: Path) -> None:
+    """``_git_rev_parse_head`` returns the current HEAD sha."""
+    _init_git_repo(tmp_path)
+    sha = _commit_file(tmp_path, "a.txt", "x\n", "init")
+    result = _git_rev_parse_head(tmp_path)
+    assert result == sha
+
+
+def test_git_rev_parse_head_outside_repo_returns_none(tmp_path: Path) -> None:
+    """No ``.git`` dir → ``None`` without invoking subprocess."""
+    result = _git_rev_parse_head(tmp_path)
+    assert result is None
+
+
+def test_git_rev_parse_head_subprocess_error(tmp_path: Path) -> None:
+    """``OSError`` from subprocess → ``None``."""
+    _init_git_repo(tmp_path)
+    with patch("subprocess.run", side_effect=OSError("fail")):
+        result = _git_rev_parse_head(tmp_path)
     assert result is None
