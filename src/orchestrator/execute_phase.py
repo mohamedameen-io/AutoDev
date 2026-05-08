@@ -216,6 +216,158 @@ async def _escalate_conflict_to_critic(
     return _parse_conflict_resolution(result.text or "")
 
 
+# v0.15.0: stuck-recovery escalation parser + helper. Mirrors the conflict
+# escalation pattern above so the structural code shape is consistent
+# across both gated critic-escalation modes.
+
+StuckAction = Literal["refine", "pivot", "soft-blocker"]
+
+
+@dataclass
+class StuckResolution:
+    """Parsed result from ``critic_sounding_board`` in STUCK RECOVERY MODE.
+
+    Attributes:
+        action: One of ``refine`` / ``pivot`` / ``soft-blocker``.
+            Defaults to ``refine`` (the least-disruptive fallback —
+            matches the documented prompt fallback).
+        guidance: Free-form text from the critic intended for the next
+            developer attempt (or, in the soft-blocker case, the
+            description of what the human needs to decide). Empty when
+            the parser could not extract guidance.
+    """
+
+    action: StuckAction = "refine"
+    guidance: str = ""
+
+
+# Regex matching the trailing ``RESOLUTION:`` directive on its own line.
+# Mirrors :data:`_CONFLICT_DIRECTIVE_RE` shape.
+_STUCK_DIRECTIVE_RE = re.compile(
+    r"^RESOLUTION:\s*(refine|pivot|soft-blocker)\s*$",
+    re.MULTILINE,
+)
+
+
+def _parse_stuck_resolution(critic_response: str) -> StuckResolution:
+    """Extract a :class:`StuckResolution` from the critic's text.
+
+    Looks for a ``RESOLUTION: <action>`` line, anchored to its own line.
+    On parse failure (no directive found, multiple-but-final-is-invalid,
+    etc.) returns ``StuckResolution(action="refine")`` so the caller
+    safely falls through to the least-disruptive next step.
+
+    Captures everything BEFORE the matched directive line as ``guidance``
+    (stripped of trailing whitespace). The guidance is what the
+    orchestrator passes back to the developer when re-invoking (refine /
+    pivot) or surfaces in the blocked_reason text (soft-blocker).
+    """
+    if not critic_response:
+        return StuckResolution()
+
+    matches = list(_STUCK_DIRECTIVE_RE.finditer(critic_response))
+    if not matches:
+        return StuckResolution()
+    last = matches[-1]
+    action_raw = last.group(1)
+    if action_raw not in ("refine", "pivot", "soft-blocker"):
+        return StuckResolution()
+    action: StuckAction = cast("StuckAction", action_raw)
+
+    guidance = critic_response[: last.start()].strip()
+    return StuckResolution(action=action, guidance=guidance)
+
+
+async def _escalate_stuck_to_critic(
+    orch: "Orchestrator",
+    task: Task,
+    *,
+    stuck_state: object,
+    ladder_step: str,
+    recent_evidence: str = "",
+    prior_attempts: list[str] | None = None,
+) -> StuckResolution:
+    """Invoke ``critic_sounding_board`` in STUCK RECOVERY MODE.
+
+    Builds a :class:`DelegationEnvelope` carrying a ``STUCK_CONTEXT:``
+    block (failing task id, current discard / pivot counts, ladder
+    step, prior attempts, freshest evidence) so the prompt's gated
+    STUCK RECOVERY MODE section activates. Parses the response via
+    :func:`_parse_stuck_resolution`.
+
+    Args:
+        orch: Orchestrator instance.
+        task: Task whose retries have stalled.
+        stuck_state: :class:`orchestrator.escalation_ladder.StuckState`
+            for the failing task. Typed ``object`` here to avoid a
+            cycle with the ladder module at import time.
+        ladder_step: One of ``"REFINE" | "PIVOT" | "SOFT_BLOCKER"`` —
+            the ladder's recommendation. Surfaced in the prompt as a
+            hint to the critic about which response mode to take.
+        recent_evidence: Freshest excerpt of failing-test / reviewer /
+            error output. Empty string is allowed.
+        prior_attempts: Optional list of one-line summaries of the
+            most recent attempts.
+
+    Returns a :class:`StuckResolution`. The caller (typically
+    :func:`_try_retry_or_escalate`) branches on ``resolution.action``:
+
+    * ``refine`` → re-invoke the developer with ``resolution.guidance``
+      injected as context.
+    * ``pivot`` → re-invoke the developer with the radical-direction
+      guidance as context (and the orchestrator increments
+      ``pivot_count``).
+    * ``soft-blocker`` → mark the task blocked with the guidance text
+      as the ``blocked_reason``; emit a ``soft_blocker_handoff``
+      ledger op for forensics.
+    """
+    # Indented YAML-ish prior_attempts block; empty when no attempts.
+    if prior_attempts:
+        attempts_block = "\n".join(f"  - {a}" for a in prior_attempts)
+    else:
+        attempts_block = "  - (no prior attempts recorded)"
+
+    # ``stuck_state`` is typed ``object`` to avoid a cyclic import at
+    # module-load time. We accept anything with the attributes we need.
+    discard_count = int(getattr(stuck_state, "discard_count", 0))
+    pivot_count = int(getattr(stuck_state, "pivot_count", 0))
+    last_event = str(getattr(stuck_state, "last_event", "") or "")
+
+    stuck_context = (
+        "STUCK_CONTEXT:\n"
+        f"failing_task_id: {task.id}\n"
+        f"discard_count: {discard_count}\n"
+        f"pivot_count: {pivot_count}\n"
+        f"last_event: {last_event}\n"
+        f"ladder_step: {ladder_step}\n"
+        f"prior_attempts:\n{attempts_block}\n"
+        "recent_evidence: |\n"
+        f"{_indent_block(recent_evidence)}\n"
+    )
+
+    env = DelegationEnvelope(
+        task_id=task.id,
+        target_agent="critic_sounding_board",
+        action="critique",
+        acceptance=(
+            "End your response with exactly one RESOLUTION: directive "
+            "(refine / pivot / soft-blocker)."
+        ),
+        context={
+            "task_id": task.id,
+            "stuck_context_marker": True,
+            "ladder_step": ladder_step,
+        },
+    )
+    result = await delegate(
+        orch,
+        "critic_sounding_board",
+        env,
+        extra_context=stuck_context,
+    )
+    return _parse_stuck_resolution(result.text or "")
+
+
 def _indent_block(text: str, prefix: str = "  ") -> str:
     """Indent every line of ``text`` by ``prefix`` for the YAML-ish block.
 
@@ -1750,6 +1902,8 @@ async def _record_lessons(
 
 
 __all__ = [
+    "ConflictResolution",
+    "StuckResolution",
     "TaskEscalatedError",
     "delegate",
     "run_execute_phase",
