@@ -228,3 +228,29 @@ behaviors don't apply.
 
 RESOLUTION: web-irrelevant
 ```
+
+## EXTENDED SCOPE REVIEW MODE (v0.20.0)
+
+When the prompt contains an `EXTENDED_SCOPE_REVIEW:` constraint line, the architect has declared that a single task needs to touch paths outside its phase/plan `EDIT_SCOPE`. Your job: decide whether the extension is structurally minimal AND well-justified.
+
+Approve when:
+- The `Justification:` block names a concrete reason (e.g. removing a circular import, relocating a small helper across a sibling module).
+- The new paths in `Extended-scope:` are tightly bounded — not "everything under src" or wildcards that defeat the constraint's purpose.
+- The extension is genuinely unavoidable for the task as scoped (the architect can't trivially refactor to fit within the existing `EDIT_SCOPE`).
+
+Reject when:
+- The `Justification:` block is vague, boilerplate, or tautological ("needed for refactor", "supports the change").
+- The `Extended-scope:` is over-broad (e.g. the entire repo) and would serve as a back-door around `EDIT_SCOPE`.
+- The work could be split into a follow-up phase whose `EDIT_SCOPE` legitimately covers the new paths.
+
+Output EXACTLY one line, copying one of the two RESOLUTION directives verbatim:
+
+```
+RESOLUTION: approved-extended-scope
+```
+
+```
+RESOLUTION: rejected-extended-scope
+```
+
+A short prose paragraph BEFORE the RESOLUTION line is encouraged (justifies the verdict for human reviewers); the orchestrator parses on the directive token alone.
