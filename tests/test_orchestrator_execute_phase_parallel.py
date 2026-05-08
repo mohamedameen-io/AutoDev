@@ -272,6 +272,53 @@ async def test_failed_task_cascade_blocks_dependent(
 
 
 @pytest.mark.asyncio
+async def test_maybe_run_phase_review_skips_when_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.11.0 commit 11: _maybe_run_phase_review returns early when any
+    task in the phase is currently in-flight, even if the others are
+    terminal. Without this guard, a worker that finishes early could
+    fire phase-review while siblings are still running."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan([_t("1.1"), _t("1.2")]))
+    orch = _make_orch(tmp_path, pm)
+    orch.cfg.tournaments.phase_review.enabled = True
+
+    # Walk 1.1 to complete WITHOUT clearing in_flight on 1.2.
+    for status in (
+        "in_progress",
+        "coded",
+        "auto_gated",
+        "reviewed",
+        "tested",
+        "tournamented",
+        "complete",
+    ):
+        await pm.update_task_status("1.1", status)
+    # Mark 1.2 as in_progress + in_flight.
+    await pm.update_task_status("1.2", "in_progress")
+    await pm.mark_in_flight("1.2")
+
+    fired: list[str] = []
+
+    async def stub_run_phase_review(orch_, phase):
+        fired.append(phase.id)
+
+    monkeypatch.setattr(ep, "_run_phase_review", stub_run_phase_review)
+
+    # 1.1 is complete, 1.2 is in_progress + in_flight → guard returns.
+    await ep._maybe_run_phase_review(orch, "1")
+    assert fired == []
+
+    # Clear in_flight → guard now allows the call (but 1.2 is not
+    # terminal so the all-terminal check still defers).
+    await pm.clear_in_flight("1.2")
+    await ep._maybe_run_phase_review(orch, "1")
+    # Still not fired because 1.2 isn't terminal.
+    assert fired == []
+
+
+@pytest.mark.asyncio
 async def test_phase_review_does_not_double_fire_on_concurrent_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
