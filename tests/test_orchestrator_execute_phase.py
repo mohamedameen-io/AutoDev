@@ -582,3 +582,30 @@ async def test_developer_max_turns_falls_back_to_spec_when_complexity_none(
     assert inv.max_turns == 10
     # Orchestrator fallback when no per-task override: 900s.
     assert inv.timeout_s == 900
+
+
+def test_developer_envelope_context_contains_complexity_hint() -> None:
+    """v0.8.0 polish: the developer's envelope context surfaces the task
+    complexity so the prompt itself reinforces the per-task budget. A task
+    with ``complexity=None`` defaults to the prompt-side ``"medium"``
+    fallback (matching the orchestrator's spec-default shape)."""
+    from orchestrator.execute_phase import _developer_envelope
+
+    complex_task = Task(
+        id="1.1",
+        phase_id="1",
+        title="big refactor",
+        description="d",
+        complexity="complex",
+    )
+    env = _developer_envelope(complex_task, extra_issues=[])
+    assert env.context["complexity"] == "complex"
+
+    untagged_task = Task(
+        id="1.2",
+        phase_id="1",
+        title="legacy",
+        description="d",
+    )
+    env_legacy = _developer_envelope(untagged_task, extra_issues=[])
+    assert env_legacy.context["complexity"] == "medium"

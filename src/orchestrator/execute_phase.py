@@ -531,6 +531,13 @@ async def delegate(
 def _developer_envelope(task: Task, extra_issues: list[str]) -> DelegationEnvelope:
     acceptance = " | ".join(a.description for a in task.acceptance) or None
     context: dict = {"task_title": task.title, "task_description": task.description}
+    # v0.8.0: surface the architect-tagged complexity bucket to the developer
+    # so it can pace itself (a ``complex`` task gets 40 turns and should not
+    # wrap up after 5 — the prompt-level hint reinforces the budget the
+    # adapter-level ``max_turns`` enforces). Defaults to ``"medium"`` when
+    # the architect didn't tag a bucket — matches the orchestrator's spec
+    # fallback shape and avoids surfacing the raw ``None`` value.
+    context["complexity"] = task.complexity or "medium"
     if extra_issues:
         context["prior_issues"] = extra_issues
     return DelegationEnvelope(
