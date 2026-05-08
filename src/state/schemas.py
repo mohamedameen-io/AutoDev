@@ -81,7 +81,15 @@ class AcceptanceCriterion(BaseModel):
 
 
 class Task(BaseModel):
-    """Leaf unit of work that the ``coder`` role implements."""
+    """Leaf unit of work that the ``coder`` role implements.
+
+    v0.17.0 S5: ``files`` accepts glob patterns (``*``, ``?``, ``[...]``).
+    Downstream consumers (:func:`orchestrator.dag.find_file_overlaps`,
+    :func:`orchestrator.dag.validate_edit_scope`) expand globs against a
+    tracked-files cache. The schema validator here permits both literal
+    paths and glob entries without distinguishing — runtime expansion
+    handles the cache lookup.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -91,6 +99,36 @@ class Task(BaseModel):
     description: str
     status: TaskStatus = "pending"
     files: list[str] = Field(default_factory=list)
+
+    @field_validator("files", mode="after")
+    @classmethod
+    def _validate_files_format(cls, v: list[str]) -> list[str]:
+        """Permit glob entries; reject only structurally bogus paths.
+
+        v0.17.0 S5: an architect may declare ``files: ["src/qa/*.py"]``.
+        The validator does not at this layer attempt to resolve globs
+        against the project — that's the runtime expansion's job. Here
+        we just enforce that every entry is a non-empty string and is
+        repo-relative (no leading ``/``, no ``..`` segments). Same shape
+        as :func:`_validate_edit_scope_paths` so the surface is uniform.
+        """
+        for raw in v:
+            if not isinstance(raw, str) or not raw:
+                raise ValueError(
+                    f"Task.files entries must be non-empty strings, got {raw!r}"
+                )
+            if raw.startswith("/"):
+                raise ValueError(
+                    f"Task.files entries must be repo-relative, got absolute "
+                    f"path {raw!r}"
+                )
+            parts = raw.split("/")
+            if any(p == ".." for p in parts):
+                raise ValueError(
+                    f"Task.files entries must not contain '..' segments, "
+                    f"got {raw!r}"
+                )
+        return v
     acceptance: list[AcceptanceCriterion] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
     requires: list[Literal["hardware", "human", "external_service", "manual"]] = Field(
