@@ -42,15 +42,25 @@ logger = get_logger(component="runtime.repo_probe")
 _HUGE_FILE_COUNT_THRESHOLD = 20_000
 _HUGE_TOTAL_BYTES_THRESHOLD = 5 * 1024**3  # 5 GB
 
-# Multiplier applied when ``capacity.is_huge`` is True. Justification: the
-# motivating Unity QNX run hit ``error_max_turns`` on simple tasks at the
-# default 10-turn budget; doubling to 20 turns / simple, 40 / medium, 80 /
-# complex restored progress without dramatically increasing per-task cost
-# (worst case: 2× the default — well below the 3-retry escalation surface
-# that already existed pre-v0.13.0). See plan rollback signal: lower to 1.5
-# in v0.13.1 if average per-task cost on huge repos exceeds 2× v0.13.0
-# baseline.
+# Multiplier applied when ``capacity.is_huge`` is True. v0.13.0 used a single
+# 2.0× multiplier across all buckets; v0.20.0 D1 introduces per-bucket curves
+# because the navigation cost is unevenly distributed: simple tasks burn the
+# most extra turns just navigating the repo, while complex tasks already
+# carry generous budgets. Default per-bucket curves:
+#
+#     simple  → 3.0× (10 → 30)   # heavy navigation overhead
+#     medium  → 2.0× (20 → 40)   # legacy multiplier preserved
+#     complex → 1.5× (40 → 60)   # already generous; modest bump
+#
+# The legacy single-multiplier (used as a fallback when a bucket isn't in the
+# map) remains 2.0 for byte-identical behavior on operator-supplied ``base``
+# overrides (which have no complexity bucket to consult).
 _HUGE_MULTIPLIER = 2.0
+_HUGE_BUCKET_MULTIPLIERS: dict[str, float] = {
+    "simple": 3.0,
+    "medium": 2.0,
+    "complex": 1.5,
+}
 
 
 @dataclass
@@ -206,6 +216,7 @@ def resolve_max_turns(
     complexity: str | None,
     capacity: RepoCapacity,
     base: int | None = None,
+    bucket_multipliers: dict[str, float] | None = None,
 ) -> int | None:
     """Resolve a ``max_turns`` value for a task, optionally scaled for huge repos.
 
@@ -218,25 +229,41 @@ def resolve_max_turns(
          :data:`tournament.task_overrides.TASK_MAX_TURNS_DEFAULTS`.
        * Else return ``None`` (caller falls back to its own spec default).
 
-    2. If ``capacity.is_huge`` is True, multiply by ``_HUGE_MULTIPLIER`` (2.0)
-       and round to the nearest int. Else pass through.
+    2. If ``capacity.is_huge`` is True, multiply by the per-bucket curve
+       value and round to the nearest int. v0.20.0 D1 default per-bucket
+       curves — simple 3.0×, medium 2.0×, complex 1.5× — replace the
+       legacy single 2.0× multiplier.
+
+       * When ``bucket_multipliers`` is supplied (operator override), look
+         up the bucket there first; missing buckets fall through to the
+         default curve.
+       * When ``base`` is supplied (no complexity bucket to key off of) OR
+         ``complexity`` is unknown, the legacy single ``_HUGE_MULTIPLIER``
+         (2.0) is used — preserves byte-identical behavior for operator
+         overrides.
 
     Args:
         complexity: The task's complexity bucket (``simple``, ``medium``,
             ``complex``) or None when the architect did not tag it.
         capacity: Snapshot from :func:`probe_repo`.
         base: Operator-supplied override. When set, bypasses the lookup
-            table; still subject to the ``is_huge`` multiplier.
+            table; still subject to the ``is_huge`` multiplier (legacy
+            single-multiplier path).
+        bucket_multipliers: Optional operator override for the per-bucket
+            curve. ``None`` (default) uses :data:`_HUGE_BUCKET_MULTIPLIERS`.
+            Missing buckets fall through to the default curve.
 
     Returns:
         A positive int suitable as ``max_turns`` for an
         :class:`~adapters.types.AgentInvocation`, or None when no signal
         was available (caller's spec default kicks in).
     """
+    bucket: str | None = None
     if base is not None:
         raw: int | None = base
     elif complexity is not None and complexity in TASK_MAX_TURNS_DEFAULTS:
         raw = TASK_MAX_TURNS_DEFAULTS[complexity]
+        bucket = complexity
     else:
         raw = None
 
@@ -244,7 +271,16 @@ def resolve_max_turns(
         return None
 
     if capacity.is_huge:
-        return int(round(raw * _HUGE_MULTIPLIER))
+        # Per-bucket curve when we have a bucket; legacy single multiplier
+        # for operator-supplied bases (no bucket) and unknown complexity.
+        if bucket is None:
+            return int(round(raw * _HUGE_MULTIPLIER))
+        # Operator-overridden curve wins; otherwise default.
+        if bucket_multipliers is not None and bucket in bucket_multipliers:
+            mult = bucket_multipliers[bucket]
+        else:
+            mult = _HUGE_BUCKET_MULTIPLIERS.get(bucket, _HUGE_MULTIPLIER)
+        return int(round(raw * mult))
     return raw
 
 

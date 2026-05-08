@@ -106,18 +106,19 @@ def test_probe_repo_logs_once(
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_max_turns_huge_repo_doubles_simple() -> None:
-    """``is_huge=True`` + ``complexity='simple'`` + ``base=None`` → 20
-    (doubled from default 10)."""
+def test_resolve_max_turns_huge_repo_simple_per_bucket_curve() -> None:
+    """v0.20.0 D1: ``is_huge=True`` + ``complexity='simple'`` → 30
+    (3.0× the default 10 — the per-bucket curve replaces the legacy 2.0×)."""
     from runtime.repo_probe import RepoCapacity, resolve_max_turns
 
     cap = RepoCapacity(
         file_count=25_000, total_bytes=10_000_000_000, depth_max=10, is_huge=True
     )
-    assert resolve_max_turns("simple", cap, base=None) == 20
+    assert resolve_max_turns("simple", cap, base=None) == 30
 
 
-def test_resolve_max_turns_huge_repo_doubles_medium() -> None:
+def test_resolve_max_turns_huge_repo_medium_per_bucket_curve() -> None:
+    """v0.20.0 D1: medium bucket retains the legacy 2.0× multiplier."""
     from runtime.repo_probe import RepoCapacity, resolve_max_turns
 
     cap = RepoCapacity(
@@ -126,13 +127,14 @@ def test_resolve_max_turns_huge_repo_doubles_medium() -> None:
     assert resolve_max_turns("medium", cap, base=None) == 40
 
 
-def test_resolve_max_turns_huge_repo_doubles_complex() -> None:
+def test_resolve_max_turns_huge_repo_complex_per_bucket_curve() -> None:
+    """v0.20.0 D1: complex bucket gets a more modest 1.5× (was 2.0×)."""
     from runtime.repo_probe import RepoCapacity, resolve_max_turns
 
     cap = RepoCapacity(
         file_count=25_000, total_bytes=10_000_000_000, depth_max=10, is_huge=True
     )
-    assert resolve_max_turns("complex", cap, base=None) == 80
+    assert resolve_max_turns("complex", cap, base=None) == 60
 
 
 def test_resolve_max_turns_normal_repo_preserves_base() -> None:

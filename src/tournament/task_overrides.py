@@ -61,6 +61,7 @@ def resolve_task_max_turns(
     task: "Task",
     spec_default: int | None,
     capacity: "RepoCapacity | None" = None,
+    huge_repo_multipliers: dict[str, float] | None = None,
 ) -> int | None:
     """Return the per-task ``max_turns`` override or ``None``.
 
@@ -72,9 +73,15 @@ def resolve_task_max_turns(
 
     v0.13.0: optional ``capacity`` argument enables repo-size-aware scaling.
     When ``capacity.is_huge`` is True, the looked-up bucket value is
-    multiplied per :data:`runtime.repo_probe._HUGE_MULTIPLIER` so genuinely
-    complex tasks have runway on Unity-class repos. When ``capacity`` is
-    None (legacy callers) or ``is_huge`` is False, behavior is unchanged.
+    multiplied per :data:`runtime.repo_probe._HUGE_BUCKET_MULTIPLIERS` so
+    genuinely complex tasks have runway on Unity-class repos. When ``capacity``
+    is None (legacy callers) or ``is_huge`` is False, behavior is unchanged.
+
+    v0.20.0 D1: per-bucket curves replace the single 2.0× multiplier.
+    Default curves (simple 3.0×, medium 2.0×, complex 1.5×) live in
+    :data:`runtime.repo_probe._HUGE_BUCKET_MULTIPLIERS`. Operators may
+    override via the ``huge_repo_multipliers`` arg (typically threaded
+    through from ``cfg.task_overrides.huge_repo_multipliers``).
     """
     if task.complexity is None:
         return None
@@ -84,9 +91,23 @@ def resolve_task_max_turns(
     if capacity is not None and capacity.is_huge:
         # Local import: avoid a static cycle with runtime.repo_probe (which
         # imports ``TASK_MAX_TURNS_DEFAULTS`` from this module).
-        from runtime.repo_probe import _HUGE_MULTIPLIER
+        from runtime.repo_probe import (
+            _HUGE_BUCKET_MULTIPLIERS,
+            _HUGE_MULTIPLIER,
+        )
 
-        return int(round(base * _HUGE_MULTIPLIER))
+        # Operator-override wins; otherwise default per-bucket curve;
+        # otherwise the legacy single multiplier (2.0).
+        if (
+            huge_repo_multipliers is not None
+            and task.complexity in huge_repo_multipliers
+        ):
+            mult = huge_repo_multipliers[task.complexity]
+        else:
+            mult = _HUGE_BUCKET_MULTIPLIERS.get(
+                task.complexity, _HUGE_MULTIPLIER
+            )
+        return int(round(base * mult))
     return base
 
 

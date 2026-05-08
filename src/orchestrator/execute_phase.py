@@ -1993,8 +1993,24 @@ async def delegate(
         # some unit tests (back-compat). Fall back to legacy behavior in
         # that case.
         repo_capacity = getattr(orch, "_repo_capacity", None)
+        # v0.20.0 D1: thread per-bucket huge-repo multiplier overrides
+        # through to the resolver. Default ``None`` → resolver uses
+        # baked-in per-bucket curves (simple 3.0×, medium 2.0×, complex 1.5×).
+        # ``getattr`` on the cfg attribute is defensive — orchestrator stubs
+        # in some unit tests omit ``task_overrides`` entirely.
+        _task_overrides_cfg = getattr(orch.cfg, "task_overrides", None)
+        huge_mult_overrides = (
+            getattr(_task_overrides_cfg, "huge_repo_multipliers", None)
+            if _task_overrides_cfg is not None
+            else None
+        )
         max_turns = (
-            resolve_task_max_turns(task, spec.max_turns, capacity=repo_capacity)
+            resolve_task_max_turns(
+                task,
+                spec.max_turns,
+                capacity=repo_capacity,
+                huge_repo_multipliers=huge_mult_overrides,
+            )
             or spec.max_turns
             or 1
         )

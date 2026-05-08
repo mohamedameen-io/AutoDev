@@ -105,10 +105,7 @@ def _build_orch_stub(
 async def test_delegate_passes_capacity_into_resolve_task_max_turns(
     tmp_path: Path,
 ) -> None:
-    """``orch._repo_capacity.is_huge=True`` doubles the per-complexity budget.
-
-    Task complexity is ``simple`` → default 10 → with huge cap → 20.
-    """
+    """v0.20.0 D1: simple+huge → 30 (3.0× per-bucket curve replaces legacy 2.0×)."""
     huge_cap = RepoCapacity(
         file_count=25_000, total_bytes=10_000_000_000, depth_max=10, is_huge=True
     )
@@ -126,7 +123,7 @@ async def test_delegate_passes_capacity_into_resolve_task_max_turns(
         context={},
     )
     await delegate(orch, "developer", env, task=task)
-    assert captured["max_turns"] == 20
+    assert captured["max_turns"] == 30
 
 
 @pytest.mark.asyncio
@@ -177,10 +174,10 @@ async def test_delegate_with_no_capacity_preserves_legacy_max_turns(
 
 
 @pytest.mark.asyncio
-async def test_delegate_huge_cap_with_complex_task_doubles_to_80(
+async def test_delegate_huge_cap_with_complex_task_per_bucket_curve(
     tmp_path: Path,
 ) -> None:
-    """Most-aggressive bucket: complex (40) × huge (2.0x) = 80 turns."""
+    """v0.20.0 D1: complex bucket gets 1.5× (was 2.0×) — 40 → 60."""
     huge_cap = RepoCapacity(
         file_count=25_000, total_bytes=10_000_000_000, depth_max=10, is_huge=True
     )
@@ -198,4 +195,4 @@ async def test_delegate_huge_cap_with_complex_task_doubles_to_80(
         context={},
     )
     await delegate(orch, "developer", env, task=task)
-    assert captured["max_turns"] == 80
+    assert captured["max_turns"] == 60

@@ -112,15 +112,16 @@ def test_timeout_s_table_keys_match_complexity_literal() -> None:
 
 
 def test_resolve_task_max_turns_with_huge_capacity_applies_multiplier() -> None:
-    """``capacity.is_huge=True`` doubles the per-complexity bucket."""
+    """v0.20.0 D1: ``capacity.is_huge=True`` applies per-bucket curves
+    (simple 3.0×, medium 2.0×, complex 1.5×)."""
     from runtime.repo_probe import RepoCapacity
 
     cap = RepoCapacity(
         file_count=25_000, total_bytes=10_000_000_000, depth_max=10, is_huge=True
     )
-    assert resolve_task_max_turns(_task("simple"), spec_default=10, capacity=cap) == 20
+    assert resolve_task_max_turns(_task("simple"), spec_default=10, capacity=cap) == 30
     assert resolve_task_max_turns(_task("medium"), spec_default=10, capacity=cap) == 40
-    assert resolve_task_max_turns(_task("complex"), spec_default=10, capacity=cap) == 80
+    assert resolve_task_max_turns(_task("complex"), spec_default=10, capacity=cap) == 60
 
 
 def test_resolve_task_max_turns_capacity_none_preserves_legacy_behavior() -> None:
