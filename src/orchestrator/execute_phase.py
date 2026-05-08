@@ -1438,6 +1438,17 @@ async def _execute_one(
                 "complete",
                 meta={"evidence_bundle": f".autodev/evidence/{task.id}-coder.json"},
             )
+            # v0.15.0: zero the stuck-state counters on success so the
+            # ladder accounting tracks the *current* episode of stuck-ness,
+            # not historical retries that successfully recovered.
+            try:
+                await orch.plan_manager.reset_stuck_state(task.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.reset_stuck_state_failed",
+                    task_id=task.id,
+                    err=str(exc),
+                )
             logger.info("execute_phase.task_complete", task_id=task.id)
             return task
     finally:
@@ -1465,7 +1476,197 @@ async def _try_retry_or_escalate(
 
     Returns the updated task. If ``task.escalated`` becomes True on return,
     the caller should stop the loop.
+
+    v0.15.0: in addition to the legacy retry-then-escalate logic, this
+    helper now consults the per-task :class:`StuckState` against
+    :func:`orchestrator.escalation_ladder.next_step`. When the ladder
+    returns ``"continue"`` (the dominant path in normal runs), behavior
+    is identical to v0.14.0 — backward compat. Otherwise the helper
+    dispatches to :func:`_escalate_stuck_to_critic` and applies the
+    resolution:
+
+    * ``"REFINE"`` → critic suggests a small adjustment; on
+      ``RESOLUTION: refine`` the task is restarted in_progress (the
+      caller's loop picks up the developer with the refined guidance
+      injected via ``last_issues`` on the next iteration). The
+      lessons-emit path records a ``course_correction`` event.
+    * ``"PIVOT"`` → critic suggests a radical redirect; on
+      ``RESOLUTION: pivot`` the pivot counter is bumped and the task
+      is restarted with the radical guidance.
+    * ``"SOFT_BLOCKER"`` → critic confirms a human-required decision;
+      the task is marked ``escalated`` + ``blocked`` with the guidance
+      surfaced as ``blocked_reason``. Lessons-emit records a
+      ``soft_blocker`` event.
+
+    All branches first bump :meth:`PlanManager.increment_discard` so the
+    ladder accounting reflects the freshest signal.
     """
+    from orchestrator.escalation_ladder import next_step
+    from state.knowledge import TournamentEvent
+
+    # v0.15.0: bump the stuck-state discard counter under lock.
+    stuck_state = await orch.plan_manager.increment_discard(task.id)
+    step = next_step(stuck_state)
+
+    if step != "continue":
+        # Ladder dispatch path. Build a minimal prior_attempts list from
+        # the legacy retry_count for forensics.
+        prior_attempts = [f"retry_count={task.retry_count}, reason={reason}"]
+        try:
+            resolution = await _escalate_stuck_to_critic(
+                orch,
+                task,
+                stuck_state=stuck_state,
+                ladder_step=step,
+                recent_evidence=reason,
+                prior_attempts=prior_attempts,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.stuck_escalation_failed",
+                task_id=task.id,
+                step=step,
+                err=str(exc),
+            )
+            # Fall through to legacy path on any escalation failure.
+            resolution = None
+
+        if resolution is not None:
+            # Branch on the critic's chosen action.
+            if resolution.action == "soft-blocker":
+                await orch.plan_manager.mark_escalated(task.id)
+                guidance_text = resolution.guidance or "human decision required"
+                updated = await orch.plan_manager.update_task_status(
+                    task.id,
+                    "blocked",
+                    meta={
+                        "blocked_reason": (
+                            f"soft-blocker: {guidance_text}"
+                        )
+                    },
+                )
+                # Audit-only ledger op + cross-run lesson.
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="soft_blocker_handoff",
+                        payload={
+                            "task_id": task.id,
+                            "reason": reason,
+                            "critic_response_excerpt": guidance_text[:500],
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.ledger_append_failed",
+                        op="soft_blocker_handoff",
+                        err=str(exc),
+                    )
+                try:
+                    await orch.knowledge.record_tournament_event(
+                        TournamentEvent(
+                            event_type="soft_blocker",
+                            family="execute-phase",
+                            hypothesis=(
+                                f"task {task.id} required human decision "
+                                f"after {stuck_state.discard_count} discards "
+                                f"and {stuck_state.pivot_count} pivots"
+                            ),
+                            evidence=guidance_text[:500],
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.knowledge_record_failed",
+                        event="soft_blocker",
+                        err=str(exc),
+                    )
+                return updated
+
+            if resolution.action == "pivot":
+                # Bump pivot counter under lock + audit ledger op.
+                await orch.plan_manager.increment_pivot(task.id)
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="stuck_pivot",
+                        payload={
+                            "task_id": task.id,
+                            "reason": reason,
+                            "critic_response_excerpt": resolution.guidance[:500],
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.ledger_append_failed",
+                        op="stuck_pivot",
+                        err=str(exc),
+                    )
+                try:
+                    await orch.knowledge.record_tournament_event(
+                        TournamentEvent(
+                            event_type="course_correction",
+                            family="execute-phase",
+                            hypothesis=(
+                                f"task {task.id} pivoted at "
+                                f"discard_count={stuck_state.discard_count}"
+                            ),
+                            evidence=resolution.guidance[:500],
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.knowledge_record_failed",
+                        event="pivot",
+                        err=str(exc),
+                    )
+                # Restart the task so the executor's outer loop re-picks
+                # it with the pivot guidance injected via ``last_issues``.
+                if task.status != "in_progress":
+                    task = await orch.plan_manager.update_task_status(
+                        task.id, "in_progress"
+                    )
+                return await orch.plan_manager.get_task(task.id) or task
+
+            # ``refine`` (also the defensive default).
+            try:
+                await orch.plan_manager.ledger_append(
+                    op="stuck_refine",
+                    payload={
+                        "task_id": task.id,
+                        "reason": reason,
+                        "critic_response_excerpt": resolution.guidance[:500],
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.ledger_append_failed",
+                    op="stuck_refine",
+                    err=str(exc),
+                )
+            try:
+                await orch.knowledge.record_tournament_event(
+                    TournamentEvent(
+                        event_type="course_correction",
+                        family="execute-phase",
+                        hypothesis=(
+                            f"task {task.id} refined at "
+                            f"discard_count={stuck_state.discard_count}"
+                        ),
+                        evidence=resolution.guidance[:500],
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.knowledge_record_failed",
+                    event="refine",
+                    err=str(exc),
+                )
+            if task.status != "in_progress":
+                task = await orch.plan_manager.update_task_status(
+                    task.id, "in_progress"
+                )
+            return await orch.plan_manager.get_task(task.id) or task
+
+    # Legacy ("continue") path: behavior identical to v0.14.0.
     new_count = await orch.plan_manager.mark_task_retry(task.id)
     if new_count >= retry_limit:
         logger.warning(
@@ -1496,6 +1697,24 @@ async def _try_retry_or_escalate(
                 output_text=sb_result.text,
             ),
         )
+        # Cross-run lesson: legacy retry-exhaustion escalation.
+        try:
+            await orch.knowledge.record_tournament_event(
+                TournamentEvent(
+                    event_type="escalation",
+                    family="execute-phase",
+                    hypothesis=(
+                        f"task {task.id} exceeded retry_limit={retry_limit}"
+                    ),
+                    evidence=f"reason={reason} retry_count={new_count}",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.knowledge_record_failed",
+                event="escalation",
+                err=str(exc),
+            )
         await orch.plan_manager.mark_escalated(task.id)
         updated = await orch.plan_manager.update_task_status(
             task.id,

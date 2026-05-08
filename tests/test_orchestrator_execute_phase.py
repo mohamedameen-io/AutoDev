@@ -166,13 +166,19 @@ async def test_execute_test_failure_retries_then_passes(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_execute_retry_exhaustion_escalates(tmp_path: Path) -> None:
-    """After ``qa_retry_limit`` (default 3) failures, sounding_board is called."""
+    """After ``qa_retry_limit`` (default 3) failures, the v0.15.0 stuck
+    ladder fires REFINE then PIVOT then SOFT_BLOCKER. The critic stub
+    returns ``RESOLUTION: soft-blocker`` so the task is marked
+    escalated + blocked the first time the ladder dispatches.
+    """
     adapter = StubAdapter(
         {
             "developer": _coder_ok_with_diff(),
             "reviewer": _reviewer("NEEDS_CHANGES"),  # always fails
             "test_engineer": _test_engineer_ok(),
-            "critic_sounding_board": ok("escalation diagnosis: planning gap"),
+            "critic_sounding_board": ok(
+                "diagnosis: planning gap\n\nRESOLUTION: soft-blocker\n"
+            ),
         }
     )
     orch = await _make_orch_with_plan(tmp_path, adapter)
@@ -181,10 +187,10 @@ async def test_execute_retry_exhaustion_escalates(tmp_path: Path) -> None:
     task = tasks[0]
     assert task.escalated is True
     assert task.status == "blocked"
+    # The ladder fired at the first threshold (REFINE at discard 3); the
+    # critic returned soft-blocker, the task is blocked. Critic was
+    # invoked exactly once.
     assert adapter.count("critic_sounding_board") == 1
-    # Ensure a critic evidence file was written.
-    critic_ev = tmp_path / ".autodev" / "evidence" / "1.1-critic.json"
-    assert critic_ev.exists()
 
 
 @pytest.mark.asyncio
@@ -196,7 +202,9 @@ async def test_execute_coder_adapter_failure_retries_and_escalates(
             "developer": fail("claude binary not found"),
             "reviewer": _reviewer("APPROVED"),
             "test_engineer": _test_engineer_ok(),
-            "critic_sounding_board": ok("cannot run coder"),
+            "critic_sounding_board": ok(
+                "cannot run coder\n\nRESOLUTION: soft-blocker\n"
+            ),
         }
     )
     orch = await _make_orch_with_plan(tmp_path, adapter)
