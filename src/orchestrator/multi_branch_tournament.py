@@ -74,6 +74,7 @@ from tournament.timeouts import resolve_role_timeout_s
 
 
 if TYPE_CHECKING:
+    from config.schema import BranchConfig
     from orchestrator import Orchestrator
 
 
@@ -140,10 +141,15 @@ async def _run_one_branch(
     spec_hash: str,
     branch_index: int,
     branch_seed: int,
+    branch_config: "BranchConfig | None" = None,
 ) -> str:
     """Wrapper around :func:`run_plan_tournament` to keep ``asyncio.gather``
     happy when one branch fails. Re-raises so ``return_exceptions=True``
-    can capture the exception without cancelling siblings."""
+    can capture the exception without cancelling siblings.
+
+    v0.14.0: optional ``branch_config`` is threaded into the per-branch
+    tournament runner. ``None`` preserves homogeneous v0.12.0 behavior.
+    """
     return await run_plan_tournament(
         orch,
         initial_md,
@@ -151,6 +157,7 @@ async def _run_one_branch(
         spec_hash,
         branch_index=branch_index,
         branch_seed=branch_seed,
+        branch_config=branch_config,
     )
 
 
@@ -513,6 +520,7 @@ async def run_multi_branch_plan_tournament(
     spec: str,
     spec_hash: str,
     n_branches: int,
+    branch_configs: "list[BranchConfig] | None" = None,
 ) -> MultiBranchOutcome:
     """Run ``n_branches`` parallel plan tournaments, then meta-merge survivors.
 
@@ -551,6 +559,13 @@ async def run_multi_branch_plan_tournament(
     if n_branches < 1:
         raise ValueError(f"n_branches must be ≥1, got {n_branches}")
 
+    # v0.14.0: validate branch_configs alignment up-front.
+    if branch_configs is not None and len(branch_configs) != n_branches:
+        raise ValueError(
+            f"len(branch_configs) ({len(branch_configs)}) must equal "
+            f"n_branches ({n_branches}) — exact 1:1 correspondence required"
+        )
+
     # N=1 short-circuit: the multi-branch path is normally guarded by
     # ``num_branches > 1`` in plan_phase dispatch, but if a caller does
     # invoke this with N=1 we run a single branch with branch_index=0
@@ -559,10 +574,14 @@ async def run_multi_branch_plan_tournament(
     # callers, even though production callers gate on ``num_branches > 1``.
     if n_branches == 1:
         only_seed = int(spec_hash, 16)
+        only_branch_config = (
+            branch_configs[0] if branch_configs is not None else None
+        )
         try:
             only_md = await _run_one_branch(
                 orch, initial_md, spec, spec_hash,
                 branch_index=0, branch_seed=only_seed,
+                branch_config=only_branch_config,
             )
             outcome = MultiBranchOutcome(
                 branches=[
@@ -605,6 +624,9 @@ async def run_multi_branch_plan_tournament(
             spec_hash,
             branch_index=i,
             branch_seed=branch_seeds[i],
+            branch_config=(
+                branch_configs[i] if branch_configs is not None else None
+            ),
         )
         for i in range(n_branches)
     ]

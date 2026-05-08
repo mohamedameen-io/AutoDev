@@ -96,6 +96,7 @@ async def test_three_branches_default_invokes_three_run_plan_tournament(
         *,
         branch_index: int | None = None,
         branch_seed: int | None = None,
+        **_extra: Any,
     ) -> str:
         captured_calls.append(
             {
@@ -168,6 +169,7 @@ async def test_branches_run_concurrently(
         *,
         branch_index: int | None = None,
         branch_seed: int | None = None,
+        **_extra: Any,
     ) -> str:
         loop = asyncio.get_event_loop()
         started_at.append(loop.time())
@@ -217,6 +219,7 @@ async def test_n_branches_eq_1_produces_single_branch_passthrough(
         *,
         branch_index: int | None = None,
         branch_seed: int | None = None,
+        **_extra: Any,
     ) -> str:
         captured_calls.append({"branch_index": branch_index})
         return "# Plan: only-branch\n"
@@ -503,3 +506,137 @@ def test_multi_branch_parent_dir_helper(tmp_path: Path) -> None:
     """``multi_branch_parent_dir`` returns the expected layout root."""
     p = mbt.multi_branch_parent_dir(tmp_path, _SPEC_HASH)
     assert p == tmp_path / ".autodev" / "tournaments" / f"multi-{_SPEC_HASH[:8]}"
+
+
+# ---------------------------------------------------------------------------
+# v0.14.0 — branch_configs flowing through multi-branch dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_multi_branch_with_explicit_branch_configs_uses_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``branch_configs`` is supplied, each fan-out call passes the
+    matching ``branch_config`` into ``run_plan_tournament``."""
+    from config.schema import BranchConfig
+
+    captured_calls: list[dict[str, Any]] = []
+
+    async def fake_run(
+        orch: Any,
+        initial_md: str,
+        spec: str,
+        spec_hash: str,
+        *,
+        branch_index: int | None = None,
+        branch_seed: int | None = None,
+        branch_config: BranchConfig | None = None,
+    ) -> str:
+        captured_calls.append(
+            {
+                "branch_index": branch_index,
+                "branch_config": branch_config,
+            }
+        )
+        return f"# Plan: branch-{branch_index}\n"
+
+    monkeypatch.setattr(mbt, "run_plan_tournament", fake_run)
+
+    async def fake_meta(
+        orch: Any, candidates: list[str], spec: str, spec_hash: str
+    ) -> tuple[str, list]:
+        return candidates[0], []
+
+    monkeypatch.setattr(mbt, "_meta_merge_pairwise", fake_meta)
+
+    bcs = [
+        BranchConfig(lane="distant-scout", model_overrides={"developer": "claude-opus-4"}),
+        BranchConfig(lane="local-tweak", model_overrides={"developer": "claude-haiku-4"}),
+        BranchConfig(lane="architectural"),
+    ]
+
+    orch = _make_orch(tmp_path)
+    outcome = await mbt.run_multi_branch_plan_tournament(
+        orch,
+        initial_md="# Plan: draft\n",
+        spec="spec",
+        spec_hash=_SPEC_HASH,
+        n_branches=len(bcs),
+        branch_configs=bcs,
+    )
+    assert isinstance(outcome, mbt.MultiBranchOutcome)
+
+    # 3 fan-out calls; each saw its matching BranchConfig.
+    assert len(captured_calls) == 3
+    by_index = {c["branch_index"]: c for c in captured_calls}
+    assert by_index[0]["branch_config"] is bcs[0]
+    assert by_index[1]["branch_config"] is bcs[1]
+    assert by_index[2]["branch_config"] is bcs[2]
+
+
+@pytest.mark.asyncio
+async def test_run_multi_branch_branch_configs_none_omits_kwarg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``branch_configs=None`` (default) preserves v0.12.0 behavior:
+    each fan-out call receives no branch_config (None)."""
+    from typing import Optional
+
+    from config.schema import BranchConfig
+
+    captured_configs: list[Optional[BranchConfig]] = []
+
+    async def fake_run(
+        orch: Any,
+        initial_md: str,
+        spec: str,
+        spec_hash: str,
+        *,
+        branch_index: int | None = None,
+        branch_seed: int | None = None,
+        branch_config: BranchConfig | None = None,
+    ) -> str:
+        captured_configs.append(branch_config)
+        return f"# Plan: branch-{branch_index}\n"
+
+    monkeypatch.setattr(mbt, "run_plan_tournament", fake_run)
+
+    async def fake_meta(
+        orch: Any, candidates: list[str], spec: str, spec_hash: str
+    ) -> tuple[str, list]:
+        return candidates[0], []
+
+    monkeypatch.setattr(mbt, "_meta_merge_pairwise", fake_meta)
+
+    orch = _make_orch(tmp_path)
+    await mbt.run_multi_branch_plan_tournament(
+        orch,
+        initial_md="# Plan: draft\n",
+        spec="spec",
+        spec_hash=_SPEC_HASH,
+        n_branches=3,
+    )
+    assert captured_configs == [None, None, None]
+
+
+@pytest.mark.asyncio
+async def test_run_multi_branch_branch_configs_length_must_match_n_branches(
+    tmp_path: Path,
+) -> None:
+    """``len(branch_configs) != n_branches`` raises ValueError — the
+    dispatcher needs an exact 1:1 correspondence to thread configs."""
+    from config.schema import BranchConfig
+
+    orch = _make_orch(tmp_path)
+    with pytest.raises(ValueError):
+        await mbt.run_multi_branch_plan_tournament(
+            orch,
+            initial_md="x",
+            spec="x",
+            spec_hash=_SPEC_HASH,
+            n_branches=3,
+            branch_configs=[BranchConfig(), BranchConfig()],
+        )

@@ -67,6 +67,7 @@ def _patch_run_plan_tournament(
         *,
         branch_index: int | None = None,
         branch_seed: int | None = None,
+        **_extra: Any,
     ) -> str:
         invoked.append(branch_index if branch_index is not None else -1)
         if branch_index in fail_indices:
@@ -258,6 +259,7 @@ async def test_failing_branch_does_not_cancel_siblings(
         *,
         branch_index: int | None = None,
         branch_seed: int | None = None,
+        **_extra: Any,
     ) -> str:
         invoked.append(branch_index if branch_index is not None else -1)
         if branch_index == 1:
