@@ -13,9 +13,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
-
 _PROMPT_PATH = (
     Path(__file__).parent.parent
     / "src"
