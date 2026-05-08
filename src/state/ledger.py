@@ -54,6 +54,13 @@ LedgerOp = Literal[
     "snapshot",
     "plan_tournament_complete",
     "impl_tournament_complete",
+    # v0.9.0: phase-review tournament ops.
+    # ``phase_review_complete`` is audit-only (no plan mutation, mirrors
+    # ``plan_tournament_complete``). ``append_corrective_tasks`` and
+    # ``update_phase_meta`` mutate the plan — see :func:`_apply_op`.
+    "phase_review_complete",
+    "append_corrective_tasks",
+    "update_phase_meta",
 ]
 
 
@@ -337,6 +344,14 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # impl tournament completes. Does NOT mutate plan state.
         return plan
 
+    if op == "phase_review_complete":
+        # v0.9.0: audit-only breadcrumb appended after the phase-review
+        # tournament completes. Plan mutations (review_status, corrective
+        # tasks) are recorded by ``update_phase_meta`` and
+        # ``append_corrective_tasks`` separately, so this op never touches
+        # plan state.
+        return plan
+
     if plan is None:
         raise LedgerCorruptError(
             f"entry seq={entry.seq} op={op} applied before any init_plan"
@@ -398,6 +413,67 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
                 task.evidence_bundle = path
         return plan
 
+    if op == "append_corrective_tasks":
+        # v0.9.0: append corrective sub-tasks injected after a B/AB phase
+        # review winner. Idempotent: re-applying skips tasks already
+        # present (matched by id), and re-merges ``corrective_task_ids``
+        # without duplication. Mirrors the locked semantics of the
+        # PlanManager method that emitted the op.
+        from state.schemas import Task as _Task  # local: avoid cycle at import
+
+        phase_id = payload.get("phase_id")
+        raw_tasks = payload.get("tasks") or []
+        if not isinstance(phase_id, str) or not isinstance(raw_tasks, list):
+            raise LedgerCorruptError(
+                f"entry seq={entry.seq} append_corrective_tasks malformed"
+            )
+        phase = _find_phase(plan, phase_id)
+        if phase is None:
+            raise LedgerCorruptError(
+                f"entry seq={entry.seq} references unknown phase_id={phase_id}"
+            )
+        existing_task_ids = {t.id for t in phase.tasks}
+        for raw in raw_tasks:
+            try:
+                t = _Task.model_validate(raw)
+            except Exception as exc:
+                raise LedgerCorruptError(
+                    f"entry seq={entry.seq} corrective task invalid: {exc}"
+                ) from exc
+            if t.id not in existing_task_ids:
+                phase.tasks.append(t)
+                existing_task_ids.add(t.id)
+            if t.id not in phase.corrective_task_ids:
+                phase.corrective_task_ids.append(t.id)
+        # Status transition payload (caller writes the explicit status
+        # alongside the task list so replay reproduces exactly).
+        new_status = payload.get("review_status")
+        if isinstance(new_status, str):
+            phase.review_status = new_status  # type: ignore[assignment]
+        return plan
+
+    if op == "update_phase_meta":
+        # v0.9.0: update arbitrary phase-level metadata fields. Currently
+        # carries ``baseline_commit`` and ``review_status``. Idempotent:
+        # re-applying overwrites with the same values.
+        phase_id = payload.get("phase_id")
+        if not isinstance(phase_id, str):
+            raise LedgerCorruptError(
+                f"entry seq={entry.seq} update_phase_meta missing phase_id"
+            )
+        phase = _find_phase(plan, phase_id)
+        if phase is None:
+            raise LedgerCorruptError(
+                f"entry seq={entry.seq} references unknown phase_id={phase_id}"
+            )
+        if "baseline_commit" in payload:
+            val = payload["baseline_commit"]
+            phase.baseline_commit = val if isinstance(val, str) else None
+        if "review_status" in payload:
+            val = payload["review_status"]
+            phase.review_status = val if isinstance(val, str) else None  # type: ignore[assignment]
+        return plan
+
     # Unknown op — fail loudly rather than silently produce wrong state.
     raise LedgerCorruptError(f"entry seq={entry.seq} has unknown op={op!r}")
 
@@ -407,6 +483,14 @@ def _find_task(plan: Plan, task_id: str) -> Any:
         for task in phase.tasks:
             if task.id == task_id:
                 return task
+    return None
+
+
+def _find_phase(plan: Plan, phase_id: str) -> Any:
+    """Locate a phase by id. v0.9.0 helper for the new ledger ops."""
+    for phase in plan.phases:
+        if phase.id == phase_id:
+            return phase
     return None
 
 

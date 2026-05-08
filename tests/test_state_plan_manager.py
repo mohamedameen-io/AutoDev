@@ -485,3 +485,124 @@ def test_plan_complexity_rejects_invalid() -> None:
             updated_at=_iso(),
             complexity="moderate",  # type: ignore[arg-type]
         )
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0 — append_corrective_tasks + update_phase_meta
+# ---------------------------------------------------------------------------
+
+
+def _mk_corrective_task(idx: int = 1) -> Task:
+    return Task(
+        id=f"1.c{idx}",
+        phase_id="1",
+        title=f"corrective {idx}",
+        description=f"corrective body {idx}",
+        complexity="medium",
+        assigned_agent="developer",
+        metadata={"origin": "phase_review_corrective"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_append_corrective_tasks_appends_to_phase(tmp_path: Path) -> None:
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    plan = await pm.append_corrective_tasks("1", [_mk_corrective_task(1)])
+    phase = plan.phases[0]
+    assert any(t.id == "1.c1" for t in phase.tasks)
+    assert "1.c1" in phase.corrective_task_ids
+
+
+@pytest.mark.asyncio
+async def test_append_corrective_tasks_records_ledger_op(tmp_path: Path) -> None:
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    await pm.append_corrective_tasks("1", [_mk_corrective_task(1)])
+    entries = await pm.read_ledger()
+    ops = [e.op for e in entries]
+    assert "append_corrective_tasks" in ops
+
+
+@pytest.mark.asyncio
+async def test_append_corrective_tasks_updates_review_status(tmp_path: Path) -> None:
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    plan = await pm.append_corrective_tasks(
+        "1", [_mk_corrective_task(1)], review_status="corrective_required"
+    )
+    assert plan.phases[0].review_status == "corrective_required"
+
+
+@pytest.mark.asyncio
+async def test_append_corrective_tasks_idempotent_replay(tmp_path: Path) -> None:
+    """Calling twice with the same ids does not create duplicates."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    await pm.append_corrective_tasks("1", [_mk_corrective_task(1)])
+    await pm.append_corrective_tasks("1", [_mk_corrective_task(1)])
+    plan = await pm.load()
+    assert plan is not None
+    matching = [t for t in plan.phases[0].tasks if t.id == "1.c1"]
+    assert len(matching) == 1
+    assert plan.phases[0].corrective_task_ids.count("1.c1") == 1
+
+
+@pytest.mark.asyncio
+async def test_update_phase_meta_persists_baseline_commit(tmp_path: Path) -> None:
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    plan = await pm.update_phase_meta("1", baseline_commit="deadbeef1234")
+    assert plan.phases[0].baseline_commit == "deadbeef1234"
+
+
+@pytest.mark.asyncio
+async def test_update_phase_meta_persists_review_status(tmp_path: Path) -> None:
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    plan = await pm.update_phase_meta("1", review_status="accepted")
+    assert plan.phases[0].review_status == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_ledger_replay_includes_corrective_append(tmp_path: Path) -> None:
+    """After append_corrective_tasks, replay (load) reproduces the state."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    await pm.append_corrective_tasks("1", [_mk_corrective_task(1)])
+    # Force a full replay path: rebuild a new manager + load.
+    pm2 = PlanManager(tmp_path, session_id="s2")
+    plan = await pm2.load()
+    assert plan is not None
+    assert any(t.id == "1.c1" for t in plan.phases[0].tasks)
+    assert "1.c1" in plan.phases[0].corrective_task_ids
+    assert plan.phases[0].review_status == "corrective_required"
+
+
+@pytest.mark.asyncio
+async def test_ledger_replay_includes_phase_meta_update(tmp_path: Path) -> None:
+    """After update_phase_meta, replay reproduces the metadata."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    await pm.update_phase_meta("1", baseline_commit="abc123", review_status="accepted")
+    pm2 = PlanManager(tmp_path, session_id="s2")
+    plan = await pm2.load()
+    assert plan is not None
+    assert plan.phases[0].baseline_commit == "abc123"
+    assert plan.phases[0].review_status == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_append_corrective_tasks_unknown_phase_raises(tmp_path: Path) -> None:
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    with pytest.raises(PlanConcurrentModificationError):
+        await pm.append_corrective_tasks("999", [_mk_corrective_task(1)])
+
+
+@pytest.mark.asyncio
+async def test_update_phase_meta_unknown_phase_raises(tmp_path: Path) -> None:
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    with pytest.raises(PlanConcurrentModificationError):
+        await pm.update_phase_meta("999", baseline_commit="abc")

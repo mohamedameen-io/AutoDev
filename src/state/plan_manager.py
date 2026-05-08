@@ -271,6 +271,118 @@ class PlanManager:
             )
             await snapshot_plan(self._cwd, plan, session_id=self._session_id)
 
+    # --- v0.9.0: phase-level mutations -------------------------------
+
+    async def append_corrective_tasks(
+        self,
+        phase_id: str,
+        tasks: list[Task],
+        review_status: str = "corrective_required",
+    ) -> Plan:
+        """Append corrective sub-tasks to ``phase_id`` and update review_status.
+
+        Mirrors :meth:`update_task_status`'s lock + ledger + snapshot
+        pattern. The phase's ``corrective_task_ids`` and ``review_status``
+        are updated atomically alongside the ``tasks`` list. Idempotent on
+        replay (see :func:`state.ledger._apply_op` for the
+        ``append_corrective_tasks`` op).
+
+        Returns the updated plan.
+        """
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            plan = self._load_sync()
+            if plan is None:
+                raise PlanConcurrentModificationError(
+                    "no plan initialized; call init_plan first"
+                )
+            phase = next((p for p in plan.phases if p.id == phase_id), None)
+            if phase is None:
+                raise PlanConcurrentModificationError(
+                    f"phase_id={phase_id!r} not found in current plan"
+                )
+
+            existing_ids = {t.id for t in phase.tasks}
+            appended: list[Task] = []
+            for t in tasks:
+                if t.id in existing_ids:
+                    continue
+                phase.tasks.append(t)
+                existing_ids.add(t.id)
+                if t.id not in phase.corrective_task_ids:
+                    phase.corrective_task_ids.append(t.id)
+                appended.append(t)
+            phase.review_status = review_status  # type: ignore[assignment]
+
+            await append_entry(
+                self._cwd,
+                op="append_corrective_tasks",
+                payload={
+                    "phase_id": phase_id,
+                    "tasks": [t.model_dump(mode="json") for t in appended],
+                    "review_status": review_status,
+                },
+                session_id=self._session_id,
+            )
+            plan = plan.model_copy(update={"updated_at": _iso_now()})
+            await snapshot_plan(self._cwd, plan, session_id=self._session_id)
+            self._log.info(
+                "phase.corrective_tasks_appended",
+                phase_id=phase_id,
+                appended=len(appended),
+                review_status=review_status,
+            )
+            return plan
+
+    async def update_phase_meta(
+        self,
+        phase_id: str,
+        *,
+        baseline_commit: str | None = None,
+        review_status: str | None = None,
+    ) -> Plan:
+        """Update phase-level metadata fields (baseline_commit / review_status).
+
+        Lock + ledger + snapshot. Either field can be ``None`` to leave
+        unchanged; passing both updates them in one ledger entry. Mirrors
+        :meth:`update_task_status` semantics so resumes / replays
+        reproduce the metadata transitions exactly.
+        """
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            plan = self._load_sync()
+            if plan is None:
+                raise PlanConcurrentModificationError(
+                    "no plan initialized; call init_plan first"
+                )
+            phase = next((p for p in plan.phases if p.id == phase_id), None)
+            if phase is None:
+                raise PlanConcurrentModificationError(
+                    f"phase_id={phase_id!r} not found in current plan"
+                )
+
+            payload: dict = {"phase_id": phase_id}
+            if baseline_commit is not None:
+                phase.baseline_commit = baseline_commit
+                payload["baseline_commit"] = baseline_commit
+            if review_status is not None:
+                phase.review_status = review_status  # type: ignore[assignment]
+                payload["review_status"] = review_status
+
+            await append_entry(
+                self._cwd,
+                op="update_phase_meta",
+                payload=payload,
+                session_id=self._session_id,
+            )
+            plan = plan.model_copy(update={"updated_at": _iso_now()})
+            await snapshot_plan(self._cwd, plan, session_id=self._session_id)
+            self._log.info(
+                "phase.meta_updated",
+                phase_id=phase_id,
+                baseline_commit=baseline_commit,
+                review_status=review_status,
+            )
+            return plan
+
     async def read_ledger(self) -> list[LedgerEntry]:
         """Convenience accessor for debugging / CLI `status`."""
         return read_entries(self._cwd)
@@ -365,6 +477,56 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
 
     if op == "impl_tournament_complete":
         # Audit-only breadcrumb. No plan state mutation.
+        return plan
+
+    if op == "phase_review_complete":
+        # v0.9.0: audit-only breadcrumb appended after the phase-review
+        # tournament completes. Plan mutations live in ``update_phase_meta``
+        # / ``append_corrective_tasks``.
+        return plan
+
+    if op == "append_corrective_tasks":
+        # v0.9.0: same logic as :func:`state.ledger._apply_op` but tolerant
+        # to missing / mismatched data during a load-fast-path replay.
+        from state.schemas import Task as _Task
+
+        phase_id = payload.get("phase_id")
+        raw_tasks = payload.get("tasks") or []
+        if not isinstance(phase_id, str):
+            return plan
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            return plan
+        existing = {t.id for t in phase.tasks}
+        for raw in raw_tasks:
+            try:
+                t = _Task.model_validate(raw)
+            except Exception:
+                continue
+            if t.id not in existing:
+                phase.tasks.append(t)
+                existing.add(t.id)
+            if t.id not in phase.corrective_task_ids:
+                phase.corrective_task_ids.append(t.id)
+        new_status = payload.get("review_status")
+        if isinstance(new_status, str):
+            phase.review_status = new_status  # type: ignore[assignment]
+        return plan
+
+    if op == "update_phase_meta":
+        # v0.9.0: idempotent phase-meta update.
+        phase_id = payload.get("phase_id")
+        if not isinstance(phase_id, str):
+            return plan
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            return plan
+        if "baseline_commit" in payload:
+            val = payload["baseline_commit"]
+            phase.baseline_commit = val if isinstance(val, str) else None
+        if "review_status" in payload:
+            val = payload["review_status"]
+            phase.review_status = val if isinstance(val, str) else None  # type: ignore[assignment]
         return plan
 
     return plan
