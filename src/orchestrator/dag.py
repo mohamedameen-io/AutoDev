@@ -19,6 +19,10 @@ which tasks may run concurrently:
   returns every pending task whose ancestry includes any of them. The
   worker pool calls this after a task fails so dependents are
   cascade-blocked rather than left hanging.
+* :func:`find_file_overlaps` — symmetric task-id → set-of-task-ids map
+  derived from intersecting ``Task.files``. The dispatcher uses this to
+  serialize concurrent execution of tasks touching the same files
+  (worktree apply-time conflict avoidance).
 
 Errors are surfaced as :class:`DagValidationError` for the user-facing
 "architect emitted a bad DAG" case. Programming errors inside this
@@ -200,9 +204,39 @@ def find_blocked_descendants(
     return descendants
 
 
+def find_file_overlaps(tasks: list[Task]) -> dict[str, set[str]]:
+    """Map each task id to the set of OTHER task ids sharing >=1 ``files`` entry.
+
+    The relation is symmetric: if A overlaps B, B overlaps A. Tasks with
+    empty ``files`` lists never appear as keys with non-empty values
+    (you can't conflict on no files).
+
+    Returns a dict for every task id (including those with empty
+    overlap sets) so callers can iterate without ``.get()``-with-default
+    boilerplate.
+
+    The dispatcher uses this map to refuse to start a task whose files
+    intersect any in-flight task's files — apply-to-main conflict
+    avoidance up-front rather than recover-after.
+    """
+    out: dict[str, set[str]] = {t.id: set() for t in tasks}
+    for i, a in enumerate(tasks):
+        a_files = set(a.files)
+        if not a_files:
+            continue
+        for b in tasks[i + 1:]:
+            if not b.files:
+                continue
+            if a_files & set(b.files):
+                out[a.id].add(b.id)
+                out[b.id].add(a.id)
+    return out
+
+
 __all__ = [
     "DagValidationError",
     "find_blocked_descendants",
+    "find_file_overlaps",
     "topological_levels",
     "validate_phase_dag",
 ]

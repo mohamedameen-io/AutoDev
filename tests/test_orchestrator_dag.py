@@ -7,6 +7,7 @@ import pytest
 from orchestrator.dag import (
     DagValidationError,
     find_blocked_descendants,
+    find_file_overlaps,
     topological_levels,
     validate_phase_dag,
 )
@@ -214,3 +215,60 @@ def test_find_blocked_descendants_empty_failed_set_returns_empty() -> None:
 def test_find_blocked_descendants_empty_phase() -> None:
     """No tasks → no descendants regardless of failed set."""
     assert find_blocked_descendants(_phase([]), {"x.y"}) == []
+
+
+# ---------------------------------------------------------------------------
+# find_file_overlaps
+# ---------------------------------------------------------------------------
+
+
+def test_find_file_overlaps_detects_shared_files() -> None:
+    """Two tasks sharing a file land in each other's overlap sets."""
+    tasks = [
+        _t("1.1", files=["src/foo.py"]),
+        _t("1.2", files=["src/foo.py", "src/bar.py"]),
+    ]
+    out = find_file_overlaps(tasks)
+    assert out["1.1"] == {"1.2"}
+    assert out["1.2"] == {"1.1"}
+
+
+def test_find_file_overlaps_no_overlap_means_empty_sets() -> None:
+    """Disjoint file lists → all overlap sets are empty."""
+    tasks = [
+        _t("1.1", files=["src/a.py"]),
+        _t("1.2", files=["src/b.py"]),
+        _t("1.3", files=[]),
+    ]
+    out = find_file_overlaps(tasks)
+    assert out == {"1.1": set(), "1.2": set(), "1.3": set()}
+
+
+def test_find_file_overlaps_symmetric() -> None:
+    """A overlaps B ⟹ B overlaps A — the relation is symmetric."""
+    tasks = [
+        _t("1.1", files=["x.py"]),
+        _t("1.2", files=["x.py"]),
+        _t("1.3", files=["x.py"]),
+    ]
+    out = find_file_overlaps(tasks)
+    for a, b in [("1.1", "1.2"), ("1.2", "1.3"), ("1.1", "1.3")]:
+        assert b in out[a]
+        assert a in out[b]
+
+
+def test_find_file_overlaps_empty_files_no_overlap() -> None:
+    """A task with no files cannot overlap anyone."""
+    tasks = [
+        _t("1.1", files=[]),
+        _t("1.2", files=["x.py"]),
+    ]
+    out = find_file_overlaps(tasks)
+    assert out == {"1.1": set(), "1.2": set()}
+
+
+def test_find_file_overlaps_includes_all_task_ids_as_keys() -> None:
+    """Every task id appears as a key, even with empty overlap set."""
+    tasks = [_t("1.1"), _t("1.2", files=["x.py"])]
+    out = find_file_overlaps(tasks)
+    assert set(out.keys()) == {"1.1", "1.2"}
