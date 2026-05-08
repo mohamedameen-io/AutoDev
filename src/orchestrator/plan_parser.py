@@ -71,6 +71,15 @@ _RE_REQUIRES = re.compile(
     r"^\s*-?\s*Requires\s*:\s*(.+?)\s*$",
     re.IGNORECASE,
 )
+# v0.20.0 C1: per-task extended-scope block. Architects emit
+# ``- Extended-scope: path/a, path/b`` (single-line) OR
+# ``- Extended-scope:`` followed by ``  - path`` items (multi-line).
+# The parser matches the inline form here; the multi-line form falls
+# through into the Files / Description state machine via ``in_extended_scope_block``.
+_RE_EXTENDED_SCOPE = re.compile(
+    r"^\s*-\s*Extended[-_]scope\s*:\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
 # v0.8.0: per-task complexity directive. Mirrors :data:`_RE_COMPLEXITY` (the
 # trailing plan-level directive) but lives inside a task body, alongside
 # ``- Requires:`` / ``- Description:``. Captured tokens are normalized to
@@ -267,6 +276,8 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
                 "acceptance": [],
                 "depends_on": [],
                 "requires": [],
+                # v0.20.0 C1
+                "extended_scope": [],
             }
             in_acceptance_block = False
             # v0.9.0: a Task heading definitively ends the phase-acceptance
@@ -379,6 +390,22 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
             in_acceptance_block = False
             continue
 
+        # v0.20.0 C1: per-task ``Extended-scope:`` parsing. Mirrors the
+        # ``Files:`` parser — comma-separated single-line list. Each
+        # entry is normalized via the schema validator (trim trailing /,
+        # reject absolute, reject ``..``).
+        ext_scope_m = _RE_EXTENDED_SCOPE.match(line)
+        if ext_scope_m:
+            payload = ext_scope_m.group(1).strip()
+            if payload:
+                current_task["extended_scope"] = [
+                    s.strip().rstrip("/")
+                    for s in payload.split(",")
+                    if s.strip()
+                ]
+            in_acceptance_block = False
+            continue
+
         # v0.8.0: per-task complexity directive. The regex constrains the
         # captured group to {simple, medium, complex} (case-insensitive); we
         # still defensively validate the lowercased token and drop unknowns
@@ -460,6 +487,8 @@ def _make_task(raw: dict, phase_id: str) -> Task:
         # downstream resolver returns ``None`` and execute_phase falls back
         # to the spec default.
         complexity=raw.get("complexity"),
+        # v0.20.0 C1: per-task extended scope parsed from ``- Extended-scope:``.
+        extended_scope=raw.get("extended_scope", []),
         assigned_agent="developer",
     )
 
