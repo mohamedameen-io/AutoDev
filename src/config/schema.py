@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 REQUIRED_AGENT_ROLES: tuple[str, ...] = (
@@ -38,6 +38,66 @@ class AgentConfig(BaseModel):
     # user-global default in ``~/.claude/settings.json``). Validated at the
     # config layer; the adapter accepts any string for forward-compat.
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+
+
+class BranchConfig(BaseModel):
+    """v0.14.0: per-branch configuration for heterogeneous-model multi-branch
+    plan tournaments.
+
+    The default plan-tournament configuration runs N homogeneous branches
+    (same model per role across all branches). Setting
+    :attr:`TournamentPhaseConfig.branches` to a list of :class:`BranchConfig`
+    swaps each branch's per-role model and stamps a divergent
+    ``lane`` / ``risk`` / ``family`` tag for forensics + future
+    plateau-detection heuristics.
+
+    Fields:
+
+    * ``model_overrides``: ``{role: model_name}`` map. The plan-tournament
+      runner consults this first when resolving the per-role model;
+      missing roles fall through to the existing :func:`resolve_model`
+      path (i.e. ``cfg.agents[role].model`` then registry default).
+      Empty dict (default) means "no overrides" — branch behaves like a
+      legacy homogeneous branch.
+    * ``lane``: divergent-trajectory label.
+      Used to suffix the branch's artifact directory
+      (``branch-{i}-{lane}/``) and stamped into ledger metadata.
+    * ``risk``: relative risk classification (``low`` / ``medium`` /
+      ``high``). Advisory only in v0.14.0 — future versions may use it
+      to gate higher-risk branches behind a separate cohort.
+    * ``family``: free-form tag for plateau detection. Two branches with
+      the same family but different lanes are siblings; the future
+      v0.14.1+ plateau detector can suppress repeated families.
+
+    All fields have safe defaults so an empty :class:`BranchConfig` is
+    well-formed (lane=local-tweak, risk=medium, no overrides).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_overrides: dict[str, str] = Field(default_factory=dict)
+    lane: Literal[
+        "distant-scout",
+        "local-tweak",
+        "architectural",
+        "constraint-removal",
+        "incumbent-confirmation",
+    ] = "local-tweak"
+    risk: Literal["low", "medium", "high"] = "medium"
+    family: str | None = None
+
+    @field_validator("model_overrides", mode="after")
+    @classmethod
+    def _validate_role_keys(cls, v: dict[str, str]) -> dict[str, str]:
+        """Reject empty model strings (would silently fall through to
+        resolve_model). Empty dict is fine; an entry mapping a role to
+        ``""`` is almost certainly a config typo."""
+        for role, model in v.items():
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(
+                    f"BranchConfig.model_overrides[{role!r}] must be a non-empty string"
+                )
+        return v
 
 
 class TournamentPhaseConfig(BaseModel):
@@ -93,6 +153,46 @@ class TournamentPhaseConfig(BaseModel):
     # ``num_branches=1`` because branch fan-out isn't wired into those
     # runners in this release.
     num_branches: int = Field(default=1, ge=1, le=5)
+    # v0.14.0: heterogeneous-model branches. ``None`` (default) preserves
+    # v0.12.0 homogeneous behavior — every branch uses the same per-role
+    # models. When set to a non-None list, each entry is a
+    # :class:`BranchConfig` describing a divergent branch's model overrides
+    # / lane / risk / family. The multi-branch dispatcher uses the list's
+    # length as the branch fan-out count and threads each entry's model
+    # overrides into the per-branch tournament runner. Mutually exclusive
+    # with ``num_branches > 1`` (validated below).
+    branches: list[BranchConfig] | None = None
+
+    @model_validator(mode="after")
+    def _validate_branches(self) -> "TournamentPhaseConfig":
+        """Enforce the v0.14.0 ``branches`` invariants.
+
+        * Empty list ``[]`` is rejected — use ``None`` to disable.
+        * Length is clamped to [1, 5] (matches ``num_branches`` ceiling).
+        * Non-None branches AND ``num_branches > 1`` is rejected — the
+          two are mutually exclusive paths to multi-branch fan-out.
+          ``num_branches=1`` (the default) is fine alongside ``branches``;
+          the dispatcher derives the actual count from ``len(branches)``.
+        """
+        if self.branches is not None:
+            if len(self.branches) == 0:
+                raise ValueError(
+                    "TournamentPhaseConfig.branches must be None or a "
+                    "non-empty list (use None to disable hetero-models)"
+                )
+            if len(self.branches) > 5:
+                raise ValueError(
+                    f"TournamentPhaseConfig.branches has "
+                    f"{len(self.branches)} entries, max is 5"
+                )
+            if self.num_branches > 1:
+                raise ValueError(
+                    "TournamentPhaseConfig: ``branches`` and "
+                    "``num_branches > 1`` are mutually exclusive — "
+                    f"got num_branches={self.num_branches} with "
+                    f"{len(self.branches)} branch entries"
+                )
+        return self
 
 
 def _default_phase_review_cfg() -> "TournamentPhaseConfig":
