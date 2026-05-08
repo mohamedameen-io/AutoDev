@@ -1,4 +1,4 @@
-"""Execute-phase loop.
+"""Execute-phase loop and conflict-escalation helpers.
 
 For each pending task (or a specific task when ``task_id`` is given):
 
@@ -19,7 +19,9 @@ escalated, mark it blocked, and stop the loop.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -88,6 +90,141 @@ class TaskEscalatedError(AutodevError):
     The execute loop catches this internally — it is surfaced to the CLI
     only when the user explicitly targets a task that ends up escalated.
     """
+
+
+# v0.11.0: conflict-escalation helpers.
+
+ConflictAction = Literal["rebase-and-retry", "abandon-task", "rewrite"]
+
+
+@dataclass
+class ConflictResolution:
+    """Parsed result from ``critic_sounding_board`` in CONFLICT ESCALATION MODE.
+
+    Attributes:
+        action: One of ``rebase-and-retry`` / ``abandon-task`` /
+            ``rewrite``. Defaults to ``abandon-task`` when the parser
+            cannot extract a valid directive (defensive — the worker
+            then blocks the task with a parser-fallback reason).
+        rewrite_guidance: Free-form text from the critic intended to
+            steer a re-invoked developer pass. Only meaningful when
+            ``action == "rewrite"``. Empty for the other two branches.
+    """
+
+    action: ConflictAction = "abandon-task"
+    rewrite_guidance: str = ""
+
+
+# Regex matching the trailing ``RESOLUTION:`` directive on its own line.
+# The directive may be followed by trailing whitespace / blank lines.
+_CONFLICT_DIRECTIVE_RE = re.compile(
+    r"^RESOLUTION:\s*(rebase-and-retry|abandon-task|rewrite)\s*$",
+    re.MULTILINE,
+)
+
+
+def _parse_conflict_resolution(critic_response: str) -> ConflictResolution:
+    """Extract a :class:`ConflictResolution` from the critic's text.
+
+    Looks for a ``RESOLUTION: <action>`` line, anchored to its own line.
+    On parse failure (no directive found, multiple conflicting
+    directives, etc.) returns ``ConflictResolution(action="abandon-task")``
+    so the caller can safely block the task.
+
+    For ``rewrite``, captures everything BEFORE the matched directive
+    line as ``rewrite_guidance`` (stripped of trailing whitespace). The
+    guidance is what the orchestrator passes back to the developer
+    when re-invoking.
+    """
+    if not critic_response:
+        return ConflictResolution()
+
+    matches = list(_CONFLICT_DIRECTIVE_RE.finditer(critic_response))
+    if not matches:
+        return ConflictResolution()
+    # Take the LAST directive — the prompt instructs ending with one
+    # directive, so the last match is the authoritative answer.
+    last = matches[-1]
+    action_raw = last.group(1)
+    if action_raw not in ("rebase-and-retry", "abandon-task", "rewrite"):
+        return ConflictResolution()
+    action: ConflictAction = cast("ConflictAction", action_raw)
+
+    guidance = ""
+    if action == "rewrite":
+        # Everything before the directive's start position is guidance.
+        guidance = critic_response[: last.start()].strip()
+    return ConflictResolution(action=action, rewrite_guidance=guidance)
+
+
+async def _escalate_conflict_to_critic(
+    orch: "Orchestrator",
+    task: Task,
+    worktree: Path,
+    conflict_diff: str,
+    already_applied_diff: str = "",
+    conflict_files: list[str] | None = None,
+) -> ConflictResolution:
+    """Invoke ``critic_sounding_board`` in CONFLICT ESCALATION MODE.
+
+    Builds a :class:`DelegationEnvelope` carrying a ``CONFLICT_CONTEXT:``
+    block (failing task id, conflict file paths, both diffs) so the
+    prompt's gated CONFLICT ESCALATION MODE section activates. Parses
+    the response via :func:`_parse_conflict_resolution`.
+
+    Returns a :class:`ConflictResolution`. The caller (typically the
+    worker after ``apply_patch_to_main`` raises) branches on
+    ``resolution.action``:
+
+    * ``rebase-and-retry`` → retry apply with ``three_way=True``.
+    * ``abandon-task`` → mark the task blocked.
+    * ``rewrite`` → re-invoke the developer with
+      ``resolution.rewrite_guidance`` injected as context.
+    """
+    files_block = "\n".join(
+        f"  - {f}" for f in (conflict_files or [str(worktree)])
+    )
+    conflict_context = (
+        "CONFLICT_CONTEXT:\n"
+        f"failing_task_id: {task.id}\n"
+        f"conflict_files:\n{files_block}\n"
+        "already_applied_diff: |\n"
+        f"{_indent_block(already_applied_diff)}\n"
+        "attempted_diff: |\n"
+        f"{_indent_block(conflict_diff)}\n"
+    )
+
+    env = DelegationEnvelope(
+        task_id=task.id,
+        target_agent="critic_sounding_board",
+        action="critique",
+        acceptance=(
+            "End your response with exactly one RESOLUTION: directive "
+            "(rebase-and-retry / abandon-task / rewrite)."
+        ),
+        context={
+            "task_id": task.id,
+            "conflict_context_marker": True,
+        },
+    )
+    result = await delegate(
+        orch,
+        "critic_sounding_board",
+        env,
+        extra_context=conflict_context,
+    )
+    return _parse_conflict_resolution(result.text or "")
+
+
+def _indent_block(text: str, prefix: str = "  ") -> str:
+    """Indent every line of ``text`` by ``prefix`` for the YAML-ish block.
+
+    Returns the empty string verbatim so the CONFLICT_CONTEXT: block is
+    well-formed even when one of the diffs is missing.
+    """
+    if not text:
+        return ""
+    return "\n".join(prefix + line for line in text.splitlines())
 
 
 async def run_execute_phase(
