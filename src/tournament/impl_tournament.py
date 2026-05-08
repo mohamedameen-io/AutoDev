@@ -415,6 +415,7 @@ class ImplTournament(Tournament[ImplBundle]):
         coder_runner: CoderRunner,
         worktree_manager: Any,  # WorktreeManager — typed Any to avoid cycle
         judge_plugins: list[Any] | None = None,
+        voting_strategy: Any | None = None,
     ) -> None:
         super().__init__(
             handler=handler,
@@ -423,6 +424,7 @@ class ImplTournament(Tournament[ImplBundle]):
             artifact_dir=artifact_dir,
             rng=rng,
             judge_plugins=judge_plugins,
+            voting_strategy=voting_strategy,
         )
         self._coder_runner = coder_runner
         self._worktrees = worktree_manager

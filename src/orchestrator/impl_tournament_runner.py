@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from adapters import InlineAdapter
 from autologging import get_logger
@@ -375,6 +375,16 @@ async def run_impl_tournament(
         if orch.plugin_registry is not None
         else []
     )
+
+    # v0.18.0 C1: opt into the council/veto strategy when the operator
+    # configures ``cfg.tournaments.impl.voting_strategy = "veto"``. Default
+    # ``"borda"`` preserves v0.17.0 byte-identical aggregation behavior.
+    voting_strategy: Any = None
+    if getattr(cfg, "voting_strategy", "borda") == "veto":
+        from tournament.voting import VetoAggregator
+
+        voting_strategy = VetoAggregator()
+
     tournament = ImplTournament(
         handler=ImplContentHandler(),
         client=client,
@@ -383,6 +393,7 @@ async def run_impl_tournament(
         coder_runner=coder_runner,
         worktree_manager=wt_mgr,
         judge_plugins=judge_plugins,
+        voting_strategy=voting_strategy,
     )
 
     logger.info(

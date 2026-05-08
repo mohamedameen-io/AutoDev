@@ -190,6 +190,37 @@ class TournamentPhaseConfig(BaseModel):
     # call per pass and is most useful on long-form impl outputs where
     # slop / hallucinated APIs are the dominant failure mode.
     explorer_enabled: bool = False
+    # v0.18.0 C1: pluggable judge-aggregation strategy. ``"borda"`` (default)
+    # uses the legacy Borda count and is byte-identical to v0.17.0
+    # behavior. ``"veto"`` switches to the council/veto policy implemented
+    # in :class:`tournament.voting.VetoAggregator` — any judge ranking a
+    # candidate last vetoes that candidate; surviving candidates fall
+    # through to a Borda tally. Currently consumed by the impl-tournament
+    # runner only; plan + phase_review continue to use the default.
+    voting_strategy: Literal["borda", "veto"] = "borda"
+    # v0.18.0 C3: optional list of specialist judge roles. ``None``
+    # (default) preserves the legacy ``["judge"] * num_judges`` cohort.
+    # When set (e.g. ``["critic", "reviewer", "test_engineer",
+    # "domain_expert", "explorer"]``), each entry becomes a judge of that
+    # role. The list length wins over ``num_judges`` — ``num_judges`` is
+    # derived as ``len(judge_roles)`` when the list is set.
+    judge_roles: list[str] | None = None
+    # v0.18.0 C3: per-role weighting for specialist judges. ``None``
+    # (default) gives every judge equal weight. When set, each role's
+    # vote is weighted by the corresponding float (e.g.
+    # ``{"test_engineer": 2.0}`` doubles the test engineer's Borda
+    # contribution). Roles missing from the dict default to weight 1.0.
+    judge_role_weights: dict[str, float] | None = None
+    # v0.18.0 B2: per-family plateau detection toggle. When True, the
+    # multi-branch dispatcher checks
+    # :class:`orchestrator.plateau_detector.PlateauDetector` for each
+    # branch's family before fan-out and forces a ``distant-scout`` lane
+    # change on the first plateaued branch. Default False — opt-in
+    # because the detector requires non-trivial knowledge state.
+    plateau_detection_enabled: bool = False
+    plateau_window: int = 4
+    cross_family_plateau_enabled: bool = False
+    cross_family_plateau_window: int = 10
 
     @model_validator(mode="after")
     def _validate_branches(self) -> "TournamentPhaseConfig":
