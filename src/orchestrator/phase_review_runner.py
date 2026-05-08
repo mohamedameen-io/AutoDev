@@ -1,6 +1,13 @@
 """Glue between :class:`~orchestrator.Orchestrator` and the v0.9.0
 phase-review tournament engine.
 
+v0.18.0 A2: ``run_multi_branch_phase_review_tournament`` adds branched
+phase-review fan-out — N independent reviews run concurrently and a
+majority-vote meta-merge produces the final outcome (no LLM synthesis
+needed because the phase-review verdict is text-only). Mirrors
+:mod:`orchestrator.multi_branch_tournament` but simpler (no synthesizer
+step, just text dedup + majority voting).
+
 Mirrors :mod:`orchestrator.impl_tournament_runner` shape but uses
 :class:`tournament.phase_review.PhaseReviewBundle` as the content type
 and :class:`tournament.core.Tournament` (the base class) directly — no
@@ -518,9 +525,230 @@ async def run_phase_review_tournament(
 _extract_files_from_diff = extract_files_from_diff
 
 
+async def run_multi_branch_phase_review_tournament(
+    orch: "Orchestrator",
+    phase: "Phase",
+    baseline_commit: str,
+    tip_commit: str,
+    spec_md: str,
+    n_branches: int,
+    branch_configs: "list[BranchConfig] | None" = None,
+) -> PhaseReviewOutcome:
+    """Run N concurrent phase-review tournaments and meta-merge survivors.
+
+    Each branch runs a full phase-review tournament independently (with
+    optional :class:`~config.schema.BranchConfig` for hetero-models +
+    lane). After all branches return, the meta-merge applies majority
+    voting on ``accept_phase`` and concatenate-deduplicates corrective
+    text from non-A winners. NO LLM synthesis — phase-review verdicts
+    are text-only.
+
+    Survivor floor: ``max(2, ceil(N/2))``. If fewer survive, raises
+    :class:`~errors.TournamentError`.
+
+    Args:
+        orch: Orchestrator instance.
+        phase: Phase being reviewed.
+        baseline_commit / tip_commit: Diff range for variant A.
+        spec_md: User intent string.
+        n_branches: Number of parallel branches (>=1).
+        branch_configs: Optional list of per-branch configs; must be of
+            length ``n_branches`` if provided.
+
+    Returns:
+        :class:`PhaseReviewOutcome` with the meta-merged verdict. The
+        ``history`` field carries the union of all branch histories
+        (forensics).
+
+    Raises:
+        TournamentError: when fewer than the survivor floor of branches
+            succeeded.
+        ValueError: on caller misuse (n_branches<1 or branch_configs
+            length mismatch).
+    """
+    import asyncio
+    import math
+
+    from errors import TournamentError
+
+    if n_branches < 1:
+        raise ValueError(f"n_branches must be ≥1, got {n_branches}")
+    if branch_configs is not None and len(branch_configs) != n_branches:
+        raise ValueError(
+            f"len(branch_configs) ({len(branch_configs)}) must equal "
+            f"n_branches ({n_branches})"
+        )
+
+    # N=1 short-circuit: just call the single-branch path with the lone
+    # branch_config (or None) and return its outcome unchanged.
+    if n_branches == 1:
+        only_bc = branch_configs[0] if branch_configs else None
+        return await run_phase_review_tournament(
+            orch=orch,
+            phase=phase,
+            baseline_commit=baseline_commit,
+            tip_commit=tip_commit,
+            spec_md=spec_md,
+            branch_config=only_bc,
+        )
+
+    # Audit-trail breadcrumb at start.
+    await orch.plan_manager.ledger_append(
+        op="multi_branch_phase_review_start",
+        payload={
+            "phase_id": phase.id,
+            "n_branches": n_branches,
+            "lanes": [
+                (branch_configs[i].lane if branch_configs and branch_configs[i]
+                 else None)
+                for i in range(n_branches)
+            ],
+        },
+    )
+
+    logger.info(
+        "multi_branch_phase_review.start",
+        phase_id=phase.id,
+        n_branches=n_branches,
+    )
+
+    # Step 1: gather N concurrent phase reviews. ``return_exceptions=True``
+    # so a single branch failure does NOT cancel siblings.
+    coros = [
+        run_phase_review_tournament(
+            orch=orch,
+            phase=phase,
+            baseline_commit=baseline_commit,
+            tip_commit=tip_commit,
+            spec_md=spec_md,
+            branch_config=(
+                branch_configs[i] if branch_configs is not None else None
+            ),
+        )
+        for i in range(n_branches)
+    ]
+    raw_results = await asyncio.gather(*coros, return_exceptions=True)
+
+    # Partition into survivors + failures.
+    survivors: list[PhaseReviewOutcome] = []
+    failures: list[tuple[int, BaseException]] = []
+    for i, r in enumerate(raw_results):
+        if isinstance(r, BaseException):
+            failures.append((i, r))
+            logger.warning(
+                "multi_branch_phase_review.branch_failed",
+                branch_index=i,
+                error=str(r),
+            )
+        else:
+            survivors.append(r)
+
+    floor = max(2, math.ceil(n_branches / 2))
+    if len(survivors) < floor:
+        raise TournamentError(
+            f"only {len(survivors)} of {n_branches} phase-review branches "
+            f"succeeded; survivor floor is {floor}"
+        )
+
+    # Step 2: meta-merge — majority vote on accept_phase + dedup corrective.
+    accept_votes = sum(1 for s in survivors if s.accept_phase)
+    reject_votes = len(survivors) - accept_votes
+    accept_phase_majority = accept_votes >= reject_votes
+    # On ties, accept (conservative — incumbent wins).
+    if accept_votes == reject_votes:
+        accept_phase_majority = True
+
+    # Concatenate-deduplicate corrective text from rejecting survivors.
+    corrective_blocks: list[str] = []
+    seen: set[str] = set()
+    for s in survivors:
+        if s.accept_phase or not s.corrective_direction:
+            continue
+        text = s.corrective_direction.strip()
+        # Dedup by line: drop lines we've already seen.
+        deduped_lines: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                if deduped_lines and deduped_lines[-1] != "":
+                    deduped_lines.append("")
+                continue
+            if stripped in seen:
+                continue
+            seen.add(stripped)
+            deduped_lines.append(line)
+        if deduped_lines:
+            corrective_blocks.append("\n".join(deduped_lines).strip())
+
+    merged_corrective: str | None = None
+    if not accept_phase_majority and corrective_blocks:
+        merged_corrective = "\n\n".join(corrective_blocks)
+    elif accept_phase_majority:
+        merged_corrective = None
+
+    # Pick a canonical winner label based on the majority verdict.
+    if accept_phase_majority:
+        meta_winner: WinnerLabelLit = "A"
+    else:
+        # Use the most common non-A winner label among rejecting survivors.
+        non_a_labels = [s.winner for s in survivors if not s.accept_phase]
+        if non_a_labels:
+            # Mode (first wins on tie).
+            counts: dict[str, int] = {}
+            for label in non_a_labels:
+                counts[label] = counts.get(label, 0) + 1
+            meta_winner = max(counts.keys(), key=lambda k: counts[k])  # type: ignore[arg-type,assignment]
+        else:
+            meta_winner = "B"
+
+    # Concatenate histories from all survivors so post-hoc analysis can
+    # walk every pass that ran across the cohort.
+    union_history: list[PassResult] = []
+    for s in survivors:
+        union_history.extend(s.history)
+
+    # Audit-trail breadcrumb at end.
+    await orch.plan_manager.ledger_append(
+        op="multi_branch_phase_review_meta_merge_complete",
+        payload={
+            "phase_id": phase.id,
+            "n_survivors": len(survivors),
+            "n_branches": n_branches,
+            "accept_votes": accept_votes,
+            "reject_votes": reject_votes,
+            "majority_accept": accept_phase_majority,
+        },
+    )
+    await orch.plan_manager.ledger_append(
+        op="multi_branch_phase_review_complete",
+        payload={
+            "phase_id": phase.id,
+            "n_branches": n_branches,
+            "n_survivors": len(survivors),
+            "winner": meta_winner,
+            "accept_phase": accept_phase_majority,
+        },
+    )
+
+    logger.info(
+        "multi_branch_phase_review.done",
+        phase_id=phase.id,
+        n_survivors=len(survivors),
+        accept_phase=accept_phase_majority,
+    )
+
+    return PhaseReviewOutcome(
+        winner=meta_winner,
+        accept_phase=accept_phase_majority,
+        corrective_direction=merged_corrective,
+        history=union_history,
+    )
+
+
 __all__ = [
     "PhaseReviewOutcome",
     "_phase_complexity_rollup",
     "_phase_review_tournament_id",
+    "run_multi_branch_phase_review_tournament",
     "run_phase_review_tournament",
 ]
