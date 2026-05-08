@@ -172,6 +172,12 @@ class TournamentPhaseConfig(BaseModel):
     # incumbent quality matters most) while staying off for the impl
     # tournament (where the cost doubling would be punitive).
     promotion_grade_enabled: bool = False
+    # v0.19.0 C1: holdout-set evaluation. When True and a winner reaches
+    # the ``repeated`` ladder rung, the tournament invokes the holdout
+    # runner against the baseline-commit ``tests/`` snapshot before
+    # promoting. Failure → ``no_change`` (winner stays at ``repeated``);
+    # success → ``promote_to_eligible`` as before.
+    holdout_evaluation_enabled: bool = False
     # v0.16.0: drift-verifier final-defense gate. v0.17.0 flips the default
     # ON now that ``tests/stub_adapter.py`` returns a parser-compatible
     # ``VERDICT: APPROVED`` for ``critic_drift_verifier`` by default —
