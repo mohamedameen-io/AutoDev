@@ -21,12 +21,14 @@ Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from adapters import InlineAdapter
 from autologging import get_logger
+from errors import TournamentError
 from orchestrator.delegation_envelope import DelegationEnvelope
 from orchestrator.worktree import WorktreeManager
 from runtime.resource_probe import probe_host, resolve_parallelism
@@ -551,8 +553,364 @@ async def run_impl_tournament(
     return final_bundle
 
 
+async def run_multi_branch_impl_tournament(
+    orch: "Orchestrator",
+    task: "Task",
+    initial_bundle: ImplBundle,
+    n_branches: int,
+    branch_configs: "list[BranchConfig] | None" = None,
+) -> ImplBundle:
+    """v0.21.0 A2: run N parallel impl tournaments, then meta-merge survivors.
+
+    Mirrors :func:`run_multi_branch_plan_tournament` for impl scope. The
+    high-level flow:
+
+    1. Append ``multi_branch_impl_start`` ledger op.
+    2. ``asyncio.gather`` N copies of :func:`run_impl_tournament`,
+       each in its own per-branch worktree (when applicable) with
+       ``return_exceptions=True`` so a single branch failure does NOT
+       cancel siblings.
+    3. Apply the survivor floor ``max(2, ceil(N/2))`` — fewer surviving
+       branches → :class:`TournamentError` raised so the caller falls
+       back to the v0.6.0 salvage path.
+    4. **Meta-merge via diff synthesis**: not git 3-way merge (conflict
+       risk on real code), not Borda-only on diffs (loses information).
+       Instead, the synthesizer LLM call sees N candidate diffs side-by-
+       side, produces merged-diff markdown, then a fresh ``CoderRunner``
+       re-materializes the merged diff in a clean worktree to produce
+       the final :class:`ImplBundle`.
+    5. Append ``multi_branch_impl_meta_merge_complete`` and
+       ``multi_branch_impl_complete`` ledger ops.
+
+    Branch-config alignment is the same contract as
+    :func:`run_multi_branch_plan_tournament`: when ``branch_configs`` is
+    non-None, ``len(branch_configs) == n_branches`` is required.
+
+    Survivor-floor failure raises :class:`TournamentError`. The caller
+    (the execute-phase impl-tournament dispatch site) is expected to
+    catch and either fall back to the original ``initial_bundle`` or
+    activate the salvage path that scans
+    ``tournaments/multi-impl-{task_id_prefix}/branch-N/`` for the best
+    surviving incumbent.
+
+    Args:
+        orch: Orchestrator carrying adapter, cfg, registry.
+        task: Task being implemented.
+        initial_bundle: Variant A (incumbent) bundle.
+        n_branches: Number of parallel branches.
+        branch_configs: Optional list of per-branch model overrides; one
+            entry per branch when supplied.
+    """
+    if n_branches < 1:
+        raise ValueError(f"n_branches must be ≥1, got {n_branches}")
+
+    if branch_configs is not None and len(branch_configs) != n_branches:
+        raise ValueError(
+            f"len(branch_configs) ({len(branch_configs)}) must equal "
+            f"n_branches ({n_branches}) — exact 1:1 correspondence required"
+        )
+
+    # N=1 short-circuit: pass-through to single-branch runner so the
+    # multi-branch path is purely additive.
+    if n_branches == 1:
+        only_bc = branch_configs[0] if branch_configs is not None else None
+        return await run_impl_tournament(
+            orch, task, initial_bundle, branch_config=only_bc
+        )
+
+    lanes: list[str | None]
+    if branch_configs is not None:
+        lanes = [bc.lane if bc is not None else None for bc in branch_configs]
+    else:
+        lanes = [None] * n_branches
+
+    await orch.plan_manager.ledger_append(
+        op="multi_branch_impl_start",
+        payload={
+            "task_id": task.id,
+            "n_branches": n_branches,
+            "lanes": lanes,
+        },
+    )
+
+    logger.info(
+        "multi_branch_impl.start",
+        task_id=task.id,
+        n_branches=n_branches,
+    )
+
+    # Step 1: gather N parallel branches with return_exceptions so a
+    # single branch failure does NOT cancel siblings.
+    coros = [
+        run_impl_tournament(
+            orch,
+            task,
+            initial_bundle,
+            branch_config=(
+                branch_configs[i] if branch_configs is not None else None
+            ),
+        )
+        for i in range(n_branches)
+    ]
+    raw_results = await asyncio.gather(*coros, return_exceptions=True)
+
+    branches: list[tuple[int, ImplBundle | None, str | None]] = []
+    for i, r in enumerate(raw_results):
+        if isinstance(r, BaseException):
+            branches.append((i, None, str(r)))
+            logger.warning(
+                "multi_branch_impl.branch_failed",
+                branch_index=i,
+                err=str(r),
+            )
+        else:
+            branches.append((i, r, None))
+
+    survivors = [(i, b) for (i, b, e) in branches if b is not None]
+    floor = _impl_survivor_floor(n_branches)
+    if len(survivors) < floor:
+        logger.warning(
+            "multi_branch_impl.under_floor",
+            survivors=len(survivors),
+            floor=floor,
+            n_branches=n_branches,
+        )
+        raise TournamentError(
+            f"only {len(survivors)} of {n_branches} impl branches succeeded; "
+            f"survivor floor is {floor}"
+        )
+
+    # Step 2: meta-merge via diff synthesis.
+    survivor_diffs = [b.diff or "" for (_, b) in survivors]
+    merged_bundle = await _impl_meta_merge_via_diff_synthesis(
+        orch,
+        task,
+        initial_bundle,
+        survivor_diffs,
+    )
+
+    await orch.plan_manager.ledger_append(
+        op="multi_branch_impl_meta_merge_complete",
+        payload={
+            "task_id": task.id,
+            "n_survivors": len(survivors),
+            "n_branches": n_branches,
+        },
+    )
+    await orch.plan_manager.ledger_append(
+        op="multi_branch_impl_complete",
+        payload={
+            "task_id": task.id,
+            "n_branches": n_branches,
+            "n_survivors": len(survivors),
+            "winner_diff_bytes": len(merged_bundle.diff or ""),
+        },
+    )
+
+    logger.info(
+        "multi_branch_impl.done",
+        task_id=task.id,
+        n_branches=n_branches,
+        n_survivors=len(survivors),
+        winner_diff_bytes=len(merged_bundle.diff or ""),
+    )
+
+    return merged_bundle
+
+
+def _impl_survivor_floor(n_branches: int) -> int:
+    """``max(2, ceil(N/2))`` — same shape as plan-side multi-branch."""
+    import math
+
+    return max(2, math.ceil(n_branches / 2))
+
+
+async def _impl_meta_merge_via_diff_synthesis(
+    orch: "Orchestrator",
+    task: "Task",
+    initial_bundle: ImplBundle,
+    diffs: list[str],
+) -> ImplBundle:
+    """v0.21.0 A2: synthesizer-LLM-on-diffs meta-merge.
+
+    Renders the diff-synthesis prompt over the survivor diffs, calls the
+    synthesizer role, parses the merged-diff markdown, then re-runs the
+    coder in a fresh worktree to materialize a new :class:`ImplBundle`.
+
+    Fallback chain:
+        1. ``len(diffs) == 1`` → return a clone of the initial_bundle
+           with that diff (no synthesis needed).
+        2. Synthesizer raises / returns unparseable diff → fall back to
+           the strongest survivor by tests_passed (Borda surrogate over
+           pre-merge metrics).
+        3. CoderRunner materialization fails → return the strongest
+           survivor.
+    """
+    if not diffs:
+        # Defensive: caller should have raised survivor floor before
+        # reaching this. Return initial_bundle untouched.
+        return initial_bundle
+
+    # ── Build LLM client for the synthesizer call ──
+    role_max_turns, role_allowed_tools, role_timeout_s, role_effort = (
+        await _build_tournament_role_overrides(orch)
+    )
+    client = AdapterLLMClient(
+        orch.adapter,
+        cwd=orch.cwd,
+        role_max_turns=role_max_turns,
+        role_allowed_tools=role_allowed_tools,
+        role_effort=role_effort,
+        role_timeout_s=role_timeout_s,
+    )
+
+    handler = ImplContentHandler()
+    user_prompt = handler.render_for_diff_synthesis(
+        task_prompt=task.description,
+        diffs=diffs,
+    )
+
+    from tournament.prompts import SYNTHESIZER_SYSTEM
+
+    synth_model = _resolve_tournament_model(orch)
+    try:
+        synth_text = await client.call(
+            system=SYNTHESIZER_SYSTEM,
+            user=user_prompt,
+            role="synthesizer",
+            model=synth_model,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "multi_branch_impl.meta_merge.synth_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return _fallback_strongest_survivor(initial_bundle, diffs)
+
+    merged_diff = _extract_diff_block(synth_text)
+    if not merged_diff:
+        logger.warning(
+            "multi_branch_impl.meta_merge.no_diff_block",
+            task_id=task.id,
+            synth_text_excerpt=synth_text[:200] if synth_text else "",
+        )
+        return _fallback_strongest_survivor(initial_bundle, diffs)
+
+    # ── Re-materialize via CoderRunner in a fresh worktree ──
+    artifact_dir = (
+        autodev_root(orch.cwd)
+        / "tournaments"
+        / f"multi-impl-{task.id}-meta"
+    )
+    worktree_dir = artifact_dir / "worktrees"
+    wt_mgr = WorktreeManager(main_repo=orch.cwd, tournament_dir=worktree_dir)
+    coder_runner = _CoderRunner(orch)
+
+    try:
+        wt = await wt_mgr.create("meta")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "multi_branch_impl.meta_merge.worktree_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return _fallback_strongest_survivor(initial_bundle, diffs)
+
+    try:
+        # Pass merged diff as the developer's "direction" — the coder
+        # role re-implements per the merged diff and runs tests.
+        merged = await coder_runner.run(
+            variant_label="AB",
+            direction=(
+                "META-MERGE DIRECTIVE — apply the following merged diff "
+                f"into the worktree. Run tests after.\n\n```diff\n"
+                f"{merged_diff}\n```"
+            ),
+            worktree=wt,
+            task=initial_bundle,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "multi_branch_impl.meta_merge.coder_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return _fallback_strongest_survivor(initial_bundle, diffs)
+    finally:
+        try:
+            await wt_mgr.cleanup_all()
+        except Exception:  # noqa: BLE001
+            pass
+
+    return merged
+
+
+def _fallback_strongest_survivor(
+    initial_bundle: ImplBundle,
+    diffs: list[str],
+) -> ImplBundle:
+    """Return a clone of ``initial_bundle`` carrying the largest survivor diff.
+
+    Used when meta-merge fails. Picks the longest diff as a stand-in for
+    "richest survivor" — a crude but conservative surrogate when the
+    survivors carry no ranking metadata at this layer.
+    """
+    if not diffs:
+        return initial_bundle
+    best_diff = max(diffs, key=len)
+    return ImplBundle(
+        task_id=initial_bundle.task_id,
+        task_description=initial_bundle.task_description,
+        diff=best_diff,
+        files_changed=list(initial_bundle.files_changed),
+        tests_passed=initial_bundle.tests_passed,
+        tests_failed=initial_bundle.tests_failed,
+        tests_total=initial_bundle.tests_total,
+        test_output_excerpt=initial_bundle.test_output_excerpt,
+        variant_label="AB",
+        notes="meta-merge-fallback",
+    )
+
+
+def _extract_diff_block(text: str) -> str:
+    """Extract the first fenced ``diff`` block from ``text``.
+
+    Looks for ```diff ... ``` (case-insensitive opener). When no fenced
+    block is present, falls back to looking for a ``diff --git ...``
+    prefix and returning everything from there to end-of-text. Returns
+    empty string when no diff-shaped content is found — caller falls
+    back to the strongest-survivor path.
+    """
+    if not text:
+        return ""
+    # 1. Fenced ```diff ... ``` (preferred shape).
+    import re
+
+    m = re.search(
+        r"```\s*diff\s*\n(.*?)```",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if m is not None:
+        return m.group(1).strip()
+    # 2. Generic fenced block (```\n...\n```), use only if it contains
+    #    a ``diff --git`` marker so we don't grab prose.
+    m2 = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
+    if m2 is not None and "diff --git" in m2.group(1):
+        return m2.group(1).strip()
+    # 3. Bare ``diff --git`` prefix.
+    idx = text.find("diff --git")
+    if idx >= 0:
+        return text[idx:].strip()
+    return ""
+
+
 __all__ = [
+    "_extract_diff_block",
+    "_impl_survivor_floor",
     "_is_auto_disabled",
     "_resolve_tournament_model",
     "run_impl_tournament",
+    "run_multi_branch_impl_tournament",
 ]

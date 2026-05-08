@@ -29,7 +29,7 @@ from adapters.git_utils import _git_rev_parse_head, extract_files_from_diff
 from adapters.inline import InlineAdapter
 from adapters.inline_types import DelegationPendingSignal
 from adapters.types import AgentInvocation, AgentResult
-from errors import AutodevError, GuardrailExceededError
+from errors import AutodevError, GuardrailExceededError, TournamentError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
 from orchestrator.inline_state import write_suspend_state
@@ -1481,6 +1481,7 @@ async def _execute_one(
             if orch.cfg.tournaments.impl.enabled and not orch.disable_impl_tournament:
                 from orchestrator.impl_tournament_runner import (
                     run_impl_tournament,
+                    run_multi_branch_impl_tournament,
                 )
                 from tournament import ImplBundle as _ImplBundle
 
@@ -1494,8 +1495,43 @@ async def _execute_one(
                     tests_total=total,
                     test_output_excerpt=test_result.text[:1000],
                 )
+                # v0.21.0 A2: opt into the multi-branch impl-tournament fan-
+                # out when ``cfg.tournaments.impl.num_branches > 1`` OR the
+                # operator pinned a non-None ``branches`` list. Keeps the
+                # single-branch path byte-identical when neither is set.
+                _impl_cfg = orch.cfg.tournaments.impl
+                _impl_branch_configs = (
+                    list(_impl_cfg.branches) if _impl_cfg.branches else None
+                )
+                _impl_n_branches = (
+                    len(_impl_branch_configs)
+                    if _impl_branch_configs is not None
+                    else _impl_cfg.num_branches
+                )
                 try:
-                    await run_impl_tournament(orch, task, _initial_bundle)
+                    if _impl_n_branches > 1:
+                        try:
+                            await run_multi_branch_impl_tournament(
+                                orch,
+                                task,
+                                _initial_bundle,
+                                n_branches=_impl_n_branches,
+                                branch_configs=_impl_branch_configs,
+                            )
+                        except TournamentError as _mb_exc:
+                            # Survivor floor or other fan-out failure —
+                            # fall back to the single-branch path so the
+                            # task still gets tournament refinement.
+                            logger.warning(
+                                "execute_phase.multi_branch_impl_fallback",
+                                task_id=task.id,
+                                err=str(_mb_exc),
+                            )
+                            await run_impl_tournament(
+                                orch, task, _initial_bundle
+                            )
+                    else:
+                        await run_impl_tournament(orch, task, _initial_bundle)
                 except Exception as _exc:  # noqa: BLE001
                     logger.warning(
                         "execute_phase.impl_tournament_error",
