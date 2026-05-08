@@ -66,21 +66,37 @@ def _high_entropy_strings(content: str) -> list[str]:
     return [c for c in candidates if _shannon_entropy(c) >= _ENTROPY_THRESHOLD]
 
 
-async def run_secretscan(cwd: Path) -> GateResult:
+async def run_secretscan(
+    cwd: Path,
+    paths: list[Path] | None = None,
+) -> GateResult:
     """Scan *cwd* for hard-coded secrets.
+
+    v0.13.0: when *paths* is non-None, restrict the scan to the listed
+    files (resolved relative to *cwd*). Non-existent paths are silently
+    skipped. Files in the legacy ``_SKIP_EXTENSIONS`` set are still
+    skipped even when explicitly listed (binary blobs are never useful
+    secret carriers).
+
+    When *paths* is None (legacy), walk the whole tree under *cwd*.
 
     Returns ``GateResult(passed=False, ...)`` if any secrets are found,
     ``GateResult(passed=True, ...)`` otherwise.
     """
     findings: list[str] = []
 
-    for path in _iter_files(cwd):
+    for path in _iter_files(cwd, paths=paths):
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
 
-        rel = path.relative_to(cwd)
+        try:
+            rel = path.relative_to(cwd)
+        except ValueError:
+            # Caller passed an absolute path outside cwd. Use the path
+            # as-is for reporting; never let this crash the gate.
+            rel = path
 
         # Regex pattern scan.
         for label, pattern in _SECRET_PATTERNS:
@@ -99,17 +115,51 @@ async def run_secretscan(cwd: Path) -> GateResult:
     return GateResult(passed=True, details="no secrets detected")
 
 
-def _iter_files(cwd: Path):
-    """Yield all scannable files under *cwd*, skipping known noise dirs."""
-    for item in cwd.rglob("*"):
-        if not item.is_file():
+def _iter_files(cwd: Path, paths: list[Path] | None = None):
+    """Yield scannable files under *cwd*.
+
+    Two modes:
+
+    * ``paths=None`` (legacy): recursive ``cwd.rglob("*")`` walk, skipping
+      known noise directories (``.git``, ``.venv``, ``node_modules``…) and
+      file extensions in ``_SKIP_EXTENSIONS``.
+    * ``paths=[...]`` (v0.13.0 diff-scope): yield only the files in the
+      list. Each entry is resolved relative to *cwd* if not absolute.
+      Non-existent paths and ``_SKIP_EXTENSIONS`` matches are skipped
+      silently. Skip-dir filter is *not* applied — caller is expected to
+      have curated the list (typically from a developer's diff, which is
+      already scoped to changes the executor introduced).
+    """
+    if paths is None:
+        for item in cwd.rglob("*"):
+            if not item.is_file():
+                continue
+            # Skip noise directories.
+            if any(part in _SKIP_DIRS for part in item.parts):
+                continue
+            if item.suffix in _SKIP_EXTENSIONS:
+                continue
+            yield item
+        return
+
+    seen: set[Path] = set()
+    for raw in paths:
+        if not raw.is_absolute():
+            candidate = cwd / raw
+        else:
+            candidate = raw
+        try:
+            resolved = candidate.resolve()
+        except OSError:
             continue
-        # Skip noise directories.
-        if any(part in _SKIP_DIRS for part in item.parts):
+        if resolved in seen:
             continue
-        if item.suffix in _SKIP_EXTENSIONS:
+        seen.add(resolved)
+        if not resolved.is_file():
             continue
-        yield item
+        if resolved.suffix in _SKIP_EXTENSIONS:
+            continue
+        yield resolved
 
 
 __all__ = ["run_secretscan"]
