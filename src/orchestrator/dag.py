@@ -415,6 +415,53 @@ def validate_edit_scope(
                     )
 
 
+async def validate_edit_scope_with_critic_review(
+    orch: object,  # type: ignore[no-untyped-def]
+    plan: Plan,
+    tracked_files: set[str] | None = None,
+) -> None:
+    """v0.20.0 C2: validate_edit_scope wrapper that gates extended_scope.
+
+    For each task with a non-empty ``extended_scope`` the orchestrator
+    routes the request through ``critic_sounding_board`` (cached per
+    ``(task_id, scope_signature)`` in plan_manager metadata) BEFORE
+    invoking the synchronous :func:`validate_edit_scope` check. A
+    rejected critic verdict raises :class:`EditScopeViolation` with the
+    rejection reason inline. An approved verdict admits the extension
+    via the union semantics already implemented in the sync validator.
+
+    Tasks with empty ``extended_scope`` are completely unaffected — the
+    critic is never invoked, and the wrapper degrades to a single
+    :func:`validate_edit_scope` call. This preserves byte-identical
+    v0.19.0 behavior on plans that don't use the new feature.
+    """
+    from orchestrator.extended_scope_critic import (
+        critic_review_extended_scope,
+    )
+
+    for phase in plan.phases:
+        for task in phase.tasks:
+            ext = list(getattr(task, "extended_scope", []) or [])
+            if not ext:
+                continue
+            justification = ""
+            md = getattr(task, "metadata", {}) or {}
+            if isinstance(md, dict):
+                justification = str(md.get("extended_scope_justification") or "")
+            approved = await critic_review_extended_scope(
+                orch, task, justification=justification
+            )
+            if not approved:
+                raise EditScopeViolation(
+                    f"task {task.id!r} (phase {phase.id!r}) requested "
+                    f"extended_scope {ext!r} but critic rejected the review"
+                )
+
+    # Once approvals land, fall through to the sync validator which
+    # unions extended_scope into the resolved scope (C1 behavior).
+    validate_edit_scope(plan, tracked_files=tracked_files)
+
+
 __all__ = [
     "DagValidationError",
     "EditScopeViolation",
@@ -423,5 +470,6 @@ __all__ = [
     "is_in_scope",
     "topological_levels",
     "validate_edit_scope",
+    "validate_edit_scope_with_critic_review",
     "validate_phase_dag",
 ]
