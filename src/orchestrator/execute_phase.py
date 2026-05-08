@@ -1548,13 +1548,68 @@ async def _try_retry_or_escalate(
         # Ladder dispatch path. Build a minimal prior_attempts list from
         # the legacy retry_count for forensics.
         prior_attempts = [f"retry_count={task.retry_count}, reason={reason}"]
+
+        # v0.18.0: WEB_SEARCH ladder step — when enabled by config, fetch
+        # top-3 search results and splice them as a ``WEB_CONTEXT:`` block
+        # into the next critic prompt. After the search dispatches, fall
+        # through to the critic invocation with the spliced context. The
+        # search adapter, web_search_invoked ledger op, and search_count
+        # accounting all already shipped in v0.17.0; this is the deferred
+        # wiring at the executor's dispatch site.
+        web_context_block: str = ""
+        if step == "WEB_SEARCH" and getattr(
+            orch.cfg, "web_search_enabled", False
+        ):
+            try:
+                from adapters.web_search import web_search
+
+                # Build a minimal query from the failure reason + task.
+                query = f"{task.title}: {reason}"[:200]
+                results = await web_search(query, max_results=3)
+                # Format results into the WEB_CONTEXT: block.
+                if results:
+                    rows = []
+                    for r in results:
+                        rows.append(f"  - {r.title}: {r.url}")
+                        if r.snippet:
+                            rows.append(f"    {r.snippet[:200]}")
+                    web_context_block = (
+                        "WEB_CONTEXT:\n" + "\n".join(rows) + "\n"
+                    )
+                # Bump search_count under lock + ledger op.
+                await orch.plan_manager.increment_search(task.id)
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="web_search_invoked",
+                        payload={
+                            "task_id": task.id,
+                            "query": query,
+                            "results_count": len(results),
+                            "search_count_after": stuck_state.search_count + 1,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.ledger_append_failed",
+                        op="web_search_invoked",
+                        err=str(exc),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.web_search_failed",
+                    task_id=task.id,
+                    err=str(exc),
+                )
+
         try:
             resolution = await _escalate_stuck_to_critic(
                 orch,
                 task,
                 stuck_state=stuck_state,
                 ladder_step=step,
-                recent_evidence=reason,
+                recent_evidence=(
+                    web_context_block + reason if web_context_block else reason
+                ),
                 prior_attempts=prior_attempts,
             )
         except Exception as exc:  # noqa: BLE001
