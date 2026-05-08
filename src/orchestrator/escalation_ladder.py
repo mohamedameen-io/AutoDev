@@ -1,4 +1,4 @@
-"""v0.15.0 stuck-recovery escalation ladder.
+"""v0.15.0 stuck-recovery escalation ladder (v0.17.0 adds WEB_SEARCH step).
 
 A graduated response to repeated discard / pivot signals on the same
 task. The ladder consults the per-task :class:`StuckState` (held in
@@ -20,19 +20,19 @@ discard_count   meaning
 ==============  ==============================================
 pivot_count     meaning
 ==============  ==============================================
-0..2            no pivot threshold yet.
->=3             ``"SOFT_BLOCKER"`` — terminate task and hand off
-                to the human; we have exhausted the autonomous
+0..1            no pivot threshold yet.
+>=2 + search_count<3   ``"WEB_SEARCH"`` — fetch top-3 results and
+                splice as ``WEB_CONTEXT:`` block into the next critic
+                prompt (v0.17.0 S2). Capped at 3 searches per task.
+>=3 OR search_count>=3 ``"SOFT_BLOCKER"`` — terminate task and hand
+                off to the human; we have exhausted the autonomous
                 escalation budget.
 ==============  ==============================================
 
-When a discard threshold AND ``pivot_count >= 3`` both qualify, the
-more terminal step (``"SOFT_BLOCKER"``) wins. This captures the
-intuition that "we already pivoted three times and we are still
-stuck — autonomous progress is no longer plausible."
-
-Web search step (originally between PIVOT and SOFT_BLOCKER per
-leo-lilinxiao) is deferred to v0.15.1 — see plan "DEFERRED" section.
+When a discard threshold AND a pivot threshold both qualify, the
+more terminal step wins. This captures the intuition that "we already
+pivoted multiple times and we are still stuck — autonomous progress is
+no longer plausible."
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ StuckStepLabel = Literal[
     "continue",
     "REFINE",
     "PIVOT",
+    "WEB_SEARCH",
     "SOFT_BLOCKER",
 ]
 
@@ -55,7 +56,12 @@ StuckStepLabel = Literal[
 # (v0.15.1) can override via monkeypatch without touching call sites.
 _DISCARD_REFINE_THRESHOLD: int = 3
 _DISCARD_PIVOT_THRESHOLD: int = 5
+# v0.17.0 S2: ``WEB_SEARCH`` activates at pivot_count >= 2 (one rung
+# below SOFT_BLOCKER). The cap of 3 searches per task lives on
+# :class:`StuckState.search_count` and is enforced in :func:`next_step`.
+_PIVOT_WEB_SEARCH_THRESHOLD: int = 2
 _PIVOT_SOFT_BLOCKER_THRESHOLD: int = 3
+_SEARCH_COOLDOWN_CAP: int = 3
 
 
 @dataclass
@@ -83,6 +89,14 @@ class StuckState:
 
     discard_count: int = 0
     pivot_count: int = 0
+    # v0.17.0 S2: how many web searches have fired for this task across
+    # the ladder's lifetime. Capped at 3 (see :data:`_SEARCH_COOLDOWN_CAP`)
+    # to prevent runaway HTTP traffic on pathological cases.
+    search_count: int = 0
+    # v0.17.0 S2: ladder iteration index of the last search dispatch.
+    # Used for the 2-iteration cooldown (the ladder won't return
+    # ``WEB_SEARCH`` twice in a row).
+    last_search_iter: int = 0
     last_event: str = ""
 
 
@@ -98,11 +112,29 @@ def next_step(state: StuckState) -> StuckStepLabel:
       block, asking for a small adjustment. Bumps ``discard_count``.
     * ``"PIVOT"`` — invoke critic asking for a radical redirect.
       Bumps ``pivot_count``.
+    * ``"WEB_SEARCH"`` — fetch top-3 search results and splice them as
+      a ``WEB_CONTEXT:`` block into the next critic prompt. Bumps
+      ``search_count``. v0.17.0 S2.
     * ``"SOFT_BLOCKER"`` — terminate the task with a human-decision
       handoff (no further autonomous escalation).
     """
-    if state.pivot_count >= _PIVOT_SOFT_BLOCKER_THRESHOLD:
+    # SOFT_BLOCKER beats every other step. v0.17.0: also fires when the
+    # web-search budget (3 per task) is exhausted — after three searches
+    # the ladder concludes the task is genuinely beyond autonomous reach.
+    if (
+        state.pivot_count >= _PIVOT_SOFT_BLOCKER_THRESHOLD
+        or state.search_count >= _SEARCH_COOLDOWN_CAP
+    ):
         return "SOFT_BLOCKER"
+    # WEB_SEARCH: pivot_count just past the threshold AND budget remaining.
+    # v0.17.0 S2 — opt-in via cfg.web_search_enabled at the executor's
+    # dispatch site; the ladder itself unconditionally returns the label
+    # so callers can gate behaviour without re-implementing the threshold.
+    if (
+        state.pivot_count >= _PIVOT_WEB_SEARCH_THRESHOLD
+        and state.search_count < _SEARCH_COOLDOWN_CAP
+    ):
+        return "WEB_SEARCH"
     if state.discard_count >= _DISCARD_PIVOT_THRESHOLD:
         return "PIVOT"
     if state.discard_count >= _DISCARD_REFINE_THRESHOLD:

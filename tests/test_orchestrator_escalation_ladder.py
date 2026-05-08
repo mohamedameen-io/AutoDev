@@ -83,7 +83,9 @@ def test_state_is_a_dataclass_with_named_fields() -> None:
         (5, 0, "PIVOT"),
         (6, 0, "PIVOT"),
         (3, 1, "REFINE"),
-        (5, 2, "PIVOT"),
+        # v0.17.0: pivot_count >= 2 + search_count == 0 → WEB_SEARCH wins.
+        # The legacy v0.15.0 expectation here was PIVOT.
+        (5, 2, "WEB_SEARCH"),
         (5, 3, "SOFT_BLOCKER"),
         (0, 3, "SOFT_BLOCKER"),
         (0, 4, "SOFT_BLOCKER"),
