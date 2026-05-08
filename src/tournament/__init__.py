@@ -25,6 +25,10 @@ from tournament.impl_tournament import (
     ImplTournament,
     VariantLabel,
 )
+from tournament.phase_review import (
+    PhaseReviewBundle,
+    _PhaseReviewContentHandler,
+)
 from tournament.plan_tournament import PlanContentHandler
 from tournament.state import TournamentArtifactStore
 
@@ -39,6 +43,7 @@ __all__ = [
     "LLMClient",
     "PartialPassState",
     "PassResult",
+    "PhaseReviewBundle",
     "PlanContentHandler",
     "StubLLMClient",
     "Tournament",
@@ -47,6 +52,7 @@ __all__ = [
     "TransientError",
     "VariantLabel",
     "WinnerLabel",
+    "_PhaseReviewContentHandler",
     "aggregate_rankings",
     "parse_ranking",
     "randomize_for_judge",
