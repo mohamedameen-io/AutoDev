@@ -365,8 +365,202 @@ def detect_context_thrash(events: list[TrajectoryEvent]) -> Pattern | None:
     return Pattern(name="context_thrash")
 
 
+# ---------------------------------------------------------------------------
+# v0.20.0 A1: LLM-based PRM classifier (augments rule-based detectors)
+# ---------------------------------------------------------------------------
+
+import json as _json
+import re as _re
+from typing import Awaitable, Callable, Protocol
+
+
+# A pure-text completion function; pluggable so tests can stub deterministically
+# without depending on a live API. The orchestrator wires a Haiku-class
+# adapter call here (see :func:`orchestrator.execute_phase` integration).
+LLMCompleter = Callable[[str], Awaitable[str]]
+
+
+class _ClassifiableEvent(Protocol):
+    """Protocol satisfied by :class:`TrajectoryEvent` for trajectory summary
+    rendering — kept loose so tests can pass plain dataclass shims if needed."""
+
+    role: str
+    action: str
+    target_files: tuple[str, ...]
+    success: bool
+
+
+def _summarize_events(events: list[TrajectoryEvent]) -> str:
+    """Compact per-event summary for the LLM prompt.
+
+    Each event renders as a single line ``[role:action] files=... ok=true|false``
+    so the LLM sees a tight trajectory chronology without the raw timestamps
+    (which would only inflate the prompt without adding signal).
+    """
+    out: list[str] = []
+    for ev in events:
+        files = ",".join(ev.target_files) if ev.target_files else "-"
+        out.append(
+            f"[{ev.role}:{ev.action}] files={files} ok={'true' if ev.success else 'false'}"
+        )
+    return "\n".join(out)
+
+
+def _build_classify_prompt(events: list[TrajectoryEvent], threshold: float) -> str:
+    """Render a Haiku-friendly classifier prompt.
+
+    The expected response is a single JSON line of the form:
+
+        {"patterns": [{"name": "stuck_on_test", "confidence": 0.85}]}
+
+    The orchestrator parses any names that match the canonical
+    :data:`_PATTERN_TAXONOMY` keys with confidence ≥ ``threshold``.
+    """
+    summary = _summarize_events(events)
+    return (
+        "You are a trajectory classifier. Given a chronological list of "
+        "agent dispatches, identify any failure-mode patterns from this set:\n"
+        f"{', '.join(_PATTERN_TAXONOMY)}\n\n"
+        "Patterns may overlap. Respond with ONE JSON line ONLY (no prose), "
+        "matching this schema:\n"
+        '{"patterns": [{"name": "<pattern>", "confidence": 0.0-1.0}]}\n\n'
+        f"Only include patterns whose confidence is >= {threshold:.2f}.\n\n"
+        "Trajectory:\n"
+        f"{summary}\n"
+    )
+
+
+_PATTERN_KEY_RE = _re.compile(r'"name"\s*:\s*"([^"]+)"')
+_CONF_RE = _re.compile(r'"confidence"\s*:\s*([0-9.]+)')
+
+
+def _parse_classify_response(text: str, threshold: float) -> list[Pattern]:
+    """Parse the LLM's JSON response into a list of :class:`Pattern`.
+
+    Defensive parser: tries strict JSON first, then falls back to regex
+    extraction so a slightly-malformed LLM response (e.g. trailing prose)
+    still yields useful patterns.
+    """
+    if not text or not text.strip():
+        return []
+    out: list[Pattern] = []
+    try:
+        # Locate first { ... } block to avoid pre/post prose.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            obj = _json.loads(text[start : end + 1])
+            for entry in obj.get("patterns", []):
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                conf = float(entry.get("confidence", 0.0))
+                if (
+                    isinstance(name, str)
+                    and name in _PATTERN_TAXONOMY
+                    and conf >= threshold
+                ):
+                    out.append(Pattern(name=name))
+            return out
+    except (ValueError, _json.JSONDecodeError):
+        pass
+
+    # Regex fallback: extract paired (name, confidence). Best-effort only.
+    names = _PATTERN_KEY_RE.findall(text)
+    confs = _CONF_RE.findall(text)
+    for name, conf_s in zip(names, confs):
+        try:
+            conf = float(conf_s)
+        except ValueError:
+            continue
+        if name in _PATTERN_TAXONOMY and conf >= threshold:
+            out.append(Pattern(name=name))
+    return out
+
+
+class LLMTrajectoryClassifier:
+    """v0.20.0 A1: LLM-augmented trajectory pattern classifier.
+
+    Augments — does not replace — the rule-based detectors. The
+    orchestrator runs both and merges results: rule-based patterns are
+    primary (high precision), ML patterns are secondary (broader recall
+    on novel failure modes the rules don't encode).
+
+    The classifier is a thin wrapper around an :class:`LLMCompleter`
+    callable. Tests stub the completer with a deterministic function;
+    production wires through the existing adapter infrastructure
+    (sonnet/haiku via the platform adapter).
+
+    Usage:
+
+        clf = LLMTrajectoryClassifier(completer=my_completer, threshold=0.7)
+        patterns = await clf.classify(store.events_for(task_id))
+    """
+
+    def __init__(
+        self,
+        completer: LLMCompleter,
+        threshold: float = 0.7,
+        min_events: int = 3,
+    ) -> None:
+        self._completer = completer
+        self._threshold = max(0.0, min(1.0, threshold))
+        self._min_events = max(1, min_events)
+
+    @property
+    def threshold(self) -> float:
+        return self._threshold
+
+    async def classify(self, events: list[TrajectoryEvent]) -> list[Pattern]:
+        """Classify the given event list. Returns ``[]`` on any error.
+
+        Cold-start: when fewer than ``min_events`` events are available,
+        skips the LLM call (the rule-based detectors handle short
+        windows). Returning ``[]`` is the correct degradation — the
+        executor falls through to rule-only patterns without surfacing
+        a noisy "ML failed" warning.
+        """
+        if len(events) < self._min_events:
+            return []
+        prompt = _build_classify_prompt(events, self._threshold)
+        try:
+            response = await self._completer(prompt)
+        except Exception:  # noqa: BLE001
+            # Graceful fallback — never let LLM errors block the executor.
+            return []
+        return _parse_classify_response(response, self._threshold)
+
+
+def merge_patterns(
+    rules_patterns: list[Pattern],
+    ml_patterns: list[Pattern],
+) -> list[Pattern]:
+    """Merge rules + ml pattern lists, deduplicate by name, sort by severity.
+
+    Rules-first dedup: if a pattern is in both lists, the rule-based
+    instance wins (canonical, no ML confidence to attach to a rule).
+    Returns the union sorted by severity descending.
+    """
+    seen: set[str] = set()
+    out: list[Pattern] = []
+    for p in rules_patterns:
+        if p.name in seen:
+            continue
+        seen.add(p.name)
+        out.append(p)
+    for p in ml_patterns:
+        if p.name in seen:
+            continue
+        seen.add(p.name)
+        out.append(p)
+    out.sort(key=lambda p: p.severity, reverse=True)
+    return out
+
+
 __all__ = [
     "CourseCorrection",
+    "LLMCompleter",
+    "LLMTrajectoryClassifier",
     "Pattern",
     "PatternName",
     "TrajectoryEvent",
@@ -376,4 +570,5 @@ __all__ = [
     "detect_ping_pong",
     "detect_repetition_loop",
     "detect_stuck_on_test",
+    "merge_patterns",
 ]
