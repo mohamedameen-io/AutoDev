@@ -20,6 +20,7 @@ escalated, mark it blocked, and stop the loop.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 from adapters.git_utils import _git_rev_parse_head
@@ -30,6 +31,7 @@ from errors import AutodevError, GuardrailExceededError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
 from orchestrator.inline_state import write_suspend_state
+from orchestrator.worktree import WorktreeError, WorktreeManager
 from state.evidence import write_evidence, write_patch
 from qa import (
     GateResult,
@@ -388,8 +390,23 @@ async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
         )
 
 
-async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
-    """Run the developer -> reviewer -> tests loop for one task. Returns the final task."""
+async def _execute_one(
+    orch: "Orchestrator",
+    task: Task,
+    worktree_mgr: "WorktreeManager | None" = None,
+) -> Task:
+    """Run the developer -> reviewer -> tests loop for one task. Returns the final task.
+
+    v0.11.0: when ``worktree_mgr`` is supplied, the task runs in an
+    isolated git worktree (``tournament_dir/tasks/<task_id>``) and the
+    final diff is applied to main via ``apply_patch_to_main`` after the
+    task completes. The worktree is removed in a ``finally`` clause so
+    a worker exit (success or failure) always cleans up.
+
+    When ``worktree_mgr`` is ``None`` the task runs in ``orch.cwd``
+    directly — the legacy serial path used by the single-task CLI
+    (``execute --task-id``) and by tests that don't initialize git.
+    """
     retry_limit = orch.cfg.qa_retry_limit
 
     # Step 0: short-circuit non-agent-executable tasks (v0.6.1).
@@ -414,6 +431,23 @@ async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
 
     task = await orch.plan_manager.update_task_status(task.id, "in_progress")
 
+    # v0.11.0: per-task worktree isolation. ``worktree`` is the cwd
+    # passed into delegate() for every agent invocation in this task —
+    # the developer writes there, QA gates run there, and the diff is
+    # applied to main after completion. ``None`` keeps the legacy path
+    # where everything happens in orch.cwd.
+    worktree: Path | None = None
+    if worktree_mgr is not None:
+        try:
+            worktree = await worktree_mgr.create_per_task(task.id)
+        except WorktreeError as exc:
+            logger.warning(
+                "execute_phase.worktree_create_failed",
+                task_id=task.id,
+                err=str(exc),
+            )
+            worktree = None
+
     orch.guardrails.start_task(task.id)
     try:
         # Retry loop — one iteration = one developer-then-gates cycle.
@@ -428,6 +462,7 @@ async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
                     retry_count=task.retry_count,
                     last_issues=last_issues,
                     task=task,
+                    cwd_override=worktree,
                 )
             except GuardrailExceededError as exc:
                 logger.warning(
@@ -496,6 +531,7 @@ async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
                     review_env,
                     retry_count=task.retry_count,
                     last_issues=last_issues,
+                    cwd_override=worktree,
                 )
             except GuardrailExceededError as exc:
                 logger.warning(
@@ -543,6 +579,7 @@ async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
                     test_env,
                     retry_count=task.retry_count,
                     last_issues=last_issues,
+                    cwd_override=worktree,
                 )
             except GuardrailExceededError as exc:
                 logger.warning(
@@ -617,6 +654,30 @@ async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
             await _record_lessons(orch, task.id, review_result.text, "reviewer")
             await _record_lessons(orch, task.id, test_result.text, "test_engineer")
 
+            # v0.11.0: when running in a per-task worktree, apply the
+            # diff to the main repo BEFORE marking complete. This is
+            # the convergence step that makes parallel execution safe:
+            # only after a successful apply do dependent tasks see the
+            # change. Apply failures route into the conflict-escalation
+            # path (commit 14 wires this in).
+            if worktree_mgr is not None and worktree is not None:
+                try:
+                    await worktree_mgr.apply_patch_to_main(worktree, base_ref="HEAD")
+                except WorktreeError as exc:
+                    logger.warning(
+                        "execute_phase.apply_patch_failed",
+                        task_id=task.id,
+                        err=str(exc),
+                    )
+                    task = await orch.plan_manager.update_task_status(
+                        task.id,
+                        "blocked",
+                        meta={
+                            "blocked_reason": f"apply_patch_failed: {exc}"
+                        },
+                    )
+                    return task
+
             # Step 8: complete.
             task = await orch.plan_manager.update_task_status(
                 task.id,
@@ -627,6 +688,17 @@ async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
             return task
     finally:
         orch.guardrails.end_task(task.id)
+        # v0.11.0: always clean up the per-task worktree, even on
+        # exception. ``remove_per_task`` swallows missing-worktree races.
+        if worktree_mgr is not None and worktree is not None:
+            try:
+                await worktree_mgr.remove_per_task(task.id, force=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.worktree_remove_failed",
+                    task_id=task.id,
+                    err=str(exc),
+                )
 
 
 async def _try_retry_or_escalate(
@@ -693,6 +765,7 @@ async def delegate(
     retry_count: int = 0,
     last_issues: list[str] | None = None,
     task: Task | None = None,
+    cwd_override: Path | None = None,
 ) -> AgentResult:
     """Build an :class:`AgentInvocation` from the envelope and call the adapter.
 
@@ -763,10 +836,16 @@ async def delegate(
         max_turns = spec_max_turns
         timeout_s = None  # adapter applies its own default (600s in claude_code)
 
+    # v0.11.0: per-task worktree isolation — when a worker passes a
+    # cwd_override (its worktree path), agent execution happens there
+    # rather than in orch.cwd (the main repo). All other accounting
+    # (evidence, ledger, guardrails) still keys off orch.cwd.
+    effective_cwd = cwd_override if cwd_override is not None else orch.cwd
+
     inv = AgentInvocation(
         role=role,
         prompt="\n".join(parts),
-        cwd=orch.cwd,
+        cwd=effective_cwd,
         model=spec.model,
         allowed_tools=list(spec.tools) if spec.tools else None,
         max_turns=max_turns,
