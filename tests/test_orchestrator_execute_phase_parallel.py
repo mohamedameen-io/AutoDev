@@ -345,3 +345,69 @@ async def test_phase_review_does_not_double_fire_on_concurrent_completion(
     # Phase 1 review fires exactly once even with two workers finishing
     # in close succession.
     assert fired.count("1") == 1
+
+
+# ---------------------------------------------------------------------------
+# v0.11.0 commit 15 — DAG validator hook in run_execute_phase
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_execute_phase_blocks_phase_on_dag_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A phase with a DAG cycle has all pending tasks marked blocked
+    with reason=dag_invalid before the worker pool engages."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    # Phase with a cycle: 1.1 → 1.2 → 1.1.
+    await pm.init_plan(
+        _mk_plan(
+            [
+                _t("1.1", deps=["1.2"]),
+                _t("1.2", deps=["1.1"]),
+            ]
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    _patch_execute_one(monkeypatch)
+
+    await ep.run_execute_phase(orch)
+
+    plan = await pm.load()
+    assert plan is not None
+    by_id = {t.id: t for t in plan.phases[0].tasks}
+    # Both tasks blocked with dag_invalid.
+    for tid in ("1.1", "1.2"):
+        assert by_id[tid].status == "blocked"
+        assert (
+            by_id[tid].blocked_reason is not None
+            and "dag_invalid" in by_id[tid].blocked_reason
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_execute_phase_undefined_dep_blocks_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A task referencing an undefined depends_on id triggers DAG error
+    and the phase is blocked with the underlying error in blocked_reason."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan(
+            [
+                _t("1.1"),
+                _t("1.2", deps=["1.999"]),  # undefined
+            ]
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    _patch_execute_one(monkeypatch)
+
+    await ep.run_execute_phase(orch)
+
+    plan = await pm.load()
+    assert plan is not None
+    by_id = {t.id: t for t in plan.phases[0].tasks}
+    # Both pending tasks blocked.
+    for tid in ("1.1", "1.2"):
+        assert by_id[tid].status == "blocked"
