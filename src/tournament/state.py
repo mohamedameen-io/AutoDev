@@ -42,6 +42,13 @@ _JUDGE_ORDER_RE = re.compile(r"^(\d+)_order\.json$")
 _JUDGE_RESPONSE_RE = re.compile(r"^(\d+)_response\.json$")
 _INCUMBENT_AFTER_RE = re.compile(r"^incumbent_after_(\d+)\.md$")
 
+# v0.16.0: valid promotion-grade values for the incumbent-grade sidecar.
+# The promotion ladder lives in :mod:`tournament.promotion`; this module
+# only persists the grade — the rules are enforced there.
+_VALID_INCUMBENT_GRADES: frozenset[str] = frozenset(
+    {"dev_best", "pending_repeat", "repeated", "promotion_eligible"}
+)
+
 
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write `content` to `path` atomically via a same-directory tempfile."""
@@ -80,10 +87,62 @@ class TournamentArtifactStore:
         _atomic_write_text(path, a_md)
         return path
 
-    def write_incumbent_after(self, pass_num: int, a_md: str) -> Path:
+    def write_incumbent_after(
+        self,
+        pass_num: int,
+        a_md: str,
+        grade: str = "dev_best",
+    ) -> Path:
+        """Write ``incumbent_after_NN.md`` plus a ``.grade.json`` sidecar.
+
+        v0.16.0: ``grade`` defaults to ``"dev_best"`` so legacy callers
+        produce an explicit grade record instead of an ungraded artifact.
+        Unknown grade values raise :class:`ValueError` so a typo at the
+        call site doesn't corrupt the sidecar.
+        """
+        if grade not in _VALID_INCUMBENT_GRADES:
+            raise ValueError(
+                f"unknown incumbent grade {grade!r}; "
+                f"expected one of {sorted(_VALID_INCUMBENT_GRADES)!r}"
+            )
         path = self.artifact_dir / f"incumbent_after_{pass_num:02d}.md"
         _atomic_write_text(path, a_md)
+        sidecar = self.artifact_dir / f"incumbent_after_{pass_num:02d}.grade.json"
+        _atomic_write_json(sidecar, {"grade": grade, "pass_num": pass_num})
         return path
+
+    def latest_incumbent_grade(self) -> str | None:
+        """Return the persisted grade of the highest-numbered incumbent.
+
+        v0.16.0 promotion-ladder helper. Reads the
+        ``incumbent_after_NN.grade.json`` sidecar for the top
+        ``incumbent_after_NN.md``. Returns ``None`` when:
+
+          * no ``incumbent_after_*.md`` file exists, or
+          * the top incumbent has no sidecar (legacy artifact predating
+            this release), or
+          * the sidecar is malformed (defensive — caller can fall back
+            to ``dev_best`` if it cares).
+        """
+        nums = self._scan_incumbent_pass_nums()
+        if not nums:
+            return None
+        top = nums[-1]
+        sidecar = self.artifact_dir / f"incumbent_after_{top:02d}.grade.json"
+        try:
+            raw = sidecar.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        grade = data.get("grade")
+        if not isinstance(grade, str):
+            return None
+        return grade
 
     def write_final(self, final_md: str, history: list["PassResult"]) -> tuple[Path, Path]:
         final_path = self.artifact_dir / "final_output.md"
