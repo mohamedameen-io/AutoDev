@@ -313,3 +313,108 @@ def test_tournament_evidence_phase_review_kind() -> None:
         converged=True,
     )
     assert ev.phase == "phase_review"
+
+
+# ---------------------------------------------------------------------------
+# v0.14.0 — ``Plan.edit_scope`` and ``Phase.edit_scope`` fields with validators
+# ---------------------------------------------------------------------------
+
+
+def _make_dummy_plan_kwargs(
+    edit_scope: list[str] | None = None,
+    phases: list[Phase] | None = None,
+) -> dict:
+    from state.schemas import Plan as _PlanType  # noqa: F401
+
+    out: dict = {
+        "plan_id": "plan-test",
+        "spec_hash": "abcdef0123456789",
+        "phases": phases if phases is not None else [
+            Phase(id="1", title="Setup", tasks=[_make_dummy_task()])
+        ],
+        "created_at": "2025-01-01T00:00:00+00:00",
+        "updated_at": "2025-01-01T00:00:00+00:00",
+    }
+    if edit_scope is not None:
+        out["edit_scope"] = edit_scope
+    return out
+
+
+def test_plan_edit_scope_default_empty() -> None:
+    """``Plan.edit_scope`` defaults to an empty list — legacy whole-repo
+    semantics. No constraint enforced when empty."""
+    from state.schemas import Plan
+
+    plan = Plan(**_make_dummy_plan_kwargs())
+    assert plan.edit_scope == []
+
+
+def test_plan_edit_scope_rejects_absolute_path() -> None:
+    """Absolute paths are rejected at construction — scope is repo-relative."""
+    from pydantic import ValidationError as _ValidationError
+
+    from state.schemas import Plan
+
+    with pytest.raises(_ValidationError):
+        Plan(**_make_dummy_plan_kwargs(edit_scope=["/etc/passwd"]))
+
+
+def test_plan_edit_scope_rejects_dotdot() -> None:
+    """Paths containing ``..`` segments are rejected — would break
+    is_in_scope semantics by escaping the repo root."""
+    from pydantic import ValidationError as _ValidationError
+
+    from state.schemas import Plan
+
+    with pytest.raises(_ValidationError):
+        Plan(**_make_dummy_plan_kwargs(edit_scope=["../outside"]))
+    with pytest.raises(_ValidationError):
+        Plan(**_make_dummy_plan_kwargs(edit_scope=["src/../etc"]))
+
+
+def test_plan_edit_scope_strips_trailing_slash() -> None:
+    """Trailing slashes are normalized away so ``"src/"`` and ``"src"``
+    are equivalent for prefix matching downstream."""
+    from state.schemas import Plan
+
+    plan = Plan(**_make_dummy_plan_kwargs(edit_scope=["src/", "tests/"]))
+    assert plan.edit_scope == ["src", "tests"]
+
+
+def test_phase_edit_scope_optional_inherits_plan() -> None:
+    """``Phase.edit_scope`` defaults to ``None`` — inherit semantics, not
+    "empty" semantics. Distinct from Plan.edit_scope which defaults to []."""
+    phase = Phase(id="1", title="Setup", tasks=[_make_dummy_task()])
+    assert phase.edit_scope is None
+
+
+def test_phase_edit_scope_validators_match_plan() -> None:
+    """Phase-level scope override is validated identically to Plan.edit_scope."""
+    from pydantic import ValidationError as _ValidationError
+
+    # Trailing slash stripped
+    phase = Phase(
+        id="1",
+        title="Setup",
+        tasks=[_make_dummy_task()],
+        edit_scope=["src/foo/"],
+    )
+    assert phase.edit_scope == ["src/foo"]
+
+    # Absolute path rejected
+    with pytest.raises(_ValidationError):
+        Phase(
+            id="1",
+            title="Setup",
+            tasks=[_make_dummy_task()],
+            edit_scope=["/abs"],
+        )
+
+    # ``..`` rejected
+    with pytest.raises(_ValidationError):
+        Phase(
+            id="1",
+            title="Setup",
+            tasks=[_make_dummy_task()],
+            edit_scope=["src/../etc"],
+        )

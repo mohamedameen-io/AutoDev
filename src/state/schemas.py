@@ -19,7 +19,40 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def _validate_edit_scope_paths(scope: list[str]) -> list[str]:
+    """Normalize and validate a list of repo-relative path prefixes.
+
+    v0.14.0: ``Plan.edit_scope`` and ``Phase.edit_scope`` use repo-relative
+    path prefixes for substring/prefix matching downstream. This validator:
+
+    * trims trailing ``/`` so ``"src/"`` and ``"src"`` are equivalent;
+    * rejects absolute paths (``"/etc/passwd"``) — scope is repo-relative;
+    * rejects paths containing ``..`` segments — would break the
+      is_in_scope semantics by escaping the repo root.
+
+    Empty list is the no-op (legacy) value and is returned unchanged.
+    """
+    out: list[str] = []
+    for raw in scope:
+        if not isinstance(raw, str):
+            raise ValueError(f"edit_scope entries must be str, got {type(raw).__name__!r}")
+        if raw.startswith("/"):
+            raise ValueError(
+                f"edit_scope entries must be repo-relative, got absolute path {raw!r}"
+            )
+        # Reject ``..`` as a standalone segment (split on '/'), not as a
+        # substring — paths like ``src/some..file`` should be allowed; only
+        # parent-directory traversal is rejected.
+        parts = raw.split("/")
+        if any(p == ".." for p in parts):
+            raise ValueError(
+                f"edit_scope entries cannot contain '..' segments, got {raw!r}"
+            )
+        out.append(raw.rstrip("/"))
+    return out
 
 
 TaskStatus = Literal[
@@ -122,6 +155,20 @@ class Phase(BaseModel):
     # but at phase scope — observability for "which sub-tasks were synthesized
     # from architect_b's direction text vs. the architect's original plan".
     corrective_task_ids: list[str] = Field(default_factory=list)
+    # v0.14.0: optional per-phase override of ``Plan.edit_scope``. ``None``
+    # (default) means "inherit Plan.edit_scope" — distinct from the empty
+    # list, which would explicitly opt into legacy whole-repo semantics for
+    # this phase only. When non-None, validators mirror those on
+    # ``Plan.edit_scope`` (trim trailing slash, reject absolute, reject
+    # ``..`` segments).
+    edit_scope: list[str] | None = None
+
+    @field_validator("edit_scope", mode="after")
+    @classmethod
+    def _validate_phase_edit_scope(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        return _validate_edit_scope_paths(v)
 
 
 class Plan(BaseModel):
@@ -144,6 +191,20 @@ class Plan(BaseModel):
     created_at: str
     updated_at: str
     content_hash: str = ""  # CAS hash, recomputed on save by the ledger
+    # v0.14.0: optional list of repo-relative path prefixes the plan may
+    # modify. Empty list (default) preserves legacy whole-repo behavior —
+    # no constraint is enforced. When non-empty, the orchestrator's
+    # :func:`orchestrator.dag.validate_edit_scope` ensures every task's
+    # ``files`` are subsumed by the resolved scope before any task
+    # dispatches. Validator: trim trailing ``/``, reject absolute paths,
+    # reject paths containing ``..`` segments. Phase-level override lives
+    # on :attr:`Phase.edit_scope` (``None`` = inherit; non-None = override).
+    edit_scope: list[str] = Field(default_factory=list)
+
+    @field_validator("edit_scope", mode="after")
+    @classmethod
+    def _validate_plan_edit_scope(cls, v: list[str]) -> list[str]:
+        return _validate_edit_scope_paths(v)
 
 
 # ---------------------------------------------------------------------------
