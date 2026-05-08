@@ -174,3 +174,80 @@ def test_resolve_parallelism_role_mix_phase_review_accepted() -> None:
     for role in ("plan", "impl", "phase_review"):
         out = resolve_parallelism(None, cap, role, 3)  # type: ignore[arg-type]
         assert out >= 1
+
+
+# ---------------------------------------------------------------------------
+# measure_subprocess_rss: mean RSS across PIDs, robust to dead children
+# ---------------------------------------------------------------------------
+
+
+def test_measure_subprocess_rss_returns_mean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given 3 reachable PIDs returning 100/200/300 MB → mean is 200 MB."""
+    from runtime import resource_probe
+
+    def fake_process(pid: int) -> Mock:
+        rss_by_pid = {1: 100, 2: 200, 3: 300}
+        proc = Mock()
+        proc.memory_info.return_value = Mock(rss=rss_by_pid[pid] * 1024 * 1024)
+        return proc
+
+    monkeypatch.setattr(resource_probe.psutil, "Process", fake_process)
+    out = resource_probe.measure_subprocess_rss([1, 2, 3])
+    assert out == pytest.approx(200.0, rel=1e-6)
+
+
+def test_measure_subprocess_rss_skips_dead_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``psutil.NoSuchProcess`` is silently skipped; mean is taken over
+    living children only."""
+    from runtime import resource_probe
+
+    def fake_process(pid: int) -> Mock:
+        if pid == 2:
+            raise resource_probe.psutil.NoSuchProcess(pid)
+        proc = Mock()
+        proc.memory_info.return_value = Mock(rss=400 * 1024 * 1024)
+        return proc
+
+    monkeypatch.setattr(resource_probe.psutil, "Process", fake_process)
+    out = resource_probe.measure_subprocess_rss([1, 2, 3])
+    # Mean of 400, 400 (PID 2 skipped) = 400.
+    assert out == pytest.approx(400.0, rel=1e-6)
+
+
+def test_measure_subprocess_rss_skips_access_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``psutil.AccessDenied`` is silently skipped (e.g. in sandboxed CI)."""
+    from runtime import resource_probe
+
+    def fake_process(pid: int) -> Mock:
+        raise resource_probe.psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(resource_probe.psutil, "Process", fake_process)
+    out = resource_probe.measure_subprocess_rss([1, 2])
+    # Both denied → no living children → return None.
+    assert out is None
+
+
+def test_measure_subprocess_rss_empty_pids_returns_none() -> None:
+    """No PIDs supplied → no probe possible → return None."""
+    from runtime.resource_probe import measure_subprocess_rss
+
+    assert measure_subprocess_rss([]) is None
+
+
+def test_measure_subprocess_rss_all_dead_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All PIDs unreachable → return None (no per-pass ratchet decision)."""
+    from runtime import resource_probe
+
+    def fake_process(pid: int) -> Mock:
+        raise resource_probe.psutil.NoSuchProcess(pid)
+
+    monkeypatch.setattr(resource_probe.psutil, "Process", fake_process)
+    assert resource_probe.measure_subprocess_rss([1, 2, 3]) is None

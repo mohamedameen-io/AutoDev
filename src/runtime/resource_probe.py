@@ -169,3 +169,40 @@ def resolve_parallelism(
         cpu_cap=cpu_cap,
     )
     return chosen
+
+
+def measure_subprocess_rss(pids: list[int]) -> float | None:
+    """Return the mean resident-set-size in MB across the given PIDs.
+
+    Used by per-pass adaptive ratcheting in :class:`tournament.core.Tournament`.
+    After all judges in a pass complete, the runner collects their adapter
+    PIDs and asks this helper for the mean RSS so the tournament can decide
+    whether to ratchet down ``max_parallel_subprocesses``.
+
+    Robust to:
+
+    * Empty ``pids`` list → returns ``None``.
+    * ``psutil.NoSuchProcess`` (child already exited) → silently skipped.
+    * ``psutil.AccessDenied`` (sandboxed CI / privilege drop) → silently
+      skipped.
+
+    Args:
+        pids: List of operating-system process IDs to probe. Order does
+            not matter; duplicates would be counted twice (caller's
+            responsibility to dedupe).
+
+    Returns:
+        Mean RSS in MB across reachable PIDs, or ``None`` when no PID is
+        reachable (caller should treat ``None`` as "no decision possible
+        this pass" and skip the ratchet).
+    """
+    rss_values: list[float] = []
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+            rss_values.append(proc.memory_info().rss / 1024**2)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if not rss_values:
+        return None
+    return sum(rss_values) / len(rss_values)
