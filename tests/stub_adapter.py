@@ -49,6 +49,18 @@ class StubAdapter(PlatformAdapter):
         self._counters[inv.role] = self._counters.get(inv.role, 0) + 1
         handler = self._responses.get(inv.role)
         if handler is None:
+            # v0.17.0 S1: role-aware fallback for ``critic_drift_verifier``.
+            # Drift-verifier output is parsed for ``VERDICT: APPROVED|REJECTED``;
+            # the legacy ``[stub:{role}] default-ok`` text is unparseable and
+            # would crash drift-verifier-enabled tests that don't explicitly
+            # stub the role. Returning an APPROVED verdict here mirrors the
+            # "no drift" default (the gate's safe-mode position).
+            if inv.role == "critic_drift_verifier":
+                return AgentResult(
+                    success=True,
+                    text="VERDICT: APPROVED\n",
+                    duration_s=0.01,
+                )
             return AgentResult(
                 success=True,
                 text=f"[stub:{inv.role}] default-ok",
