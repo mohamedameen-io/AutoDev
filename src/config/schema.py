@@ -376,6 +376,34 @@ class HiveConfig(BaseModel):
     path: Path
 
 
+class DecayCurveConfig(BaseModel):
+    """v0.20.0 B1: per-event-type confidence-decay curve.
+
+    A decay curve maps a lesson's age (delta between now and its
+    timestamp) to a multiplier applied to its confidence score during
+    ranking. Two parameters:
+
+    * :attr:`half_life_days` — age (in days) at which the curve hits
+      ``floor + (1 - floor) / 2``. Larger values = slower decay.
+    * :attr:`floor` — asymptote of the decay (the lowest factor an
+      arbitrarily-old lesson can produce). Range ``[0.0, 1.0]``.
+
+    The curve formula used by :func:`state.knowledge._recency_factor` is
+    a smoothed linear blend toward the floor that matches the legacy
+    behavior when ``half_life_days=15`` and ``floor=0.5`` — i.e. the
+    legacy 30-day-window/0.5-floor curve hits 0.75 at 15 days and 0.5
+    at 30 days. Per-event-type tuning lets ``winner_promoted`` lessons
+    decay slower (still useful months later) while ``soft_blocker``
+    lessons decay faster (early failures often inform near-term passes
+    more than month-old ones).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    half_life_days: float = Field(default=15.0, gt=0.0)
+    floor: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
 class KnowledgeConfig(BaseModel):
     """Behavioral config for the two-tier knowledge system (Phase 9).
 
@@ -416,6 +444,18 @@ class KnowledgeConfig(BaseModel):
     # Default ON because the cost is negligible (one dict lookup per
     # entry) and the precision win on multi-branch runs is significant.
     lane_aware_injection_enabled: bool = True
+    # v0.20.0 B1: per-event-type confidence-decay curves. ``None`` (default)
+    # preserves byte-identical legacy behavior — every lesson uses the
+    # 30-day linear decay (1.0 → 0.5 over 30 days). When set, each entry
+    # is keyed by ``metadata["event_type"]`` and looked up here; entries
+    # without an event_type or without a matching curve fall back to the
+    # legacy curve. Example::
+    #
+    #     decay_curves = {
+    #         "winner_promoted": DecayCurveConfig(half_life_days=30, floor=0.5),
+    #         "soft_blocker":     DecayCurveConfig(half_life_days=7,  floor=0.4),
+    #     }
+    decay_curves: dict[str, DecayCurveConfig] | None = None
 
 
 class AutodevConfig(BaseModel):
