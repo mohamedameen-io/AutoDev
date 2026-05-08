@@ -358,6 +358,51 @@ class GuardrailsConfig(BaseModel):
     cost_budget_usd_per_plan: float | None = None
 
 
+class PRMConfig(BaseModel):
+    """v0.20.0 A1: configuration for the trajectory PRM (Process Reward Model).
+
+    The rule-based detectors in :mod:`orchestrator.prm` always run.
+    ``strategy`` controls whether an additional LLM-based classifier
+    augments the rule output:
+
+    * ``"rules"`` (default) — rule-based only, byte-identical to v0.19.0.
+    * ``"rules+ml"`` — rules-primary; LLM-secondary. Both run; the
+      orchestrator merges results (rules win on dedup; ML pattern
+      confidence ≥ ``ml_threshold``).
+
+    ``ml_threshold`` is the LLM-confidence cutoff below which the
+    classifier discards a pattern. 0.7 is the empirical default —
+    higher cutoffs admit fewer patterns; lower admits more (but more
+    false positives).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: Literal["rules", "rules+ml"] = "rules"
+    ml_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    # Minimum trajectory length before the LLM classifier is invoked.
+    # Cold-start guard — the rule-based detectors already handle short
+    # windows; running the LLM on 1–2 events wastes tokens.
+    ml_min_events: int = Field(default=3, ge=1)
+
+
+class PlateauDetectorConfig(BaseModel):
+    """v0.20.0 A2: configuration for the plateau detector.
+
+    ``strategy="rules"`` (default) preserves the v0.18.0 rule-based
+    detection (no winner_promoted in trailing window). ``"regression"``
+    swaps in a least-squares regression on
+    ``cumulative winner_promoted_count`` vs event index — slope below
+    ``plateau_slope_threshold`` flags a plateau.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: Literal["rules", "regression"] = "rules"
+    regression_window: int = Field(default=10, ge=3)
+    plateau_slope_threshold: float = Field(default=0.1, ge=0.0)
+
+
 class TaskOverridesConfig(BaseModel):
     """v0.20.0 D1: per-task overrides for the ``max_turns`` resolver.
 
@@ -503,6 +548,14 @@ class AutodevConfig(BaseModel):
     # ``huge_repo_multipliers=None`` — the resolver uses the baked-in
     # curve (simple 3.0×, medium 2.0×, complex 1.5×).
     task_overrides: TaskOverridesConfig = Field(default_factory=TaskOverridesConfig)
+    # v0.20.0 A1: PRM (trajectory pattern) detection strategy + threshold.
+    # Default ``strategy="rules"`` preserves byte-identical v0.19.0 behavior.
+    prm: PRMConfig = Field(default_factory=PRMConfig)
+    # v0.20.0 A2: plateau-detector strategy. Default ``strategy="rules"``
+    # preserves v0.18.0 rule-based detection (no-winner-in-window).
+    plateau_detector: PlateauDetectorConfig = Field(
+        default_factory=PlateauDetectorConfig
+    )
     hive: HiveConfig
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     # v0.16.0 hallucination-guard top-level toggle. Default True — the
