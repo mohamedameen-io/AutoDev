@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Literal, cast
 
+from adapters.git_utils import _git_rev_parse_head
 from adapters.inline import InlineAdapter
 from adapters.inline_types import DelegationPendingSignal
 from adapters.types import AgentInvocation, AgentResult
@@ -39,9 +40,11 @@ from qa import (
     run_syntax_check,
     run_tests,
 )
+from state.paths import autodev_root
 from state.schemas import (
     CoderEvidence,
     CriticEvidence,
+    Phase,
     ReviewEvidence,
     Task,
     TestEvidence,
@@ -69,6 +72,14 @@ logger = get_logger(__name__)
 _DEFAULT_DEVELOPER_TIMEOUT_S = 900
 
 
+# v0.9.0: terminal task statuses that count toward "phase done" for
+# phase-review trigger detection. All three pause forward progress for
+# the task in question; ``complete`` and ``skipped`` are intentional
+# terminal states; ``blocked`` is escalation. The phase-review tournament
+# fires once the LAST task in the phase reaches one of these.
+_TERMINAL_TASK_STATUSES: tuple[str, ...] = ("complete", "blocked", "skipped")
+
+
 class TaskEscalatedError(AutodevError):
     """Raised (and logged) when a task is escalated to critic_sounding_board.
 
@@ -80,7 +91,14 @@ class TaskEscalatedError(AutodevError):
 async def run_execute_phase(
     orch: "Orchestrator", task_id: str | None = None
 ) -> list[Task]:
-    """Run the execute loop. Returns the list of tasks processed (in order)."""
+    """Run the execute loop. Returns the list of tasks processed (in order).
+
+    v0.9.0: when the loop processes the last task in a phase (all tasks
+    terminal), the per-phase code-review tournament fires. The tournament
+    decides whether to accept the phase as-is (winner=A) or inject
+    corrective sub-tasks (winner=B/AB) — corrective tasks land at the end
+    of the same phase and execute BEFORE the next phase begins.
+    """
     processed: list[Task] = []
 
     if task_id is not None:
@@ -90,16 +108,284 @@ async def run_execute_phase(
         if task.status in ("complete", "skipped"):
             logger.info("execute_phase.skip", task_id=task_id, status=task.status)
             return processed
+        # Single-task path: still record baseline_commit on first entry to
+        # the phase so a later (whole-loop) run picks up the right
+        # baseline. This is idempotent (the meta-update only runs when
+        # baseline_commit is unset).
+        await _maybe_record_phase_entry(orch, task.phase_id)
         processed.append(await _execute_one(orch, task))
+        # Single-task path also triggers review when the targeted task
+        # was the last terminal one in its phase.
+        await _maybe_run_phase_review(orch, task.phase_id)
         return processed
 
-    # Loop over all pending tasks.
+    # Loop over all pending tasks. v0.9.0: track the current phase id and
+    # observe phase-boundary crossings so the per-phase review fires once
+    # per phase.
+    current_phase_id: str | None = None
     while True:
         task = await orch.plan_manager.next_pending_task()
         if task is None:
+            # End of plan: trigger one last review for the trailing phase
+            # (covers the case where the last phase's last task just
+            # completed).
+            if current_phase_id is not None:
+                await _maybe_run_phase_review(orch, current_phase_id)
             break
+
+        # Phase boundary observation: if we crossed into a new phase,
+        # first run the review for the OLD phase (its tasks are all
+        # terminal because next_pending_task moved on), then record the
+        # baseline_commit for the NEW phase.
+        if current_phase_id is not None and task.phase_id != current_phase_id:
+            await _maybe_run_phase_review(orch, current_phase_id)
+        if task.phase_id != current_phase_id:
+            await _maybe_record_phase_entry(orch, task.phase_id)
+            current_phase_id = task.phase_id
+
         processed.append(await _execute_one(orch, task))
+
+        # Within-phase trigger: if the task we just ran was the LAST
+        # non-terminal task in its phase (i.e. next_pending_task would
+        # now skip past this phase), fire the review immediately. The
+        # next iteration's phase-boundary check is a defensive backstop
+        # in case status churn between iterations races us.
+        await _maybe_run_phase_review(orch, task.phase_id)
     return processed
+
+
+async def _maybe_record_phase_entry(orch: "Orchestrator", phase_id: str) -> None:
+    """Record ``Phase.baseline_commit`` once at first entry to the phase.
+
+    Idempotent: if the phase already has a ``baseline_commit``, this is a
+    no-op. Failure to read HEAD (no git repo, etc.) is logged and skipped
+    rather than raising — phase review will degrade gracefully to an
+    empty-diff bundle.
+    """
+    plan = await orch.plan_manager.load()
+    if plan is None:
+        return
+    phase = next((p for p in plan.phases if p.id == phase_id), None)
+    if phase is None or phase.baseline_commit is not None:
+        return
+    sha = _git_rev_parse_head(orch.cwd)
+    if sha is None:
+        logger.info(
+            "execute_phase.baseline_commit_unavailable", phase_id=phase_id
+        )
+        return
+    try:
+        await orch.plan_manager.update_phase_meta(phase_id, baseline_commit=sha)
+    except Exception as exc:  # noqa: BLE001 — never let phase metadata
+        logger.warning(
+            "execute_phase.update_phase_meta_failed",
+            phase_id=phase_id,
+            err=str(exc),
+        )
+
+
+def _all_phase_tasks_terminal(phase: Phase) -> bool:
+    """Return ``True`` iff every task in the phase is in a terminal state.
+
+    Terminal = complete | blocked | skipped. The phase-review tournament
+    fires only when ALL tasks are terminal — partial progress doesn't
+    trigger review.
+    """
+    if not phase.tasks:
+        return False
+    return all(t.status in _TERMINAL_TASK_STATUSES for t in phase.tasks)
+
+
+async def _maybe_run_phase_review(
+    orch: "Orchestrator", phase_id: str
+) -> None:
+    """Trigger the phase-review tournament if the phase is fully terminal.
+
+    Critical loop guard: phases with ``review_status`` already in
+    ``{"accepted", "corrective_required", "skipped"}`` are skipped. This
+    prevents corrective tasks (which themselves land terminal) from
+    re-firing the tournament. Once corrective tasks reach terminal, this
+    function transitions ``"corrective_required"`` directly to
+    ``"accepted"`` without a second tournament.
+    """
+    if not orch.cfg.tournaments.phase_review.enabled:
+        return
+
+    plan = await orch.plan_manager.load()
+    if plan is None:
+        return
+    phase = next((p for p in plan.phases if p.id == phase_id), None)
+    if phase is None:
+        return
+
+    # Critical loop guard: reviewed phases are not re-reviewed.
+    if phase.review_status == "accepted":
+        return
+    if phase.review_status == "skipped":
+        return
+    if phase.review_status == "corrective_required":
+        # Corrective tasks have landed terminal — accept and move on.
+        if _all_phase_tasks_terminal(phase):
+            try:
+                await orch.plan_manager.update_phase_meta(
+                    phase_id, review_status="accepted"
+                )
+                logger.info(
+                    "execute_phase.corrective_completed_accepted",
+                    phase_id=phase_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.corrective_accept_failed",
+                    phase_id=phase_id,
+                    err=str(exc),
+                )
+        return
+
+    # Only fire on full-terminal observation.
+    if not _all_phase_tasks_terminal(phase):
+        return
+
+    await _run_phase_review(orch, phase)
+
+
+async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
+    """Run the phase-review tournament and apply its outcome.
+
+    A-winner → ``review_status="accepted"``.
+    B/AB-winner → parse direction → append corrective tasks. The tasks land
+    at the end of the phase, where ``next_pending_task()`` will pick them
+    up before advancing to the next phase.
+    Exception → ``review_status="skipped"``, log warning, do not block
+    forward progress.
+    """
+    from orchestrator.corrective_parser import parse_corrective_direction
+    from orchestrator.phase_review_runner import (
+        _phase_complexity_rollup,
+        run_phase_review_tournament,
+    )
+
+    # Mark in-progress so a concurrent observer can see we're working.
+    try:
+        await orch.plan_manager.update_phase_meta(
+            phase.id, review_status="in_progress"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.review_status_in_progress_failed",
+            phase_id=phase.id,
+            err=str(exc),
+        )
+
+    baseline_commit = phase.baseline_commit or ""
+    tip_commit = _git_rev_parse_head(orch.cwd) or ""
+    spec_md = ""
+    spec_path = autodev_root(orch.cwd) / "spec.md"
+    if spec_path.exists():
+        try:
+            spec_md = spec_path.read_text(encoding="utf-8")
+        except OSError:
+            spec_md = ""
+
+    try:
+        outcome = await run_phase_review_tournament(
+            orch, phase, baseline_commit, tip_commit, spec_md
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.phase_review_error",
+            phase_id=phase.id,
+            err=str(exc),
+        )
+        try:
+            await orch.plan_manager.update_phase_meta(
+                phase.id, review_status="skipped"
+            )
+        except Exception as exc2:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.review_status_skipped_failed",
+                phase_id=phase.id,
+                err=str(exc2),
+            )
+        return
+
+    if outcome.accept_phase:
+        try:
+            await orch.plan_manager.update_phase_meta(
+                phase.id, review_status="accepted"
+            )
+            logger.info(
+                "execute_phase.phase_review_accepted",
+                phase_id=phase.id,
+                winner=outcome.winner,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.review_status_accepted_failed",
+                phase_id=phase.id,
+                err=str(exc),
+            )
+        return
+
+    # Non-A winner: parse the direction and inject corrective sub-tasks.
+    if not outcome.corrective_direction:
+        logger.warning(
+            "execute_phase.phase_review_no_direction",
+            phase_id=phase.id,
+            winner=outcome.winner,
+        )
+        try:
+            await orch.plan_manager.update_phase_meta(
+                phase.id, review_status="skipped"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.review_status_skipped_failed",
+                phase_id=phase.id,
+                err=str(exc),
+            )
+        return
+
+    rollup = _phase_complexity_rollup(phase)
+    corrective_tasks = parse_corrective_direction(
+        outcome.corrective_direction,
+        phase_id=phase.id,
+        base_task_count=len(phase.tasks),
+        phase_complexity=rollup,
+    )
+    if not corrective_tasks:
+        logger.warning(
+            "execute_phase.phase_review_no_corrective_parsed",
+            phase_id=phase.id,
+        )
+        try:
+            await orch.plan_manager.update_phase_meta(
+                phase.id, review_status="skipped"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.review_status_skipped_failed",
+                phase_id=phase.id,
+                err=str(exc),
+            )
+        return
+
+    try:
+        await orch.plan_manager.append_corrective_tasks(
+            phase.id, corrective_tasks
+        )
+        logger.info(
+            "execute_phase.phase_review_corrective_injected",
+            phase_id=phase.id,
+            winner=outcome.winner,
+            count=len(corrective_tasks),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.append_corrective_failed",
+            phase_id=phase.id,
+            err=str(exc),
+        )
 
 
 async def _execute_one(orch: "Orchestrator", task: Task) -> Task:
