@@ -383,8 +383,25 @@ async def run_impl_tournament(
         role_mix="impl",
         num_judges=cfg.num_judges,
     )
+    # v0.18.0 C3: when veto-mode is active, use specialist judge roles by
+    # default. Operators can override via ``cfg.tournaments.impl.judge_roles``
+    # to set their own cohort. Otherwise fall through to the legacy
+    # ``["judge"] * num_judges`` cohort.
+    judge_roles_resolved: list[str] | None = None
+    if getattr(cfg, "voting_strategy", "borda") == "veto":
+        judge_roles_resolved = (
+            list(cfg.judge_roles) if cfg.judge_roles else
+            ["critic", "reviewer", "test_engineer", "domain_expert", "explorer"]
+        )
+    elif cfg.judge_roles:
+        judge_roles_resolved = list(cfg.judge_roles)
+
+    effective_num_judges = (
+        len(judge_roles_resolved) if judge_roles_resolved else cfg.num_judges
+    )
+
     tcfg = TournamentConfig(
-        num_judges=cfg.num_judges,
+        num_judges=effective_num_judges,
         convergence_k=cfg.convergence_k,
         max_rounds=cfg.max_rounds,
         model=model,
@@ -396,6 +413,10 @@ async def run_impl_tournament(
         # (impl artifacts are diff bundles, not line-counted plan markdown);
         # plumbed through for symmetry with ``TournamentConfig``.
         max_plan_lines_growth_ratio=cfg.max_plan_lines_growth_ratio,
+        judge_roles=judge_roles_resolved,
+        judge_role_weights=(
+            dict(cfg.judge_role_weights) if cfg.judge_role_weights else None
+        ),
     )
 
     wt_mgr = WorktreeManager(main_repo=orch.cwd, tournament_dir=worktree_dir)
