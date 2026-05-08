@@ -147,24 +147,53 @@ def test_architect_prompt_contains_execution_env_constraints() -> None:
 def test_architect_prompt_complexity_section_remains_last() -> None:
     """``OUTPUT REQUIREMENT — PLAN COMPLEXITY`` must remain the LAST section.
 
-    The new ``EXECUTION ENVIRONMENT CONSTRAINTS`` section is inserted
-    immediately above it, but the COMPLEXITY directive is consumed by the
-    parser and must be the final section so its position is unambiguous.
+    v0.5.4 inserted ``EXECUTION ENVIRONMENT CONSTRAINTS`` immediately above
+    it; v0.8.0 inserted ``OUTPUT REQUIREMENT — PER-TASK COMPLEXITY`` between
+    the two. The trailing ``COMPLEXITY:`` directive must remain the very
+    last section so :func:`orchestrator.plan_parser.extract_complexity` can
+    locate it unambiguously at the end of the architect's output.
     """
     specs = build_registry(default_config())
     architect_prompt = specs["architect"].prompt
 
     constraints_idx = architect_prompt.find("## EXECUTION ENVIRONMENT CONSTRAINTS")
+    per_task_idx = architect_prompt.find("## OUTPUT REQUIREMENT — PER-TASK COMPLEXITY")
     complexity_idx = architect_prompt.find("## OUTPUT REQUIREMENT — PLAN COMPLEXITY")
 
     assert constraints_idx > 0, "constraints section missing"
-    assert complexity_idx > 0, "complexity section missing"
-    assert constraints_idx < complexity_idx, (
-        "constraints must appear BEFORE the complexity output requirement"
+    assert per_task_idx > 0, "per-task complexity section missing"
+    assert complexity_idx > 0, "plan complexity section missing"
+    assert constraints_idx < per_task_idx < complexity_idx, (
+        "expected order: EXECUTION ENVIRONMENT < PER-TASK COMPLEXITY < PLAN COMPLEXITY"
     )
 
-    # No `## ` heading should appear after the complexity section header.
+    # No `## ` heading should appear after the plan-complexity section header.
     tail = architect_prompt[complexity_idx + len("## OUTPUT REQUIREMENT — PLAN COMPLEXITY") :]
     assert "\n## " not in tail, (
         "OUTPUT REQUIREMENT — PLAN COMPLEXITY must remain the final section"
     )
+
+
+# ── v0.8.0: Architect prompt PER-TASK COMPLEXITY directive ───────────────
+
+
+def test_architect_prompt_contains_per_task_complexity_directive() -> None:
+    """The architect's rendered prompt must include the PER-TASK COMPLEXITY
+    section AND mention the ``- Complexity:`` body line so each emitted
+    task carries the bucket the orchestrator's
+    :func:`tournament.task_overrides.resolve_task_max_turns` resolver can
+    consume."""
+    specs = build_registry(default_config())
+    architect_prompt = specs["architect"].prompt
+
+    assert "## OUTPUT REQUIREMENT — PER-TASK COMPLEXITY" in architect_prompt, (
+        "architect prompt is missing the PER-TASK COMPLEXITY section header"
+    )
+    assert "- Complexity:" in architect_prompt, (
+        "architect prompt must mention the ``- Complexity:`` body-line directive"
+    )
+    # All three buckets must be documented in the worked example.
+    for tier in ("simple", "medium", "complex"):
+        assert f"Complexity: {tier}" in architect_prompt, (
+            f"architect prompt must include the ``{tier}`` tier in its example"
+        )

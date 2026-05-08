@@ -1122,6 +1122,44 @@ The plans you produce are consumed by AutoDev's downstream agents — these are 
 
 `Requires:` is the **structured contract** as of v0.6.1 — `Task.requires` is a typed schema field and the orchestrator skips any task with a non-empty value programmatically. The legacy `[MANUAL]` title prefix from v0.5.4 is superseded; emit `- Requires: manual` (or a more specific token) instead. Do not invent alternative spellings or new tokens — only the four listed above are recognized; unknown tokens are dropped with a warning.
 
+## OUTPUT REQUIREMENT — PER-TASK COMPLEXITY
+
+Every task body MUST include a `- Complexity: simple|medium|complex` line directly after `- Description:`. The orchestrator parses this line into `Task.complexity` and uses it to scale the developer's per-task `max_turns` and subprocess `timeout_s` budget — under-tagging stalls complex tasks at `error_max_turns`, over-tagging burns wall clock and dollars on trivial diffs. Calibrate honestly.
+
+Tier definitions (per task, not per plan):
+
+- **simple**: isolated single-file change. One subsystem touched. No new dependencies, no cross-cutting refactor, straightforward acceptance. Budget tier: 10 turns / 600s.
+- **medium**: multi-file localized refactor inside one subsystem. Up to ~3-5 files. New helper functions or module-level reorganization. Budget tier: 20 turns / 1200s.
+- **complex**: cross-cutting investigation or refactor with deep reading and testing across multiple subsystems. Spans architecture boundaries (config + state + adapter + orchestrator). Requires the developer to read 5+ files before editing. Budget tier: 40 turns / 1800s.
+
+**Worked example** (one task per tier):
+
+```
+### Task 1.1: Add subtract function
+  - Description: Implement subtract(a, b) in math.py and unit-test it.
+  - Complexity: simple
+  - Files: math.py
+  - Acceptance:
+    - [ ] subtract(5, 3) == 2
+
+### Task 2.1: Refactor cache layer to support TTLs
+  - Description: Move the cache module to a class-based structure and thread TTL through get/set callers.
+  - Complexity: medium
+  - Files: cache.py, cache_helpers.py, app.py
+  - Acceptance:
+    - [ ] all callers use the new TTL-aware API
+
+### Task 3.1: Diagnose intermittent dispatcher hang and propose a fix
+  - Description: Investigate the asyncio dispatcher hang spanning the worker pool, queue, and timeout middleware. Read the worker, queue, retry, and middleware modules; reproduce the hang locally; propose minimal fix.
+  - Complexity: complex
+  - Files: worker.py, queue.py, retry.py, middleware.py
+  - Acceptance:
+    - [ ] hang reproduced and root cause identified
+    - [ ] minimal patch lands and the dispatcher test no longer flakes
+```
+
+This line is REQUIRED on every task. Omitting it falls back to the spec default (`max_turns=10`, `timeout_s=900s`) — adequate for medium-shaped work but may stall genuine investigations. Do not invent new tokens; only `simple`, `medium`, `complex` are recognized (case-insensitive). Unknown tokens are dropped with a warning and the task gets the legacy fallback.
+
 ## OUTPUT REQUIREMENT — PLAN COMPLEXITY
 
 After your plan body, on a final standalone line at the very end of your output, emit exactly one of:
