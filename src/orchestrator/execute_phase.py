@@ -95,11 +95,24 @@ async def run_execute_phase(
 ) -> list[Task]:
     """Run the execute loop. Returns the list of tasks processed (in order).
 
+    v0.11.0: replaces the serial ``next_pending_task`` walk with a
+    DAG-aware worker pool. Within a phase, independent tasks execute
+    concurrently up to ``cfg.tournaments.execute_max_parallel_tasks``
+    (auto-resolved via the v0.10.0 resource probe when ``None``). Tasks
+    with overlapping ``files`` are serialized; failed tasks
+    cascade-block their dependents via
+    :meth:`PlanManager.mark_blocked_descendants`.
+
     v0.9.0: when the loop processes the last task in a phase (all tasks
     terminal), the per-phase code-review tournament fires. The tournament
     decides whether to accept the phase as-is (winner=A) or inject
     corrective sub-tasks (winner=B/AB) — corrective tasks land at the end
     of the same phase and execute BEFORE the next phase begins.
+
+    Single-task path (``task_id`` set) bypasses the DAG dispatcher and
+    runs the legacy serial path, with a NEW per-task worktree if the
+    repo is git-initialized (otherwise falls back to running in
+    ``orch.cwd`` directly).
     """
     processed: list[Task] = []
 
@@ -121,39 +134,311 @@ async def run_execute_phase(
         await _maybe_run_phase_review(orch, task.phase_id)
         return processed
 
-    # Loop over all pending tasks. v0.9.0: track the current phase id and
-    # observe phase-boundary crossings so the per-phase review fires once
-    # per phase.
-    current_phase_id: str | None = None
-    while True:
-        task = await orch.plan_manager.next_pending_task()
-        if task is None:
-            # End of plan: trigger one last review for the trailing phase
-            # (covers the case where the last phase's last task just
-            # completed).
-            if current_phase_id is not None:
-                await _maybe_run_phase_review(orch, current_phase_id)
-            break
+    # v0.11.0: DAG-aware worker pool over all phases.
+    plan = await orch.plan_manager.load()
+    if plan is None:
+        return processed
 
-        # Phase boundary observation: if we crossed into a new phase,
-        # first run the review for the OLD phase (its tasks are all
-        # terminal because next_pending_task moved on), then record the
-        # baseline_commit for the NEW phase.
-        if current_phase_id is not None and task.phase_id != current_phase_id:
-            await _maybe_run_phase_review(orch, current_phase_id)
-        if task.phase_id != current_phase_id:
-            await _maybe_record_phase_entry(orch, task.phase_id)
-            current_phase_id = task.phase_id
+    # Resolve worker-pool cap once per run.
+    parallelism = _resolve_execute_parallelism(orch)
 
-        processed.append(await _execute_one(orch, task))
+    # Build a worktree manager rooted under the autodev root. Skip
+    # worktree-isolation when the repo is not git-initialized — tests
+    # commonly use bare tmp dirs and the legacy serial path applies.
+    worktree_mgr: WorktreeManager | None = None
+    if _is_git_repo(orch.cwd):
+        worktree_mgr = WorktreeManager(
+            main_repo=orch.cwd,
+            tournament_dir=autodev_root(orch.cwd) / "execute_worktrees",
+        )
 
-        # Within-phase trigger: if the task we just ran was the LAST
-        # non-terminal task in its phase (i.e. next_pending_task would
-        # now skip past this phase), fire the review immediately. The
-        # next iteration's phase-boundary check is a defensive backstop
-        # in case status churn between iterations races us.
-        await _maybe_run_phase_review(orch, task.phase_id)
+    try:
+        # Validate every phase's DAG up-front. A bad DAG short-circuits
+        # the entire run rather than propagating mid-execute.
+        from orchestrator.dag import DagValidationError, validate_phase_dag
+
+        for phase in plan.phases:
+            try:
+                validate_phase_dag(phase)
+            except DagValidationError as exc:
+                logger.warning(
+                    "execute_phase.dag_invalid",
+                    phase_id=phase.id,
+                    err=str(exc),
+                )
+                # Block every pending task in the offending phase so the
+                # run terminates cleanly.
+                for t in phase.tasks:
+                    if t.status == "pending":
+                        try:
+                            await orch.plan_manager.update_task_status(
+                                t.id,
+                                "blocked",
+                                meta={
+                                    "blocked_reason": f"dag_invalid: {exc}"
+                                },
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+
+        for phase in plan.phases:
+            await _maybe_record_phase_entry(orch, phase.id)
+            # Run the worker pool for this phase, then phase-review.
+            # If phase-review injects corrective tasks (review_status
+            # transitions to ``corrective_required``), loop again so
+            # those tasks execute within this phase before advancing
+            # to the next. Cap at a small number of iterations as a
+            # defensive net against pathological architect_b output.
+            for _round in range(3):
+                phase_processed = await _execute_phase_dag(
+                    orch, phase.id, worktree_mgr, parallelism
+                )
+                processed.extend(phase_processed)
+                await _maybe_run_phase_review(orch, phase.id)
+                # Did phase-review accept? If so we're done with this
+                # phase. Otherwise (corrective_required) the next loop
+                # iteration will run any newly-injected tasks.
+                latest_plan = await orch.plan_manager.load()
+                if latest_plan is None:
+                    break
+                latest_phase = next(
+                    (p for p in latest_plan.phases if p.id == phase.id), None
+                )
+                if latest_phase is None:
+                    break
+                if latest_phase.review_status in ("accepted", "skipped"):
+                    break
+                # Any new pending tasks? If not, stop looping.
+                if not any(t.status == "pending" for t in latest_phase.tasks):
+                    break
+    finally:
+        if worktree_mgr is not None:
+            try:
+                await worktree_mgr.cleanup_all()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.cleanup_all_failed", err=str(exc)
+                )
     return processed
+
+
+def _resolve_execute_parallelism(orch: "Orchestrator") -> int:
+    """Resolve the per-task worker pool cap via runtime.resource_probe.
+
+    Forwards ``cfg.tournaments.execute_max_parallel_tasks`` (None =
+    auto-resolve) into :func:`runtime.resource_probe.resolve_parallelism`
+    with ``role_mix='execute'``. ``num_judges=16`` (the absolute
+    ceiling) when no explicit cap is configured — the dispatcher polls
+    greedily, so this just sets the upper bound.
+    """
+    from runtime.resource_probe import probe_host, resolve_parallelism
+
+    configured = orch.cfg.tournaments.execute_max_parallel_tasks
+    capacity = probe_host()
+    return resolve_parallelism(
+        configured=configured,
+        capacity=capacity,
+        role_mix="execute",
+        num_judges=configured if configured is not None else 16,
+    )
+
+
+def _is_git_repo(cwd: Path) -> bool:
+    """Return True iff ``cwd`` looks like a git repo (has a ``.git`` entry).
+
+    Worktree-isolation requires git, so the dispatcher falls back to
+    the legacy in-place execution path for non-git fixtures.
+    """
+    try:
+        gp = cwd / ".git"
+        return gp.exists()
+    except OSError:
+        return False
+
+
+async def _all_phase_tasks_terminal_async(
+    orch: "Orchestrator", phase_id: str
+) -> bool:
+    """Read the latest plan and return True iff every task in the phase
+    is in a terminal state. Distinct from the synchronous helper
+    :func:`_all_phase_tasks_terminal` which takes a Phase object."""
+    plan = await orch.plan_manager.load()
+    if plan is None:
+        return False
+    phase = next((p for p in plan.phases if p.id == phase_id), None)
+    if phase is None or not phase.tasks:
+        return False
+    return _all_phase_tasks_terminal(phase)
+
+
+async def _execute_phase_dag(
+    orch: "Orchestrator",
+    phase_id: str,
+    worktree_mgr: WorktreeManager | None,
+    parallelism: int,
+) -> list[Task]:
+    """Run the worker pool for one phase. Returns processed tasks.
+
+    Polls :meth:`PlanManager.next_pending_tasks` for runnable tasks
+    (deps met, no file overlap with in-flight) and spawns asyncio
+    workers up to ``parallelism``. Awaits the first to complete via
+    :func:`asyncio.wait` with ``FIRST_COMPLETED``, drains, and resumes
+    polling. Failures route into ``mark_blocked_descendants`` to
+    cascade-block dependents.
+    """
+    import asyncio
+
+    in_flight: dict[str, asyncio.Task[Task]] = {}
+    processed: list[Task] = []
+
+    while True:
+        # Termination: phase is fully terminal AND no workers running.
+        if not in_flight and await _all_phase_tasks_terminal_async(orch, phase_id):
+            return processed
+
+        # Try to spawn new workers up to the cap.
+        if len(in_flight) < parallelism:
+            slots = parallelism - len(in_flight)
+            excluded = await orch.plan_manager.in_flight_files()
+            tasks_to_run = await orch.plan_manager.next_pending_tasks(
+                limit=slots, exclude_files=excluded
+            )
+            # Filter to tasks that belong to THIS phase (others wait
+            # for their phase's turn — phase-major scheduling).
+            tasks_to_run = [t for t in tasks_to_run if t.phase_id == phase_id]
+            for t in tasks_to_run:
+                if t.id in in_flight:
+                    continue
+                await orch.plan_manager.mark_in_flight(t.id)
+                in_flight[t.id] = asyncio.create_task(
+                    _execute_one_worker(orch, t, worktree_mgr)
+                )
+
+        if not in_flight:
+            # Nothing to spawn AND not all terminal — likely waiting on
+            # an in-flight task in a different phase; brief sleep then
+            # re-poll. Bounded short delay keeps unit tests snappy.
+            # If the ENTIRE phase is in_progress (no pending, no
+            # in_flight in our set), another runner / external mutation
+            # is in play — break out so we don't spin forever.
+            if await _all_phase_tasks_terminal_async(orch, phase_id):
+                return processed
+            # Defensive: also break if the phase has ZERO pending tasks
+            # at this point — there's nothing to wait for.
+            phase_has_pending = False
+            plan = await orch.plan_manager.load()
+            if plan is not None:
+                phase_obj = next(
+                    (p for p in plan.phases if p.id == phase_id), None
+                )
+                if phase_obj is not None:
+                    phase_has_pending = any(
+                        t.status == "pending" for t in phase_obj.tasks
+                    )
+            if not phase_has_pending:
+                return processed
+            await asyncio.sleep(0.05)
+            continue
+
+        # Wait for any worker to finish.
+        done, _pending = await asyncio.wait(
+            list(in_flight.values()), return_when=asyncio.FIRST_COMPLETED
+        )
+        for d in done:
+            # Reverse-lookup the task id from the asyncio.Task instance.
+            finished_id = next(
+                (tid for tid, h in in_flight.items() if h is d), None
+            )
+            if finished_id is None:
+                continue
+            del in_flight[finished_id]
+            await orch.plan_manager.clear_in_flight(finished_id)
+            try:
+                completed_task = d.result()
+                processed.append(completed_task)
+            except DelegationPendingSignal:
+                # Inline-adapter suspend: propagate to the caller so
+                # ``write_suspend_state`` runs and the CLI exits cleanly.
+                # The plan_manager already cleared in_flight for this id.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # Worker raised — cascade-block descendants. The worker
+                # itself should have caught and routed to update_task_status,
+                # so this is a defensive net.
+                logger.warning(
+                    "execute_phase.worker_unhandled_exception",
+                    task_id=finished_id,
+                    err=str(exc),
+                )
+                try:
+                    await orch.plan_manager.mark_blocked_descendants(
+                        phase_id, finished_id, str(exc)
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.mark_blocked_descendants_failed",
+                        phase_id=phase_id,
+                        task_id=finished_id,
+                        err=str(exc2),
+                    )
+
+
+async def _execute_one_worker(
+    orch: "Orchestrator",
+    task: Task,
+    worktree_mgr: WorktreeManager | None,
+) -> Task:
+    """Worker entry: run :func:`_execute_one` and route all exceptions.
+
+    Workers must NEVER raise plan-fatal exceptions back to the
+    dispatcher — instead they catch any exception, transition the task
+    to ``blocked`` with a structured reason, and call
+    ``mark_blocked_descendants`` so dependents are cascade-blocked.
+    The dispatcher reads the worker's return value (the final Task)
+    and only sees "done, status was X".
+
+    EXCEPTION: :class:`DelegationPendingSignal` (raised by the inline
+    adapter to suspend the run pending external response) MUST
+    propagate to the dispatcher so the caller can persist suspend
+    state. We re-raise it untouched.
+    """
+    try:
+        return await _execute_one(orch, task, worktree_mgr)
+    except DelegationPendingSignal:
+        # Inline-adapter suspend signal — let the dispatcher / caller
+        # handle it. The plan_manager already recorded the task as
+        # in_progress; resume picks up where we left off.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.worker_caught_exception",
+            task_id=task.id,
+            err=str(exc),
+        )
+        try:
+            blocked = await orch.plan_manager.update_task_status(
+                task.id,
+                "blocked",
+                meta={"blocked_reason": f"worker_exception: {exc}"},
+            )
+        except Exception as exc2:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.worker_block_failed",
+                task_id=task.id,
+                err=str(exc2),
+            )
+            return task
+        try:
+            await orch.plan_manager.mark_blocked_descendants(
+                task.phase_id, task.id, str(exc)
+            )
+        except Exception as exc2:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.cascade_block_failed",
+                task_id=task.id,
+                err=str(exc2),
+            )
+        return blocked
 
 
 async def _maybe_record_phase_entry(orch: "Orchestrator", phase_id: str) -> None:
@@ -211,6 +496,13 @@ async def _maybe_run_phase_review(
     ``"accepted"`` without a second tournament.
     """
     if not orch.cfg.tournaments.phase_review.enabled:
+        return
+
+    # v0.11.0 race guard: if any worker for this phase is still in
+    # flight, defer firing. The dispatcher will call this again after
+    # each worker drains. Without this guard, two workers completing
+    # simultaneously can both observe "all terminal" and double-fire.
+    if (await orch.plan_manager.phase_in_flight_count(phase_id)) > 0:
         return
 
     plan = await orch.plan_manager.load()

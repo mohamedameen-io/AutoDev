@@ -117,7 +117,9 @@ def _patch_execute_one(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """
     captured: list[str] = []
 
-    async def fake_execute_one(orch: Any, task: Task) -> Task:
+    async def fake_execute_one(
+        orch: Any, task: Task, worktree_mgr: Any = None
+    ) -> Task:
         captured.append(task.id)
         # Walk the full FSM path so the strict transition validator
         # accepts each step.

@@ -215,6 +215,11 @@ class PlanManager:
                 for task in phase.tasks:
                     status_by_id[task.id] = task.status
 
+            # Accumulator: every task we pick adds its files to the
+            # running excluded set so subsequent picks in this batch
+            # never share files with an earlier pick. Without this,
+            # two batchmates with overlapping files would both ship.
+            running_excluded: set[str] = set(excluded)
             picked: list[Task] = []
             for phase in plan.phases:
                 for task in phase.tasks:
@@ -231,10 +236,17 @@ class PlanManager:
                             break
                     if not deps_ok:
                         continue
-                    # exclude_files: must not intersect.
-                    if excluded and any(f in excluded for f in task.files):
+                    # exclude_files: must not intersect either the
+                    # caller-provided set OR any earlier pick in this
+                    # batch. The latter is the within-batch overlap
+                    # guard — without it, two simultaneous picks could
+                    # both touch the same file.
+                    if running_excluded and any(
+                        f in running_excluded for f in task.files
+                    ):
                         continue
                     picked.append(task)
+                    running_excluded.update(task.files)
             return picked
 
     async def update_task_status(
