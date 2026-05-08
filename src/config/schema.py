@@ -162,6 +162,16 @@ class TournamentPhaseConfig(BaseModel):
     # overrides into the per-branch tournament runner. Mutually exclusive
     # with ``num_branches > 1`` (validated below).
     branches: list[BranchConfig] | None = None
+    # v0.16.0 promotion-grade ladder toggle. Off by default — opt-in for
+    # safety-critical work where a single-pass winner shouldn't auto-
+    # promote to incumbent. When True, the tournament loop drives
+    # :func:`tournament.promotion.decide` to advance the on-disk grade
+    # rung (``dev_best`` → ``repeated`` → ``promotion_eligible``) across
+    # consecutive non-A wins. The flag lives on the per-phase config so
+    # it can be enabled for the plan tournament (where double-checking
+    # incumbent quality matters most) while staying off for the impl
+    # tournament (where the cost doubling would be punitive).
+    promotion_grade_enabled: bool = False
 
     @model_validator(mode="after")
     def _validate_branches(self) -> "TournamentPhaseConfig":

@@ -213,6 +213,40 @@ def test_tournament_phase_config_complex_plan_num_judges_override_accepts_none()
 
 
 # ---------------------------------------------------------------------------
+# v0.16.0 — TournamentPhaseConfig.promotion_grade_enabled toggle
+# ---------------------------------------------------------------------------
+
+
+def test_tournament_phase_config_promotion_grade_enabled_defaults_false() -> None:
+    """Promotion-grade ladder ships off by default for backward compat."""
+    from config.schema import TournamentPhaseConfig
+
+    cfg = TournamentPhaseConfig(
+        enabled=True,
+        num_judges=3,
+        convergence_k=2,
+        max_rounds=10,
+    )
+    assert cfg.promotion_grade_enabled is False
+
+
+def test_tournament_phase_config_promotion_grade_enabled_round_trips() -> None:
+    """Explicit ``True`` round-trips through model_dump/model_validate."""
+    from config.schema import TournamentPhaseConfig
+
+    cfg = TournamentPhaseConfig(
+        enabled=True,
+        num_judges=3,
+        convergence_k=2,
+        max_rounds=10,
+        promotion_grade_enabled=True,
+    )
+    assert cfg.promotion_grade_enabled is True
+    reloaded = TournamentPhaseConfig.model_validate(cfg.model_dump())
+    assert reloaded.promotion_grade_enabled is True
+
+
+# ---------------------------------------------------------------------------
 # v0.9.0 — TournamentsConfig.phase_review default factory
 # ---------------------------------------------------------------------------
 
