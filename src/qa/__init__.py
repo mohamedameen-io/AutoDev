@@ -9,6 +9,7 @@ from __future__ import annotations
 from plugins.registry import GateResult
 from qa.build_check import run_build_check
 from qa.detect import detect_language, detect_toolchain
+from qa.hallucination_guard import run_hallucination_guard
 from qa.lint import run_lint
 from qa.secretscan import run_secretscan
 from qa.syntax_check import run_syntax_check
@@ -19,6 +20,7 @@ __all__ = [
     "detect_language",
     "detect_toolchain",
     "run_build_check",
+    "run_hallucination_guard",
     "run_lint",
     "run_secretscan",
     "run_syntax_check",
