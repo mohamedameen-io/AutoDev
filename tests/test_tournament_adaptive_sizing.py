@@ -216,7 +216,7 @@ async def test_run_judges_collects_pids_and_probes_rss(
     t = _make_tournament(tmp_path, max_parallel=4)
 
     # Force ``_guarded_judge`` to fake completion + register a PID.
-    async def fake_guarded(self, user, model, pass_num, judge_index, order):
+    async def fake_guarded(self, user, model, pass_num, judge_index, order, role="judge"):
         self._pass_judge_pids.append(1000 + judge_index)
         return "RANKING: 1, 2, 3"
 
@@ -256,7 +256,7 @@ async def test_run_judges_probe_failure_does_not_break_tournament(
 
     t = _make_tournament(tmp_path, max_parallel=4)
 
-    async def fake_guarded(self, user, model, pass_num, judge_index, order):
+    async def fake_guarded(self, user, model, pass_num, judge_index, order, role="judge"):
         return "RANKING: 1, 2, 3"
 
     monkeypatch.setattr(core_mod.Tournament, "_guarded_judge", fake_guarded)
@@ -291,7 +291,7 @@ async def test_run_judges_clears_pid_buffer_between_passes(
 
     pass_call: list[int] = [0]
 
-    async def fake_guarded(self, user, model, pass_num, judge_index, order):
+    async def fake_guarded(self, user, model, pass_num, judge_index, order, role="judge"):
         # Each pass uses different PIDs.
         self._pass_judge_pids.append(pass_num * 100 + judge_index)
         return "RANKING: 1, 2, 3"

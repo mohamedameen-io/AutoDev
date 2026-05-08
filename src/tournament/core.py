@@ -126,6 +126,16 @@ class TournamentConfig:
     # the tournament does roughly 2× the work of the legacy single-pass
     # promotion.
     promotion_grade_enabled: bool = False
+    # v0.18.0 C3: optional list of specialist judge roles. ``None`` (default)
+    # preserves the legacy ``["judge"] * num_judges`` cohort. When set, each
+    # entry becomes a judge with that role's prompt — the list length wins
+    # over ``num_judges`` (callers should set ``num_judges`` to the list's
+    # length when constructing the config).
+    judge_roles: list[str] | None = None
+    # v0.18.0 C3: per-role weighting for specialist judges. ``None`` (default)
+    # gives every judge equal weight 1.0. When set, each role's vote counts
+    # ``weight × Borda points`` (e.g. ``{"test_engineer": 2.0}``).
+    judge_role_weights: dict[str, float] | None = None
 
 
 class PassResult(BaseModel):
@@ -1007,9 +1017,37 @@ class Tournament(Generic[T]):
         # byte-for-byte; ``VetoAggregator`` enables council/veto semantics
         # for impl tournaments that opt in via config.
         tiebreak = "A" if self.cfg.conservative_tiebreak else None
-        raw_winner, scores, valid_judges = self.voting_strategy.aggregate(
-            rankings, labels=["A", "B", "AB"], tiebreak_winner=tiebreak
-        )
+        # v0.18.0 C3: when judge_roles + judge_role_weights are configured,
+        # build the per-judge weight vector aligned to the ranking list.
+        # Default 1.0 for missing roles. When weights is None, behavior
+        # is byte-identical to v0.17.0.
+        weights: list[float] | None = None
+        if self.cfg.judge_role_weights and self.cfg.judge_roles:
+            roles_for_aggreg = list(self.cfg.judge_roles)
+            # The plugin judges (orch.plugin_registry) append rankings
+            # AFTER the LLM judges in ``rankings``; weights only cover
+            # the LLM cohort. Plugin judges default to 1.0.
+            weights = [
+                self.cfg.judge_role_weights.get(role, 1.0)
+                for role in roles_for_aggreg
+            ]
+            # Pad weights to len(rankings) with 1.0 for any plugin judges.
+            while len(weights) < len(rankings):
+                weights.append(1.0)
+
+        # v0.18.0 C1+C3: pass weights when supported by the strategy.
+        try:
+            raw_winner, scores, valid_judges = self.voting_strategy.aggregate(
+                rankings,
+                labels=["A", "B", "AB"],
+                tiebreak_winner=tiebreak,
+                weights=weights,
+            )
+        except TypeError:
+            # Strategy doesn't accept ``weights`` — fall back without it.
+            raw_winner, scores, valid_judges = self.voting_strategy.aggregate(
+                rankings, labels=["A", "B", "AB"], tiebreak_winner=tiebreak
+            )
 
         # v0.6.2 / Issue 5B: demote oversize AB winners. The raw ``winner``
         # we return drives the streak/incumbent update path in :meth:`run`;
@@ -1112,12 +1150,22 @@ class Tournament(Generic[T]):
         recorded_orders = recorded_orders or {}
         recorded_responses = recorded_responses or {}
 
+        # v0.18.0 C3: derive the per-judge role list. When
+        # ``cfg.judge_roles`` is set, iterate that list (and override the
+        # effective num_judges to its length). When None, the legacy
+        # cohort is ``["judge"] * num_judges``.
+        judge_roles_cfg = getattr(self.cfg, "judge_roles", None)
+        if judge_roles_cfg:
+            effective_judge_roles: list[str] = list(judge_roles_cfg)
+        else:
+            effective_judge_roles = ["judge"] * self.cfg.num_judges
+
         # Build per-judge plan: order, fresh-or-recorded flag.
         orders: list[dict[int, str]] = []
         # task_meta entries: ("recorded", response_dict) or ("fresh", None)
         task_meta: list[tuple[str, dict[str, Any] | None]] = []
         coros: list[Any] = []
-        for i in range(self.cfg.num_judges):
+        for i, judge_role in enumerate(effective_judge_roles):
             recorded_resp = recorded_responses.get(i)
             recorded_order = recorded_orders.get(i)
 
@@ -1149,7 +1197,9 @@ class Tournament(Generic[T]):
             task_meta.append(("fresh", None))
             user = self.handler.render_for_judge(task_prompt, v_a, v_b, v_ab, order)
             coros.append(
-                self._guarded_judge(user, model, pass_num, i, order)
+                self._guarded_judge(
+                    user, model, pass_num, i, order, role=judge_role
+                )
             )
 
         # Run only the fresh-call judges; map their responses back into the
@@ -1303,6 +1353,7 @@ class Tournament(Generic[T]):
         pass_num: int,
         judge_index: int,
         order: dict[int, str],
+        role: str = "judge",
     ) -> str:
         """Run a judge call under the concurrency semaphore.
 
@@ -1315,11 +1366,17 @@ class Tournament(Generic[T]):
         immediately after the call resolves, appending into
         ``self._pass_judge_pids``. ``_run_judges`` reads + clears the
         list after the pass completes for adaptive ratcheting.
+
+        v0.18.0 C3: accepts an optional ``role`` parameter (default
+        ``"judge"``). When ``cfg.judge_roles`` is set, the runner
+        dispatches each judge with its role (e.g. ``"critic"``,
+        ``"reviewer"``, ``"test_engineer"``); when None, all judges
+        use the legacy ``"judge"`` role.
         """
         async with self._sem:
             self.store.write_judge_order(pass_num, judge_index, order)
             response_text = await self.client.call(
-                system=JUDGE_SYSTEM, user=user, role="judge", model=model
+                system=JUDGE_SYSTEM, user=user, role=role, model=model
             )
             # v0.10.0: capture this judge's subprocess PID for the
             # post-pass RSS probe. ``last_pid`` may be None if the

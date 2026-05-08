@@ -76,16 +76,24 @@ class BordaAggregator:
         rankings: list[list[str] | None],
         labels: list[str] | None = None,
         tiebreak_winner: str | None = "A",
+        weights: list[float] | None = None,
     ) -> tuple[str, dict[str, int], int]:
         if labels is None:
             labels = ["A", "B", "AB"]
         scores: dict[str, int] = {label: 0 for label in labels}
         n = len(labels)
         valid = [r for r in rankings if r is not None]
-        for ranking in valid:
+        # v0.18.0 C3: when weights are supplied, scale each judge's Borda
+        # contribution by its weight. ``weights`` aligns to ``rankings``
+        # (same length, same order); None defaults to weight 1.0 per
+        # judge — preserves byte-identical legacy behavior.
+        for idx, ranking in enumerate(rankings):
+            if ranking is None:
+                continue
+            w = weights[idx] if weights is not None and idx < len(weights) else 1.0
             for pos, label in enumerate(ranking):
                 if label in scores and pos < n:
-                    scores[label] += n - pos
+                    scores[label] += int((n - pos) * w)
         if tiebreak_winner:
             priority = {
                 label: (0 if label == tiebreak_winner else i + 1)
@@ -138,6 +146,7 @@ class VetoAggregator:
         rankings: list[list[str] | None],
         labels: list[str] | None = None,
         tiebreak_winner: str | None = "A",
+        weights: list[float] | None = None,
     ) -> tuple[str, dict[str, int], int]:
         if labels is None:
             labels = ["A", "B", "AB"]
@@ -156,7 +165,10 @@ class VetoAggregator:
         # No veto fires → fall through to Borda directly.
         if not vetoed:
             return BordaAggregator().aggregate(
-                rankings, labels=labels, tiebreak_winner=tiebreak_winner
+                rankings,
+                labels=labels,
+                tiebreak_winner=tiebreak_winner,
+                weights=weights,
             )
 
         survivors = [label for label in labels if label not in vetoed]
@@ -179,7 +191,10 @@ class VetoAggregator:
         # restrict to survivors. The winner is the highest-Borda survivor;
         # tiebreak_winner among survivors keeps priority on ties.
         borda_winner, borda_scores, n_valid = BordaAggregator().aggregate(
-            rankings, labels=labels, tiebreak_winner=tiebreak_winner
+            rankings,
+            labels=labels,
+            tiebreak_winner=tiebreak_winner,
+            weights=weights,
         )
 
         if borda_winner in survivors:
