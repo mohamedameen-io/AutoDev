@@ -295,6 +295,19 @@ class AdapterLLMClient:
             return self._role_timeout_s[role]
         return self._timeout_s
 
+    @property
+    def last_pid(self) -> int | None:
+        """Most recent subprocess PID from the underlying adapter, or None.
+
+        v0.10.0: forwards the adapter's ``last_pid`` for use by
+        :meth:`tournament.core.Tournament._run_judges`'s per-pass adaptive
+        ratcheting. Defined as a property so the tournament code can read
+        a fresh value on each call without holding a reference to the
+        adapter directly. Returns ``None`` if the wrapped adapter doesn't
+        expose ``last_pid`` (e.g. ``StubAdapter``) — graceful degradation.
+        """
+        return getattr(self._adapter, "last_pid", None)
+
     async def call(
         self,
         *,

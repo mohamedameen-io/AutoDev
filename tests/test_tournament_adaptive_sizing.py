@@ -197,3 +197,121 @@ async def test_maybe_resize_at_threshold_no_ratchet(tmp_path: Path) -> None:
     t = _make_tournament(tmp_path, max_parallel=4)
     await t.maybe_resize_semaphore(EXPECTED_RSS_MB * 1.3)
     assert _sem_capacity(t._sem) == 4
+
+
+# ---------------------------------------------------------------------------
+# _run_judges integration: PIDs collected and probe runs at pass-end
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_judges_collects_pids_and_probes_rss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_run_judges`` clears ``_pass_judge_pids`` at start, ``_guarded_judge``
+    appends to it during the pass, and at end calls
+    ``measure_subprocess_rss`` → ``maybe_resize_semaphore``."""
+    from tournament import core as core_mod
+
+    t = _make_tournament(tmp_path, max_parallel=4)
+
+    # Force ``_guarded_judge`` to fake completion + register a PID.
+    async def fake_guarded(self, user, model, pass_num, judge_index, order):
+        self._pass_judge_pids.append(1000 + judge_index)
+        return "RANKING: 1, 2, 3"
+
+    monkeypatch.setattr(core_mod.Tournament, "_guarded_judge", fake_guarded)
+
+    # Mock the probe to return a known RSS.
+    measure_calls: list[list[int]] = []
+
+    def fake_measure(pids):
+        measure_calls.append(list(pids))
+        return 1500.0  # well above 1.3 × 1024 → triggers ratchet
+
+    monkeypatch.setattr(core_mod, "measure_subprocess_rss", fake_measure)
+
+    await t._run_judges(
+        task_prompt="prompt",
+        v_a="A",
+        v_b="B",
+        v_ab="AB",
+        model=None,
+        pass_num=1,
+    )
+
+    assert len(measure_calls) == 1
+    # 3 judges → PIDs 1000, 1001, 1002 collected.
+    assert sorted(measure_calls[0]) == [1000, 1001, 1002]
+    # Ratchet fired: 4 → 3.
+    assert _sem_capacity(t._sem) == 3
+
+
+@pytest.mark.asyncio
+async def test_run_judges_probe_failure_does_not_break_tournament(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flaky probe (raises) is logged and swallowed — no tournament impact."""
+    from tournament import core as core_mod
+
+    t = _make_tournament(tmp_path, max_parallel=4)
+
+    async def fake_guarded(self, user, model, pass_num, judge_index, order):
+        return "RANKING: 1, 2, 3"
+
+    monkeypatch.setattr(core_mod.Tournament, "_guarded_judge", fake_guarded)
+
+    def boom(pids):
+        raise RuntimeError("psutil exploded")
+
+    monkeypatch.setattr(core_mod, "measure_subprocess_rss", boom)
+
+    # Should NOT raise.
+    await t._run_judges(
+        task_prompt="prompt",
+        v_a="A",
+        v_b="B",
+        v_ab="AB",
+        model=None,
+        pass_num=1,
+    )
+    # Semaphore unchanged — no ratchet on probe failure.
+    assert _sem_capacity(t._sem) == 4
+
+
+@pytest.mark.asyncio
+async def test_run_judges_clears_pid_buffer_between_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each pass starts with an empty ``_pass_judge_pids`` so a previous
+    pass's PIDs do not contaminate the new pass's measurement."""
+    from tournament import core as core_mod
+
+    t = _make_tournament(tmp_path, max_parallel=4)
+
+    pass_call: list[int] = [0]
+
+    async def fake_guarded(self, user, model, pass_num, judge_index, order):
+        # Each pass uses different PIDs.
+        self._pass_judge_pids.append(pass_num * 100 + judge_index)
+        return "RANKING: 1, 2, 3"
+
+    monkeypatch.setattr(core_mod.Tournament, "_guarded_judge", fake_guarded)
+
+    measured: list[list[int]] = []
+
+    def fake_measure(pids):
+        measured.append(list(pids))
+        pass_call[0] += 1
+        return None  # No ratchet.
+
+    monkeypatch.setattr(core_mod, "measure_subprocess_rss", fake_measure)
+
+    await t._run_judges("p", "A", "B", "AB", None, pass_num=1)
+    await t._run_judges("p", "A", "B", "AB", None, pass_num=2)
+
+    assert len(measured) == 2
+    # Pass 1: PIDs 100, 101, 102.
+    assert sorted(measured[0]) == [100, 101, 102]
+    # Pass 2: PIDs 200, 201, 202 — NOT 100..102 mixed in.
+    assert sorted(measured[1]) == [200, 201, 202]

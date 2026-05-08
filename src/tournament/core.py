@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from errors import TournamentError
 from autologging import get_logger
+from runtime.resource_probe import measure_subprocess_rss
 from tournament.prompts import (
     ARCHITECT_B_SYSTEM,
     CRITIC_SYSTEM,
@@ -395,6 +396,15 @@ class Tournament(Generic[T]):
         self._sem = asyncio.Semaphore(max(1, cfg.max_parallel_subprocesses))
         # Optional list of JudgeProviderPlugin instances to supplement LLM judges.
         self._judge_plugins: list[Any] = judge_plugins or []
+        # v0.10.0: per-pass collected subprocess PIDs from ``_guarded_judge``.
+        # ``_run_judges`` clears this at start, ``_guarded_judge`` appends
+        # after each LLM call resolves. ``list.append`` is GIL-protected so
+        # concurrent appends from gathered judges are safe in CPython
+        # asyncio (no event-loop-level lock needed). After all judges in a
+        # pass complete, ``_run_judges`` reads the list and feeds
+        # :func:`runtime.resource_probe.measure_subprocess_rss` →
+        # :meth:`maybe_resize_semaphore`.
+        self._pass_judge_pids: list[int] = []
 
     async def maybe_resize_semaphore(self, observed_rss_mb: float | None) -> None:
         """Ratchet the in-flight subprocess cap DOWN if memory pressure
@@ -898,7 +908,17 @@ class Tournament(Generic[T]):
         returns a permutation of ``[0, 1, 2]`` (best-to-worst indices into
         ``[v_a, v_b, v_ab]``), which is validated then mapped to canonical
         labels (0→"A", 1→"B", 2→"AB") before being added to the Borda tally.
+
+        v0.10.0: at pass start, ``_pass_judge_pids`` is cleared. After all
+        judges complete (LLM + plugin), the mean RSS across collected PIDs
+        is fed to :meth:`maybe_resize_semaphore` for adaptive ratchet-down
+        decisions. Probe runs at pass-end ONLY — not during the pass.
         """
+        # v0.10.0: clear the per-pass PID buffer before spawning judges.
+        # ``_guarded_judge`` will append into this list as each LLM call
+        # resolves (under the semaphore, but appends are GIL-safe).
+        self._pass_judge_pids = []
+
         recorded_orders, recorded_responses = partial_judges
         recorded_orders = recorded_orders or {}
         recorded_responses = recorded_responses or {}
@@ -1066,6 +1086,25 @@ class Tournament(Generic[T]):
                 }
             )
 
+        # v0.10.0: post-pass adaptive ratcheting probe. After all LLM
+        # judges (and plugin judges) for this pass have completed, sample
+        # mean RSS across the captured PIDs and pass it to
+        # :meth:`maybe_resize_semaphore`. Pass-end only — no probing
+        # during a pass (would race with live subprocesses + add no
+        # signal because the judges within a pass are independent).
+        # Errors here are non-fatal: any exception from the probe path
+        # logs and continues so a flaky psutil call cannot derail the
+        # tournament.
+        try:
+            observed_rss_mb = measure_subprocess_rss(list(self._pass_judge_pids))
+            await self.maybe_resize_semaphore(observed_rss_mb)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning(
+                "tournament.adaptive_probe_failed",
+                pass_num=pass_num,
+                error=str(exc),
+            )
+
         return rankings, judge_details
 
     async def _guarded_judge(
@@ -1082,12 +1121,24 @@ class Tournament(Generic[T]):
         crash mid-call leaves the order on disk for the resumed run; persists
         the parsed response to disk AFTER the call lands so a missing
         ``response.json`` indicates a still-pending judge.
+
+        v0.10.0: snapshots the LLM client's most-recent subprocess PID
+        immediately after the call resolves, appending into
+        ``self._pass_judge_pids``. ``_run_judges`` reads + clears the
+        list after the pass completes for adaptive ratcheting.
         """
         async with self._sem:
             self.store.write_judge_order(pass_num, judge_index, order)
             response_text = await self.client.call(
                 system=JUDGE_SYSTEM, user=user, role="judge", model=model
             )
+            # v0.10.0: capture this judge's subprocess PID for the
+            # post-pass RSS probe. ``last_pid`` may be None if the
+            # underlying client/adapter doesn't expose it (e.g. a stub
+            # or inline adapter); skip the append in that case.
+            pid = getattr(self.client, "last_pid", None)
+            if pid is not None:
+                self._pass_judge_pids.append(int(pid))
             ranking = parse_ranking(response_text, "123")
             self.store.write_judge_response(
                 pass_num,
