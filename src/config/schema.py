@@ -368,6 +368,13 @@ class AutodevConfig(BaseModel):
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
     hive: HiveConfig
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
+    # v0.16.0 hallucination-guard top-level toggle. Default True — the
+    # guard ships on by default so projects benefit immediately. Skip
+    # patterns: dynamic imports, third-party packages not installed in
+    # the scan environment, syntax errors. Set to False to silence the
+    # gate entirely (e.g. for projects that mostly use untyped dynamic
+    # imports and would generate too much noise).
+    hallucination_guard: bool = True
 
     def require_all_roles(self) -> None:
         """Raise ValueError if any required role is missing from `agents`."""

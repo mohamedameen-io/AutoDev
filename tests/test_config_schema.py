@@ -230,6 +230,22 @@ def test_tournament_phase_config_promotion_grade_enabled_defaults_false() -> Non
     assert cfg.promotion_grade_enabled is False
 
 
+def test_autodev_config_hallucination_guard_defaults_true() -> None:
+    """v0.16.0 hallucination_guard ships on by default."""
+    cfg = default_config()
+    assert cfg.hallucination_guard is True
+
+
+def test_autodev_config_hallucination_guard_round_trips() -> None:
+    """The toggle round-trips through model_dump/model_validate."""
+    from config.schema import AutodevConfig
+
+    cfg = default_config()
+    cfg.hallucination_guard = False
+    reloaded = AutodevConfig.model_validate(cfg.model_dump())
+    assert reloaded.hallucination_guard is False
+
+
 def test_tournament_phase_config_promotion_grade_enabled_round_trips() -> None:
     """Explicit ``True`` round-trips through model_dump/model_validate."""
     from config.schema import TournamentPhaseConfig
