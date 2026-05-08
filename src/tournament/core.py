@@ -338,25 +338,20 @@ def aggregate_rankings(
 
     Tiebreak: `tiebreak_winner` gets priority 0; all others get 1+index. This
     gives the incumbent (A) priority when tied with B or AB (conservative bias).
+
+    v0.18.0: this function is preserved as a thin wrapper around
+    :class:`tournament.voting.BordaAggregator` for backward compatibility.
+    Internal callers should prefer constructing a strategy instance directly
+    (eg ``BordaAggregator()`` or ``VetoAggregator()``) and invoking
+    :meth:`VotingStrategy.aggregate`. The output of this function is
+    byte-identical to the strategy form — see
+    ``tests/test_tournament_voting.py`` for the regression invariant.
     """
-    if labels is None:
-        labels = ["A", "B", "AB"]
-    scores: dict[str, int] = {label: 0 for label in labels}
-    n = len(labels)
-    valid = [r for r in rankings if r is not None]
-    for ranking in valid:
-        for pos, label in enumerate(ranking):
-            if label in scores and pos < n:
-                scores[label] += n - pos
-    if tiebreak_winner:
-        priority = {
-            label: (0 if label == tiebreak_winner else i + 1)
-            for i, label in enumerate(labels)
-        }
-    else:
-        priority = {label: i for i, label in enumerate(labels)}
-    ranked = sorted(scores.keys(), key=lambda k: (-scores[k], priority[k]))
-    return ranked[0], scores, len(valid)
+    from tournament.voting import BordaAggregator
+
+    return BordaAggregator().aggregate(
+        rankings, labels=labels, tiebreak_winner=tiebreak_winner
+    )
 
 
 def _score_window_stable(
@@ -491,6 +486,7 @@ class Tournament(Generic[T]):
         artifact_dir: Path,
         rng: random.Random | None = None,
         judge_plugins: list[Any] | None = None,
+        voting_strategy: Any | None = None,
     ) -> None:
         self.handler = handler
         self.client = client
@@ -502,6 +498,16 @@ class Tournament(Generic[T]):
         self._sem = asyncio.Semaphore(max(1, cfg.max_parallel_subprocesses))
         # Optional list of JudgeProviderPlugin instances to supplement LLM judges.
         self._judge_plugins: list[Any] = judge_plugins or []
+        # v0.18.0 C1: pluggable judge-aggregation policy. ``None`` (default)
+        # uses the legacy Borda count via :class:`BordaAggregator` so existing
+        # callers behave identically. Override with
+        # :class:`VetoAggregator` for council/veto semantics on impl tournaments
+        # via ``cfg.tournaments.impl.voting_strategy == "veto"``.
+        if voting_strategy is None:
+            from tournament.voting import BordaAggregator
+
+            voting_strategy = BordaAggregator()
+        self.voting_strategy = voting_strategy
         # v0.10.0: per-pass collected subprocess PIDs from ``_guarded_judge``.
         # ``_run_judges`` clears this at start, ``_guarded_judge`` appends
         # after each LLM call resolves. ``list.append`` is GIL-protected so
@@ -996,8 +1002,12 @@ class Tournament(Generic[T]):
         )
 
         # 5. Borda aggregation with conservative tiebreak to A
+        # v0.18.0 C1: dispatch through the pluggable voting strategy.
+        # Default ``BordaAggregator`` preserves the legacy outcome
+        # byte-for-byte; ``VetoAggregator`` enables council/veto semantics
+        # for impl tournaments that opt in via config.
         tiebreak = "A" if self.cfg.conservative_tiebreak else None
-        raw_winner, scores, valid_judges = aggregate_rankings(
+        raw_winner, scores, valid_judges = self.voting_strategy.aggregate(
             rankings, labels=["A", "B", "AB"], tiebreak_winner=tiebreak
         )
 
