@@ -1205,8 +1205,36 @@ async def _execute_one(
     # where everything happens in orch.cwd.
     worktree: Path | None = None
     if worktree_mgr is not None:
+        # v0.17.0 S6: optional sparse-checkout. When the config flag is on,
+        # narrow the worktree to ``phase.edit_scope or plan.edit_scope``
+        # so huge repos don't materialize gigabytes of unrelated files
+        # into every per-task worktree. Falls back to a full checkout
+        # when (a) the flag is off, (b) no scope is declared, or (c)
+        # git is older than 2.25 (pre-flighted in WorktreeManager.create).
+        sparse_paths: list[str] | None = None
+        if orch.cfg.worktree_sparse_checkout_enabled:
+            try:
+                _plan_for_scope = await orch.plan_manager.load()
+            except Exception:  # noqa: BLE001
+                _plan_for_scope = None
+            if _plan_for_scope is not None:
+                _resolved: list[str] = []
+                for _ph in _plan_for_scope.phases:
+                    if _ph.id == task.phase_id:
+                        _resolved = (
+                            list(_ph.edit_scope)
+                            if _ph.edit_scope is not None
+                            else list(_plan_for_scope.edit_scope)
+                        )
+                        break
+                else:
+                    _resolved = list(_plan_for_scope.edit_scope)
+                if _resolved:
+                    sparse_paths = _resolved
         try:
-            worktree = await worktree_mgr.create_per_task(task.id)
+            worktree = await worktree_mgr.create_per_task(
+                task.id, sparse_paths=sparse_paths
+            )
         except WorktreeError as exc:
             logger.warning(
                 "execute_phase.worktree_create_failed",
