@@ -10,7 +10,7 @@
 [![pydantic v2](https://img.shields.io/badge/pydantic-v2_strict-success)](https://docs.pydantic.dev/latest/)
 [![Version](https://img.shields.io/badge/version-v0.21.1-informational)](CHANGELOG.md)
 
-[Lede](#what-autodev-is) · [Quick Start](#quick-start) · [Four Mechanisms](#the-four-discipline-mechanisms) · [Architecture](#architecture) · [Tournaments](#tournaments--multi-branch) · [Documentation](#documentation-index)
+[Overview](#what-autodev-is) · [Quick Start](#quick-start) · [Four Mechanisms](#the-four-discipline-mechanisms) · [Architecture](#architecture) · [Tournaments](#tournaments--multi-branch) · [Documentation](#documentation-index)
 
 </div>
 
@@ -39,10 +39,10 @@ cd /your/project
 autodev init --inline
 ```
 
-In your AI coding agent:
+In your AI coding agent, invoke the `/autodev` skill with your feature request:
 
 ```text
-Build a REST API with user registration, login, and JWT auth.
+/autodev Build a REST API with user registration, login, and JWT auth.
 ```
 
 Uses your existing AI coding agent's session — no API keys to wire up. Currently supports Claude Code and Cursor.
@@ -82,7 +82,7 @@ Every decision — why this variant won, what the critic said, which judge ranke
 You describe the feature. AutoDev coordinates the rest.
 
 ```text
-Build a REST API with user registration, login, and JWT auth.
+/autodev Build a REST API with user registration, login, and JWT auth.
 ```
 
 ```
