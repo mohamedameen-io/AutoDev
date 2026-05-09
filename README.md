@@ -179,6 +179,16 @@ flowchart TB
         execute_phase["EXECUTE phase"]
         fsm --> plan_phase
         fsm --> execute_phase
+
+        subgraph V21["v0.21 components"]
+            direction LR
+            worktree_pool["WorktreePool<br/>warm-start"]
+            speculative["Speculative<br/>dispatcher"]
+            cross_phase["Cross-phase<br/>parallelism"]
+            phase_review["Phase Review<br/>runner"]
+        end
+
+        execute_phase --> V21
     end
 
     CLI --> Orchestrator
@@ -191,6 +201,8 @@ flowchart TB
         state["Durable State<br/>SHA-256 chained ledger<br/>+ evidence / tournaments"]
         guardrails["Guardrails<br/>duration / calls /<br/>diff-size / loop detector"]
         plugins_sub["Plugin Registry<br/>entry_points"]
+        prm["PRM<br/>(rules / rules+ml)"]
+        plateau["Plateau Detector<br/>(rules / regression)"]
     end
 
     Orchestrator --> Components
@@ -210,6 +222,7 @@ flowchart TB
     Orchestrator:::orch
     Components:::comp
     Adapters:::adap
+    V21:::comp
 
     classDef cli fill:#e1f5fe
     classDef orch fill:#fff3e0
@@ -219,7 +232,7 @@ flowchart TB
 
 **Serial by default.** One specialist at a time. Parallelism inside the tournament — N judges via `asyncio.gather`, capped by `max_parallel_subprocesses`. No shared mutable state across agents.
 
-**Opt-in v0.21 components.** A `WorktreePool` warm-starts parallel worktrees at executor init. A speculative-execution dispatcher starts one child task per phase before its parent completes (rolling back on parent failure). The cross-phase dispatcher overlaps work across phase boundaries via stable `Phase.end_checkpoint_commit` handoff points.
+**v0.21 components.** WorktreePool warm-start, speculative execution, and cross-phase parallelism are opt-in via `*_enabled` flags in `config.json`. Phase Review runs by default between phases (3 judges, k=1, 2 rounds). PRM and Plateau Detector default to rule-based mode; their `rules+ml` and `regression` strategies are opt-in.
 
 ---
 
@@ -256,7 +269,8 @@ After the architect drafts a plan, and after every developer task passes QA gate
 
 ```mermaid
 flowchart TD
-    A["Incumbent A"] --> B["critic_t<br/>What's wrong?"]
+    A["Incumbent A"] --> FAN["[1..N branches]<br/>BranchConfig.model_overrides<br/>lane / risk / family"]
+    FAN --> B["critic_t<br/>What's wrong?<br/>(per branch)"]
     B --> C["architect_b<br/>Revised B"]
     C --> D["synthesizer<br/>Merge X,Y -> AB"]
     D --> E["N judges<br/>Rank A,B,AB"]
@@ -265,19 +279,34 @@ flowchart TD
     G -->|Yes| H["streak++"]
     G -->|No| I["streak = 0<br/>incumbent = winner"]
     H --> J{streak >= k?}
-    J -->|Yes| K["CONVERGED"]
-    J -->|No| M{scores stable<br/>over window?}
-    I --> M
-    M -->|Yes| N["RUNAWAY<br/>(early termination)"]
-    M -->|No| L["Next pass"]
+    J -->|Yes| K["Branch CONVERGED"]
+    J -->|No| S{score-stability<br/>scores stable over window?}
+    I --> S
+    S -->|Yes| RUN1["RUNAWAY<br/>(score-stable)"]
+    S -->|No| W{winner-stability<br/>same winner over window?}
+    W -->|Yes| RUN2["RUNAWAY<br/>(winner-stable, e.g. AB x N)"]
+    W -->|No| P{plateau detected?<br/>(rules / regression)}
+    P -->|Yes| RUN3["PLATEAU<br/>(early termination)"]
+    P -->|No| L["Next pass"]
     L --> B
+    K --> META["Meta-merge across branches<br/>diff-based (impl) /<br/>markdown (plan)"]
+    RUN1 --> META
+    RUN2 --> META
+    RUN3 --> META
+    META --> FINAL["Final winner"]
 
     style A fill:#e3f2fd
+    style FAN fill:#e1f5fe
     style K fill:#c8e6c9
-    style N fill:#ffcdd2
+    style FINAL fill:#c8e6c9
+    style RUN1 fill:#ffcdd2
+    style RUN2 fill:#ffcdd2
+    style RUN3 fill:#ffcdd2
     style J fill:#fff9c4
     style G fill:#ffecb3
-    style M fill:#fff9c4
+    style S fill:#fff9c4
+    style W fill:#fff9c4
+    style P fill:#fff9c4
 ```
 
 ### Plan tournament
