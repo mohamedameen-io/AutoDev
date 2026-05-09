@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**A discipline layer that wraps any AI coding agent, raising its output to enterprise-grade quality.**
+**An open-source agentic orchestration layer that wraps any AI coding agent into a multi-agent swarm, raising its output to enterprise-grade quality.**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
