@@ -18,7 +18,7 @@
 
 ## What AutoDev is
 
-AutoDev is a discipline layer that wraps any AI coding agent — and raises its output from prototype-quality to enterprise-quality: code that's actually worth a senior engineer's time to review and merge.
+AutoDev is a an open-source agentic orchestration layer that wraps any AI coding agent (Claude Code, Cursor, GitHub Copilot, etc.) into a multi-agent swarm — and raises its output from prototype-quality to enterprise-quality: code that's actually worth a senior engineer's time to review and merge.
 
 It does this with four mechanisms: tournament-based self-refinement (no model ever judges its own output), agent role specialization, mandatory QA gates (lint, build, tests, security, optionally mutation), and a content-addressed audit trail of every decision.
 
