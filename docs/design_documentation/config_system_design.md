@@ -3,10 +3,11 @@
 **Status:** Implemented
 **Author:** Mohamed Ameen
 **Date:** 2026-04-17
-**Last Updated:** 2026-04-17
+**Last Updated:** 2026-05-09
 **Reviewers:** --
 **Package:** `src/config/`
 **Entry Point:** N/A (library-only, consumed by CLI and orchestrator)
+**Version:** v0.21.1
 
 ## 1. Overview
 
@@ -110,11 +111,16 @@ flowchart TB
 | File | Element | Responsibility |
 |------|---------|---------------|
 | `src/config/schema.py` | `AutodevConfig` | Root Pydantic model for `.autodev/config.json` |
-| `src/config/schema.py` | `AgentConfig` | Per-agent model/disabled configuration |
-| `src/config/schema.py` | `TournamentsConfig` | Tournament parameters (plan + impl phases) |
-| `src/config/schema.py` | `TournamentPhaseConfig` | Per-phase tournament tuning (judges, rounds, convergence) |
-| `src/config/schema.py` | `QAGatesConfig` | Boolean toggles for each QA gate |
+| `src/config/schema.py` | `AgentConfig` | Per-agent model/disabled/effort/max_turns configuration |
+| `src/config/schema.py` | `BranchConfig` | Per-branch overrides for heterogeneous-model multi-branch tournaments (v0.14.0) |
+| `src/config/schema.py` | `TournamentsConfig` | Tournament parameters (plan + impl + phase_review phases) |
+| `src/config/schema.py` | `TournamentPhaseConfig` | Per-phase tournament tuning (judges, rounds, convergence, runaway/plateau detectors, voting strategy) |
+| `src/config/schema.py` | `QAGatesConfig` | Boolean toggles + tuning for each QA gate (incl. baselines, mutation thresholds) |
 | `src/config/schema.py` | `GuardrailsConfig` | Per-task safety caps |
+| `src/config/schema.py` | `PRMConfig` | Strategy + thresholds for the trajectory PRM (v0.20.0 A1) |
+| `src/config/schema.py` | `PlateauDetectorConfig` | Strategy + slope threshold for plateau detection (v0.20.0 A2) |
+| `src/config/schema.py` | `TaskOverridesConfig` | Per-bucket huge-repo `max_turns` multipliers (v0.20.0 D1) |
+| `src/config/schema.py` | `DecayCurveConfig` | Per-event-type confidence-decay curves (v0.20.0 B1) |
 | `src/config/schema.py` | `HiveConfig` | File-level settings for cross-project knowledge |
 | `src/config/schema.py` | `KnowledgeConfig` | Behavioral config for the two-tier knowledge system |
 | `src/config/schema.py` | `REQUIRED_AGENT_ROLES` | Tuple of all 14 mandatory agent role names |
@@ -138,15 +144,39 @@ class AutodevConfig(BaseModel):
     tournaments: TournamentsConfig
     qa_gates: QAGatesConfig = Field(default_factory=QAGatesConfig)
     qa_retry_limit: int = 3
+    user_complexity: Literal["low", "medium", "high", "max"] = "medium"
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
+    task_overrides: TaskOverridesConfig = Field(default_factory=TaskOverridesConfig)
+    prm: PRMConfig = Field(default_factory=PRMConfig)
+    plateau_detector: PlateauDetectorConfig = Field(default_factory=PlateauDetectorConfig)
     hive: HiveConfig
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
+    hallucination_guard: bool = True
+    repeated_hypothesis_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    web_search_enabled: bool = False
+    worktree_sparse_checkout_enabled: bool = False
+    worktree_pool_enabled: bool = False                # v0.21.0 A1
+    cross_phase_parallelism_enabled: bool = False      # v0.21.0 B1
+    speculative_execution_enabled: bool = False        # v0.21.0 B2
 
     def require_all_roles(self) -> None:
         missing = [r for r in REQUIRED_AGENT_ROLES if r not in self.agents]
         if missing:
             raise ValueError(f"missing required agent roles: {missing}")
 ```
+
+Top-level toggles added since v0.6.0:
+
+| Field | Type | Default | Read by |
+|-------|------|---------|---------|
+| `user_complexity` | `Literal["low","medium","high","max"]` | `"medium"` | `tournament.effort.resolve_role_effort()` — feeds the architect-effort floor and combines with `Plan.complexity` to derive per-role `--effort` |
+| `hallucination_guard` | `bool` | `True` | `qa.hallucination_guard` — when False, the gate is skipped entirely |
+| `repeated_hypothesis_threshold` | `float ∈ [0,1]` | `0.6` | Multi-branch hypothesis dedup detector (v0.17.0 S4) — bigram-Jaccard threshold; advisory only |
+| `web_search_enabled` | `bool` | `False` | Executor stuck-recovery ladder (v0.17.0 S2) — opt-in `WEB_CONTEXT:` block in `critic_sounding_board` prompts |
+| `worktree_sparse_checkout_enabled` | `bool` | `False` | Per-task worktree creation (v0.17.0 S6) — narrows checkout to declared `edit_scope` |
+| `worktree_pool_enabled` | `bool` | `False` | Execute-phase warm-start worktree pool (v0.21.0 A1) |
+| `cross_phase_parallelism_enabled` | `bool` | `False` | Execute dispatcher (v0.21.0 B1) — allows file-disjoint phase N+1 tasks while phase N tail finishes |
+| `speculative_execution_enabled` | `bool` | `False` | Execute dispatcher (v0.21.0 B2) — pre-runs single-parent child tasks; rollback on parent failure |
 
 #### Agent Configuration
 
@@ -156,7 +186,43 @@ class AgentConfig(BaseModel):
 
     model: str | None = None    # LLM model alias; None = use platform default
     disabled: bool = False       # Disable this agent role entirely
+    max_turns: int | None = None  # None = use role default
+    # v0.13.0 / 0.17.0: per-role override for Claude Code's --effort flag.
+    # None inherits from the effort resolver (plan + user complexity).
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
 ```
+
+`effort` is consumed by `tournament.effort.resolve_role_effort()` (highest priority — explicit per-role override wins over the architect floor and the matrix in `tournament/effort.py`). The adapter then forwards it via `LLMInvocation.effort` to `claude -p --effort` (`adapters/claude_code.py`) or to the Cursor adapter.
+
+#### Branch Configuration (v0.14.0)
+
+```python
+class BranchConfig(BaseModel):
+    """Per-branch overrides for heterogeneous-model multi-branch
+    plan tournaments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_overrides: dict[str, str] = Field(default_factory=dict)
+    lane: Literal[
+        "distant-scout",
+        "local-tweak",
+        "architectural",
+        "constraint-removal",
+        "incumbent-confirmation",
+    ] = "local-tweak"
+    risk: Literal["low", "medium", "high"] = "medium"
+    family: str | None = None
+```
+
+| Field | Type | Default | Read by |
+|-------|------|---------|---------|
+| `model_overrides` | `dict[str, str]` | `{}` | Plan-tournament runner — first lookup before falling through to `cfg.agents[role].model` then `resolve_model()` |
+| `lane` | `Literal[...]` | `"local-tweak"` | Multi-branch dispatcher — suffixes the per-branch artifact dir (`branch-{i}-{lane}/`) and stamps ledger metadata; `"distant-scout"` is the lane the plateau detector forces |
+| `risk` | `Literal["low","medium","high"]` | `"medium"` | Advisory only in v0.14.0 — reserved for future risk-cohort gating |
+| `family` | `str \| None` | `None` | Plateau detector — siblings sharing a family are tracked together for per-family plateau detection |
+
+`BranchConfig` is referenced from `TournamentPhaseConfig.branches`. Empty list and combination with `num_branches > 1` are rejected by `_validate_branches`.
 
 #### Tournament Configuration
 
@@ -164,21 +230,67 @@ class AgentConfig(BaseModel):
 class TournamentPhaseConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool               # Whether this tournament phase runs
-    num_judges: int             # Number of judges per round
-    convergence_k: int          # Consecutive stable-winner rounds to converge
-    max_rounds: int             # Hard cap on tournament rounds
+    enabled: bool                    # Whether this tournament phase runs
+    num_judges: int                  # Number of judges per round
+    convergence_k: int               # Consecutive stable-winner rounds to converge
+    max_rounds: int                  # Hard cap on tournament rounds
+    # Runaway / plateau detectors --------------------------------------------
+    score_stability_window: int | None = None
+    score_stability_max_delta: int | None = None
+    winner_stability_window: int | None = None       # v0.6.0 / Issue 4
+    max_plan_lines_growth_ratio: float | None = None # v0.6.2 / Issue 5B
+    complex_plan_num_judges_override: int | None = None  # v0.7.0 / Issue 5C
+    # Multi-branch / heterogeneity -------------------------------------------
+    num_branches: int = Field(default=1, ge=1, le=5)  # v0.12.0
+    branches: list[BranchConfig] | None = None         # v0.14.0
+    # Promotion / drift ------------------------------------------------------
+    promotion_grade_enabled: bool = False              # v0.16.0
+    holdout_evaluation_enabled: bool = False           # v0.19.0 C1
+    drift_verifier_enabled: bool = True                # v0.16.0 / 0.17.0
+    explorer_enabled: bool = False                     # v0.17.0 S3
+    # Voting -----------------------------------------------------------------
+    voting_strategy: Literal["borda", "veto"] = "borda"  # v0.18.0 C1
+    judge_roles: list[str] | None = None                  # v0.18.0 C3
+    judge_role_weights: dict[str, float] | None = None    # v0.18.0 C3
+    # Plateau detection ------------------------------------------------------
+    plateau_detection_enabled: bool = False               # v0.18.0 B2
+    plateau_window: int = 4
+    cross_family_plateau_enabled: bool = False
+    cross_family_plateau_window: int = 10
 
 class TournamentsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     plan: TournamentPhaseConfig
     impl: TournamentPhaseConfig
-    max_parallel_subprocesses: int = 3
-    auto_disable_for_models: list[str] = Field(
-        default_factory=lambda: ["opus"]
-    )
+    phase_review: TournamentPhaseConfig = Field(default_factory=_default_phase_review_cfg)
+    max_parallel_subprocesses: int | None = None        # v0.10.0 widened to int|None
+    execute_max_parallel_tasks: int | None = None       # v0.11.0
+    auto_disable_for_models: list[str] = Field(default_factory=lambda: ["opus"])
 ```
+
+| Field | Type | Default | Read by |
+|-------|------|---------|---------|
+| `score_stability_window` | `int \| None` | `None` | `tournament.core.Tournament.run` — early-terminate when the trailing-window Borda scores barely change |
+| `score_stability_max_delta` | `int \| None` | `None` | Same — paired with the window; sum of \|Δscore\| across A/B/AB ≤ this triggers early break |
+| `winner_stability_window` | `int \| None` | `None` | `tournament.core.Tournament.run` — halts when the trailing window's `effective_winner` is stable on a non-A label (catches the QNX `[AB,AB,AB]` pattern) |
+| `max_plan_lines_growth_ratio` | `float \| None` | `None` (plan default 1.5) | `tournament.core` — demotes oversize AB winners (markdown line count > ratio × incumbent lines) to next-best Borda winner |
+| `complex_plan_num_judges_override` | `int \| None` | `None` (plan default 7) | `orchestrator.plan_tournament_runner` — substitutes `num_judges` with this value when `Plan.complexity == "complex"` |
+| `num_branches` | `int ∈ [1,5]` | `1` | `orchestrator.plan_phase` — fans out N independent RNG-seeded branch tournaments via `multi_branch_tournament` (mutually exclusive with `branches`) |
+| `branches` | `list[BranchConfig] \| None` | `None` | Multi-branch dispatcher — heterogeneous-model branches; list length wins over `num_branches` |
+| `promotion_grade_enabled` | `bool` | `False` | `tournament.promotion.decide` — drives the on-disk grade rung ladder (`dev_best → repeated → promotion_eligible`) |
+| `holdout_evaluation_enabled` | `bool` | `False` | Tournament loop — invokes the holdout runner against baseline `tests/` snapshot before promoting `repeated → eligible` |
+| `drift_verifier_enabled` | `bool` | `True` | `orchestrator.drift_verifier.run_drift_verifier` — final-defense gate after A-winner outcome |
+| `explorer_enabled` | `bool` | `False` | Tournament loop — dispatches an Explorer specialist judge whose `FINDINGS:` block becomes `discard`-grade lessons |
+| `voting_strategy` | `Literal["borda","veto"]` | `"borda"` | `tournament.voting` — `BordaAggregator` (default) vs `VetoAggregator`; impl-tournament runner is the current consumer |
+| `judge_roles` | `list[str] \| None` | `None` | `tournament.core` (line 1158) — list of specialist judge roles; length wins over `num_judges` |
+| `judge_role_weights` | `dict[str, float] \| None` | `None` | `tournament.core` (line 1025) — per-role Borda weighting; missing roles default to weight 1.0 |
+| `plateau_detection_enabled` | `bool` | `False` | `multi_branch_tournament` — per-family plateau detection; fires `force_distant_scout()` |
+| `plateau_window` | `int` | `4` | Per-family plateau window count (rule-based strategy) |
+| `cross_family_plateau_enabled` | `bool` | `False` | `multi_branch_tournament` — cross-family plateau detection across all families |
+| `cross_family_plateau_window` | `int` | `10` | Cross-family plateau window count |
+
+See `plateau_detection_design.md` and `prm.md` for the dedicated detector / strategy designs.
 
 #### QA Gates Configuration
 
@@ -191,9 +303,20 @@ class QAGatesConfig(BaseModel):
     build_check: bool = True
     test_runner: bool = True
     secretscan: bool = True
-    sast_scan: bool = False       # Off by default (expensive)
-    mutation_test: bool = False   # Off by default (expensive)
+    secretscan_baseline_enabled: bool = False           # v0.19.0
+    secretscan_per_extension_thresholds: dict[str, float] | None = None  # v0.19.0
+    sast_scan: bool = False           # planning-time advisory only
+    mutation_test: bool = False       # planning-time advisory only
+    mutation_test_enabled: bool = False        # v0.19.0 — actual gate dispatch
+    mutation_test_threshold: float = 0.7
 ```
+
+| Field | Type | Default | Read by |
+|-------|------|---------|---------|
+| `secretscan_baseline_enabled` | `bool` | `False` | `qa.secretscan.run_secretscan` — diff-filters findings against `.autodev/secretscan-baseline.json`; baseline managed via `autodev secretscan baseline` |
+| `secretscan_per_extension_thresholds` | `dict[str, float] \| None` | `None` | `qa.secretscan` — per-extension entropy override; `None` falls back to the module's `_DEFAULT_PER_EXTENSION_ENTROPY` curve |
+| `mutation_test_enabled` | `bool` | `False` | QA gate dispatcher — when True, runs `qa.mutation_test.run_mutation_test`. (Distinct from the legacy `mutation_test` field which is consumed only by agent prompts for security-tier routing) |
+| `mutation_test_threshold` | `float` | `0.7` | `qa.mutation_test` (passed as `kill_rate_threshold` in `execute_phase.py` line 2905) — minimum mutation kill-rate required to pass the gate |
 
 #### Guardrails Configuration
 
@@ -201,11 +324,61 @@ class QAGatesConfig(BaseModel):
 class GuardrailsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    max_tool_calls_per_task: int = 60
+    max_invocations_per_task: int = 60       # round-trip cap (pre_invocation enforced)
+    max_tool_calls_per_task: int = 60        # cumulative tool-call cap (stream-json)
     max_duration_s_per_task: int = 900       # 15 minutes
     max_diff_bytes: int = 5_242_880          # 5 MB
     cost_budget_usd_per_plan: float | None = None  # Reserved
 ```
+
+#### PRM (Process Reward Model) Configuration (v0.20.0 A1)
+
+```python
+class PRMConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: Literal["rules", "rules+ml"] = "rules"
+    ml_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    ml_min_events: int = Field(default=3, ge=1)
+```
+
+| Field | Type | Default | Read by |
+|-------|------|---------|---------|
+| `strategy` | `Literal["rules","rules+ml"]` | `"rules"` | `orchestrator.execute_phase` (line 2483) — chooses between rule-based-only (legacy) and rules + LLM trajectory classifier augmentation |
+| `ml_threshold` | `float ∈ [0,1]` | `0.7` | `LLMTrajectoryClassifier` — confidence cutoff for the LLM classifier output |
+| `ml_min_events` | `int ≥ 1` | `3` | `LLMTrajectoryClassifier` — cold-start guard; skip the LLM call when the trajectory has fewer events than this |
+
+See `prm.md` for the full PRM design.
+
+#### Plateau Detector Configuration (v0.20.0 A2)
+
+```python
+class PlateauDetectorConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: Literal["rules", "regression"] = "rules"
+    regression_window: int = Field(default=10, ge=3)
+    plateau_slope_threshold: float = Field(default=0.1, ge=0.0)
+```
+
+| Field | Type | Default | Read by |
+|-------|------|---------|---------|
+| `strategy` | `Literal["rules","regression"]` | `"rules"` | `orchestrator.multi_branch_tournament` (line 691) — chooses between v0.18.0 rule-based and v0.20.0 OLS-regression detection |
+| `regression_window` | `int ≥ 3` | `10` | Sliding-window size for the cumulative-`winner_promoted` regression |
+| `plateau_slope_threshold` | `float ≥ 0` | `0.1` | OLS slope below this → plateau flagged → forced lane change |
+
+See `plateau_detection_design.md` for the full plateau detection design.
+
+#### Task Overrides Configuration (v0.20.0 D1)
+
+```python
+class TaskOverridesConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    huge_repo_multipliers: dict[str, float] | None = None
+```
+
+`huge_repo_multipliers` overrides per-bucket multipliers in `runtime.repo_probe._HUGE_BUCKET_MULTIPLIERS` (defaults: `simple` 3.0×, `medium` 2.0×, `complex` 1.5×). `None` (default) preserves the baked-in curve. Operator overrides merge per-bucket — missing buckets fall through to the default. Read by `tournament.task_overrides` and the `max_turns` resolver.
 
 #### Knowledge Configuration (Two-Tier)
 
@@ -216,6 +389,13 @@ class HiveConfig(BaseModel):
 
     enabled: bool = True
     path: Path                   # e.g. ~/.local/share/autodev/shared-learnings.jsonl
+
+class DecayCurveConfig(BaseModel):
+    """v0.20.0 B1: per-event-type confidence decay."""
+    model_config = ConfigDict(extra="forbid")
+
+    half_life_days: float = Field(default=15.0, gt=0.0)
+    floor: float = Field(default=0.5, ge=0.0, le=1.0)
 
 class KnowledgeConfig(BaseModel):
     """Behavioral config for the two-tier knowledge system."""
@@ -235,7 +415,11 @@ class KnowledgeConfig(BaseModel):
             "architect_b", "synthesizer",
         ]
     )
+    lane_aware_injection_enabled: bool = True            # v0.18.0 B1
+    decay_curves: dict[str, DecayCurveConfig] | None = None  # v0.20.0 B1
 ```
+
+`lane_aware_injection_enabled` is consumed by `KnowledgeStore.inject_block` — when True (default), lessons are filtered by branch lane when a `lane=` argument is supplied. `decay_curves` lets `state.knowledge._recency_factor` apply per-event-type half-life curves (e.g. `winner_promoted` decays slower than `soft_blocker`).
 
 #### Required Agent Roles
 
@@ -255,23 +439,43 @@ classDiagram
     class AutodevConfig {
         schema_version: Literal["1.0.0"]
         platform: Literal[...]
+        user_complexity: Literal[...]
         agents: dict[str, AgentConfig]
         tournaments: TournamentsConfig
         qa_gates: QAGatesConfig
-        qa_retry_limit: int
         guardrails: GuardrailsConfig
+        task_overrides: TaskOverridesConfig
+        prm: PRMConfig
+        plateau_detector: PlateauDetectorConfig
         hive: HiveConfig
         knowledge: KnowledgeConfig
+        hallucination_guard: bool
+        repeated_hypothesis_threshold: float
+        web_search_enabled: bool
+        worktree_sparse_checkout_enabled: bool
+        worktree_pool_enabled: bool
+        cross_phase_parallelism_enabled: bool
+        speculative_execution_enabled: bool
         require_all_roles()
     }
     class AgentConfig {
         model: str | None
         disabled: bool
+        max_turns: int | None
+        effort: Literal[...] | None
+    }
+    class BranchConfig {
+        model_overrides: dict[str, str]
+        lane: Literal[...]
+        risk: Literal[...]
+        family: str | None
     }
     class TournamentsConfig {
         plan: TournamentPhaseConfig
         impl: TournamentPhaseConfig
-        max_parallel_subprocesses: int
+        phase_review: TournamentPhaseConfig
+        max_parallel_subprocesses: int | None
+        execute_max_parallel_tasks: int | None
         auto_disable_for_models: list[str]
     }
     class TournamentPhaseConfig {
@@ -279,6 +483,24 @@ classDiagram
         num_judges: int
         convergence_k: int
         max_rounds: int
+        score_stability_window: int | None
+        score_stability_max_delta: int | None
+        winner_stability_window: int | None
+        max_plan_lines_growth_ratio: float | None
+        complex_plan_num_judges_override: int | None
+        num_branches: int
+        branches: list[BranchConfig] | None
+        promotion_grade_enabled: bool
+        holdout_evaluation_enabled: bool
+        drift_verifier_enabled: bool
+        explorer_enabled: bool
+        voting_strategy: Literal["borda","veto"]
+        judge_roles: list[str] | None
+        judge_role_weights: dict[str, float] | None
+        plateau_detection_enabled: bool
+        plateau_window: int
+        cross_family_plateau_enabled: bool
+        cross_family_plateau_window: int
     }
     class QAGatesConfig {
         syntax_check: bool
@@ -286,18 +508,40 @@ classDiagram
         build_check: bool
         test_runner: bool
         secretscan: bool
+        secretscan_baseline_enabled: bool
+        secretscan_per_extension_thresholds: dict | None
         sast_scan: bool
         mutation_test: bool
+        mutation_test_enabled: bool
+        mutation_test_threshold: float
     }
     class GuardrailsConfig {
+        max_invocations_per_task: int
         max_tool_calls_per_task: int
         max_duration_s_per_task: int
         max_diff_bytes: int
         cost_budget_usd_per_plan: float | None
     }
+    class PRMConfig {
+        strategy: Literal["rules","rules+ml"]
+        ml_threshold: float
+        ml_min_events: int
+    }
+    class PlateauDetectorConfig {
+        strategy: Literal["rules","regression"]
+        regression_window: int
+        plateau_slope_threshold: float
+    }
+    class TaskOverridesConfig {
+        huge_repo_multipliers: dict[str, float] | None
+    }
     class HiveConfig {
         enabled: bool
         path: Path
+    }
+    class DecayCurveConfig {
+        half_life_days: float
+        floor: float
     }
     class KnowledgeConfig {
         enabled: bool
@@ -309,16 +553,24 @@ classDiagram
         promotion_min_confirmations: int
         promotion_min_confidence: float
         denylist_roles: list[str]
+        lane_aware_injection_enabled: bool
+        decay_curves: dict[str, DecayCurveConfig] | None
     }
 
     AutodevConfig --> AgentConfig : agents
     AutodevConfig --> TournamentsConfig : tournaments
     AutodevConfig --> QAGatesConfig : qa_gates
     AutodevConfig --> GuardrailsConfig : guardrails
+    AutodevConfig --> TaskOverridesConfig : task_overrides
+    AutodevConfig --> PRMConfig : prm
+    AutodevConfig --> PlateauDetectorConfig : plateau_detector
     AutodevConfig --> HiveConfig : hive
     AutodevConfig --> KnowledgeConfig : knowledge
     TournamentsConfig --> TournamentPhaseConfig : plan
     TournamentsConfig --> TournamentPhaseConfig : impl
+    TournamentsConfig --> TournamentPhaseConfig : phase_review
+    TournamentPhaseConfig --> BranchConfig : branches[*]
+    KnowledgeConfig --> DecayCurveConfig : decay_curves[*]
 ```
 
 ### 3.5 Protocol / Interface Contracts
@@ -462,45 +714,104 @@ All failures in `load_config()` are wrapped in `ConfigError` (subclass of `Autod
 
 The config system is self-referential -- it *is* the configuration mechanism for AutoDev. The config file location defaults to `.autodev/config.json` relative to the project root and can be overridden via the `--config` CLI flag.
 
-**Default config file structure:**
+**Default config file structure (v0.21.1 schema dump):**
+
+The block below is generated verbatim by:
+
+```bash
+uv run python -c "from config.schema import AutodevConfig, AgentConfig, HiveConfig, REQUIRED_AGENT_ROLES, TournamentPhaseConfig, TournamentsConfig; from pathlib import Path; cfg = AutodevConfig(agents={r: AgentConfig() for r in REQUIRED_AGENT_ROLES}, tournaments=TournamentsConfig(plan=TournamentPhaseConfig(enabled=True, num_judges=3, convergence_k=2, max_rounds=15), impl=TournamentPhaseConfig(enabled=True, num_judges=1, convergence_k=1, max_rounds=3)), hive=HiveConfig(path=Path('~/.local/share/autodev/shared-learnings.jsonl'))); print(cfg.model_dump_json(indent=2))"
+```
 
 ```json
 {
   "schema_version": "1.0.0",
   "platform": "auto",
   "agents": {
-    "architect": { "model": "opus", "disabled": false },
-    "explorer": { "model": "haiku", "disabled": false },
-    "domain_expert": { "model": "sonnet", "disabled": false },
-    "developer": { "model": "sonnet", "disabled": false },
-    "reviewer": { "model": "sonnet", "disabled": false },
-    "test_engineer": { "model": "sonnet", "disabled": false },
-    "critic_sounding_board": { "model": "sonnet", "disabled": false },
-    "critic_drift_verifier": { "model": "sonnet", "disabled": false },
-    "docs": { "model": "sonnet", "disabled": false },
-    "designer": { "model": "sonnet", "disabled": false },
-    "critic_t": { "model": "sonnet", "disabled": false },
-    "architect_b": { "model": "sonnet", "disabled": false },
-    "synthesizer": { "model": "sonnet", "disabled": false },
-    "judge": { "model": "sonnet", "disabled": false }
+    "architect":             { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "explorer":              { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "domain_expert":         { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "developer":             { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "reviewer":              { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "test_engineer":         { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "critic_sounding_board": { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "critic_drift_verifier": { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "docs":                  { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "designer":              { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "critic_t":              { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "architect_b":           { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "synthesizer":           { "model": null, "disabled": false, "max_turns": null, "effort": null },
+    "judge":                 { "model": null, "disabled": false, "max_turns": null, "effort": null }
   },
   "tournaments": {
-    "plan": { "enabled": true, "num_judges": 3, "convergence_k": 2, "max_rounds": 15 },
-    "impl": { "enabled": true, "num_judges": 1, "convergence_k": 1, "max_rounds": 3 },
-    "max_parallel_subprocesses": 3,
+    "plan": {
+      "enabled": true, "num_judges": 3, "convergence_k": 2, "max_rounds": 15,
+      "score_stability_window": null, "score_stability_max_delta": null,
+      "winner_stability_window": null,
+      "max_plan_lines_growth_ratio": null,
+      "complex_plan_num_judges_override": null,
+      "num_branches": 1, "branches": null,
+      "promotion_grade_enabled": false, "holdout_evaluation_enabled": false,
+      "drift_verifier_enabled": true, "explorer_enabled": false,
+      "voting_strategy": "borda",
+      "judge_roles": null, "judge_role_weights": null,
+      "plateau_detection_enabled": false, "plateau_window": 4,
+      "cross_family_plateau_enabled": false, "cross_family_plateau_window": 10
+    },
+    "impl": {
+      "enabled": true, "num_judges": 1, "convergence_k": 1, "max_rounds": 3,
+      "score_stability_window": null, "score_stability_max_delta": null,
+      "winner_stability_window": null,
+      "max_plan_lines_growth_ratio": null,
+      "complex_plan_num_judges_override": null,
+      "num_branches": 1, "branches": null,
+      "promotion_grade_enabled": false, "holdout_evaluation_enabled": false,
+      "drift_verifier_enabled": true, "explorer_enabled": false,
+      "voting_strategy": "borda",
+      "judge_roles": null, "judge_role_weights": null,
+      "plateau_detection_enabled": false, "plateau_window": 4,
+      "cross_family_plateau_enabled": false, "cross_family_plateau_window": 10
+    },
+    "phase_review": {
+      "enabled": true, "num_judges": 3, "convergence_k": 1, "max_rounds": 2,
+      "score_stability_window": null, "score_stability_max_delta": null,
+      "winner_stability_window": null,
+      "max_plan_lines_growth_ratio": null,
+      "complex_plan_num_judges_override": null,
+      "num_branches": 1, "branches": null,
+      "promotion_grade_enabled": false, "holdout_evaluation_enabled": false,
+      "drift_verifier_enabled": true, "explorer_enabled": false,
+      "voting_strategy": "borda",
+      "judge_roles": null, "judge_role_weights": null,
+      "plateau_detection_enabled": false, "plateau_window": 4,
+      "cross_family_plateau_enabled": false, "cross_family_plateau_window": 10
+    },
+    "max_parallel_subprocesses": null,
+    "execute_max_parallel_tasks": null,
     "auto_disable_for_models": ["opus"]
   },
   "qa_gates": {
     "syntax_check": true, "lint": true, "build_check": true,
     "test_runner": true, "secretscan": true,
-    "sast_scan": false, "mutation_test": false
+    "secretscan_baseline_enabled": false,
+    "secretscan_per_extension_thresholds": null,
+    "sast_scan": false, "mutation_test": false,
+    "mutation_test_enabled": false, "mutation_test_threshold": 0.7
   },
   "qa_retry_limit": 3,
+  "user_complexity": "medium",
   "guardrails": {
+    "max_invocations_per_task": 60,
     "max_tool_calls_per_task": 60,
     "max_duration_s_per_task": 900,
     "max_diff_bytes": 5242880,
     "cost_budget_usd_per_plan": null
+  },
+  "task_overrides": { "huge_repo_multipliers": null },
+  "prm": { "strategy": "rules", "ml_threshold": 0.7, "ml_min_events": 3 },
+  "plateau_detector": {
+    "strategy": "rules",
+    "regression_window": 10,
+    "plateau_slope_threshold": 0.1
   },
   "hive": {
     "enabled": true,
@@ -515,8 +826,17 @@ The config system is self-referential -- it *is* the configuration mechanism for
     "hive_enabled": true,
     "promotion_min_confirmations": 3,
     "promotion_min_confidence": 0.7,
-    "denylist_roles": ["explorer", "judge", "critic_t", "architect_b", "synthesizer"]
-  }
+    "denylist_roles": ["explorer", "judge", "critic_t", "architect_b", "synthesizer"],
+    "lane_aware_injection_enabled": true,
+    "decay_curves": null
+  },
+  "hallucination_guard": true,
+  "repeated_hypothesis_threshold": 0.6,
+  "web_search_enabled": false,
+  "worktree_sparse_checkout_enabled": false,
+  "worktree_pool_enabled": false,
+  "cross_phase_parallelism_enabled": false,
+  "speculative_execution_enabled": false
 }
 ```
 
@@ -541,11 +861,16 @@ Every major AutoDev subsystem reads from `AutodevConfig`:
 | Consumer | Config Section | Usage |
 |----------|---------------|-------|
 | Orchestrator | `platform`, `agents`, `qa_retry_limit` | Platform selection, agent roster, retry policy |
-| Tournament engine | `tournaments` | Phase enable/disable, judge count, convergence, rounds |
-| QA phase engine | `qa_gates` | Which gates to run |
+| Tournament engine | `tournaments` | Phase enable/disable, judge count, convergence, rounds, voting strategy, judge specialists |
+| Multi-branch dispatcher | `tournaments.plan.{num_branches,branches,plateau_detection_enabled,cross_family_plateau_enabled}`, `plateau_detector` | Branch fan-out, plateau detection strategy, lane forcing |
+| Plan tournament runner | `tournaments.plan.complex_plan_num_judges_override` | Judge escalation on complex plans |
+| Effort resolver | `agents[role].effort`, `user_complexity` | Per-role `--effort` derivation |
+| Execute phase | `prm`, `worktree_*`, `cross_phase_parallelism_enabled`, `speculative_execution_enabled` | PRM strategy/classifier, worktree pooling, scheduler modes |
+| QA phase engine | `qa_gates` | Which gates to run; mutation/secretscan baselines + thresholds |
 | Guardrails enforcer | `guardrails` | Per-task safety caps |
-| Knowledge system | `knowledge`, `hive` | Behavioral tuning and file-level settings |
+| Knowledge system | `knowledge`, `hive` | Behavioral tuning, decay curves, lane-aware injection |
 | Adapter factory | `agents[role].model`, `platform` | Model selection per agent role |
+| `max_turns` resolver | `task_overrides.huge_repo_multipliers` | Per-bucket huge-repo multipliers |
 | Workspace initializer | `agents` | Agent definitions and disabled roles |
 
 ### 6.5 External Systems
@@ -675,6 +1000,8 @@ The config system makes zero LLM calls. However, the configuration it defines di
 - `src/config/loader.py` -- load_config, save_config, expand_paths
 - `src/config/defaults.py` -- default_config, resolve_model
 - `src/errors.py` -- ConfigError definition
+- [`prm.md`](prm.md) -- PRM (Process Reward Model) strategy + LLM trajectory classifier design
+- [`plateau_detection_design.md`](plateau_detection_design.md) -- Plateau detector design (rules + regression strategies)
 - [Pydantic v2 documentation](https://docs.pydantic.dev/latest/)
 - [Python typing.Literal](https://docs.python.org/3/library/typing.html#typing.Literal)
 
@@ -683,3 +1010,4 @@ The config system makes zero LLM calls. However, the configuration it defines di
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-04-17 | Mohamed Ameen | Initial draft |
+| 2026-05-09 | Mohamed Ameen | Refresh for v0.21.1: documented `BranchConfig`, runaway/plateau/winner-stability detectors, voting strategies (`borda`/`veto`), specialist `judge_roles` + weights, complex-plan judge escalation, multi-branch (`num_branches`/`branches`), QA additions (`secretscan_baseline_enabled`, per-extension thresholds, `mutation_test_enabled`/`threshold`), per-agent `effort`, new top-level models (`PRMConfig`, `PlateauDetectorConfig`, `TaskOverridesConfig`, `DecayCurveConfig`), v0.21.0 worktree-pool / cross-phase / speculative toggles. Regenerated example config JSON via current schema. Linked new `prm.md` and `plateau_detection_design.md`. |

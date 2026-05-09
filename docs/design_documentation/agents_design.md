@@ -3,7 +3,8 @@
 **Status:** Implemented
 **Author:** Mohamed Ameen
 **Date:** 2026-04-17
-**Last Updated:** 2026-04-17
+**Last Updated:** 2026-05-09
+**Version:** v0.21.1
 **Reviewers:** --
 **Package:** `src/agents/`
 **Entry Point:** N/A (library-only, consumed by `src/orchestrator/` via `build_registry()`)
@@ -23,7 +24,10 @@ The Agent Registry and Prompts subsystem defines the 14-role agent taxonomy that
 - Prompt template system: YAML frontmatter + markdown with `{{KEY}}` placeholder substitution
 - Platform rendering: `render_claude_agents()` and `render_cursor_rules()`
 - Per-role model configuration via `AutodevConfig.agents`
+- Per-role `effort` override for Claude Code's `--effort` test-time-compute flag (low/medium/high/xhigh/max)
+- Per-role `max_turns` override for the adapter loop ceiling
 - Tournament role prompt loading from `tournament.prompts` module
+- Specialist-judge support (`judge_roles` + `judge_role_weights` on `TournamentPhaseConfig`) for weighted multi-role judge ensembles
 
 **Out of scope:**
 - Prompt content authoring guidelines (this document covers the system, not the content)
@@ -57,6 +61,8 @@ The orchestrator looks up an `AgentSpec` by role name, uses its prompt and tool 
 - FR-7: `render_claude_agents()` must produce `.claude/agents/<name>.md` files with YAML frontmatter containing `name`, `description`, `tools`, and optional `model`.
 - FR-8: `render_cursor_rules()` must produce `.cursor/rules/<name>.mdc` files with YAML frontmatter containing `description` and `alwaysApply: false`.
 - FR-9: Prompt templates must support `{{KEY}}` placeholder substitution for `QA_RETRY_LIMIT` and `TOOLS`.
+- FR-10: Per-role `effort` and `max_turns` overrides must surface in `AgentConfig` and flow through to the platform adapter (`--effort` flag for Claude Code; loop ceiling for the orchestrator's adapter wrapper).
+- FR-11: `TournamentPhaseConfig.judge_roles` must support an arbitrary list of agent role names to be used as judges (specialist judge ensemble), and `TournamentPhaseConfig.judge_role_weights` must apply per-role weights to the resulting Borda tally. When `judge_roles` is set, `num_judges` is derived as `len(judge_roles)`.
 
 ### 2.2 Non-Functional Requirements
 
@@ -131,11 +137,13 @@ flowchart TB
 
 | File | Responsibility |
 |------|---------------|
-| `__init__.py` | `build_registry()`, `load_prompt()`, `load_description()`, `render_prompt()`, `_tournament_prompt()` |
-| `tool_map.py` | `AGENT_TOOL_MAP`, `CLAUDE_CODE_TOOLS`, `resolve_claude_tools()` |
-| `render_claude.py` | `render_claude_agents()`: writes `.claude/agents/<name>.md` files |
-| `render_cursor.py` | `render_cursor_rules()`: writes `.cursor/rules/<name>.mdc` files |
-| `prompts/*.md` | 11 markdown prompt files for swarm roles (one per role, except tournament roles) |
+| `src/agents/__init__.py` | `build_registry()`, `load_prompt()`, `load_description()`, `render_prompt()`, `_tournament_prompt()` |
+| `src/agents/tool_map.py` | `AGENT_TOOL_MAP`, `CLAUDE_CODE_TOOLS`, `resolve_claude_tools()` |
+| `src/agents/render_claude.py` | `render_claude_agents()`: writes `.claude/agents/<name>.md` files |
+| `src/agents/render_cursor.py` | `render_cursor_rules()`: writes `.cursor/rules/<name>.mdc` files |
+| `src/agents/prompts/*.md` | 12 markdown prompt files: 10 for the canonical swarm roles + `critic.md` (plan-tournament critic auxiliary) + `judge_explorer.md` (anti-slop specialist judge invoked when `cfg.tournaments.<phase>.explorer_enabled = True`) |
+| `src/agents/prompts/_source/*.ts.md` | Snapshot of the original opencode-swarm TypeScript prompts for provenance + diff comparison only. NOT loaded at runtime. |
+| `src/tournament/prompts.py` | Tournament role prompts (`CRITIC_SYSTEM`, `ARCHITECT_B_SYSTEM`, `SYNTHESIZER_SYSTEM`, `JUDGE_SYSTEM`) — loaded by `_tournament_prompt()` for `critic_t`, `architect_b`, `synthesizer`, `judge`. |
 
 ### 3.3 Data Models
 
@@ -162,7 +170,19 @@ class AgentConfig(BaseModel):
 
     model: str | None = None   # Model override (e.g., "claude-sonnet-4-20250514")
     disabled: bool = False     # Future: disable a role
+    max_turns: int | None = None
+    # Per-role override for Claude Code's ``--effort`` test-time-compute
+    # flag. ``None`` (default) = inherit (let the orchestrator's effort
+    # resolver derive a value from plan + user complexity, or fall back
+    # to the user-global default in ``~/.claude/settings.json``).
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
 ```
+
+The `effort` field is validated at the config layer; the adapter accepts
+any string for forward-compatibility. See
+[tournament_engine_design.md](tournament_engine_design.md) for how the
+plan-level `COMPLEXITY: <bucket>` directive feeds into the effort
+resolver alongside this per-role override.
 
 ### 3.4 State Machine
 
@@ -344,7 +364,64 @@ alwaysApply: false
 
 Written to `.cursor/rules/developer.mdc`. The `alwaysApply: false` ensures the rule is opt-in. A `# <name> role` heading is prepended to the body for readability.
 
-### 5.5 Error Handling
+### 5.5 Specialist judge roles (v0.18.0 C3)
+
+Standard tournament voting uses `num_judges` copies of the canonical
+`judge` role, each producing a Borda-style ranking that is summed for the
+final tally. v0.18.0 introduced two opt-in `TournamentPhaseConfig` fields
+that swap this homogeneous cohort for a **specialist judge ensemble**:
+
+```python
+class TournamentPhaseConfig(BaseModel):
+    # ...
+    judge_roles: list[str] | None = None
+    judge_role_weights: dict[str, float] | None = None
+```
+
+**Semantics**
+
+- `judge_roles=None` (default) — preserves legacy behavior: the cohort is
+  `["judge"] * num_judges`.
+- `judge_roles=["critic", "reviewer", "test_engineer", "domain_expert", "explorer"]` —
+  each entry becomes a judge of that role. The list length wins over
+  `num_judges`; `num_judges` is derived as `len(judge_roles)`.
+- `judge_role_weights=None` — every judge contributes a unit Borda
+  weight.
+- `judge_role_weights={"test_engineer": 2.0, "reviewer": 1.5}` — each
+  role's vote is multiplied by its weight (roles missing from the dict
+  default to weight 1.0). Useful when one specialist's perspective is
+  load-bearing for a particular task class, e.g. doubling the test
+  engineer's vote on test-heavy tournaments.
+
+**Example use cases**
+
+- **Security-sensitive task** — weight a `domain_expert` judge (acting
+  as a security specialist) higher so a security regression vetoes a
+  candidate even if the others rank it strongly.
+- **Test-coverage tournament** — weight `test_engineer` 2.0 to bias
+  toward solutions whose test additions look right to a tester's eye.
+- **Architectural decision** — use `judge_roles=["architect", "critic", "reviewer"]`
+  to surface architectural concerns the standard `judge` prompt
+  underweights.
+
+The standard `judge` role's prompt lives in `tournament/prompts.py`
+(`JUDGE_SYSTEM`). Specialist judges reuse the swarm role's normal prompt
+(`reviewer.md`, `test_engineer.md`, etc.); the tournament runner wraps
+the candidate set into a judging directive at invocation time.
+
+**Anti-slop Explorer judge.** A separate per-phase
+`TournamentPhaseConfig.explorer_enabled` flag dispatches an additional
+**Explorer** judge alongside the standard cohort. Its `FINDINGS:` block is
+extracted via `tournament.core.extract_explorer_findings` and emitted as
+`discard`-grade lessons (confidence 0.6). The Explorer judge's prompt
+lives at `src/agents/prompts/judge_explorer.md` and is loaded directly
+by the tournament core, not via `build_registry()` (the role is not in
+`REQUIRED_AGENT_ROLES`).
+
+See [tournament_engine_design.md](tournament_engine_design.md) for the
+voting strategies that consume the cohort (Borda vs. council/veto).
+
+### 5.6 Error Handling
 
 | Error Condition | Handling |
 |----------------|----------|
@@ -355,21 +432,26 @@ Written to `.cursor/rules/developer.mdc`. The `alwaysApply: false` ensures the r
 | `tournament.prompts` module unavailable | `_tournament_prompt()` returns empty string with warning log (graceful degradation) |
 | Unknown role in `AGENT_TOOL_MAP` | `resolve_claude_tools()` returns empty list (graceful) |
 
-### 5.6 Dependencies
+### 5.7 Dependencies
 
 - **pydantic:** `AgentSpec`, `AgentConfig` model validation
 - **yaml (PyYAML):** Frontmatter serialization in `render_claude.py` and `render_cursor.py`
 - **structlog:** Logging via standard library `logging` module (this package uses `logging.getLogger` directly)
-- **Internal:** `src/adapters/types.py` for `AgentSpec`, `src/config/schema.py` for `REQUIRED_AGENT_ROLES` and `AutodevConfig`
+- **Internal:** `src/adapters/types.py` for `AgentSpec`, `src/config/schema.py` for `REQUIRED_AGENT_ROLES` and `AutodevConfig`, `src/tournament/prompts.py` for tournament role prompts
 
-### 5.7 Configuration
+### 5.8 Configuration
 
 | Config Path | Description | Default |
 |-------------|-------------|---------|
-| `AutodevConfig.agents` | `dict[str, AgentConfig]` -- per-role model and disabled flag | All 14 roles required |
+| `AutodevConfig.agents` | `dict[str, AgentConfig]` -- per-role model, disabled flag, max_turns, effort | All 14 roles required |
 | `AgentConfig.model` | Per-role model override | `None` (platform default) |
 | `AgentConfig.disabled` | Future: disable a role | `False` |
+| `AgentConfig.max_turns` | Per-role override of the adapter's per-invocation turn ceiling | `None` (use role default) |
+| `AgentConfig.effort` | Per-role override for Claude Code's `--effort` flag (`low`/`medium`/`high`/`xhigh`/`max`) | `None` (inherit from plan complexity / user-global) |
 | `AutodevConfig.qa_retry_limit` | Injected as `{{QA_RETRY_LIMIT}}` in prompts | `3` |
+| `TournamentPhaseConfig.judge_roles` | Specialist-judge ensemble (overrides `num_judges`) | `None` (homogeneous `judge` cohort) |
+| `TournamentPhaseConfig.judge_role_weights` | Per-role Borda weight | `None` (unit weights) |
+| `TournamentPhaseConfig.explorer_enabled` | Dispatch the anti-slop Explorer judge alongside the cohort | `False` |
 
 ## 6. Integration Points
 
@@ -448,7 +530,7 @@ This component does not write ledger events. It is a stateless builder.
 
 ## 9. Performance Considerations
 
-- **Registry construction:** `build_registry()` reads 11 markdown files from disk (one per swarm role). This is a one-time cost at startup (microseconds for file I/O, no LLM calls).
+- **Registry construction:** `build_registry()` reads 10 markdown files from disk (one per swarm role; tournament roles load their prompts from `tournament/prompts.py`). This is a one-time cost at startup (microseconds for file I/O, no LLM calls).
 - **Prompt rendering:** `render_prompt()` performs simple string replacement. No regex or template engine overhead.
 - **Workspace rendering:** Writing 14 agent files to disk is fast and happens once per `init_workspace()` call.
 
@@ -527,3 +609,4 @@ The agent registry itself has zero LLM cost. Costs are incurred when the orchest
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-04-17 | Mohamed Ameen | Initial draft |
+| 2026-05-09 | Mohamed Ameen | v0.21.1 refresh: reconciled prompts directory inventory (12 .md files: 10 swarm-role prompts + `critic.md` plan-tournament auxiliary + `judge_explorer.md` anti-slop specialist), corrected the "11 markdown files" performance claim to 10, documented the per-role `effort` and `max_turns` fields, added the v0.18.0 specialist-judge subsection (`judge_roles` + `judge_role_weights`), pointed tournament-prompt readers at `src/tournament/prompts.py` rather than the (nonexistent) `prompts/` markdown variant. |

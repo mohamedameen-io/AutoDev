@@ -3,7 +3,8 @@
 **Status:** Implemented
 **Author:** Mohamed Ameen
 **Date:** 2026-04-17
-**Last Updated:** 2026-04-17
+**Last Updated:** 2026-05-09
+**Version:** v0.21.1
 **Reviewers:** --
 **Package:** `src/tournament/`
 **Entry Point:** Invoked by `orchestrator.plan_phase` (plan tournament) and `orchestrator.execute_phase` (impl tournament); no standalone CLI subcommand.
@@ -214,7 +215,197 @@ class CoderRunner(Protocol):
 |----------|-------------|
 | `parse_ranking(text, valid_labels) -> list[str] \| None` | Extract the last `RANKING:` line from judge output. |
 | `randomize_for_judge(v_a, v_b, v_ab, rng) -> (list[T], dict[int, str])` | Shuffle variants into randomized display order. |
-| `aggregate_rankings(rankings, labels, tiebreak_winner) -> (str, dict, int)` | Borda count with conservative tiebreak. |
+| `aggregate_rankings(rankings, labels, tiebreak_winner) -> (str, dict, int)` | Borda count with conservative tiebreak (v0.18.0: thin wrapper around `BordaAggregator`). |
+
+## 3.7 v0.18+ Tournament Features
+
+The base loop in §3.1 is unchanged from the Phase-7 baseline, but several
+strategy hooks have been layered around it: heterogeneous multi-branch
+fan-out, diff-based impl synthesis, pluggable voting strategies, specialist
+judges, additional convergence detectors, and an out-of-band PRM hook.
+Each subsection cites the source file/line that implements the claim.
+
+### 3.7.1 Multi-branch impl tournament
+
+Single-branch tournaments converge to a local optimum: the same model,
+seeded identically, tends to revisit the same critique → revision arc.
+The multi-branch path runs N independent tournaments concurrently and
+meta-merges their winners.
+
+**Plan side** (v0.12.0): `orchestrator.multi_branch_tournament.run_multi_branch_plan_tournament`
+fans out N parallel `Tournament[str]` runs over `PlanContentHandler`,
+each seeded from `int(spec_hash, 16) + branch_index`, then reduces
+survivors through a synthesizer-only meta-merge in
+`_meta_merge_pairwise` (`src/orchestrator/multi_branch_tournament.py:425`).
+
+**Impl side** (v0.21.0 A2): `orchestrator.impl_tournament_runner.run_multi_branch_impl_tournament`
+at `src/orchestrator/impl_tournament_runner.py:556` fans out N parallel
+`ImplTournament` runs (each in its own worktree cohort) and meta-merges
+via diff synthesis instead of pairwise plan-text reduction —
+`_impl_meta_merge_via_diff_synthesis` (line 728) calls a single
+synthesizer LLM over the N candidate diffs, then re-materializes the
+merged diff in a fresh worktree.
+
+Both runners enforce a survivor floor of `max(2, ceil(N/2))`
+(`_survivor_floor`, `_impl_survivor_floor`); fewer survivors raises
+`TournamentError` and the dispatch site (`plan_phase.py` lines 213-264 for
+plan, `execute_phase.py` lines 1937-1948 for impl) falls back to either
+the on-disk salvage path or single-branch.
+
+**Heterogeneous models per branch** are configured via
+`BranchConfig.model_overrides` (a `{role: model_name}` map) — see
+`src/config/schema.py:43`. Each branch carries:
+
+- `model_overrides: dict[str, str]` — per-role model swap.
+- `lane: Literal["distant-scout", "local-tweak", "architectural", "constraint-removal", "incumbent-confirmation"]` — divergent-trajectory tag, suffixed onto the artifact dir.
+- `risk: Literal["low", "medium", "high"]` — advisory severity.
+- `family: str | None` — free-form tag consumed by the cross-family plateau detector.
+
+Per-branch artifact dirs are suffixed with the lane:
+`tournaments/multi-{spec_hash[:8]}/branch-{i}-{lane}/` for plan, and
+`tournaments/{tournament_id}-{lane}/` for impl
+(`impl_tournament_runner.py:339`).
+
+See also: [`multi_branch_tournament.md`](multi_branch_tournament.md) for
+the full multi-branch design doc — schema, fan-out flow, cross-family
+plateau detection, salvage paths, cost.
+
+### 3.7.2 Diff-based synthesis
+
+The impl tournament historically rendered each `ImplBundle` as full
+markdown for the synthesizer step. v0.21.0 A2 added a diff-aware
+rendering path used exclusively by the multi-branch impl meta-merge:
+`ImplContentHandler.render_for_diff_synthesis()` at
+`src/tournament/impl_tournament.py:320` truncates each candidate diff to
+8000 chars and emits a `CANDIDATE 1 / CANDIDATE 2 / ...` block. The
+synthesizer is asked to emit a fenced ` ```diff ... ``` ` block carrying
+the merged unified diff.
+
+The dispatcher (`_impl_meta_merge_via_diff_synthesis`,
+`impl_tournament_runner.py:728`) then:
+
+1. Calls the synthesizer LLM with `SYNTHESIZER_SYSTEM` and the rendered
+   diff-synthesis prompt.
+2. Extracts the diff block via `_extract_diff_block` (line 876) — looks
+   for ` ```diff ... ``` `, falls back to a generic fenced block
+   containing `diff --git`, then a bare `diff --git ...` prefix.
+3. Re-materializes the merged diff by spawning a fresh worktree and
+   passing the diff to a `_CoderRunner` as a "META-MERGE DIRECTIVE"
+   (line 825).
+
+Fallback chain on any failure:
+1. Synth raises / returns no diff block → fall back to the
+   strongest-survivor (longest diff) via
+   `_fallback_strongest_survivor` (line 849).
+2. Worktree creation fails → same fallback.
+3. CoderRunner fails on the merged diff → same fallback.
+
+The single-branch impl tournament (per-pass synthesis) still uses the
+markdown-shape `render_for_synthesizer` path; diff-based synthesis is
+meta-merge-only.
+
+### 3.7.3 Voting strategies
+
+The judge-aggregation step is now strategy-pluggable
+(`src/tournament/voting.py`). Two implementations ship:
+
+| Strategy | Class | Behavior |
+|----------|-------|----------|
+| Borda (default) | `BordaAggregator` | Byte-identical to the legacy `aggregate_rankings`. Each judge contributes `(n - p)` points per label at position `p`; tiebreak via conservative-incumbent priority (`A` priority 0). Optional per-judge weight via `weights=[...]` (v0.18.0 C3). |
+| Veto | `VetoAggregator` | Council/veto policy: any judge ranking a candidate **last** vetoes it. Surviving candidates fall through to a Borda tally; if every label is vetoed, the `tiebreak_winner` (default `"A"`) wins with synthetic all-zero scores. When no judge ranked anyone last, falls through entirely to Borda. |
+
+Both implementations satisfy the structural protocol:
+
+```python
+@runtime_checkable
+class VotingStrategy(Protocol):
+    def aggregate(
+        self,
+        rankings: list[list[str] | None],
+        labels: list[str] | None = None,
+        tiebreak_winner: str | None = "A",
+    ) -> tuple[str, dict[str, int], int]: ...
+```
+
+Selection is via `TournamentPhaseConfig.voting_strategy: Literal["borda", "veto"]`
+(default `"borda"`, `src/config/schema.py:206`). The impl-tournament runner
+threads `VetoAggregator` into `ImplTournament(voting_strategy=...)` only —
+plan + phase_review continue to use the default
+(`impl_tournament_runner.py:436-491`).
+
+When veto is active and `Task.acceptance` is populated, the runner
+persists a council criteria sidecar at `state.paths.council_criteria_path`
+for forensics + per-criterion vote tracking
+(`impl_tournament_runner.py:443-464`).
+
+### 3.7.4 Specialist judge roles
+
+The legacy cohort is `["judge"] * num_judges` — N judges with the same
+prompt. v0.18.0 C3 adds two opt-in fields on `TournamentPhaseConfig`
+(`src/config/schema.py:213, 219`):
+
+- `judge_roles: list[str] | None = None` — when set, each entry is a
+  judge of that role. The list length wins over `num_judges`
+  (the runner sets `effective_num_judges = len(judge_roles)`,
+  `impl_tournament_runner.py:401`).
+- `judge_role_weights: dict[str, float] | None = None` — per-role
+  multiplier applied to that judge's Borda contribution. Roles missing
+  from the dict default to weight 1.0.
+
+Veto-mode default cohort (when `judge_roles` is unset) is hard-coded to
+`["critic", "reviewer", "test_engineer", "domain_expert", "explorer"]`
+(`impl_tournament_runner.py:393-397`) so the council has structural
+diversity out of the box.
+
+`TournamentConfig.judge_roles` and `judge_role_weights`
+(`src/tournament/core.py:134-138`) carry the resolved values into the
+generic `Tournament` loop.
+
+### 3.7.5 Convergence detectors
+
+The base `Tournament` loop tracks a single A-streak counter and exits
+when `streak >= convergence_k`. v0.6+ layered three additional
+runaway / stability detectors that all live on `TournamentPhaseConfig`:
+
+| Detector | Fields | Behavior |
+|----------|--------|----------|
+| **Score-stability** (v0.6.0) | `score_stability_window`, `score_stability_max_delta` | Trailing-window check on Borda scores. When the window is full and `Σ|Δscore_label|` between the first and last pass in the window is `≤ max_delta`, emits `tournament.runaway_detected` and breaks with the current incumbent. Implemented at `src/tournament/core.py:367` (`_score_window_stable`). |
+| **Winner-stability** (v0.6.0 / Issue 4) | `winner_stability_window` (`schema.py:121`) | Trailing-window check on the *label*. When the last `window` passes all share the same non-A `effective_winner` (the QNX runaway pattern of `[AB, AB, AB]` where the synthesizer keeps winning but content stabilizes), break. The `"A"` branch is excluded — `convergence_k` already owns A-streaks, so the two detectors don't double-count. Implemented at `src/tournament/core.py:428` (`_winner_window_stable`). |
+| **Plateau detection** (v0.18.0 B2 / v0.20.0 A2) | `plateau_detection_enabled`, `plateau_window`, `cross_family_plateau_enabled`, `cross_family_plateau_window` | Cross-tournament historical detector consulted by the multi-branch dispatcher *before* fan-out (`multi_branch_tournament.py:667-779`). Walks the lessons knowledge store via `orchestrator.plateau_detector.PlateauDetector` looking for a family with no recent `winner_promoted` events. When triggered, mutates one branch's lane to `"distant-scout"` so the cohort breaks out of the local minimum. v0.20.0 A2 added a regression-based variant (`strategy="regression"` on `cfg.plateau_detector`) using least-squares slope on cumulative winner-promoted counts. |
+
+The two trailing-window detectors run inside a single tournament run;
+plateau detection is multi-run / multi-branch and operates on the
+lessons-knowledge layer. All three default to `None` / `False` so legacy
+configs validate unchanged. The plan-tournament default
+(`src/config/defaults.py:115-128`) ships score-stability and
+winner-stability turned on with `(window=4, max_delta=2)` and
+`window=3` respectively; impl defaults to `(window=2, max_delta=1)`
+and `winner_window=2`.
+
+### 3.7.6 LLM PRM hooks
+
+The Process Reward Model layer (`src/orchestrator/prm.py`) is primarily
+an **execute-phase** trajectory pattern detector — it records every
+delegate dispatch as a `TrajectoryEvent` and flags five patterns
+(`repetition_loop`, `ping_pong`, `expansion_drift`, `stuck_on_test`,
+`context_thrash`) via rule-based detectors. v0.20.0 A1 added an
+LLM-augmented classifier (`LLMTrajectoryClassifier`,
+`prm.py:478`) gated on `cfg.prm.strategy == "rules+ml"` (config at
+`src/config/schema.py:361`).
+
+PRM does not currently run inside a tournament pass (no in-loop
+trajectory scoring on critic/architect_b/synthesizer/judge calls). The
+integration surface is at the dispatch boundary in
+`orchestrator/execute_phase.py:2460-2540` — when a tournament run is
+followed by retries / escalations, the PRM detector consults the
+trajectory of those subsequent dispatches and may splice a
+`CourseCorrection` into the next agent prompt.
+
+The hook for a future trajectory-aware judge is the `judge_plugins`
+parameter on `Tournament.__init__` and the `voting_strategy` slot — a
+PRM-aware voting strategy could weight Borda contributions by trajectory
+quality, but no such strategy is shipped today. See [`prm.md`](prm.md)
+(forthcoming) for the full PRM design.
 
 ## 4. Design Decisions
 
@@ -547,3 +738,4 @@ Tournament behavior is controlled via `.autodev/config.json`:
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-04-17 | Mohamed Ameen | Initial draft |
+| 2026-05-09 | Mohamed Ameen | v0.21.1: added §3.7 covering multi-branch impl tournament, diff-based synthesis, voting strategies (Borda / Veto), specialist judge roles + per-role weighting, the three convergence detectors (score-stability, winner-stability, plateau detection), and the LLM PRM hook surface. |

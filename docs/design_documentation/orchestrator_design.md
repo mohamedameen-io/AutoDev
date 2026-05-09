@@ -3,7 +3,8 @@
 **Status:** Implemented
 **Author:** Mohamed Ameen
 **Date:** 2026-04-17
-**Last Updated:** 2026-04-17
+**Last Updated:** 2026-05-09
+**Version:** v0.21.1
 **Reviewers:** --
 **Package:** `src/orchestrator/`
 **Entry Point:** `autodev run`, `autodev plan`, `autodev execute`, `autodev resume`, `autodev status`
@@ -172,6 +173,8 @@ flowchart TB
 | `plan_tournament_runner.py` | `run_plan_tournament()`: glue between orchestrator and tournament engine for plan refinement |
 | `impl_tournament_runner.py` | `run_impl_tournament()`: glue between orchestrator and tournament engine for implementation refinement |
 | `worktree.py` | `WorktreeManager`: git worktree creation, removal, diffing, and patch application |
+| `worktree_pool.py` | `WorktreePool` (v0.21.0 A1): warm-start pool wrapping `WorktreeManager` — cold-starts N worktrees concurrently and recycles via `git reset --hard <baseline> && git clean -fdx`. Same `create_per_task` / `remove_per_task` / `get_diff_vs_base` / `apply_patch_to_main` surface as `WorktreeManager` so the worker is unaware of the substitution. |
+| `speculative.py` | `rollback_speculative_task`, `commit_speculative_task`, `reset_speculative_worktree` (v0.21.0 B2): rollback handler for speculatively-started child tasks when their parent fails. |
 
 ### 3.3 Data Models
 
@@ -562,7 +565,95 @@ sequenceDiagram
 
 The `InlineSuspendState` captures: `session_id`, `pending_task_id`, `pending_role`, `delegation_path`, `response_path`, `orchestrator_step` (which step in the FSM), `retry_count`, and `last_issues`.
 
-### 5.6 Error Handling
+### 5.6 Cross-phase parallelism dispatcher (v0.21.0 B1)
+
+`run_execute_phase` selects between two dispatchers based on `cfg.cross_phase_parallelism_enabled`:
+
+| Mode | Dispatcher | Scope |
+|------|-----------|-------|
+| Default (per-phase) | `_execute_phase_dag` (`src/orchestrator/execute_phase.py:823`) | One worker pool per phase. Tasks from later phases wait for the current phase to finish (`tasks_to_run = [t for t in tasks_to_run if t.phase_id == phase_id]`). |
+| Cross-phase (opt-in) | `_execute_cross_phase_dag` (`src/orchestrator/execute_phase.py:989`) | One worker pool spans every phase. Tasks from phase N+1 may begin while phase N's tail is still in-flight, provided their `depends_on` are terminal AND files are disjoint with every in-flight task. |
+
+**Concurrency cap** is computed once via `_resolve_execute_parallelism` (`src/orchestrator/execute_phase.py:774`): forwards `cfg.tournaments.execute_max_parallel_tasks` (None = auto-resolve) into `runtime.resource_probe.resolve_parallelism` with `role_mix='execute'`.
+
+**Cross-phase DAG validation.** Per-phase DAGs reject cross-phase deps as "undefined references", so under the cross-phase flag `_validate_cross_phase_dag` (`src/orchestrator/execute_phase.py:935`) runs a relaxed plan-level check that accepts cross-phase deps as long as every dep resolves SOMEWHERE in the plan; cycle detection still runs across the unified graph.
+
+**Phase boundary capture.** When all tasks in a phase reach a terminal state, `_maybe_record_phase_checkpoint` (`src/orchestrator/execute_phase.py:1324`) captures HEAD into `Phase.end_checkpoint_commit`. Phase-review uses this SHA as the `tip_commit` of its diff range so phase N+1's concurrent commits don't pollute phase N's review window. Idempotent: phases already carrying an `end_checkpoint_commit` are skipped.
+
+**Dispatcher lifecycle (cross-phase mode):**
+
+```
+1. Validate plan-level DAG (_validate_cross_phase_dag).
+2. Record baseline_commit per phase (_maybe_record_phase_entry).
+3. Loop:
+   a. Spawn workers up to parallelism cap from PlanManager.next_pending_tasks
+      (file-overlap and depends-on guards enforced at the plan_manager layer).
+   b. Optionally speculate ONE child task per phase (see 5.7).
+   c. asyncio.wait FIRST_COMPLETED on in_flight workers.
+   d. For each finished task: clear in_flight, capture result; on failure
+      cascade-block descendants via mark_blocked_descendants.
+   e. Roll back any speculative children whose parents just failed.
+   f. Fire phase-review for any phase that just observed all-terminal.
+4. Terminate when every task across every plan is terminal AND in_flight is empty.
+```
+
+**Failure isolation.** Workers go through `_execute_one_worker` (`src/orchestrator/execute_phase.py:1236`), which catches every exception except `DelegationPendingSignal`, transitions the task to `blocked`, and cascade-blocks descendants. Plan-fatal exceptions never reach the dispatcher.
+
+### 5.7 Speculative execution + rollback handler (v0.21.0 B2)
+
+When `cfg.speculative_execution_enabled` is True, the cross-phase dispatcher may opportunistically start ONE child task per phase while its parent is still in-flight. The bet: if the parent succeeds, the child's work is valid with no extra step; if the parent fails, the child's worktree is reset and the child is re-queued.
+
+**Candidate selection** is delegated to `PlanManager.speculable_candidate(parent_id)` (`src/state/plan_manager.py:431`). It returns a single child task that satisfies ALL of:
+
+* the parent is in-flight (status not in `_TERMINAL_TASK_STATUSES`),
+* the parent's `retry_count == 0` (first attempt only — speculating on a retry compounds risk),
+* the child has a SINGLE `depends_on` entry pointing at the parent (diamond avoidance),
+* the child's files are disjoint with EVERY currently in-flight task's files,
+* the child is currently `pending`.
+
+**Per-phase cap of 1.** The dispatcher tracks `speculative_phase: set[str]` and skips parents whose phase already hosts an active speculative child (`src/orchestrator/execute_phase.py:1077`). One per phase prevents a chain of speculative failures from compounding.
+
+**Rollback** (`rollback_speculative_task` in `src/orchestrator/speculative.py:76`):
+
+1. Best-effort `git reset --hard <baseline>` + `git clean -fdx` on the speculative worktree (`reset_speculative_worktree`, mirrors `WorktreePool.release` semantics).
+2. If a `WorktreeManager` was supplied, also remove the per-task worktree (overflow path).
+3. Re-queue the speculative task as `pending` via `PlanManager.revert_task_to_pending` (`src/state/plan_manager.py:371`) — this is the one legitimate caller for the FSM `assert_transition` bypass on the in_progress→pending edge. Resets `retry_count` and `escalated`.
+4. Append a `speculative_rolled_back` ledger op for forensics.
+
+All steps are best-effort: errors are logged, never raised. Idempotent on re-invocation.
+
+**Ledger surface** (`src/state/ledger.py:152-162`, `:530-538`): three audit-only ops emitted alongside the regular `update_task_status` ops that mutate plan state:
+
+| Op | Payload | When |
+|----|---------|------|
+| `speculative_started` | `{task_id, parent_task_id}` | Immediately before the speculative worker is created (dispatcher emits) |
+| `speculative_rolled_back` | `{task_id, parent_task_id, reason}` | After the rollback handler completes (handler emits) |
+| `speculative_committed` | `{task_id, parent_task_id}` | Confirms a speculative task after parent success — emitted by `commit_speculative_task` (currently unused by the dispatcher; see `speculative_execution.md`). |
+
+Replay treats these as no-ops — the actual status transitions are reconstructed from the regular `update_task_status` entries.
+
+See `speculative_execution.md` for full semantics, failure modes, and configuration knobs.
+
+### 5.8 WorktreePool warm-start (v0.21.0 A1)
+
+`WorktreePool` (`src/orchestrator/worktree_pool.py`) is an opt-in warm-start pool that wraps `WorktreeManager`. It cold-starts `N` worktrees concurrently at execute-phase entry and recycles them via `git reset --hard <baseline> && git clean -fdx` on every release, instead of paying `git worktree add` cost on every task dispatch.
+
+**Activation.** When `cfg.worktree_pool_enabled` is True and `cwd` is a git repo, `run_execute_phase` substitutes a `WorktreePool` for the `WorktreeManager` (`src/orchestrator/execute_phase.py:592-608`). The pool implements the same `create_per_task` / `remove_per_task` / `get_diff_vs_base` / `apply_patch_to_main` surface so the worker (`_execute_one`) is unaware of the substitution. Default False — cold-start adds 2-5s of upfront latency that's only worthwhile on multi-task plans.
+
+**Pool size** equals the resolved execute parallelism (`_resolve_execute_parallelism`), so the pool exactly fills the worker concurrency budget. Persistent dir: `<autodev_root>/execute_worktrees_pool/`.
+
+**Lifecycle:**
+
+1. `cold_start(n)` — captures baseline (HEAD SHA) once, then concurrently `git worktree add` for `pool-0` … `pool-(n-1)`. Failures are logged; pool runs at reduced size rather than aborting.
+2. `claim(task_id)` — pops one path from the queue. If empty, falls back to `WorktreeManager.create_per_task` under `tasks/<task_id>` (overflow path) so the dispatcher never blocks.
+3. `release(worktree, task_id)` — resets worktree to baseline + clean, returns to queue. Overflow worktrees (under `tasks/<id>`) are REMOVED rather than queued so the queue never inflates beyond `size`.
+4. `cleanup_all()` — removes every worktree (pooled + overflow) and the persistent pool dir. Safe to call multiple times.
+
+**Baseline capture.** `cold_start` records the main repo's HEAD SHA into `self._baseline`. Every `release` resets to this SHA — even if HEAD advances during execution (e.g. an in-flight task commits), the pool keeps recycling against the original baseline. This is what guarantees predictable, side-effect-free diff generation per task.
+
+**Sparse checkout caveat.** Pool worktrees are full checkouts. The `create_per_task(sparse_paths=...)` parameter is accepted for API parity but ignored at claim time (the cold-start budget assumes upfront cost is paid once and recycled). Operators who require sparse-checkout per task should keep `worktree_pool_enabled=False`.
+
+### 5.9 Error Handling
 
 | Error Condition | Handling |
 |----------------|----------|
@@ -580,7 +671,7 @@ The `InlineSuspendState` captures: `session_id`, `pending_task_id`, `pending_rol
 | Impl tournament error | Log warning and continue (non-fatal) |
 | `WorktreeError` | Propagates from worktree operations; cleanup_all in finally block |
 
-### 5.7 Dependencies
+### 5.10 Dependencies
 
 - **pydantic:** `DelegationEnvelope`, all evidence schemas, `InlineSuspendState`
 - **structlog:** Structured logging via `autologging.get_logger`
@@ -594,7 +685,7 @@ The `InlineSuspendState` captures: `session_id`, `pending_task_id`, `pending_rol
   - `src/tournament/` -- `Tournament`, `ImplTournament`, `AdapterLLMClient`, `TournamentConfig`
   - `src/errors.py` -- `AutodevError`, `GuardrailExceededError`
 
-### 5.8 Configuration
+### 5.11 Configuration
 
 | Config Path | Description | Default |
 |-------------|-------------|---------|
@@ -610,6 +701,10 @@ The `InlineSuspendState` captures: `session_id`, `pending_task_id`, `pending_rol
 | `AutodevConfig.guardrails.max_tool_calls_per_task` | Per-task tool call limit | `60` |
 | `AutodevConfig.guardrails.max_duration_s_per_task` | Per-task duration limit | `900` (15 min) |
 | `AutodevConfig.guardrails.max_diff_bytes` | Maximum diff size before warning | `5 MB` |
+| `AutodevConfig.tournaments.execute_max_parallel_tasks` | Per-task worker pool cap (None = auto-resolve via `runtime.resource_probe`) | `None` |
+| `AutodevConfig.worktree_pool_enabled` (v0.21.0 A1) | Opt-in: pre-create worktrees at execute-phase entry, recycle via reset+clean | `False` |
+| `AutodevConfig.cross_phase_parallelism_enabled` (v0.21.0 B1) | Opt-in: tasks from phase N+1 may begin while phase N's tail is in-flight | `False` |
+| `AutodevConfig.speculative_execution_enabled` (v0.21.0 B2) | Opt-in: speculatively start ONE child task per phase while parent is in-flight | `False` |
 
 ## 6. Integration Points
 
@@ -645,6 +740,9 @@ The orchestrator consumes the `PlatformAdapter` protocol via `orch.adapter.execu
 | Evidence: `SMEEvidence` | `plan_phase.py` | After domain_expert during plan phase |
 | Evidence: `CriticEvidence` | `execute_phase.py` | After critic_sounding_board escalation |
 | Evidence: `TournamentEvidence` | `impl_tournament_runner.py` | After impl tournament completion |
+| `speculative_started` (v0.21.0 B2) | `execute_phase.py` | Cross-phase dispatcher, before launching speculative child worker |
+| `speculative_rolled_back` (v0.21.0 B2) | `speculative.py` | After parent failure rollback completes (worktree reset + child re-queued) |
+| `speculative_committed` (v0.21.0 B2) | `speculative.py:commit_speculative_task` | After parent success confirms speculative child (helper exists; not currently invoked from execute_phase) |
 
 ### 6.4 Components That Depend on This
 
@@ -706,7 +804,9 @@ The orchestrator consumes the `PlatformAdapter` protocol via `orch.adapter.execu
 
 ## 9. Performance Considerations
 
-- **Sequential task execution:** The execute phase processes tasks one at a time within a phase. Cross-task parallelism is not implemented (tasks may have dependencies).
+- **Within-phase concurrency, cross-phase parallelism (v0.21.0 B1):** The execute phase runs an asyncio worker pool per phase via `_execute_phase_dag` (`src/orchestrator/execute_phase.py:823`). Up to `parallelism` workers — capped by `cfg.tournaments.execute_max_parallel_tasks` and the host probe in `_resolve_execute_parallelism` — are spawned for runnable tasks (deps terminal, files non-overlapping with in-flight). When `cfg.cross_phase_parallelism_enabled` is True, `_execute_cross_phase_dag` (`src/orchestrator/execute_phase.py:989`) widens the pool to span every phase: tasks from phase N+1 may begin while phase N's tail is still in-flight, provided `Task.depends_on` is terminal and files are disjoint with every in-flight task. Phase-review still fires per-phase, using `Phase.end_checkpoint_commit` (captured at the moment all tasks in the phase reach a terminal state) so phase N+1's concurrent commits don't pollute phase N's review diff range.
+- **Speculative execution (v0.21.0 B2, opt-in):** With `cfg.speculative_execution_enabled`, the cross-phase dispatcher may opportunistically start ONE child task per phase while its parent is still in-flight (see `Speculative execution + rollback handler` below). On parent failure the speculative worktree is reset to baseline and the child re-queued as pending; on success no extra step runs.
+- **WorktreePool warm-start (v0.21.0 A1, opt-in):** With `cfg.worktree_pool_enabled`, `WorktreePool.cold_start` (`src/orchestrator/worktree_pool.py:108`) pre-creates `parallelism` worktrees concurrently at execute-phase entry and recycles them via `git reset --hard <baseline> && git clean -fdx` on `release` instead of paying `git worktree add` cost on every dispatch.
 - **LLM latency dominates:** Each adapter call takes 10-120 seconds depending on the model and task complexity. The orchestrator overhead (state transitions, evidence writes) is negligible in comparison.
 - **Tournament cost multiplier:** A plan tournament adds `max_rounds * (1 critic + 1 architect_b + 1 synthesizer + num_judges judge)` LLM calls. An impl tournament adds the same plus `num_rounds * (1 developer + 1 test_engineer)` calls per variant.
 - **Worktree creation:** `git worktree add` is fast (< 1 second for typical repos). Cleanup via `git worktree remove` is also fast.
@@ -818,7 +918,6 @@ N/A -- this is the initial implementation.
 ## 13. Future Enhancements
 
 - **Phase 8: Full QA gate enforcement.** The `_run_qa_gates()` function will wire real gate results into the FSM with per-gate retry logic.
-- **Cross-task parallelism.** Tasks within a phase that have no dependency edges could be executed in parallel.
 - **Streaming progress.** Real-time progress reporting via SSE or WebSocket for long-running plan/execute operations.
 - **Plan revision loop.** A `critic_t` gate before plan approval (currently handled by the plan tournament) with explicit revision cycles.
 - **Incremental re-planning.** On task failure patterns, re-invoke the architect to revise the remaining plan.
@@ -847,3 +946,4 @@ N/A -- this is the initial implementation.
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-04-17 | Mohamed Ameen | Initial draft |
+| 2026-05-09 | Mohamed Ameen | v0.21.1: documented WorktreePool warm-start (v0.21.0 A1), cross-phase parallelism dispatcher (v0.21.0 B1), and speculative execution + rollback handler (v0.21.0 B2). Rewrote performance section to reflect within-phase worker pool and cross-phase mode (replacing the obsolete "sequential task execution" claim). Added new opt-in config knobs. Added `speculative_started` / `speculative_rolled_back` / `speculative_committed` ledger ops. |

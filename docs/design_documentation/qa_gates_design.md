@@ -3,10 +3,11 @@
 **Status:** Implemented
 **Author:** Mohamed Ameen
 **Date:** 2026-04-17
-**Last Updated:** 2026-04-17
+**Last Updated:** 2026-05-09
+**Version:** v0.21.1
 **Reviewers:** --
 **Package:** `src/qa/`
-**Entry Point:** Invoked by `orchestrator/execute_phase.py` after the `coded` status; no standalone CLI subcommand.
+**Entry Point:** Invoked by `orchestrator/execute_phase.py` after the `coded` status; no standalone CLI subcommand. The `autodev secretscan baseline` CLI subcommand (v0.19.0) refreshes the per-repo secretscan baseline.
 
 ## 1. Overview
 
@@ -19,17 +20,19 @@ The QA Gates Pipeline provides a sequential battery of local, zero-LLM-cost qual
 **In scope:**
 
 - Language and toolchain detection from project manifest files
-- Five built-in gates: `syntax_check`, `lint`, `build_check`, `test_runner`, `secretscan`
+- Built-in gates: `syntax_check`, `lint`, `build_check`, `test_runner`, `secretscan`, `hallucination_guard`, `mutation_test`
 - Sequential fail-fast pipeline execution
 - Per-gate configuration toggles via `QAGatesConfig`
 - Graceful degradation when tools are not installed
 - `GateResult` return type for uniform verdict reporting
 - Extension via `QAGatePlugin` protocol for third-party gates
+- Per-repo secretscan baseline (v0.19.0): catches NEW secrets vs. an accepted baseline, with per-extension entropy tuning
+- Mutation-test gate (v0.19.0): opt-in `mutmut` runner that gates on kill-rate
+- Extended-scope critic gate (v0.20.0): `critic_sounding_board` review of any task that declares paths outside its phase/plan `EDIT_SCOPE` (see [extended_scope.md](extended_scope.md))
 
 **Out of scope:**
 
-- SAST scanning (toggle exists in config but not yet implemented)
-- Mutation testing (toggle exists in config but not yet implemented)
+- SAST scanning (toggle `sast_scan` is a planning-time advisory consumed by agent prompts only; no dispatch yet)
 - LLM-based code review (that is the `reviewer` agent role, not a QA gate)
 - Retry/escalation logic (handled by `orchestrator/execute_phase.py`)
 
@@ -48,12 +51,15 @@ Gates run locally using the project's own toolchain. They are the cheapest valid
 ### 2.1 Functional Requirements
 
 - **FR-1:** Detect the project's primary language from manifest files (`pyproject.toml`, `package.json`, `Cargo.toml`, etc.).
-- **FR-2:** Run each enabled gate in sequence: syntax_check -> lint -> build_check -> test_runner -> secretscan.
+- **FR-2:** Run each enabled gate in sequence: syntax_check -> lint -> build_check -> test_runner -> secretscan -> hallucination_guard -> mutation_test.
 - **FR-3:** Stop at the first failed gate and return the failure details (fail-fast).
 - **FR-4:** When a gate's required tool is not installed, pass gracefully with an informational message rather than failing.
 - **FR-5:** Support per-gate enable/disable toggles via `QAGatesConfig`.
 - **FR-6:** Support third-party gate extensions via the `QAGatePlugin` protocol.
 - **FR-7:** Secret scanning must detect well-known secret patterns (AWS keys, GitHub PATs, Slack tokens, Stripe keys, private key headers) and high-entropy strings.
+- **FR-8:** Secretscan must support a per-repo baseline (`secretscan_baseline_enabled`) that masks pre-existing findings, plus per-extension entropy thresholds (`secretscan_per_extension_thresholds`) tunable from config.
+- **FR-9:** Mutation testing (`mutation_test_enabled`) must run after the standard test gate passes and gate on a configurable kill-rate threshold (`mutation_test_threshold`, default 0.7).
+- **FR-10:** Tasks that declare a non-empty `Task.extended_scope` must be routed through `critic_sounding_board` for an EXTENDED SCOPE REVIEW before the synchronous edit-scope validator admits the paths.
 
 ### 2.2 Non-Functional Requirements
 
@@ -90,15 +96,23 @@ flowchart TB
         L -->|pass| B[build_check]
         B -->|pass| T[test_runner]
         T -->|pass| SC[secretscan]
-        SC -->|pass| PASS[GateResult: passed]
+        SC -->|pass| HG[hallucination_guard]
+        HG -->|pass| MT[mutation_test]
+        MT -->|pass| PL[plugin gates]
+        PL -->|pass| PASS[GateResult: passed]
 
         S -->|fail| FAIL[GateResult: failed]
         L -->|fail| FAIL
         B -->|fail| FAIL
         T -->|fail| FAIL
         SC -->|fail| FAIL
+        HG -->|fail| FAIL
+        MT -->|fail| FAIL
+        PL -->|fail| FAIL
     end
 ```
+
+The `secretscan` and `mutation_test` gates accept a diff-scoped path list (v0.13.0+ / v0.19.0+ respectively) so the scan touches only the developer's just-introduced changes — pre-existing repo state is not re-evaluated on every retry.
 
 ### 3.2 Component Structure
 
@@ -110,7 +124,15 @@ flowchart TB
 | `qa/lint.py` | `run_lint()` -- ruff (Python), eslint (Node.js), cargo clippy (Rust), golangci-lint (Go) |
 | `qa/build_check.py` | `run_build_check()` -- py_compile (Python), tsc/npm build (Node.js), cargo check (Rust), go build (Go) |
 | `qa/test_runner.py` | `run_tests()` -- pytest (Python), npm test (Node.js), cargo test (Rust), go test (Go) |
-| `qa/secretscan.py` | `run_secretscan()` -- regex patterns + Shannon entropy heuristics |
+| `qa/secretscan.py` | `run_secretscan()` -- regex patterns + Shannon entropy heuristics; per-extension thresholds; baseline filter |
+| `qa/secretscan_baseline.py` | `compute_baseline()`, `load_baseline()`, `filter_against_baseline()` -- per-repo baseline persisted to `.autodev/secretscan-baseline.json` |
+| `qa/mutation_test.py` | `run_mutation_test()` -- mutmut subprocess wrapper, kill-rate gate |
+| `qa/equivalence_filter.py` | Stage-1 static AST/whitespace equivalence filter for surviving mutants |
+| `qa/llm_equivalence_judge.py` | Stage-2 LLM-based semantic-equivalence judge for surviving mutants |
+| `qa/hallucination_guard.py` | `run_hallucination_guard()` -- AST walk over developer-introduced files |
+| `qa/cpp_symbols.py` | C++ symbol-table support for hallucination-guard cross-file resolution |
+| `cli/commands/secretscan_baseline.py` | `autodev secretscan baseline` Click command -- refreshes the baseline |
+| `orchestrator/extended_scope_critic.py` | `critic_review_extended_scope()` -- routes a task with non-empty `extended_scope` through `critic_sounding_board` |
 | `plugins/registry.py` | `QAGatePlugin` protocol, `GateResult` dataclass, `QAContext`, plugin discovery |
 
 ### 3.3 Data Models
@@ -137,8 +159,24 @@ class QAGatesConfig(BaseModel):
     build_check: bool = True
     test_runner: bool = True
     secretscan: bool = True
-    sast_scan: bool = False       # not yet implemented
-    mutation_test: bool = False    # not yet implemented
+    # v0.19.0: per-repo secretscan baseline. When True, the gate diffs
+    # findings against ``.autodev/secretscan-baseline.json`` and only
+    # net-new findings trip the gate. Refresh with
+    # ``autodev secretscan baseline``.
+    secretscan_baseline_enabled: bool = False
+    # v0.19.0: per-extension entropy override. ``None`` means use the
+    # module-default curve (looser thresholds for ``.cpp`` / ``.yaml`` etc.).
+    secretscan_per_extension_thresholds: dict[str, float] | None = None
+    # Planning-time advisories (consumed by agent prompts only — NOT
+    # dispatched as gates). Kept for forward-compat with ADR-008.
+    sast_scan: bool = False
+    mutation_test: bool = False
+    # v0.19.0: dispatch toggle for the mutation-test gate (distinct from
+    # the planning-time ``mutation_test`` advisory). When True, the gate
+    # invokes ``qa.mutation_test.run_mutation_test`` after the standard
+    # tests pass.
+    mutation_test_enabled: bool = False
+    mutation_test_threshold: float = 0.7
 ```
 
 ### 3.4 Protocol / Interface Contracts
@@ -177,22 +215,46 @@ Third-party plugins are discovered via `importlib.metadata.entry_points(group="a
 | `run_lint(cwd, language, timeout_s) -> GateResult` | `qa/lint.py` | Run language-appropriate linter |
 | `run_build_check(cwd, language, timeout_s) -> GateResult` | `qa/build_check.py` | Run build/typecheck tool |
 | `run_tests(cwd, language, timeout_s) -> GateResult` | `qa/test_runner.py` | Run project test suite |
-| `run_secretscan(cwd) -> GateResult` | `qa/secretscan.py` | Scan for hard-coded secrets |
+| `run_secretscan(cwd, paths, per_extension_thresholds, baseline_enabled) -> GateResult` | `qa/secretscan.py` | Scan for hard-coded secrets; diff-scoped + baseline-filtered |
+| `compute_baseline(cwd) -> set[str]` | `qa/secretscan_baseline.py` | Snapshot the current finding set into `.autodev/secretscan-baseline.json` |
+| `filter_against_baseline(findings, cwd) -> list[str]` | `qa/secretscan_baseline.py` | Drop findings already recorded in the baseline |
+| `run_mutation_test(cwd, paths, kill_rate_threshold, timeout_s) -> GateResult` | `qa/mutation_test.py` | Run mutmut on Python sources; gate on kill-rate |
+| `run_hallucination_guard(cwd, paths) -> GateResult` | `qa/hallucination_guard.py` | AST walk for unresolved symbol references |
 
 **Pipeline entry (in `execute_phase.py`):**
 
 ```python
-async def _run_qa_gates(orch, task) -> str | None:
+async def _run_qa_gates(orch, task, *, developer_result=None) -> str | None:
     """Run enabled QA gates. Returns the first failure detail string, or None if all pass."""
     cfg = orch.cfg.qa_gates
+    cwd = orch.cwd
     language = detect_language(cwd)
+
+    # v0.13.0: derive a diff-scoped path list from the developer's result so
+    # secretscan / mutation_test / hallucination_guard touch only the just-
+    # introduced changes (not the pre-existing repo state).
+    secretscan_paths = _files_changed_for_secretscan(developer_result)
+    hallucination_guard_enabled = bool(getattr(orch.cfg, "hallucination_guard", True))
 
     gates = [
         (cfg.syntax_check, lambda: run_syntax_check(cwd, language)),
         (cfg.lint,         lambda: run_lint(cwd, language)),
         (cfg.build_check,  lambda: run_build_check(cwd, language)),
         (cfg.test_runner,  lambda: run_tests(cwd)),
-        (cfg.secretscan,   lambda: run_secretscan(cwd)),
+        (cfg.secretscan,   lambda: run_secretscan(
+            cwd,
+            paths=secretscan_paths,
+            per_extension_thresholds=cfg.secretscan_per_extension_thresholds,
+            baseline_enabled=cfg.secretscan_baseline_enabled,
+        )),
+        (hallucination_guard_enabled, lambda: run_hallucination_guard(
+            cwd, paths=secretscan_paths,
+        )),
+        (cfg.mutation_test_enabled, lambda: run_mutation_test(
+            cwd,
+            paths=secretscan_paths,
+            kill_rate_threshold=cfg.mutation_test_threshold,
+        )),
     ]
 
     for enabled, gate_fn in gates:
@@ -201,6 +263,7 @@ async def _run_qa_gates(orch, task) -> str | None:
         result = await gate_fn()
         if not result.passed:
             return result.details or "QA gate failed"
+    # Plugin QA gates run after all built-in gates pass (see Section 6.4).
     return None
 ```
 
@@ -335,6 +398,8 @@ All gate subprocesses follow a common pattern:
 | **test_runner (Rust)** | `cargo test` |
 | **test_runner (Go)** | `go test ./...` |
 | **secretscan** | (in-process, no subprocess) |
+| **mutation_test (Python)** | `mutmut run --no-progress [--paths-to-mutate <files>]` then `mutmut results --json` |
+| **hallucination_guard** | (in-process AST walk, no subprocess) |
 
 Python syntax check and build check filter files to exclude `.venv` and `__pycache__` directories. Node.js syntax check excludes `node_modules`.
 
@@ -350,15 +415,149 @@ The pipeline caller (`_run_qa_gates` in `execute_phase.py`) returns the first fa
 - If `retry_count < qa_retry_limit` (default 3): the developer is retried with the gate failure injected as `last_issues` context.
 - If `retry_count >= qa_retry_limit`: the task is escalated to `critic_sounding_board` and marked as `blocked`.
 
-### 5.5 Dependencies
+### 5.5 Mutation testing gate (v0.19.0)
+
+`qa/mutation_test.py` exposes `run_mutation_test()` — an opt-in QA gate that
+shells out to [`mutmut`](https://mutmut.readthedocs.io/) and gates on the
+**kill rate**: the fraction of mutants the existing test suite caught. A
+mutant survives when no test fails after the mutation, signalling that the
+mutated code path is under-covered.
+
+**Configuration**
+
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `mutation_test_enabled` | `False` | Master dispatch toggle. Distinct from the planning-time `mutation_test` advisory (which is consumed by agent prompts only and never dispatches a gate). |
+| `mutation_test_threshold` | `0.7` | Minimum acceptable kill-rate (0.0–1.0). Looser than a typical coverage gate because mutation testing is more demanding. |
+
+**When it runs.** Last in the built-in sequence — *after* `syntax_check`,
+`lint`, `build_check`, `test_runner`, `secretscan`, and
+`hallucination_guard`. The gate is meaningful only when the standard test
+suite is green; running it earlier would conflate test failures with
+mutation survivors.
+
+**Behavior.** The runner:
+
+1. Skips with a pass-and-warn if `mutmut` is not on `PATH` (graceful
+   degradation: a missing binary must not block the pipeline).
+2. Filters the diff-scope path list to Python files only. Empty Python
+   filter → pass-and-warn ("no Python files in diff scope").
+3. Invokes `mutmut run --no-progress [--paths-to-mutate <rel-paths>]`
+   with a 5-minute hard cap. Hangs return a pass-and-warn (false negatives
+   preferred over flakes).
+4. Reads `mutmut results --json` to extract counts (`killed`, `survived`,
+   `timeout`, `suspicious`, `skipped`).
+5. Computes `kill_rate = killed / (killed + survived + timeout + suspicious)`.
+   `skipped` mutants are excluded from both numerator and denominator.
+6. Optionally adjusts the kill-rate upward via two staged equivalence
+   filters when survivors exist:
+   - **Stage 1** (`qa/equivalence_filter.py`) — static AST/whitespace
+     equivalence: a mutant whose AST differs only in trivia is treated as
+     killed.
+   - **Stage 2** (`qa/llm_equivalence_judge.py`) — LLM-based semantic
+     equivalence: gated on `mutation_cache` presence + Anthropic key
+     availability; a survivor judged semantically equivalent to the
+     original is treated as killed.
+7. Returns `passed = kill_rate >= mutation_test_threshold`.
+
+**Cost shape.** Mutation testing is the most expensive gate by far — every
+mutant requires re-running the test suite. The 5-minute hard cap and
+diff-scope filter contain the blast radius; opt-in default keeps the gate
+off in default configurations where the cost is not warranted.
+
+### 5.6 Secretscan baseline (v0.19.0)
+
+`qa/secretscan_baseline.py` provides a per-repo baseline so legacy
+high-entropy strings or test fixtures don't trip the gate on every run.
+The baseline file lives at `.autodev/secretscan-baseline.json` and is
+keyed by `f"{rel_path}|{label}"` — the repo-relative file path plus the
+finding category (`"AWS access key"`, `"high-entropy string"`, etc.).
+
+**Semantics — catches NEW secrets, not existing ones.**
+
+When `secretscan_baseline_enabled = True`, `run_secretscan` calls
+`filter_against_baseline(findings, cwd)` which drops any finding whose key
+appears in the baseline file. Net-new findings — secrets introduced after
+the baseline was last refreshed — still trip the gate.
+
+**Fail-open on missing baseline.** A missing baseline file is treated as
+an empty key set (no findings filtered). This guarantees that disabling
+the baseline by deleting the file cannot silently mask findings.
+
+**CLI: `autodev secretscan baseline`**
+
+The Click command in `cli/commands/secretscan_baseline.py` refreshes the
+baseline:
+
+```bash
+autodev secretscan baseline [--cwd <path>]
+```
+
+Workflow:
+
+1. Operator inspects the current findings (`autodev` runs the gate as
+   normal, prints failures).
+2. Operator decides which findings are accepted (test fixtures, throwaway
+   credentials in `examples/`, etc.).
+3. Operator runs `autodev secretscan baseline` to snapshot the *current*
+   set of findings into `.autodev/secretscan-baseline.json`.
+4. Subsequent gate runs only flag NEW findings vs. the snapshot.
+5. The baseline is refreshed whenever new findings are intentionally
+   accepted.
+
+**Per-extension entropy thresholds.** `secretscan_per_extension_thresholds`
+overrides the default entropy curve baked into
+`qa.secretscan._DEFAULT_PER_EXTENSION_ENTROPY`:
+
+| Extension | Default threshold | Rationale |
+|-----------|-------------------|-----------|
+| `.cpp` / `.cc` / `.cxx` / `.c` / `.h` / `.hpp` / `.hxx` | 5.0 | C/C++ codebases use long camelCase / snake_case identifiers; the global 4.5 threshold over-fires. |
+| `.yaml` / `.yml` | 5.5 | Build-manifest hashes are routinely 5.0+ entropy; tighter thresholds for these files would be unusable. |
+| (all others) | 4.5 | Default Shannon-entropy threshold. |
+
+`None` (default) means "use the module curve". Operators with
+finding-noisy file types can override per extension without disabling the
+gate entirely.
+
+### 5.7 Extended-scope critic gate (v0.20.0)
+
+`orchestrator/extended_scope_critic.py` implements a critic-review gate
+that fires for any task with a non-empty `Task.extended_scope`. The
+architect signals that a task may legitimately touch paths outside its
+phase/plan `EDIT_SCOPE` by emitting an `Extended-scope:` block in the
+plan markdown; the orchestrator routes the review through
+`critic_sounding_board` before `validate_edit_scope_with_critic_review`
+admits the paths.
+
+The critic returns one of two RESOLUTION tokens:
+
+- `RESOLUTION: approved-extended-scope` — work proceeds; the resolved
+  scope is unioned with `task.extended_scope` (per `dag.py` C1).
+- `RESOLUTION: rejected-extended-scope` — `EditScopeViolation` is raised
+  with the rejection reason inline; the task is blocked.
+
+Decisions are cached in `plan_manager.metadata['extended_scope_decisions']`
+keyed by `(task_id, sorted-extended-scope)` so re-running the validator
+does not re-invoke the critic for the same scope signature.
+
+For full coverage of the architect prompt format, the
+`validate_edit_scope_with_critic_review` wrapper, the cache strategy, and
+the dynamic-scope-expansion repair flow, see
+[extended_scope.md](extended_scope.md).
+
+### 5.8 Dependencies
 
 - **asyncio:** Subprocess execution and timeout management.
 - **re / math:** Secret scanning (regex patterns, Shannon entropy).
-- **Internal:** `plugins/registry` for `GateResult` and `QAGatePlugin`, `qa/detect` for language detection.
+- **mutmut (optional):** Mutation testing gate. `pip install ai-autodev[mutation]` to install.
+- **Internal:** `plugins/registry` for `GateResult` and `QAGatePlugin`, `qa/detect` for language detection, `orchestrator/delegation_envelope` for the extended-scope critic envelope.
 
-No external Python dependencies. The gates invoke external CLI tools (ruff, eslint, pytest, etc.) as subprocesses, but these are not Python package dependencies.
+The mutation-test gate is the only gate with an optional Python
+dependency. The other gates invoke external CLI tools (ruff, eslint,
+pytest, etc.) as subprocesses, but these are not Python package
+dependencies.
 
-### 5.6 Configuration
+### 5.9 Configuration
 
 From `.autodev/config.json`:
 
@@ -370,14 +569,22 @@ From `.autodev/config.json`:
     "build_check": true,
     "test_runner": true,
     "secretscan": true,
+    "secretscan_baseline_enabled": false,
+    "secretscan_per_extension_thresholds": null,
     "sast_scan": false,
-    "mutation_test": false
+    "mutation_test": false,
+    "mutation_test_enabled": false,
+    "mutation_test_threshold": 0.7
   },
   "qa_retry_limit": 3
 }
 ```
 
-Each gate can be individually enabled or disabled. `sast_scan` and `mutation_test` are config placeholders for future gates.
+Each gate can be individually enabled or disabled. `sast_scan` and
+`mutation_test` (without the `_enabled` suffix) are planning-time
+advisories consumed by agent prompts (e.g. `architect.md` for security
+tier routing) and do NOT dispatch as gates. Use `mutation_test_enabled`
+to actually run the mutation gate.
 
 ## 6. Integration Points
 
@@ -499,19 +706,30 @@ Gate results are not persisted as separate artifacts. They are captured in the o
 | build_check | 0 | Local subprocess |
 | test_runner | 0 | Local subprocess |
 | secretscan | 0 | In-process regex + entropy |
-| **Total per pipeline run** | **0** | Zero LLM cost |
+| hallucination_guard | 0 | In-process AST walk |
+| mutation_test | 0 | mutmut subprocess + JSON parse |
+| extended-scope critic | 1 | Single `critic_sounding_board` invocation per task with non-empty `extended_scope`; cached per `(task_id, scope_signature)` to make re-runs free |
+| **Total per pipeline run** | **0–N** | N = number of tasks with new extended-scope blocks; cached after first review |
 
-The QA gates save LLM costs by catching issues locally before they reach the reviewer agent or tournament engine. A syntax error caught by `syntax_check` costs 0 LLM calls; the same error caught by the reviewer would cost at least 1 reviewer call + the retry developer call.
+The non-LLM gates save costs by catching issues locally before they reach
+the reviewer agent or tournament engine. A syntax error caught by
+`syntax_check` costs 0 LLM calls; the same error caught by the reviewer
+would cost at least 1 reviewer call + the retry developer call.
+
+The extended-scope critic is the only gate that consumes an LLM call,
+and it is gated on the rare case where a task crosses its declared
+edit-scope. The cache (keyed by `scope_signature`) ensures the cost is
+paid at most once per `(task_id, extended_scope)` pair across the run.
 
 ## 13. Future Enhancements
 
-- **SAST scanning:** Integrate `bandit` (Python), `semgrep`, or similar static analysis tools. Config toggle exists (`sast_scan: false`).
-- **Mutation testing:** Integrate `mutmut` (Python) or equivalent. Config toggle exists (`mutation_test: false`).
+- **SAST scanning gate dispatch:** Integrate `bandit` (Python), `semgrep`, or similar static analysis tools. The `sast_scan` flag is currently a planning-time advisory consumed by agent prompts only — the dispatcher hook is reserved per ADR-008.
 - **Tree-sitter integration:** Replace `py_compile` / `node --check` with tree-sitter grammars for faster, language-agnostic syntax validation without requiring the language runtime.
-- **Per-file gating:** Run gates only on changed files (from the diff) rather than the entire project, for faster feedback on large codebases.
-- **Configurable entropy threshold:** Expose `_ENTROPY_THRESHOLD` in `QAGatesConfig` for operators to tune.
-- **Gate result persistence:** Write `GateResult` objects as evidence bundles for auditability.
+- **Per-file gating beyond diff scope:** v0.13.0+ already passes diff-scope paths to `secretscan` / `mutation_test` / `hallucination_guard`; extending the same pattern to `lint` and `build_check` would give faster feedback on large codebases.
+- **Configurable global entropy threshold:** Expose the global `_ENTROPY_THRESHOLD` in `QAGatesConfig` (per-extension is already exposed via `secretscan_per_extension_thresholds`).
+- **Gate result persistence:** Write `GateResult` objects as evidence bundles for full auditability.
 - **Parallel gate execution:** For independent gates (e.g., secretscan does not depend on lint), run in parallel to reduce total pipeline time.
+- **Mutation-test equivalence Stage 1 wiring:** The `_stage1_static_filter` hook in `qa/mutation_test.py` is currently a no-op — the per-mutant text extraction depends on internal `mutmut` APIs that are not yet stable across versions. Wiring the static AST filter once a stable surface lands.
 
 ## 14. Open Questions
 
@@ -540,3 +758,4 @@ No specific ADRs have been created for the QA gates pipeline yet. Candidates:
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-04-17 | Mohamed Ameen | Initial draft |
+| 2026-05-09 | Mohamed Ameen | v0.21.1 refresh: documented v0.19.0 mutation-test gate, secretscan baseline + per-extension entropy thresholds, hallucination-guard, and v0.20.0 extended-scope critic gate. Updated `QAGatesConfig`, pipeline entry, gate list, and architecture diagram. |
