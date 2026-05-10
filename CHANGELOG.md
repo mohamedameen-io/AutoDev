@@ -2,6 +2,11 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.2] - 2026-05-10
+
+### Changed
+- **`/autodev` slash command is now a full CLI passthrough.** Every registered `autodev` subcommand (`resume`, `status`, `doctor`, `metrics regex-timeouts`, `metrics export-corpus`, `tournament`, `prune`, `reset`, `secretscan`, `plugins`, `logs`, `init`, `plan`, `execute`) is reachable directly via `/autodev <subcommand> [args]` from inside Claude Code; help/version flags (`--help`, `-h`, `--version`) too. Pre-0.24.2 the slash command only chained `plan` → `execute` and parsed any other input as a feature description, so `/autodev resume` re-planned from scratch instead of resuming. The legacy intent flows (`/autodev <feature>` one-shot and `/autodev --review <feature>` checkpointed) are unchanged. Template rendered by `adapters.inline_config.render_claude_slash_command`; freshly-`init`-ed workspaces pick up the new template automatically. Existing workspaces should run `autodev init --inline --force` to refresh `.claude/commands/autodev.md`.
+
 ## [0.24.1] - 2026-05-10
 
 ### Fixed

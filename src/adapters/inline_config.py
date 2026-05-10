@@ -52,44 +52,72 @@ the delegation file's YAML frontmatter, run:
 
 
 def render_claude_slash_command() -> str:
-    """Return the full content for .claude/commands/autodev.md.
+    """Return the full content for ``.claude/commands/autodev.md``.
 
-    The slash command lets users explicitly drive a feature through
-    AutoDev via `/autodev <intent>` (one-shot) or `/autodev --review
-    <intent>` (checkpointed).
+    v0.24.2: the slash command is now a **full CLI passthrough**.
+
+    * ``/autodev`` (no args) prints the subcommand list.
+    * ``/autodev <subcommand> [...]`` (where ``<subcommand>`` is any
+      registered ``autodev`` CLI subcommand) runs ``autodev <subcommand>
+      [...]`` verbatim and surfaces the output. This means
+      ``/autodev resume``, ``/autodev status``, ``/autodev metrics
+      regex-timeouts``, ``/autodev doctor``, etc. all work.
+    * ``/autodev [--review] <feature description>`` (legacy intent flow)
+      drives a feature through ``plan`` → ``execute`` end-to-end.
     """
     return """\
 ---
-description: Plan and ship a feature through the AutoDev multi-agent pipeline.
+description: Full AutoDev CLI passthrough — any subcommand, or drive a feature end-to-end.
 allowed-tools: [Bash]
-argument-hint: [--review] <feature description>
+argument-hint: <subcommand> [args] | [--review] <feature description>
 ---
 
-The user invoked `/autodev` to drive a feature through AutoDev instead of
-implementing directly. Do NOT write code yourself — delegate via autodev.
+The user invoked `/autodev`. This command is a **complete passthrough** to
+the `autodev` CLI binary — every subcommand reachable from the shell is
+reachable from here. Do NOT write code yourself — delegate via `autodev`.
 
 Args: $ARGUMENTS
 
-Steps:
+## Routing rule
 
-1. Parse $ARGUMENTS. If it starts with `--review` (or contains `--review` as a
-   leading flag), strip the flag and treat the remainder as the intent; set
-   review_mode = true. Otherwise review_mode = false.
+Inspect the FIRST whitespace-separated token of $ARGUMENTS:
 
-2. If `.autodev/` does not exist, run `autodev init --inline --force` first.
+1. **No arguments / empty**: run `autodev --help` via Bash and surface the
+   subcommand list verbatim. Suggest the most useful entry points:
+   `/autodev <feature>` (one-shot), `/autodev --review <feature>` (checkpointed),
+   `/autodev resume`, `/autodev status`, `/autodev doctor`,
+   `/autodev metrics regex-timeouts`.
 
-3. Run `autodev plan "<intent>"` via Bash and surface the plan summary to the
-   user (phases, tasks, projected calls).
+2. **First token is one of these registered CLI subcommands**:
+   `doctor`, `execute`, `init`, `logs`, `metrics`, `plan`, `plugins`,
+   `prune`, `reset`, `resume`, `secretscan`, `status`, `tournament`
+   — OR a help/version flag (`--help`, `-h`, `--version`).
 
-4. Branch on review_mode:
-   - review_mode = false (default, one-shot): immediately run `autodev execute`
-     (or, in inline mode, follow the resume rule in CLAUDE.md when delegation
-     files appear). Surface progress and final status.
-   - review_mode = true: STOP after the plan summary. Tell the user to reply
-     with "go" (or equivalent) to proceed; only then run `autodev execute`.
+   → Direct CLI passthrough. Run `autodev $ARGUMENTS` via Bash and surface
+   stdout/stderr verbatim. Do NOT re-interpret, do NOT auto-chain into other
+   subcommands. The user is asking for that exact subcommand.
 
-5. If any step fails, surface stderr from autodev verbatim. Do NOT retry
-   blindly. Suggest `autodev status` / `autodev doctor` for diagnostics.
+3. **First token is `--review`**: checkpointed feature flow.
+   a. Strip the `--review` flag; treat the remainder as the feature intent.
+   b. If `.autodev/` does not exist, run `autodev init --inline --force`.
+   c. Run `autodev plan "<intent>"` and surface the plan summary (phases,
+      tasks, projected calls).
+   d. STOP. Tell the user to reply with `go` (or equivalent) to proceed.
+   e. On `go`, run `autodev execute`.
+
+4. **Otherwise** (first token is a free-text feature description): one-shot
+   feature flow.
+   a. If `.autodev/` does not exist, run `autodev init --inline --force`.
+   b. Run `autodev plan "$ARGUMENTS"` and surface the plan summary.
+   c. Run `autodev execute` (or, in inline mode, follow the resume rule in
+      CLAUDE.md when delegation files appear). Surface progress + final
+      status.
+
+## Error handling
+
+If any `autodev` invocation fails (non-zero exit), surface stderr verbatim.
+Do NOT retry blindly. Suggest `autodev doctor` and `autodev status` for
+diagnostics, and `/autodev resume` after fixing the underlying issue.
 """
 
 

@@ -241,3 +241,49 @@ def test_render_claude_slash_command_documents_review_flag() -> None:
     assert "$ARGUMENTS" in result
     assert "autodev plan" in result
     assert "autodev execute" in result
+
+
+# ---------------------------------------------------------------------------
+# v0.24.2: slash command is a full CLI passthrough (every subcommand reachable)
+# ---------------------------------------------------------------------------
+
+
+def test_render_claude_slash_command_lists_every_cli_subcommand() -> None:
+    """Each registered CLI subcommand MUST appear in the routing rule list,
+    so the template stays in lock-step with src/cli/commands/."""
+    result = render_claude_slash_command()
+    for sub in (
+        "doctor",
+        "execute",
+        "init",
+        "logs",
+        "metrics",
+        "plan",
+        "plugins",
+        "prune",
+        "reset",
+        "resume",
+        "secretscan",
+        "status",
+        "tournament",
+    ):
+        assert f"`{sub}`" in result, f"missing subcommand {sub!r} in slash template"
+
+
+def test_render_claude_slash_command_documents_passthrough_routing() -> None:
+    """The template must explain the routing rule (subcommand vs intent)."""
+    result = render_claude_slash_command()
+    assert "passthrough" in result.lower()
+    # The template should describe both flows: direct subcommand AND intent.
+    assert "feature description" in result.lower() or "intent" in result.lower()
+    # Help/version flags must be reachable without falling into intent flow.
+    assert "--help" in result
+    assert "--version" in result
+
+
+def test_render_claude_slash_command_documents_resume_status_doctor() -> None:
+    """The most common direct invocations must be discoverable in the template."""
+    result = render_claude_slash_command()
+    assert "/autodev resume" in result
+    assert "/autodev status" in result
+    assert "/autodev doctor" in result
