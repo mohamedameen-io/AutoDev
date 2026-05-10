@@ -80,6 +80,10 @@ class Orchestrator:
         # and :func:`orchestrator.dag.validate_edit_scope` for glob
         # expansion of ``Task.files`` entries.
         self._tracked_files: set[str] | None = None
+        # Phase 2 (anti-bloat): one-shot guard so :meth:`_seed_hive_packs` only
+        # runs once per orchestrator instance even if it is called from
+        # multiple entry points (plan / execute / resume).
+        self._seed_packs_loaded: bool = False
 
         # Wire AgentExtensionPlugins: merge their specs into the agent registry.
         if plugin_registry is not None:
@@ -225,6 +229,56 @@ class Orchestrator:
             self._repo_capacity = probe(self._cwd)
         return self._repo_capacity
 
+    async def _seed_hive_packs(self) -> None:
+        """Phase 2 (anti-bloat): bootstrap hive-tier knowledge once per session.
+
+        Called from each high-level entry point (``plan`` / ``execute`` /
+        ``resume``) and short-circuits via :attr:`_seed_packs_loaded` so it
+        runs at most once per orchestrator instance. The underlying
+        :func:`state.seed_packs.seed_pack_if_missing` is itself idempotent
+        across runs (marker file + Jaccard dedup), so the per-instance
+        guard is purely a performance hint.
+
+        Pack files live under ``<repo_root>/seeds/<name>.jsonl`` where
+        ``repo_root`` is resolved relative to this module's location. If a
+        configured pack file is missing the loader simply returns 0; we do
+        not raise.
+        """
+        if self._seed_packs_loaded:
+            return
+        self._seed_packs_loaded = True
+        kcfg = self._cfg.knowledge
+        if not kcfg.seed_packs_enabled or not kcfg.seed_packs:
+            return
+        from state.seed_packs import seed_pack_if_missing
+
+        # repo_root is the package install root (parent of ``src/``).
+        # ``__file__`` is .../src/orchestrator/__init__.py -> parents[2] = repo root.
+        repo_root = Path(__file__).resolve().parents[2]
+        seeds_dir = repo_root / "seeds"
+        marker_dir = self._cwd / ".autodev"
+        for pack_name in kcfg.seed_packs:
+            pack_path = seeds_dir / f"{pack_name}.jsonl"
+            try:
+                inserted = await seed_pack_if_missing(
+                    self._knowledge,
+                    pack_path,
+                    pack_name,
+                    marker_dir=marker_dir,
+                )
+                if inserted:
+                    self._log.info(
+                        "orchestrator.seed_pack.loaded",
+                        pack=pack_name,
+                        inserted=inserted,
+                    )
+            except Exception as exc:  # noqa: BLE001 - seeding is best-effort
+                self._log.warning(
+                    "orchestrator.seed_pack.failed",
+                    pack=pack_name,
+                    error=str(exc),
+                )
+
     # --- High-level operations ---
 
     async def plan(self, intent: str) -> Plan:
@@ -236,6 +290,7 @@ class Orchestrator:
         # snapshot is available to downstream callers (delegate's
         # ``resolve_task_max_turns`` reads it).
         _ = self.repo_capacity
+        await self._seed_hive_packs()
 
         self._log.info("orchestrator.plan.start", intent_bytes=len(intent))
         plan = await run_plan_phase(self, intent)
@@ -253,6 +308,7 @@ class Orchestrator:
         # v0.13.0: probe lazily on first entry; downstream delegate site
         # reads ``self._repo_capacity`` to resolve per-task max_turns.
         _ = self.repo_capacity
+        await self._seed_hive_packs()
 
         self._log.info("orchestrator.execute.start", task_id=task_id or "<all-pending>")
         tasks = await run_execute_phase(self, task_id)
@@ -286,6 +342,7 @@ class Orchestrator:
 
         # v0.13.0: probe lazily on resume entry (mirrors plan/execute).
         _ = self.repo_capacity
+        await self._seed_hive_packs()
 
         if isinstance(self._adapter, InlineAdapter):
             state = load_suspend_state(self._cwd)

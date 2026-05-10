@@ -549,6 +549,18 @@ class KnowledgeConfig(BaseModel):
     #         "soft_blocker":     DecayCurveConfig(half_life_days=7,  floor=0.4),
     #     }
     decay_curves: dict[str, DecayCurveConfig] | None = None
+    # Phase 2 (anti-bloat): bootstrap hive-tier knowledge with curated
+    # anti-pattern packs at orchestrator entry. ``seed_packs_enabled``
+    # is the master switch. ``seed_packs`` lists pack basenames resolved
+    # against the repo's ``seeds/`` directory (e.g. ``"anti_bloat_v1"``
+    # -> ``seeds/anti_bloat_v1.jsonl``). Loading is idempotent via the
+    # marker file ``.autodev/seed_packs.json`` and the existing
+    # bigram-Jaccard dedup at :attr:`dedup_threshold`. Default ON because
+    # an empty hive on a fresh project means reviewers/critics get no
+    # anti-bloat guidance until enough swarm lessons accumulate to
+    # promote.
+    seed_packs_enabled: bool = True
+    seed_packs: list[str] = Field(default_factory=lambda: ["anti_bloat_v1"])
 
 
 class AutodevConfig(BaseModel):
