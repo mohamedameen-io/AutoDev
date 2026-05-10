@@ -734,6 +734,46 @@ class AutodevConfig(BaseModel):
     # complexity warrants cautious adoption.
     speculative_execution_enabled: bool = False
 
+    # v0.25.0: file/symbol index for planner candidate lookup. The index
+    # is a sqlite-FTS5 database at ``.autodev/index.db`` (path is
+    # cwd-relative; override via ``index_path``) covering tracked files
+    # and their top-level symbols (functions, classes, methods,
+    # namespaces, structs). Built at ``autodev init`` and refreshed
+    # incrementally on every ``autodev execute``/``plan``/``resume``;
+    # queried by ``orchestrator.plan_phase`` to inject a CANDIDATE_FILES
+    # block into the architect's envelope so it picks real paths in the
+    # first place. Set ``index_enabled=False`` (or set the env var
+    # ``AUTODEV_INDEX_DISABLED=1``) to opt out — the architect prompt's
+    # "PREFER paths from this list" instruction degrades into a no-op
+    # when the index is missing.
+    index_enabled: bool = True
+    # cwd-relative path to the sqlite index database. Operators rarely
+    # change this; the default lands the file inside ``.autodev/`` so it
+    # gets cleaned up by ``rm -rf .autodev/``.
+    index_path: str = ".autodev/index.db"
+    # ``None`` = auto-detect (Python via ``ast``, C++ via tree-sitter +
+    # the existing ``qa.cpp_symbols`` extractor, TypeScript via
+    # ``tree-sitter-typescript`` when installed else regex fallback).
+    # Pass an explicit list to opt-in to a subset, e.g. ``["py"]`` for a
+    # pure-Python project.
+    index_languages: list[str] | None = None
+    # When ``IndexBuilder.build_incremental`` would touch more files than
+    # this threshold, it delegates to ``build_full`` instead — at some
+    # point a "smart" incremental refresh costs more than just rebuilding
+    # the index from scratch (sqlite WAL contention + per-file tree-sitter
+    # parse overhead). 5000 is a conservative default; raise it for
+    # high-churn repos where full rebuilds are expensive.
+    index_full_rebuild_threshold_files: int = Field(
+        default=5000, ge=100, le=100_000
+    )
+    # On huge repos (``RepoCapacity.is_huge``) the initial full build can
+    # take minutes. When True (default), ``autodev init`` spawns the
+    # builder in a background subprocess and returns immediately; the
+    # ``.autodev/index.db.building`` marker file signals to the per-trigger
+    # incremental hook that it should skip until the build completes.
+    # Set False to force synchronous initial build even on huge repos.
+    index_huge_repo_async_init: bool = True
+
     def require_all_roles(self) -> None:
         """Raise ValueError if any required role is missing from `agents`."""
         missing = [r for r in REQUIRED_AGENT_ROLES if r not in self.agents]

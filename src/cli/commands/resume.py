@@ -15,10 +15,36 @@ from typing import Literal, cast
 from adapters.base import PlatformAdapter
 from adapters.detect import get_adapter
 from agents import build_registry
+from autologging import get_logger
 from config.loader import load_config
 from errors import AutodevError
 from orchestrator import Orchestrator
-from state.paths import config_path
+from state.paths import config_path, index_db_path
+
+
+logger = get_logger(__name__)
+
+
+def _maybe_refresh_index(cwd: Path, cfg) -> None:
+    """v0.25.0: incremental refresh hook (mirrors execute.py / plan.py)."""
+    if not cfg.index_enabled:
+        return
+    db_path = index_db_path(cwd)
+    building_marker = cwd / ".autodev" / "index.db.building"
+    if building_marker.exists():
+        logger.info("index.skip_async_build_in_progress")
+        return
+    try:
+        from state.file_index import IndexBuilder, _last_indexed_sha
+
+        if not db_path.exists():
+            IndexBuilder.build_full(cwd, db_path)
+        else:
+            IndexBuilder.build_incremental(
+                cwd, db_path, since_sha=_last_indexed_sha(db_path)
+            )
+    except Exception as exc:  # noqa: BLE001 - never block on index failure
+        logger.warning("index.refresh_failed", err=str(exc))
 
 
 @click.command("resume")
@@ -43,6 +69,11 @@ def resume(platform: str | None) -> None:
     except AutodevError as exc:
         console.print(f"[red]autodev resume: config error[/red]: {exc}")
         sys.exit(1)
+
+    # v0.25.0: incremental file/symbol index refresh before Orchestrator
+    # construction. The architect retry path (if it fires) sees the latest
+    # tracked files via ``IndexQuery``.
+    _maybe_refresh_index(cwd, cfg)
 
     async def _run() -> None:
         platform_pref = platform or cfg.platform  # type: ignore[assignment]

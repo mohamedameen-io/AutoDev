@@ -27,6 +27,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from autologging import get_logger
 from tournament.task_overrides import TASK_MAX_TURNS_DEFAULTS
@@ -61,6 +62,25 @@ _HUGE_BUCKET_MULTIPLIERS: dict[str, float] = {
     "medium": 2.0,
     "complex": 1.5,
 }
+
+# v0.25.0: directories never walked by :func:`iter_repo_files`. Mirrors
+# ``qa.hallucination_guard._SKIP_DIRS`` (canonical skip set used across the
+# codebase). Kept identical so the file-index inventory and the
+# hallucination-guard scanner agree on what counts as "real source".
+_SKIP_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "dist",
+        "build",
+        ".tox",
+    }
+)
 
 
 @dataclass
@@ -361,8 +381,81 @@ def resolve_max_turns(
     return raw
 
 
+def iter_repo_files(
+    cwd: Path,
+    extensions: frozenset[str] | None = None,
+) -> Iterator[Path]:
+    """Yield repo-relative source files under *cwd*.
+
+    v0.25.0: introduced for the file/symbol index builder. Mirrors the
+    :func:`_count_files` git fast-path / :func:`os.walk` fallback strategy:
+
+    1. **Git fast-path** (``cwd/.git`` exists): runs ``git ls-files`` once
+       and yields one absolute :class:`pathlib.Path` per tracked file.
+       Vendored ``node_modules`` and ``.venv`` are correctly excluded
+       because they're not tracked.
+    2. **Walk fallback** (no ``.git``, or git CLI absent): recursively walks
+       *cwd*, skipping any directory whose name appears in
+       :data:`_SKIP_DIRS` (canonical set, mirrors
+       ``qa.hallucination_guard:54``).
+
+    Args:
+        cwd: Repo root.
+        extensions: Optional extension allowlist (lowercase, with leading
+            dot, e.g. ``frozenset({".py", ".cpp"})``). When ``None``, every
+            file is yielded.
+
+    Yields:
+        Absolute :class:`pathlib.Path` instances under *cwd* that survive
+        the skip-dirs filter and the optional extension filter.
+    """
+    if (cwd / ".git").exists():
+        try:
+            out = subprocess.run(
+                ["git", "ls-files"],
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if out.returncode == 0:
+                for line in out.stdout.splitlines():
+                    rel = line.strip()
+                    if not rel:
+                        continue
+                    # Defensive: even tracked files may sit under a SKIP
+                    # dir (someone added node_modules/foo.js). Apply the
+                    # filter consistently with the walk fallback below.
+                    parts = Path(rel).parts
+                    if any(p in _SKIP_DIRS for p in parts):
+                        continue
+                    if extensions is not None:
+                        if Path(rel).suffix.lower() not in extensions:
+                            continue
+                    candidate = cwd / rel
+                    if candidate.exists():
+                        yield candidate
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    # Walk fallback. Modify ``dirs`` in-place so ``os.walk`` does not
+    # descend into skipped directories at all (cheap; preserves the
+    # cost-bound used by ``hallucination_guard._iter_files``).
+    for root, dirs, files in os.walk(cwd):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        root_path = Path(root)
+        for name in files:
+            if extensions is not None:
+                if Path(name).suffix.lower() not in extensions:
+                    continue
+            yield root_path / name
+
+
 __all__ = [
     "RepoCapacity",
+    "iter_repo_files",
     "probe_repo",
     "resolve_max_turns",
 ]

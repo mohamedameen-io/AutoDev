@@ -28,6 +28,13 @@ The flow:
    ``git ls-files`` snapshot), so the architect can self-correct on the
    second pass.
 
+v0.25.0 upgrade: when ``.autodev/index.db`` exists, the fuzzy-match
+suggestion path prefers ``IndexQuery.search_files`` (sqlite-FTS5 trigram
+search) over the ``difflib`` fallback. Higher-quality suggestions, no
+extra subprocess. The v0.24.3 fallback path remains as the no-index branch
+so non-indexed contexts (test fixtures, brand-new ``init`` runs before
+first build) still get a useful "did you mean" hint.
+
 Why a separate module: keeps :mod:`plan_parser` pure-text (existing tests
 stay green; ``parse_plan_markdown`` remains usable in fixtures without a
 real filesystem) and keeps :mod:`path_validator` focused on string-shape
@@ -39,6 +46,7 @@ from __future__ import annotations
 import difflib
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from orchestrator.path_validator import PathValidationError
 from state.schemas import Plan
@@ -58,19 +66,36 @@ class _RepoFileSnapshot:
     ``capture_output=True``). On non-git trees or git failure the snapshot
     becomes the empty set; ``exists`` then returns ``False`` for everything
     and the caller decides whether to fail-soft or hard.
+
+    v0.25.0: optionally accepts an ``IndexQuery`` instance. When supplied,
+    ``closest()`` queries the index first (sqlite-FTS5 trigram match) and
+    falls back to the v0.24.3 ``difflib`` path on miss. ``exists`` and
+    ``is_dir_prefix`` remain on the git ls-files snapshot — those are
+    cheap set lookups and the index doesn't add value there.
     """
 
-    __slots__ = ("_cwd", "_tracked", "_loaded")
+    __slots__ = ("_cwd", "_tracked", "_loaded", "_index_query")
 
-    def __init__(self, cwd: Path) -> None:
+    def __init__(
+        self, cwd: Path, *, index_query: Any | None = None
+    ) -> None:
         self._cwd = cwd
         self._tracked: frozenset[str] = frozenset()
         self._loaded = False
+        self._index_query = index_query
 
     @classmethod
-    def for_cwd(cls, cwd: Path) -> "_RepoFileSnapshot":
-        """Build a snapshot bound to *cwd*. Subprocess runs lazily on first lookup."""
-        return cls(cwd)
+    def for_cwd(
+        cls, cwd: Path, *, index_query: Any | None = None
+    ) -> "_RepoFileSnapshot":
+        """Build a snapshot bound to *cwd*.
+
+        Subprocess runs lazily on first lookup. Optional ``index_query``
+        (an :class:`state.file_index.IndexQuery` instance) gives ``closest``
+        a higher-quality suggestion source when the v0.25.0 index is
+        available.
+        """
+        return cls(cwd, index_query=index_query)
 
     def _ensure_loaded(self) -> None:
         if self._loaded:
@@ -125,14 +150,32 @@ class _RepoFileSnapshot:
         return any(p.startswith(prefix) for p in self._tracked)
 
     def closest(self, rel_path: str) -> str | None:
-        """Return the closest tracked path via :func:`difflib.get_close_matches`.
+        """Return the closest tracked path.
 
-        ``cutoff=0.7`` filters out hopelessly-different paths (returns
-        ``None`` rather than a misleading suggestion). ``n=1`` keeps the
-        suggestion surface single-shot; the v0.25.0 index swap will likely
-        return higher-quality matches but the v0.24.3 path is sufficient
-        for the bug class we're closing today.
+        v0.25.0: prefer ``IndexQuery.search_files`` when an index is
+        available — sqlite-FTS5 trigram matching beats difflib on
+        substring/typo cases and avoids loading the entire ls-files
+        snapshot into Python for the comparison.
+
+        Fallback (no index, or index query returned no hits): the v0.24.3
+        path — :func:`difflib.get_close_matches` over the cached
+        ``git ls-files`` snapshot. ``cutoff=0.7`` filters hopelessly-
+        different paths (returns ``None`` rather than a misleading
+        suggestion). ``n=1`` keeps the suggestion surface single-shot.
         """
+        # v0.25.0: index-first path. ``IndexQuery.search_files`` returns
+        # a list of ``FileHit``; take the top hit's ``.path``. Wrap in a
+        # broad except so a transient index error never blocks the
+        # validator's primary job (raising PathValidationError on the
+        # caller side).
+        if self._index_query is not None:
+            try:
+                hits = self._index_query.search_files(rel_path, limit=1)
+                if hits:
+                    return hits[0].path
+            except Exception:  # noqa: BLE001 - fall through to difflib
+                pass
+
         self._ensure_loaded()
         if not self._tracked:
             return None
@@ -174,8 +217,26 @@ def validate_files_exist(plan: Plan, cwd: Path) -> None:
     paths as missing. We skip silently in that case — non-git contexts
     (test fixtures, scratch dirs, brand-new ``git init`` with no files)
     aren't the population this validator was built for.
+
+    v0.25.0: when ``.autodev/index.db`` exists, the snapshot's ``closest``
+    method queries it for higher-quality fuzzy suggestions; otherwise the
+    v0.24.3 difflib-over-ls-files path runs.
     """
-    snapshot = _RepoFileSnapshot.for_cwd(cwd)
+    # v0.25.0: try to wire the IndexQuery for richer suggestions. Best-effort:
+    # if the index module isn't importable (e.g. parallel agent's code not
+    # landed yet) or the db doesn't exist, fall through to the v0.24.3
+    # git-ls-files-only path.
+    index_query: Any | None = None
+    db_path = cwd / ".autodev" / "index.db"
+    if db_path.exists():
+        try:
+            from state.file_index import IndexQuery
+
+            index_query = IndexQuery(db_path)
+        except Exception:  # noqa: BLE001 - graceful no-index fallback
+            index_query = None
+
+    snapshot = _RepoFileSnapshot.for_cwd(cwd, index_query=index_query)
     if snapshot.is_empty:
         return
 

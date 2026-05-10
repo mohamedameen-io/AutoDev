@@ -15,10 +15,46 @@ from typing import Literal, cast
 from adapters.detect import get_adapter
 from adapters.inline_types import DelegationPendingSignal
 from agents import build_registry
+from autologging import get_logger
 from config.loader import load_config
 from errors import AutodevError
 from orchestrator import Orchestrator
-from state.paths import config_path
+from state.paths import config_path, index_db_path
+
+
+logger = get_logger(__name__)
+
+
+def _maybe_refresh_index(cwd: Path, cfg) -> None:
+    """v0.25.0: incremental refresh hook shared across execute/plan/resume.
+
+    Skips silently when:
+      * ``cfg.index_enabled`` is False
+      * ``.autodev/index.db.building`` exists (async build in progress)
+
+    Else builds full index when missing, otherwise runs incremental refresh
+    keyed off the persisted ``last_indexed_sha``. Failures are logged and
+    swallowed — the orchestrator must continue even if the index is stale
+    (the architect just gets an emptier candidate-files block).
+    """
+    if not cfg.index_enabled:
+        return
+    db_path = index_db_path(cwd)
+    building_marker = cwd / ".autodev" / "index.db.building"
+    if building_marker.exists():
+        logger.info("index.skip_async_build_in_progress")
+        return
+    try:
+        from state.file_index import IndexBuilder, _last_indexed_sha
+
+        if not db_path.exists():
+            IndexBuilder.build_full(cwd, db_path)
+        else:
+            IndexBuilder.build_incremental(
+                cwd, db_path, since_sha=_last_indexed_sha(db_path)
+            )
+    except Exception as exc:  # noqa: BLE001 - never block on index failure
+        logger.warning("index.refresh_failed", err=str(exc))
 
 
 @click.command("execute")
@@ -61,6 +97,11 @@ def execute(
             "[yellow]--dry-run not yet implemented; no work will be done.[/yellow]"
         )
         sys.exit(0)
+
+    # v0.25.0: incremental file/symbol index refresh. Runs before
+    # Orchestrator instantiation so the planner sees the latest tracked
+    # files when it queries ``IndexQuery.get_candidates_for_spec``.
+    _maybe_refresh_index(cwd, cfg)
 
     async def _run() -> None:
         platform_pref = platform or cfg.platform  # type: ignore[assignment]

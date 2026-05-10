@@ -68,7 +68,7 @@ requires-dist = [
     { name = "tenacity", specifier = ">=8.2" },
     { name = "tree-sitter", marker = "extra == 'treesitter'", specifier = ">=0.21" },
     { name = "tree-sitter-cpp", marker = "extra == 'treesitter'", specifier = ">=0.20" },
-    { name = "tree-sitter-typescript", marker = "extra == 'treesitter'", specifier = ">=0.20" },
+    { name = "tree-sitter-typescript", marker = "extra == 'treesitter'", specifier = ">=0.21" },
     { name = "types-psutil", marker = "extra == 'dev'", specifier = ">=5.9" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "vulture", marker = "extra == 'code-size'", specifier = ">=2.10" },

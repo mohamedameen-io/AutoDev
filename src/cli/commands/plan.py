@@ -14,10 +14,41 @@ from typing import Literal, cast
 
 from adapters.detect import get_adapter
 from agents import build_registry
+from autologging import get_logger
 from config.loader import load_config
 from errors import AutodevError
 from orchestrator import Orchestrator
-from state.paths import config_path
+from state.paths import config_path, index_db_path
+
+
+logger = get_logger(__name__)
+
+
+def _maybe_refresh_index(cwd: Path, cfg) -> None:
+    """v0.25.0: incremental refresh hook (mirrors execute.py).
+
+    Skips on missing ``cfg.index_enabled`` or while ``.autodev/index.db.building``
+    marker exists. Builds full when missing, incremental otherwise. Failures
+    are logged + swallowed so the planner can continue with a stale index.
+    """
+    if not cfg.index_enabled:
+        return
+    db_path = index_db_path(cwd)
+    building_marker = cwd / ".autodev" / "index.db.building"
+    if building_marker.exists():
+        logger.info("index.skip_async_build_in_progress")
+        return
+    try:
+        from state.file_index import IndexBuilder, _last_indexed_sha
+
+        if not db_path.exists():
+            IndexBuilder.build_full(cwd, db_path)
+        else:
+            IndexBuilder.build_incremental(
+                cwd, db_path, since_sha=_last_indexed_sha(db_path)
+            )
+    except Exception as exc:  # noqa: BLE001 - never block on index failure
+        logger.warning("index.refresh_failed", err=str(exc))
 
 
 @click.command("plan")
@@ -56,6 +87,11 @@ def plan(intent: str, platform: str | None, complexity: str | None) -> None:
 
     if complexity is not None:
         cfg = cfg.model_copy(update={"user_complexity": complexity})
+
+    # v0.25.0: incremental file/symbol index refresh before Orchestrator
+    # construction. The planner queries the index for candidate files
+    # to inject into the architect's envelope.
+    _maybe_refresh_index(cwd, cfg)
 
     async def _run() -> None:
         platform_pref = platform or cfg.platform  # type: ignore[assignment]

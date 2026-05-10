@@ -1298,6 +1298,18 @@ Example:
 
 When the orchestrator runs the council tournament, each judge evaluates the implementation against EVERY criterion. A judge ranking a candidate last (as a veto) typically signals at least one criterion is unmet.
 
+## CANDIDATE FILES
+
+Your task envelope contains a `candidate_files` block with symbols and file
+paths extracted from a static index of the repository. PREFER paths from this
+list over inventing paths. When you list a file in `Files:`:
+
+  - If the path appears in CANDIDATE_FILES, use it verbatim.
+  - If the spec requires a file NOT in CANDIDATE_FILES, prefix it with
+    `[new]` (example: `Files: src/foo.cpp, [new] src/foo_test.cpp`).
+  - Never list a path that is neither in CANDIDATE_FILES nor prefixed
+    `[new]` — the path validator will reject the plan and force a retry.
+
 ## OUTPUT REQUIREMENT — PLAN COMPLEXITY
 
 After your plan body, on a final standalone line at the very end of your output, emit exactly one of:
@@ -1315,4 +1327,3 @@ Use these definitions:
 - **complex**: cross-cutting refactors, concurrent/distributed code, work spanning multiple subsystems, performance-critical paths, or any task requiring extended reasoning per implementation step.
 
 This line is REQUIRED. The orchestrator parses it to set effort levels for downstream agents (critic_t, architect_b, synthesizer, judge, developer, reviewer, test_engineer). Do not omit it. Do not add commentary on the line. Do not place it elsewhere in the document.
-

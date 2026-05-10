@@ -22,6 +22,7 @@ TOURNAMENTS_DIR: str = "tournaments"
 SESSIONS_DIR: str = "sessions"
 DEBUG_DIR: str = "debug"
 LOCK_FILE: str = ".lock"
+INDEX_DB_FILE: str = "index.db"
 
 
 def autodev_root(cwd: Path) -> Path:
@@ -148,12 +149,18 @@ def inline_state_path(cwd: Path) -> Path:
     return autodev_root(cwd) / INLINE_STATE_FILE
 
 
+def index_db_path(cwd: Path) -> Path:
+    """Return ``.autodev/index.db`` — sqlite-FTS5 file/symbol index (v0.25.0)."""
+    return autodev_root(cwd) / INDEX_DB_FILE
+
+
 __all__ = [
     "AUTODEV_DIR",
     "CONFIG_FILE",
     "DEBUG_DIR",
     "DELEGATIONS_DIR",
     "EVIDENCE_DIR",
+    "INDEX_DB_FILE",
     "INLINE_STATE_FILE",
     "KNOWLEDGE_FILE",
     "LEDGER_FILE",
@@ -173,6 +180,7 @@ __all__ = [
     "ensure_autodev_dir",
     "evidence_dir",
     "evidence_path",
+    "index_db_path",
     "inline_state_path",
     "knowledge_path",
     "ledger_path",

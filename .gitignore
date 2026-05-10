@@ -50,6 +50,14 @@ Thumbs.db
 .autodev/tournaments/*/ab/
 # v0.21.0 A1: warm-start worktree pool — recycled per execute phase.
 .autodev/execute_worktrees_pool/
+# v0.25.0: file/symbol index — built per-workspace, never checked in.
+.autodev/index.db
+.autodev/index.db-shm
+.autodev/index.db-wal
+.autodev/index.db.lock
+.autodev/index.db.building
+.autodev/index.state.json
+.autodev/index-build.log
 
 # Swarm files
 .swarm/

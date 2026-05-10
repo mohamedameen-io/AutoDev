@@ -6,16 +6,20 @@ Creates:
 - ``.autodev/spec.md`` — placeholder intent file
 - ``.claude/agents/<role>.md`` — Claude Code agent definitions
 - ``.cursor/rules/<role>.mdc`` — Cursor rules
+- ``.autodev/index.db`` — sqlite-FTS5 file/symbol index (v0.25.0)
 
 Idempotency:
 
 - If ``.autodev/`` exists and ``--force`` is not set, exit non-zero with a
   clear message.
 - With ``--force``, overwrite all generated files in place.
+- ``--rebuild-index`` forces a full index rebuild without otherwise
+  touching scaffolding (gated independently of ``--force``).
 """
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -70,16 +74,25 @@ _SPEC_TEMPLATE = """# Project Intent
     is_flag=True,
     help="Configure for inline (agent-embedded) mode.",
 )
-def init(platform: str, force: bool, inline: bool) -> None:
+@click.option(
+    "--rebuild-index",
+    is_flag=True,
+    help=(
+        "Force a full rebuild of the file/symbol index (.autodev/index.db) "
+        "even when .autodev/ already exists. Gated independently of --force."
+    ),
+)
+def init(platform: str, force: bool, inline: bool, rebuild_index: bool) -> None:
     """Scaffold ``.autodev/`` and render platform-native agent files."""
     cwd = Path.cwd()
     console = Console()
 
     autodev_dir = cwd / ".autodev"
-    if autodev_dir.exists() and not force:
+    if autodev_dir.exists() and not force and not rebuild_index:
         console.print(
             f"[red]autodev init: {autodev_dir} already exists.[/red] "
-            "Use --force to overwrite."
+            "Use --force to overwrite, or --rebuild-index to refresh "
+            "the index without touching the rest."
         )
         sys.exit(1)
 
@@ -129,6 +142,70 @@ def init(platform: str, force: bool, inline: bool) -> None:
         adapter = InlineAdapter(cwd=cwd, platform_hint="claude_code")
         asyncio.run(adapter.init_workspace(cwd, list(specs.values())))
 
+    # v0.25.0: build the file/symbol index (sqlite-FTS5 at .autodev/index.db).
+    # Synchronous on small/medium repos; spawned in a background subprocess
+    # on huge repos (RepoCapacity.is_huge AND cfg.index_huge_repo_async_init).
+    # Failures here are surfaced but never block init — the per-trigger hook
+    # in execute/plan/resume will retry on the next invocation.
+    index_summary: str | None = None
+    if cfg.index_enabled:
+        try:
+            from runtime.repo_probe import probe_repo
+            from state.file_index import IndexBuilder
+            from state.paths import index_db_path
+
+            db_path = index_db_path(cwd)
+            capacity = probe_repo(cwd)
+            if capacity.is_huge and cfg.index_huge_repo_async_init:
+                # Spawn a detached subprocess; the spawned process sets the
+                # ``.autodev/index.db.building`` marker before schema creation
+                # so the per-trigger hook in execute/plan/resume detects it
+                # and skips the incremental refresh until the build completes.
+                log_path = autodev_dir / "index-build.log"
+                log_handle = log_path.open("ab")
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "state.file_index",
+                    "build-full",
+                    "--cwd",
+                    str(cwd),
+                    "--db",
+                    str(db_path),
+                ]
+                subprocess.Popen(  # noqa: S603 - executable is sys.executable
+                    cmd,
+                    cwd=str(cwd),
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                )
+                index_summary = (
+                    "background build (huge repo) — see "
+                    f"{log_path.relative_to(cwd)}"
+                )
+                console.print(
+                    "[yellow]Index build running in background.[/yellow] "
+                    "Run [bold]autodev doctor[/bold] to check progress."
+                )
+            else:
+                with console.status("Building file/symbol index..."):
+                    stats = IndexBuilder.build_full(cwd, db_path)
+                index_summary = (
+                    f"{stats.file_count} files, {stats.symbol_count} symbols "
+                    f"({stats.duration_ms} ms)"
+                )
+                console.print(
+                    f"[green]Indexed {stats.file_count} files, "
+                    f"{stats.symbol_count} symbols in "
+                    f"{stats.duration_ms} ms.[/green]"
+                )
+        except Exception as exc:  # noqa: BLE001 - never block init on index errors
+            console.print(
+                f"[yellow]Index build failed:[/yellow] {exc} "
+                "(execute/plan/resume will retry on next invocation)"
+            )
+
     # Pretty console summary.
     table = Table(title="autodev init")
     table.add_column("File", style="cyan", no_wrap=False)
@@ -141,6 +218,8 @@ def init(platform: str, force: bool, inline: bool) -> None:
         table.add_row(str(p.relative_to(cwd)), "Cursor rule")
     if slash_path is not None:
         table.add_row(str(slash_path.relative_to(cwd)), "slash command (/autodev)")
+    if index_summary is not None:
+        table.add_row(cfg.index_path, f"file/symbol index — {index_summary}")
     console.print(table)
     console.print(
         f"[green]autodev initialized.[/green] Platform: [bold]{cfg.platform}[/bold]."

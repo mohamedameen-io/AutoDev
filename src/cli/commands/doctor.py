@@ -166,5 +166,61 @@ def doctor() -> None:
         except ConfigError:
             console.print("[yellow]Guardrails: config unavailable[/yellow]")
 
+        # --- Index section (v0.25.0) ---
+        console.print()
+        _render_index_section(console, cwd, cfg_path)
+
     exit_code = 0 if (either_ok and results[2].ok) else 1
     sys.exit(exit_code)
+
+
+def _render_index_section(console: Console, cwd: Path, cfg_path: Path) -> None:
+    """Render the v0.25.0 file/symbol index summary table.
+
+    On missing index, render a one-line action ("MISSING — run autodev
+    init --rebuild-index"). On query failure, surface the error but never
+    abort doctor — the index is informational.
+    """
+    try:
+        cfg = load_config(cfg_path)
+    except ConfigError:
+        return
+    if not cfg.index_enabled:
+        console.print(
+            "[yellow]Index:[/yellow] disabled "
+            "(cfg.index_enabled = False)"
+        )
+        return
+
+    db_path = cwd / cfg.index_path
+    table = Table(title="Index", show_lines=False)
+    table.add_column("Field", no_wrap=True)
+    table.add_column("Value", no_wrap=False)
+    table.add_row("path", str(cfg.index_path))
+
+    if not db_path.exists():
+        table.add_row(
+            "status",
+            "[yellow]MISSING — run autodev init --rebuild-index[/yellow]",
+        )
+        console.print(table)
+        return
+
+    try:
+        from state.file_index import IndexQuery
+
+        meta = IndexQuery(db_path).meta_summary()
+    except Exception as exc:  # noqa: BLE001 - informational table only
+        table.add_row("status", f"[red]error: {exc}[/red]")
+        console.print(table)
+        return
+
+    for key in (
+        "file_count",
+        "symbol_count",
+        "last_indexed_sha",
+        "last_indexed_at",
+        "index_version",
+    ):
+        table.add_row(key, str(meta.get(key, "-")))
+    console.print(table)

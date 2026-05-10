@@ -134,6 +134,28 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         )
         await write_evidence(cwd, "plan-domain_expert", sme_ev)
 
+        # v0.25.0: query the file/symbol index for candidate paths/symbols
+        # relevant to the spec text. The architect's prompt has a CANDIDATE
+        # FILES section instructing it to prefer these paths over inventing
+        # new ones; missing/disabled index degrades to an empty string and
+        # the architect prompt's "PREFER paths from this list" sentence
+        # becomes a no-op (no broken behavior).
+        candidate_digest_str = ""
+        if orch.cfg.index_enabled:
+            db_path = orch.cwd / orch.cfg.index_path
+            if db_path.exists():
+                try:
+                    from state.file_index import IndexQuery
+
+                    digest = IndexQuery(db_path).get_candidates_for_spec(
+                        spec_text=intent, limit=20
+                    )
+                    candidate_digest_str = digest.render(max_chars=2500)
+                except Exception as exc:  # noqa: BLE001 - never block plan
+                    logger.warning(
+                        "plan_phase.index_query_failed", err=str(exc)
+                    )
+
         architect_env = DelegationEnvelope(
             task_id="plan",
             target_agent="architect",
@@ -154,6 +176,7 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                 "spec": intent,
                 "explorer_findings": explorer_result.text[:4000],
                 "domain_expert_findings": domain_expert_result.text[:4000],
+                "candidate_files": candidate_digest_str,
             },
         )
         architect_result = await _delegate(orch, "architect", architect_env)

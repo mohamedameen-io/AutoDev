@@ -54,6 +54,7 @@ def status() -> None:
                 "'<intent>'[/bold] to create one."
             )
             _print_knowledge_summary(console, len(swarm_entries), len(hive_entries))
+            _print_index_summary(console, cwd, cfg)
             return
         console.print(
             f"[cyan]Plan:[/cyan] {plan.metadata.get('title', plan.plan_id)} "
@@ -87,6 +88,7 @@ def status() -> None:
         summary = " | ".join(f"{k}={v}" for k, v in totals.items())
         console.print(f"[dim]{summary}[/dim]")
         _print_knowledge_summary(console, len(swarm_entries), len(hive_entries))
+        _print_index_summary(console, cwd, cfg)
 
     try:
         asyncio.run(_run())
@@ -100,4 +102,34 @@ def _print_knowledge_summary(console: Console, swarm_count: int, hive_count: int
     console.print(
         f"[cyan]Knowledge:[/cyan] {swarm_count} lessons in swarm tier, "
         f"{hive_count} in hive tier"
+    )
+
+
+def _print_index_summary(console: Console, cwd: Path, cfg) -> None:
+    """v0.25.0: one-line file/symbol index summary. Purely informational —
+    swallows query errors and reports a friendly state when missing."""
+    if not getattr(cfg, "index_enabled", False):
+        return
+    db_path = cwd / cfg.index_path
+    if not db_path.exists():
+        console.print(
+            "[cyan]Index:[/cyan] [yellow]MISSING[/yellow] "
+            "(run [bold]autodev init --rebuild-index[/bold])"
+        )
+        return
+    try:
+        from state.file_index import IndexQuery
+
+        meta = IndexQuery(db_path).meta_summary()
+    except Exception as exc:  # noqa: BLE001 - never let index break status
+        console.print(
+            f"[cyan]Index:[/cyan] [red]error[/red] ({exc})"
+        )
+        return
+    file_count = meta.get("file_count", "?")
+    symbol_count = meta.get("symbol_count", "?")
+    last_indexed = meta.get("last_indexed_at", "?")
+    console.print(
+        f"[cyan]Index:[/cyan] {file_count} files, {symbol_count} symbols "
+        f"(last indexed {last_indexed})"
     )

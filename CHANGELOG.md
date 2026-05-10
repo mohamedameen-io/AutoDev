@@ -2,6 +2,46 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] - 2026-05-10
+
+### Added (planner substrate)
+- **Repo file/symbol index for planner candidate lookup.** New `src/state/file_index.py` builds a sqlite-FTS5 index (`.autodev/index.db`) of every tracked file and its top-level symbols (functions, classes, methods, namespaces, structs). Built at `autodev init` (synchronous for small/medium repos, background subprocess on huge repos detected via `runtime.repo_probe.RepoCapacity.is_huge`); refreshed incrementally on every `autodev execute`/`plan`/`resume` via `git diff --name-only <last_indexed_sha>..HEAD` (mtime fallback for non-git repos). WAL mode lets per-task worktrees query the index concurrently without contention. `.autodev/index.db.lock` PID file enforces single-writer; `.autodev/index.state.json` tracks `last_indexed_sha` atomically for recovery from sqlite corruption mid-build.
+- **Architect candidate-file injection.** `orchestrator/plan_phase.py` now queries the index with the spec text (`IndexQuery.get_candidates_for_spec`) and prepends a CANDIDATE_FILES block to the architect's `DelegationEnvelope.context`. The architect prompt (`src/agents/prompts/architect.md`) gained a `## CANDIDATE FILES` section instructing it to prefer indexed paths over invented ones and to use the v0.24.3 `[new]` prefix for genuinely-new files. Cuts hallucinated path retries on Unity-scale repos. Smoke benchmark on AutoDev itself: 494 files / 4124 symbols indexed in 378 ms; spec-keyed candidate lookup returns the right symbols + files.
+- **Per-language symbol extractors.** `src/state/language_extractors/` exposes a `LanguageExtractor` Protocol with concrete extractors for Python (`ast.parse` + walk), C++ (reuses `qa.cpp_symbols.extract_declarations` + tree-sitter walk when available), TypeScript/JavaScript (tree-sitter-typescript when installed, regex fallback otherwise), and a regex catch-all for unknown languages.
+- **`autodev doctor` Index section.** Reports `path`, `file_count`, `symbol_count`, `last_indexed_sha`, `last_indexed_at`, `index_version`. Surfaces missing-index state with a one-line operator action.
+- **`autodev status` Index row.** One-line snapshot in the existing summary table.
+- **`autodev init --rebuild-index` flag.** Forces a full index rebuild without overwriting other scaffolding.
+- **v0.24.3 fuzzy-suggestion upgrade.** `file_existence_validator._RepoFileSnapshot.closest()` now prefers `IndexQuery.search_files(...)` when the index is available, falling back to the v0.24.3 difflib-over-git-lsfiles path otherwise. Higher-quality "did you mean" hints in the architect-retry envelope.
+
+### Added (config schema)
+- `AutodevConfig.index_enabled: bool = True`
+- `AutodevConfig.index_path: str = ".autodev/index.db"`
+- `AutodevConfig.index_languages: list[str] | None = None` (None = auto-detect: py, cpp, ts)
+- `AutodevConfig.index_full_rebuild_threshold_files: int = 5000` (re-index from scratch when more files changed than this)
+- `AutodevConfig.index_huge_repo_async_init: bool = True`
+
+### Added (runtime)
+- `runtime.repo_probe.iter_repo_files(cwd, extensions=None) -> Iterator[Path]` — public iterator over tracked files (`git ls-files` fast-path) or walked files (`os.walk` fallback). Reuses the `qa.hallucination_guard` skip-dirs set.
+- `state.paths.index_db_path(cwd) -> Path` — canonical resolution of the index db location.
+
+### Added (optional dependency)
+- `tree-sitter-typescript >= 0.21` lands in `[project.optional-dependencies] tree-sitter` (alongside the existing `tree-sitter-cpp`). Optional: regex fallback covers when not installed.
+
+### Added (gitignore)
+- `.autodev/index.db`, `.autodev/index.db-shm`, `.autodev/index.db-wal`, `.autodev/index.db.lock`, `.autodev/index.db.building`, `.autodev/index.state.json`, `.autodev/index-build.log` — all per-workspace, never checked in.
+
+### Migration
+- Workspaces created with v0.24.x have no `.autodev/index.db`; first `autodev execute`/`plan`/`resume` triggers a full build (synchronous on small/medium repos, async on huge). `autodev doctor` reports the missing-index state until the build completes.
+- Kill switches: per-workspace via `cfg.index_enabled = False`; per-process via env var `AUTODEV_INDEX_DISABLED=1` (raises `IndexDisabledError`, caught and logged at the call site as a no-op).
+
+### Tests
+- 35 new tests across 8 new test files (`test_state_file_index_build.py`, `test_state_file_index_query.py`, `test_state_language_extractors.py`, `test_runtime_repo_probe_iter_files.py`, `test_orchestrator_plan_phase_with_index.py`, `test_cli_init_with_index.py`, `test_cli_execute_incremental_index.py`, `test_orchestrator_file_existence_validator_with_index.py`). `test_ts_extractor_with_treesitter` skips cleanly when the optional binding is absent.
+
+### Notes on deferred items
+- **Removal of `worktree_sparse_checkout_enabled` deferred to v0.26.0** (was scheduled for v0.25.0 per the v0.24.0 deprecation note). v0.25.0 stays scope-focused on the new index; the deprecated flag continues to work as in v0.24.x.
+- The architect's behavior degrades gracefully when the index is absent or disabled — the candidate-files context value is an empty string and the prompt's "PREFER paths from this list" sentence becomes a no-op.
+- LSP integration (clangd / pyright / tsserver) is the natural next step after this release once tree-sitter coverage proves insufficient. Not in scope for v0.25.0.
+
 ## [0.24.3] - 2026-05-10
 
 ### Fixed
