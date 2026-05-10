@@ -315,6 +315,25 @@ class TournamentsConfig(BaseModel):
     auto_disable_for_models: list[str] = Field(default_factory=lambda: ["opus"])
 
 
+class CodeSizeThresholds(BaseModel):
+    """v0.22.0 Phase 1: Fontana 2015 anchors for the code-size gate.
+
+    All thresholds are *inclusive ceilings* — a value > the threshold trips
+    the warn. Defaults are the v1 Fontana 2015 anchors documented in the
+    plan (cyclomatic > 20 = warn-eligible; LOC per function > 100 =
+    block-eligible). Operators may relax them per-repo via
+    ``cfg.qa_gates.code_size_thresholds`` in ``.autodev/config.json``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cyclomatic_max: int = 20  # Fontana 2015 (highly complex)
+    loc_per_function: int = 100  # Fontana 2015 (block-eligible)
+    dead_symbols: int = 0
+    commented_out_blocks: int = 0
+    duplicate_clusters: int = 0
+
+
 class QAGatesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -342,6 +361,12 @@ class QAGatesConfig(BaseModel):
     # is run as an actual gate via ``qa.mutation_test.run_mutation_test``.
     mutation_test_enabled: bool = False
     mutation_test_threshold: float = 0.7
+    # v0.22.0 Phase 1: opt-in code-size (anti-bloat) gate. Off by default
+    # for v1 (warn-only — see ``qa.code_size``). Flip to True per-repo to
+    # surface deterministic syntactic-bloat findings on the diff.
+    code_size: bool = False
+    code_size_baseline_enabled: bool = False
+    code_size_thresholds: CodeSizeThresholds | None = None
 
 
 class GuardrailsConfig(BaseModel):

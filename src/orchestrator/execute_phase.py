@@ -47,6 +47,7 @@ from qa import (
     run_syntax_check,
     run_tests,
 )
+from qa.code_size import run_code_size
 from state.paths import autodev_root
 from state.schemas import (
     CoderEvidence,
@@ -2853,6 +2854,30 @@ def _files_changed_for_secretscan(
     return [Path(p) for p in extract_files_from_diff(developer_result.diff)]
 
 
+def _surface_warning(task: "Task", gate_name: str, result: GateResult) -> None:
+    """Record a warn/info-severity gate result on the task without halting.
+
+    v0.22.0: warn-severity GateResults (passed=True, severity="warn") and
+    info-severity findings (passed=False, severity="info") are surfaced
+    via the task's ``metadata["qa_warnings"]`` list so downstream
+    consumers (evidence ledger, status command, knowledge seeding) can
+    pick them up without a separate channel. The list is appended in
+    gate-evaluation order; each entry is a small dict with the gate
+    name, severity, details snippet, and structured metrics carrier.
+    """
+    if task.metadata is None:  # pragma: no cover — Task default is dict
+        task.metadata = {}
+    warnings = task.metadata.setdefault("qa_warnings", [])
+    warnings.append(
+        {
+            "gate": gate_name,
+            "severity": result.severity,
+            "details": result.details,
+            "metrics": result.metrics,
+        }
+    )
+
+
 async def _run_qa_gates(
     orch: "Orchestrator",
     task: "Task",
@@ -2864,6 +2889,13 @@ async def _run_qa_gates(
     developer delegation. When supplied, the secretscan gate is invoked
     with ``paths=`` extracted from its diff so only the executor's just-
     introduced changes are scanned. None preserves legacy whole-tree walk.
+
+    v0.22.0: respects :class:`GateResult` severity. ``passed=False`` with
+    the default ``severity="block"`` halts as before (byte-identical to
+    v0.21.0). ``passed=True, severity="warn"`` and ``passed=False,
+    severity="info"`` are surfaced via :func:`_surface_warning` and the
+    gate dispatch continues. Existing gates that don't set ``severity``
+    inherit the "block" default — pre-v0.22.0 behavior is preserved.
     """
     from plugins.registry import QAContext
 
@@ -2879,12 +2911,15 @@ async def _run_qa_gates(
         getattr(orch.cfg, "hallucination_guard", True)
     )
 
-    gates: list[tuple[bool, Callable[[], Awaitable[GateResult]]]] = [
-        (cfg.syntax_check, lambda: run_syntax_check(cwd, language)),
-        (cfg.lint, lambda: run_lint(cwd, language)),
-        (cfg.build_check, lambda: run_build_check(cwd, language)),
-        (cfg.test_runner, lambda: run_tests(cwd)),
+    # v0.22.0: gates are ``(name, enabled, callable)`` triples so the
+    # warn-surface helper can attribute findings to a gate.
+    gates: list[tuple[str, bool, Callable[[], Awaitable[GateResult]]]] = [
+        ("syntax_check", cfg.syntax_check, lambda: run_syntax_check(cwd, language)),
+        ("lint", cfg.lint, lambda: run_lint(cwd, language)),
+        ("build_check", cfg.build_check, lambda: run_build_check(cwd, language)),
+        ("test_runner", cfg.test_runner, lambda: run_tests(cwd)),
         (
+            "secretscan",
             cfg.secretscan,
             lambda: run_secretscan(
                 cwd,
@@ -2894,10 +2929,12 @@ async def _run_qa_gates(
             ),
         ),
         (
+            "hallucination_guard",
             hallucination_guard_enabled,
             lambda: run_hallucination_guard(cwd, paths=secretscan_paths),
         ),
         (
+            "mutation_test",
             cfg.mutation_test_enabled,
             lambda: run_mutation_test(
                 cwd,
@@ -2905,14 +2942,43 @@ async def _run_qa_gates(
                 kill_rate_threshold=cfg.mutation_test_threshold,
             ),
         ),
+        (
+            "code_size",
+            getattr(cfg, "code_size", False),
+            lambda: run_code_size(
+                cwd,
+                paths=secretscan_paths,
+                thresholds=getattr(cfg, "code_size_thresholds", None),
+                baseline_enabled=getattr(
+                    cfg, "code_size_baseline_enabled", False
+                ),
+            ),
+        ),
     ]
 
-    for enabled, gate_fn in gates:
+    for name, enabled, gate_fn in gates:
         if not enabled:
             continue
         result: GateResult = await gate_fn()
-        if not result.passed:
+        # v0.22.0 severity dispatch:
+        #   * passed=False AND severity=="block" (legacy default) → halt.
+        #   * passed=True AND severity=="warn" → surface as warning, continue.
+        #   * passed=False AND severity=="info" → surface as info, continue.
+        #   * other combos (passed=True silent, etc.) → no-op.
+        severity = getattr(result, "severity", "block")
+        if not result.passed and severity == "block":
             return result.details or "QA gate failed"
+        if (result.passed and severity == "warn") or (
+            not result.passed and severity == "info"
+        ):
+            _surface_warning(task, name, result)
+            logger.info(
+                "execute_phase.qa_gate_warning",
+                task_id=task.id,
+                gate=name,
+                severity=severity,
+                details=(result.details or "")[:200],
+            )
 
     # Run plugin QA gates after all built-in gates pass.
     if hasattr(orch, "plugin_registry") and orch.plugin_registry is not None:
@@ -2928,8 +2994,13 @@ async def _run_qa_gates(
                     error=str(exc),
                 )
                 continue
-            if not plugin_result.passed:
+            severity = getattr(plugin_result, "severity", "block")
+            if not plugin_result.passed and severity == "block":
                 return plugin_result.details or f"plugin gate '{plugin.name}' failed"
+            if (plugin_result.passed and severity == "warn") or (
+                not plugin_result.passed and severity == "info"
+            ):
+                _surface_warning(task, f"plugin:{plugin.name}", plugin_result)
 
     return None
 

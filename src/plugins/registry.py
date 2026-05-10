@@ -39,7 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from autologging import get_logger
 
@@ -129,10 +129,39 @@ class QAContext:
 
 @dataclass
 class GateResult:
-    """Verdict emitted by a :class:`QAGatePlugin`."""
+    """Verdict emitted by a :class:`QAGatePlugin`.
+
+    Severity flow (v0.22.0)
+    -----------------------
+    The orchestrator's gate dispatcher (``_run_qa_gates`` in
+    ``orchestrator.execute_phase``) treats results as follows:
+
+    * ``passed=False`` AND ``severity="block"`` (the default) — halt the
+      task, route into retry/escalate. **Byte-identical to pre-v0.22.0
+      behavior.** Existing gates that don't set ``severity`` continue
+      to halt on failure.
+    * ``passed=True`` AND ``severity="warn"`` — surface as a non-fatal
+      warning on the task's evidence/metadata; do NOT halt. Used by
+      soft gates (e.g. ``code_size``) that report findings without
+      blocking the pipeline. ``passed=True`` is intentional: the gate
+      ran successfully and its verdict is "warn the operator", not
+      "fail the run".
+    * ``passed=False`` AND ``severity="info"`` — surface as an info
+      note; do NOT halt. Reserved for advisory gates that want to
+      record a finding but never block.
+    * ``passed=True`` AND ``severity="info"|"block"`` — silent pass
+      (no warning surfaced).
+
+    The ``metrics`` dict carries structured evidence (e.g. counts,
+    ratios, per-file scores) for downstream consumers — knowledge
+    seeding, longitudinal panels, and tournament judges. Gates that
+    don't produce metrics may leave it empty.
+    """
 
     passed: bool
     details: str = ""
+    severity: Literal["info", "warn", "block"] = "block"
+    metrics: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

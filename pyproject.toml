@@ -69,6 +69,16 @@ treesitter = [
 mutation = [
     "mutmut>=2.4.0",
 ]
+# v0.22.0 Phase 1: anti-bloat / code-size QA gate. radon is the AST + raw-LOC
+# engine, vulture catches dead symbols at >=80% confidence, pylint surfaces
+# duplicate-code (R0801). eradicate (commented-out blocks) is opt-in via
+# subprocess detection at runtime — not a required dep here so operators can
+# pin their own version. The gate degrades gracefully when any tool is absent.
+code-size = [
+    "radon>=6.0",
+    "vulture>=2.10",
+    "pylint>=3.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/mohamedameen/autodev"
