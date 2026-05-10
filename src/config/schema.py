@@ -153,6 +153,13 @@ class TournamentPhaseConfig(BaseModel):
     # ``num_branches=1`` because branch fan-out isn't wired into those
     # runners in this release.
     num_branches: int = Field(default=1, ge=1, le=5)
+    # v0.23.0 C4: opt-out for the plan-tournament huge-repo fast-path.
+    # When ``False`` (default) and ``runtime.repo_probe.is_huge`` is True,
+    # ``orchestrator.plan_phase`` falls back to a single-branch tournament
+    # so Unity-scale repos don't burn 80 min on the multi-branch dispatch.
+    # Set ``True`` to keep the configured branch count even on huge repos
+    # (operators with bigger compute budgets / parallelism).
+    huge_repo_overrides_disabled: bool = False
     # v0.14.0: heterogeneous-model branches. ``None`` (default) preserves
     # v0.12.0 homogeneous behavior — every branch uses the same per-role
     # models. When set to a non-None list, each entry is a
@@ -677,6 +684,25 @@ class AutodevConfig(BaseModel):
     # older than 2.25. Default False — sparse-checkout speeds up huge
     # repos but breaks tasks that need files outside the declared scope.
     worktree_sparse_checkout_enabled: bool = False
+    # v0.23.0 C1: huge-repo mode. ``"auto"`` keys off
+    # ``runtime.repo_probe.RepoCapacity.is_huge`` (file_count > 20K OR
+    # total_bytes > 5 GB) — when True, sparse-checkout becomes the
+    # default for per-task worktrees regardless of
+    # ``worktree_sparse_checkout_enabled``, and the worktree create
+    # timeout extends to ``worktree_huge_create_timeout_s`` (the v0.22.1
+    # A3 field). ``"on"`` forces huge-repo behavior; ``"off"`` disables
+    # it even on huge repos (legacy escape hatch).
+    worktree_huge_repo_mode: Literal["auto", "on", "off"] = "auto"
+    # v0.23.0 C1: extended timeout for ``git worktree add`` when
+    # huge_mode is on. Mirrors the WorktreeManager constructor param
+    # so operators can override the orchestrator's wiring without
+    # threading a new arg through every call site.
+    worktree_huge_create_timeout_s: int = Field(
+        default=600, ge=60, le=3600
+    )
+    # v0.23.0 C1: huge-repo pool sizing. Keep the warm pool small on
+    # huge repos to reduce upfront cold-start time and disk pressure.
+    worktree_huge_pool_size: int = Field(default=2, ge=0, le=8)
     # v0.21.0 A1: opt-in worktree warm-start pool. When True, the
     # orchestrator pre-creates ``resolve_parallelism(role_mix='execute')``
     # worktrees at execute-phase entry and recycles them via

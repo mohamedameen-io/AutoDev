@@ -212,6 +212,30 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
 
         if orch.cfg.tournaments.plan.enabled:
             num_branches = orch.cfg.tournaments.plan.num_branches
+            # v0.23.0 C4: plan-tournament huge-repo fast-path. Unity-scale
+            # repos burned 80 min on the multi-branch plan tournament
+            # (3 branches × 3-5 passes × 5 judges per branch). On huge
+            # repos, fall back to a single-branch tournament so the user
+            # gets a plan in <20 min instead. Operators can opt out by
+            # setting ``cfg.tournaments.plan.huge_repo_overrides_disabled = True``
+            # (treated as missing == False for back-compat).
+            _is_huge_for_plan = bool(
+                getattr(getattr(orch, "_repo_capacity", None), "is_huge", False)
+            )
+            _huge_overrides_disabled = bool(
+                getattr(
+                    orch.cfg.tournaments.plan,
+                    "huge_repo_overrides_disabled",
+                    False,
+                )
+            )
+            if _is_huge_for_plan and not _huge_overrides_disabled and num_branches > 1:
+                logger.info(
+                    "plan_phase.huge_repo_fast_path",
+                    original_num_branches=num_branches,
+                    reason="is_huge=True; falling back to single-branch tournament",
+                )
+                num_branches = 1
             try:
                 if num_branches > 1:
                     # v0.12.0 multi-branch path.

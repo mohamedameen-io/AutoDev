@@ -639,16 +639,31 @@ async def run_execute_phase(
             # Duck-type as WorktreeManager (it exposes the same surface).
             worktree_mgr = pool  # type: ignore[assignment]
         else:
-            # v0.22.1 A3: thread is_huge through so worktree-add gets the
-            # extended 600s timeout on Unity-scale repos where the historical
-            # 60s ceiling killed full-checkout creation (~80-180s observed).
-            _wm_huge_mode = bool(
+            # v0.22.1 A3 + v0.23.0 C1: huge-repo mode resolution.
+            # ``"auto"`` keys off ``RepoCapacity.is_huge``; ``"on"``/``"off"``
+            # are operator overrides. When huge mode is on we extend the
+            # worktree-add timeout (was the bug from 2026-05-09 Unity:
+            # 60 s ceiling killed 80-180 s full checkouts).
+            _is_huge = bool(
                 getattr(getattr(orch, "_repo_capacity", None), "is_huge", False)
+            )
+            _huge_mode_cfg = getattr(
+                orch.cfg, "worktree_huge_repo_mode", "auto"
+            )
+            if _huge_mode_cfg == "on":
+                _wm_huge_mode = True
+            elif _huge_mode_cfg == "off":
+                _wm_huge_mode = False
+            else:  # "auto"
+                _wm_huge_mode = _is_huge
+            _huge_create_timeout_s = float(
+                getattr(orch.cfg, "worktree_huge_create_timeout_s", 600)
             )
             worktree_mgr = WorktreeManager(
                 main_repo=orch.cwd,
                 tournament_dir=autodev_root(orch.cwd) / "execute_worktrees",
                 huge_mode=_wm_huge_mode,
+                huge_create_timeout_s=_huge_create_timeout_s,
             )
 
     try:
@@ -1713,8 +1728,24 @@ async def _execute_one(
         # into every per-task worktree. Falls back to a full checkout
         # when (a) the flag is off, (b) no scope is declared, or (c)
         # git is older than 2.25 (pre-flighted in WorktreeManager.create).
+        # v0.23.0 C1: sparse-by-default on huge repos. The legacy
+        # ``worktree_sparse_checkout_enabled`` flag still works as an
+        # explicit operator opt-in for non-huge repos. On huge repos
+        # (when ``worktree_huge_repo_mode`` resolves on) sparse becomes
+        # the default unless explicitly disabled with ``"off"``.
+        _sparse_enabled = bool(orch.cfg.worktree_sparse_checkout_enabled)
+        _huge_mode_cfg_for_sparse = getattr(
+            orch.cfg, "worktree_huge_repo_mode", "auto"
+        )
+        _is_huge_for_sparse = bool(
+            getattr(getattr(orch, "_repo_capacity", None), "is_huge", False)
+        )
+        if _huge_mode_cfg_for_sparse == "on" or (
+            _huge_mode_cfg_for_sparse == "auto" and _is_huge_for_sparse
+        ):
+            _sparse_enabled = True
         sparse_paths: list[str] | None = None
-        if orch.cfg.worktree_sparse_checkout_enabled:
+        if _sparse_enabled:
             try:
                 _plan_for_scope = await orch.plan_manager.load()
             except Exception:  # noqa: BLE001

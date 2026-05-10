@@ -28,20 +28,28 @@ All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepa
 
 All four are audit-only (NOT mutated by `_apply_op`).
 
-## [Unreleased] - v0.23.0 in progress
+## [0.23.0] - 2026-05-10
 
-### Added
-- **C3 — CLI signal handlers + child-kill on cancel + lockfile PID recording.** SIGTERM/SIGHUP handlers in `cli/__init__.py` log the signal name and raise `SystemExit(128+signum)` so `finally` blocks (notably `plan_lock` release) run before exit; previously SIGTERM died silently. Claude Code adapter (`adapters/claude_code.py`) now kills its child `claude -p` process on parent `CancelledError` (in addition to the existing `TimeoutError` path), preventing leaked subprocesses. Lockfile (`state/lockfile.py`) records `<pid> <iso8601>` instead of 0 bytes; on stale-lock detection the recorded PID is checked with `os.kill(pid, 0)` — dead-PID locks are auto-overwritten on next acquire (with a warning), alive-PID locks log a structured warning before the 30 s timeout fires. Closes D-6 lifecycle gaps.
-- **C5 — Explorer max_turns 2x on huge repos.** The explorer's job is to enumerate the codebase; on huge repos (Unity: 358K files) the default 3 turns is insufficient. P-7's investigation of the 2026-05-09 Unity `.autodev/debug/` showed the explorer hit `error_max_turns` at turn 3 with 218K cached tokens. Wired in `orchestrator/plan_phase.py:_delegate` against `orch._repo_capacity.is_huge`. Other roles unaffected.
+### Added (huge-repo mode)
+- **C1 — `worktree_huge_repo_mode` first-class config + sparse-by-default.** New `AutodevConfig.worktree_huge_repo_mode: Literal["auto", "on", "off"]` (default `"auto"`) controls cascading huge-repo defaults. When huge mode resolves on, per-task worktrees become sparse-checkout (was opt-in via `worktree_sparse_checkout_enabled`); the worktree-add timeout extends to `worktree_huge_create_timeout_s` (default 600 s); the warm-pool size shrinks to `worktree_huge_pool_size` (default 2). The legacy `worktree_sparse_checkout_enabled` flag remains as a deprecated alias for v0.23.0 (removal scheduled for v0.24.0). Resolves D-3's worktree commit-back delay on Unity-scale runs (~80-180 s full-checkout vs <10 s sparse).
+- **C3 — CLI signal handlers + child-kill on cancel + lockfile PID recording.** SIGTERM/SIGHUP handlers in `cli/__init__.py` log the signal name and raise `SystemExit(128+signum)` so `finally` blocks (notably `plan_lock` release) run before exit; previously SIGTERM died silently. Claude Code adapter (`adapters/claude_code.py`) now kills its child `claude -p` process on parent `CancelledError` (in addition to the existing `TimeoutError` path), preventing leaked subprocesses. Lockfile (`state/lockfile.py`) records `<pid> <iso8601>` instead of 0 bytes; on stale-lock detection the recorded PID is checked with `os.kill(pid, 0)` — dead-PID locks are auto-overwritten on next acquire (with a warning), alive-PID locks log a structured warning before the 30 s timeout fires.
+- **C4 — Plan-tournament huge-repo fast-path.** Unity-scale plan tournament burned 80 min on the multi-branch dispatch (3 branches × 3-5 passes × 5 judges per branch). When `is_huge` resolves true and `cfg.tournaments.plan.huge_repo_overrides_disabled` is `False` (default), `orchestrator.plan_phase` falls back to a single-branch tournament — plan completes in <20 min instead. Operators with bigger compute budgets opt out by setting the override field to `True`.
+- **C5 — Explorer max_turns 2x on huge repos.** The explorer's job is to enumerate the codebase; on huge repos (Unity: 358K files) the default 3 turns is insufficient. Wired in `orchestrator/plan_phase.py:_delegate` against `orch._repo_capacity.is_huge`.
+- **C6 — `regex_timeout` ledger op telemetry.** Watchdog (v0.22.1 A1) emits an audit ledger entry on per-file regex timeout; `autodev metrics regex-timeouts` planned for v0.24.0 D3.
+- **C7 — Operator documentation.** New `docs/huge_repo_guide.md` covers the cascading defaults, override knobs, and recovery recipe. ADR-0043 documents the design choice (`auto`/`on`/`off` mode, no global toggle, per-subsystem escape hatches).
 
-### Remaining for v0.23.0
-- C1 (`WorktreeConfig` huge_repo_mode + sparse-by-default + async removal)
-- C2 (full): default ignore_paths set, diff-mode default-on
-- C4 (plan-tournament huge fast-path: single-branch + reduced passes)
-- C7 (huge_repo_guide.md + ADR)
+### Added (config schema fields)
+- `AutodevConfig.worktree_huge_repo_mode` (Literal `"auto"|"on"|"off"`).
+- `AutodevConfig.worktree_huge_create_timeout_s` (int, default 600, bounded [60, 3600]).
+- `AutodevConfig.worktree_huge_pool_size` (int, default 2, bounded [0, 8]).
+- `TournamentPhaseConfig.huge_repo_overrides_disabled` (bool, default False).
 
-### Remaining for v0.22.x
-- B4 (full path normalization pipeline + architect-retry envelope)
+### Deferred
+- **B4 — full path normalization pipeline.** Shipped in v0.22.4 ahead of v0.23.0.
+- **C2 (full)** — default `secretscan_ignore_paths` set + diff-mode-default. v0.22.3 shipped the operator-tunable knobs; the opinionated defaults will land in v0.24.0 alongside the streaming-parser / sandboxing work.
+- **D1-D6** — entire v0.24.0 streaming-parser / sandboxing / corpus surface.
+
+## [0.22.4] - 2026-05-10
 
 ## [0.22.2] - 2026-05-10
 
