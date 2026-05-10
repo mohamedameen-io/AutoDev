@@ -159,6 +159,29 @@ LedgerOp = Literal[
     "speculative_started",
     "speculative_rolled_back",
     "speculative_committed",
+    # v0.22.2 B3: pre-flight marker emitted before developer dispatch so
+    # resume can detect orphan evidence (evidence written but
+    # ``update_task_status(coded)`` never reached because the process died
+    # between :line 1727 (write_evidence) and :line 1774 (status=coded)).
+    # Audit-only — NOT mutated by ``_apply_op``. Payload shape:
+    # ``{task_id, attempt_n, started_at, session_id}``. Used by
+    # :meth:`PlanManager.reconcile_evidence_vs_ledger` at resume time.
+    "attempt_started",
+    # v0.22.2 B3: emitted by ``reconcile_evidence_vs_ledger`` summarizing
+    # the auto-promotions and discrepancies it acted on at resume.
+    # Audit-only. Payload: ``{promoted: list[str], discrepancies: list[dict]}``.
+    "reconcile_evidence",
+    # v0.22.2 B1: emitted at end of ``PlanManager.reap_orphans`` summarizing
+    # the wedged tasks reverted to ``pending`` on resume. Audit-only;
+    # the actual ``update_task_status`` ops emitted per-task carry the
+    # state mutation. Payload: ``{reaped_task_ids: list[str], reason: str}``.
+    "reap_orphans",
+    # v0.23.0 C6: emitted by the ``hallucination_guard`` watchdog (and any
+    # future regex-on-content QA gate) when the per-file timeout fires.
+    # Audit-only. Payload: ``{path, timeout_s, gate}``. Lets operators
+    # surface common offenders via ``autodev metrics regex-timeouts``
+    # rather than reading raw stderr.
+    "regex_timeout",
 ]
 
 
@@ -535,6 +558,19 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # v0.21.0 B2: speculative-execution audit ops. The actual task
         # status transitions live in regular ``update_task_status``
         # entries emitted alongside.
+        return plan
+
+    if op in (
+        "attempt_started",
+        "reconcile_evidence",
+        "reap_orphans",
+        "regex_timeout",
+    ):
+        # v0.22.2 B1+B3 / v0.23.0 C6: audit-only ops. All actual state
+        # mutations flow through ``update_task_status`` ops emitted
+        # alongside (or the per-task ``revert_task_to_pending`` path for
+        # reap_orphans). Replay treats these as no-ops — they are
+        # forensics for "what did the resume / watchdog do".
         return plan
 
     if plan is None:

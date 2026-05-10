@@ -377,6 +377,22 @@ class QAGatesConfig(BaseModel):
     # deferred to v0.23.0 C2.
     secretscan_auto_skip_huge_repo: bool = True
     secretscan_force_run_on_huge_repo: bool = False
+    # v0.23.0 C2: gitignore-style globs for files secretscan should skip
+    # entirely. Composes with ``.autodev/secretscan-allow`` (which uses
+    # the same syntax). Ships empty so existing behavior is preserved;
+    # operators on huge repos with test-fixture density add e.g.
+    # ``["**/Tests/**", "**/Fixtures/**", "**/TestData/**", "**/*.unity.meta"]``.
+    secretscan_ignore_paths: list[str] = Field(default_factory=list)
+    # v0.23.0 C2: per-call override for the global entropy threshold
+    # (legacy default 4.5). Bumping to 4.8 suppresses Unity asset GUID
+    # false positives (32-char hex with entropy ~4.3-4.7). ``None`` keeps
+    # the module default.
+    secretscan_entropy_threshold: float | None = None
+    # v0.23.0 C2: minimum length for entropy-based string detection
+    # (legacy default 20). Bumping to 32 filters short hex strings
+    # ubiquitous in test fixtures while preserving real-world key
+    # detection (most key formats are 32+ chars). ``None`` keeps default.
+    secretscan_min_entropy_length: int | None = None
     # v0.19.0: per-extension entropy override. ``None`` means "use module
     # default curve" (see ``qa.secretscan._DEFAULT_PER_EXTENSION_ENTROPY``).
     secretscan_per_extension_thresholds: dict[str, float] | None = None

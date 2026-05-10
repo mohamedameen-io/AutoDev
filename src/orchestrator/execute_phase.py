@@ -20,6 +20,7 @@ escalated, mark it blocked, and stop the loop.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -569,12 +570,25 @@ async def run_execute_phase(
         await _maybe_run_phase_review(orch, task.phase_id)
         return processed
 
+    # v0.22.2 B3: reconcile evidence-vs-ledger BEFORE the reaper so any
+    # orphan evidence (success=true on disk but no coded ledger op) is
+    # promoted to coded first — preventing the reaper from reverting a
+    # task whose work actually completed (D-3 finding from the
+    # 2026-05-09 Unity stall).
+    try:
+        await orch.plan_manager.reconcile_evidence_vs_ledger()
+    except Exception as exc:  # noqa: BLE001 — log + continue
+        logger.warning(
+            "execute_phase.reconcile_evidence_failed", err=str(exc)
+        )
+
     # v0.22.2 B1: reap orphan in-flight tasks before any dispatch. An
     # interrupted run leaves tasks frozen in non-terminal-non-pending
     # states (``coded``, ``in_progress``, ``reviewed``, etc.) — the
     # dispatcher's pending-only filter cannot pick them up. The reaper
     # reverts orphans to ``pending`` so they re-dispatch fresh. Idempotent
-    # (no-op when there are no orphans).
+    # (no-op when there are no orphans). After B3 reconciliation runs
+    # first, only genuine orphans (no evidence) reach this path.
     try:
         reaped = await orch.plan_manager.reap_orphans()
         if reaped:
@@ -1737,6 +1751,45 @@ async def _execute_one(
         last_issues: list[str] = []
         while True:
             try:
+                # v0.22.2 B3: emit a pre-flight marker BEFORE the developer
+                # dispatch so resume can detect "evidence written but
+                # ``coded`` op missing" (a process crash between
+                # ``write_evidence`` at line 1771 and
+                # ``update_task_status("coded")`` at line 1818). Audit-only
+                # — does NOT mutate plan state.
+                try:
+                    from state.ledger import append_entry as _append_entry
+                    from state.lockfile import plan_lock as _plan_lock
+
+                    async with _plan_lock(
+                        orch.cwd,
+                        timeout_s=getattr(
+                            orch.plan_manager, "_lock_timeout_s", 30.0
+                        ),
+                    ):
+                        await _append_entry(
+                            orch.cwd,
+                            op="attempt_started",
+                            payload={
+                                "task_id": task.id,
+                                "attempt_n": task.retry_count,
+                                "started_at": _dt.datetime.now(
+                                    _dt.timezone.utc
+                                ).isoformat(),
+                                "session_id": getattr(
+                                    orch.plan_manager, "_session_id", ""
+                                ),
+                            },
+                            session_id=getattr(
+                                orch.plan_manager, "_session_id", ""
+                            ),
+                        )
+                except Exception as exc:  # noqa: BLE001 — best-effort marker
+                    logger.debug(
+                        "execute_phase.attempt_started_emit_failed",
+                        task_id=task.id,
+                        err=str(exc),
+                    )
                 developer_env = _developer_envelope(task, extra_issues=last_issues)
                 developer_result = await delegate(
                     orch,
@@ -2922,6 +2975,37 @@ def _surface_warning(task: "Task", gate_name: str, result: GateResult) -> None:
     )
 
 
+def _run_secretscan_with_cfg(
+    cwd: Path, secretscan_paths: list[Path] | None, cfg: object
+) -> Awaitable[GateResult]:
+    """v0.23.0 C2: bridge that only forwards new C2 kwargs when set.
+
+    Existing tests stub :func:`run_secretscan` with the v0.19.0 signature
+    (no C2 kwargs). When the operator hasn't opted into the new fields,
+    we omit them from the call so those mocks keep working. Only when
+    the cfg explicitly carries any new C2 setting do we thread them
+    through (and any test that exercises the C2 surface will mock
+    accordingly).
+    """
+    extra: dict[str, object] = {}
+    ignore = getattr(cfg, "secretscan_ignore_paths", None)
+    if ignore:
+        extra["ignore_paths"] = ignore
+    eth = getattr(cfg, "secretscan_entropy_threshold", None)
+    if eth is not None:
+        extra["entropy_threshold_override"] = eth
+    mlen = getattr(cfg, "secretscan_min_entropy_length", None)
+    if mlen is not None:
+        extra["min_entropy_length"] = mlen
+    return run_secretscan(
+        cwd,
+        paths=secretscan_paths,
+        per_extension_thresholds=cfg.secretscan_per_extension_thresholds,
+        baseline_enabled=cfg.secretscan_baseline_enabled,
+        **extra,
+    )
+
+
 async def _run_qa_gates(
     orch: "Orchestrator",
     task: "Task",
@@ -2990,11 +3074,10 @@ async def _run_qa_gates(
         (
             "secretscan",
             secretscan_enabled,
-            lambda: run_secretscan(
+            lambda: _run_secretscan_with_cfg(
                 cwd,
-                paths=secretscan_paths,
-                per_extension_thresholds=cfg.secretscan_per_extension_thresholds,
-                baseline_enabled=cfg.secretscan_baseline_enabled,
+                secretscan_paths,
+                cfg,
             ),
         ),
         (

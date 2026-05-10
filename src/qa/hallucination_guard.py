@@ -359,6 +359,8 @@ async def _dispatch_with_timeout(
     path: Path,
     repo_root: Path,
     timeout_s: float = DEFAULT_PER_FILE_TIMEOUT_S,
+    *,
+    emit_ledger_op: bool = True,
 ) -> list[str]:
     """Run :func:`_dispatch` in a worker thread with a wall-clock ceiling.
 
@@ -369,6 +371,12 @@ async def _dispatch_with_timeout(
     skip-and-warn (return empty findings) so the gate cannot block the
     task. The cost of skipping a slow file is a missed hallucination
     finding — which the build / test gates downstream still catch.
+
+    v0.23.0 C6: on timeout, additionally emit an ``op="regex_timeout"``
+    audit ledger entry (best-effort — failure to emit is logged but
+    not fatal, since this path is already a degraded-mode return).
+    Set ``emit_ledger_op=False`` for tests / call sites where ledger
+    plumbing is unavailable.
     """
     try:
         return await asyncio.wait_for(
@@ -381,6 +389,27 @@ async def _dispatch_with_timeout(
             str(path),
             timeout_s,
         )
+        if emit_ledger_op:
+            try:
+                from state.ledger import append_entry as _append_entry
+                from state.lockfile import plan_lock as _plan_lock
+
+                async with _plan_lock(repo_root, timeout_s=5.0):
+                    await _append_entry(
+                        repo_root,
+                        op="regex_timeout",
+                        payload={
+                            "path": str(path),
+                            "timeout_s": timeout_s,
+                            "gate": "hallucination_guard",
+                        },
+                        session_id="watchdog",
+                    )
+            except Exception as exc:  # noqa: BLE001 — never let telemetry block
+                _log.debug(
+                    "qa.hallucination_guard.regex_timeout_ledger_failed err=%s",
+                    str(exc),
+                )
         return []
 
 

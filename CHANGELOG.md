@@ -2,6 +2,23 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.3] - 2026-05-10
+
+### Fixed (atomicity + observability)
+- **B3 — Atomic evidence ↔ ledger via `attempt_started` marker + `reconcile_evidence_vs_ledger`.** Pre-flight ledger marker emitted before every developer dispatch; resume-time reconciler walks `evidence/*-developer.json` and auto-promotes orphans (success=true with no `coded` op AND a matching marker) to `coded`. Discrepancies (no marker / terminal status / promote-failed) emit a `reconcile_evidence` audit op for operator review. Closes the D-3 evidence-loss gap from the 2026-05-09 Unity stall. Wired into `run_execute_phase` BEFORE `reap_orphans` so genuine completed work is preserved instead of reverted.
+
+### Added (operator knobs)
+- **C2 (partial) — Secretscan tunables.** Three new fields on `QAGatesConfig` for huge-repo huge-fixture noise suppression: `secretscan_ignore_paths` (gitignore-style globs that bypass scan; e.g. `["Tests/**", "*.unity.meta"]`); `secretscan_entropy_threshold` (override the legacy 4.5 default — 4.8 suppresses 32-char hex GUID FPs); `secretscan_min_entropy_length` (override the legacy 20 floor — 32 filters short hex while preserving real-world keys). Composes with the existing v0.19.0 `.autodev/secretscan-allow` allowlist + per-extension entropy curve. Diff-mode default-on lands fully in v0.23.0.
+- **C6 — `regex_timeout` ledger op telemetry.** Watchdog (v0.22.1 A1) now emits an audit ledger entry with `{path, timeout_s, gate}` whenever a per-file regex scan hits the timeout. Best-effort: failure to emit is logged at debug, never blocks the gate. Foundation for `autodev metrics regex-timeouts` in v0.23.0.
+
+### Added (ledger ops)
+- `attempt_started` — pre-flight developer-dispatch marker.
+- `reconcile_evidence` — resume-time orphan-evidence summary.
+- `reap_orphans` — resume-time orphan-task summary (paired with v0.22.2 B1).
+- `regex_timeout` — QA gate watchdog event.
+
+All four are audit-only (NOT mutated by `_apply_op`).
+
 ## [Unreleased] - v0.23.0 in progress
 
 ### Added
@@ -9,14 +26,12 @@ All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepa
 
 ### Remaining for v0.23.0
 - C1 (`WorktreeConfig` huge_repo_mode + sparse-by-default + async removal)
-- C2 (secretscan diff-mode default, entropy bump, ignore_paths)
+- C2 (full): default ignore_paths set, diff-mode default-on
 - C3 (signal handlers + child-kill on cancel + lockfile PID)
 - C4 (plan-tournament huge fast-path: single-branch + reduced passes)
-- C6 (`regex_timeout` ledger op telemetry, building on v0.22.1 A1)
 - C7 (huge_repo_guide.md + ADR)
 
-### Remaining for v0.22.2
-- B3 (atomic evidence/ledger via `attempt_started` marker + `reconcile_evidence_vs_ledger`)
+### Remaining for v0.22.x
 - B4 (full path normalization pipeline + architect-retry envelope)
 
 ## [0.22.2] - 2026-05-10

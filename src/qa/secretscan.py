@@ -119,15 +119,39 @@ def _high_entropy_strings(
     content: str,
     extension: str | None = None,
     per_extension_thresholds: dict[str, float] | None = None,
+    *,
+    min_length: int | None = None,
+    global_threshold_override: float | None = None,
 ) -> list[str]:
     """Return substrings that look like high-entropy secrets.
 
     *extension* is the lowercased file extension (including leading dot),
     used to look up a per-extension threshold. *per_extension_thresholds*
     is an optional caller override; it composes with the module defaults.
+
+    v0.23.0 C2:
+    * *min_length* overrides the legacy 20-char minimum (use 32 to filter
+      Unity asset GUIDs without losing real keys).
+    * *global_threshold_override* overrides :data:`_ENTROPY_THRESHOLD`
+      (use 4.8 to suppress GUID-like 4.5-entropy candidates).
     """
     threshold = _entropy_threshold_for(extension, per_extension_thresholds)
-    candidates = re.findall(r'["\']([A-Za-z0-9/+_\-=]{20,})["\']', content)
+    if global_threshold_override is not None and (
+        extension is None
+        or extension not in _DEFAULT_PER_EXTENSION_ENTROPY
+        and (
+            per_extension_thresholds is None
+            or extension not in per_extension_thresholds
+        )
+    ):
+        threshold = global_threshold_override
+    effective_min_len = (
+        int(min_length) if min_length is not None else _MIN_ENTROPY_LEN
+    )
+    pattern = (
+        r'["\']([A-Za-z0-9/+_\-=]{' + str(effective_min_len) + r',})["\']'
+    )
+    candidates = re.findall(pattern, content)
     return [c for c in candidates if _shannon_entropy(c) >= threshold]
 
 
@@ -182,6 +206,10 @@ async def run_secretscan(
     edit_scope: list[str] | None = None,
     per_extension_thresholds: dict[str, float] | None = None,
     baseline_enabled: bool = False,
+    *,
+    ignore_paths: list[str] | None = None,
+    entropy_threshold_override: float | None = None,
+    min_entropy_length: int | None = None,
 ) -> GateResult:
     """Scan *cwd* for hard-coded secrets.
 
@@ -215,6 +243,10 @@ async def run_secretscan(
     scope_prefixes = [p.rstrip("/") for p in (edit_scope or [])]
 
     allowlist = _load_allowlist(cwd)
+    # v0.23.0 C2: config-driven ignore_paths compose with .autodev/secretscan-allow
+    # (same gitignore-style glob syntax). Operators on huge repos with test-fixture
+    # density use this to skip e.g. ``**/Tests/**``, ``**/*.unity.meta``.
+    ignore_globs = list(ignore_paths or [])
 
     for path in _iter_files(cwd, paths=paths):
         # v0.14.0 scope filter: applied after _iter_files so it composes
@@ -236,6 +268,10 @@ async def run_secretscan(
         if allowlist and _matches_allowlist(rel_for_scope, allowlist):
             continue
 
+        # v0.23.0 C2 cfg-driven ignore_paths filter (compose with allowlist).
+        if ignore_globs and _matches_allowlist(rel_for_scope, ignore_globs):
+            continue
+
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -254,11 +290,22 @@ async def run_secretscan(
                 findings.append(f"{rel}: {label}")
 
         # Entropy scan — per-extension threshold lookup.
+        # v0.23.0 C2: when entropy_threshold_override is supplied (operator
+        # tightening for huge-repo huge-fixture noise), pre-merge it into
+        # the per-extension dict so it wins for ALL extensions that don't
+        # have an explicit override of their own.
+        effective_per_ext = dict(per_extension_thresholds or {})
+        if entropy_threshold_override is not None:
+            for _ext_default in (".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
+                                 ".hxx", ".yaml", ".yml"):
+                effective_per_ext.setdefault(_ext_default, entropy_threshold_override)
         ext = path.suffix.lower()
         for suspect in _high_entropy_strings(
             content,
             extension=ext,
-            per_extension_thresholds=per_extension_thresholds,
+            per_extension_thresholds=effective_per_ext or None,
+            min_length=min_entropy_length,
+            global_threshold_override=entropy_threshold_override,
         ):
             findings.append(
                 f"{rel}: high-entropy string ({_shannon_entropy(suspect):.2f} bits) — {suspect[:8]}…"

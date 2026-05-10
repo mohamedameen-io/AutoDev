@@ -428,6 +428,149 @@ class PlanManager:
             )
             return task
 
+    async def reconcile_evidence_vs_ledger(self) -> dict[str, list]:
+        """v0.22.2 B3: detect + repair orphan evidence at resume time.
+
+        Walks ``.autodev/evidence/*-developer.json`` files. For each that
+        reports ``success=true``, checks whether a matching ``coded`` (or
+        higher) ``update_task_status`` op exists in the ledger. If not,
+        AND an ``attempt_started`` marker exists for the same task, AND
+        the task's current status is still ``pending``/``in_progress``,
+        promote: emit a fresh ``update_task_status(coded)`` op carrying
+        the original evidence file's mtime in ``meta``. Discrepancies
+        (no marker, terminal status, etc.) are collected for operator
+        review and emitted as a single ``reconcile_evidence`` audit op.
+
+        Idempotent: re-running with no orphans is a no-op (and does NOT
+        emit the summary op when both lists are empty).
+
+        D-3's finding from the 2026-05-09 Unity stall: ``write_evidence``
+        at ``execute_phase.py:1771`` runs BEFORE the
+        ``update_task_status(coded)`` at ``:1818``. A crash in between
+        leaves the evidence on disk but no ledger record — recovery
+        then resets the task to ``pending`` and re-runs from scratch,
+        discarding the completed work.
+
+        Returns:
+            ``{"promoted": [...], "discrepancies": [...]}``.
+        """
+        from state.evidence import list_evidence
+        from state.ledger import append_entry, read_entries
+        from state.paths import evidence_dir
+        from state.schemas import CoderEvidence
+
+        plan = await self.load()
+        if plan is None:
+            return {"promoted": [], "discrepancies": []}
+
+        entries = read_entries(self._cwd)
+        attempts_started: set[str] = set()
+        coded_seen: set[str] = set()
+        for e in entries:
+            if e.op == "attempt_started":
+                tid = e.payload.get("task_id")
+                if isinstance(tid, str):
+                    attempts_started.add(tid)
+            elif e.op == "update_task_status":
+                tid = e.payload.get("task_id")
+                st = e.payload.get("status")
+                if isinstance(tid, str) and st in (
+                    "coded",
+                    "auto_gated",
+                    "reviewed",
+                    "tested",
+                    "tournamented",
+                    "complete",
+                ):
+                    coded_seen.add(tid)
+
+        promoted: list[str] = []
+        discrepancies: list[dict] = []
+
+        d = evidence_dir(self._cwd)
+        if not d.exists():
+            return {"promoted": [], "discrepancies": []}
+
+        for p in sorted(d.iterdir()):
+            if not (p.is_file() and p.name.endswith("-developer.json")):
+                continue
+            task_id = p.name[: -len("-developer.json")]
+            if task_id in coded_seen:
+                continue
+            try:
+                evs = await list_evidence(self._cwd, task_id)
+            except Exception:  # noqa: BLE001
+                continue
+            coder_ev = next(
+                (e for e in evs if isinstance(e, CoderEvidence)), None
+            )
+            if coder_ev is None or not getattr(coder_ev, "success", False):
+                continue
+            task = _find_task(plan, task_id)
+            if task is None:
+                discrepancies.append(
+                    {"task_id": task_id, "reason": "evidence_orphan_no_task"}
+                )
+                continue
+            if task_id not in attempts_started:
+                discrepancies.append(
+                    {
+                        "task_id": task_id,
+                        "reason": "evidence_without_attempt_started_marker",
+                    }
+                )
+                continue
+            if task.status not in ("pending", "in_progress"):
+                discrepancies.append(
+                    {
+                        "task_id": task_id,
+                        "reason": f"task_terminal_status={task.status}",
+                    }
+                )
+                continue
+            try:
+                from datetime import datetime as _datetime, timezone as _tz
+
+                mtime_iso = _datetime.fromtimestamp(
+                    p.stat().st_mtime, tz=_tz.utc
+                ).isoformat()
+                # FSM transitions are pending → in_progress → coded; promote
+                # in two steps so ``assert_transition`` passes both edges.
+                if task.status == "pending":
+                    await self.update_task_status(task_id, "in_progress")
+                await self.update_task_status(
+                    task_id,
+                    "coded",
+                    meta={
+                        "evidence_bundle": str(p),
+                        "reconciled_from_evidence_mtime": mtime_iso,
+                    },
+                )
+                promoted.append(task_id)
+            except Exception as exc:  # noqa: BLE001
+                discrepancies.append(
+                    {"task_id": task_id, "reason": f"promote_failed: {exc}"}
+                )
+
+        if promoted or discrepancies:
+            async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+                await append_entry(
+                    self._cwd,
+                    op="reconcile_evidence",
+                    payload={
+                        "promoted": promoted,
+                        "discrepancies": discrepancies,
+                    },
+                    session_id=self._session_id,
+                )
+        if promoted or discrepancies:
+            self._log.info(
+                "reconcile_evidence.complete",
+                promoted=len(promoted),
+                discrepancies=len(discrepancies),
+            )
+        return {"promoted": promoted, "discrepancies": discrepancies}
+
     async def reap_orphans(
         self,
         *,
