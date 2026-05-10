@@ -125,6 +125,16 @@ class ClaudeCodeAdapter(PlatformAdapter):
                     proc.communicate(),
                     timeout=effective_timeout_s,
                 )
+            except asyncio.CancelledError:
+                # v0.23.0 C3: parent task cancelled (SIGTERM, KeyboardInterrupt
+                # propagation, or asyncio.gather cancel). Kill the child so
+                # we don't leak ``claude -p`` processes after the orchestrator
+                # exits — D-6 finding from the 2026-05-09 Unity stall.
+                with suppress(ProcessLookupError):
+                    proc.kill()
+                with suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                raise
             except asyncio.TimeoutError:
                 with suppress(ProcessLookupError):
                     proc.kill()
@@ -351,6 +361,13 @@ class ClaudeCodeAdapter(PlatformAdapter):
                 proc.communicate(),
                 timeout=5,
             )
+        except asyncio.CancelledError:
+            # v0.23.0 C3: kill child on parent cancel.
+            with suppress(ProcessLookupError):
+                proc.kill()
+            with suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            raise
         except asyncio.TimeoutError:
             with suppress(ProcessLookupError):
                 proc.kill()
