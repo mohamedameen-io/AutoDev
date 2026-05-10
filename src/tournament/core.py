@@ -136,6 +136,16 @@ class TournamentConfig:
     # gives every judge equal weight 1.0. When set, each role's vote counts
     # ``weight × Borda points`` (e.g. ``{"test_engineer": 2.0}``).
     judge_role_weights: dict[str, float] | None = None
+    # v0.22.0 Phase 4 (anti-bloat): absolute token-count threshold for the
+    # oversize-candidate demotion check inside :func:`_demote_oversized_winner`.
+    # When > 0, ANY winner whose markdown body exceeds this many estimated
+    # tokens (``len(text.split()) * 1.3``) is demoted to the next-best Borda
+    # survivor under the cap. Default 0 = disabled (preserves byte-identical
+    # legacy behavior). Cites Li et al. 2025 ("Mitigating Verbosity Bias in
+    # LLM-as-Judge", arxiv 2506.09443, Fig. 5): judges show sharp score-
+    # inflation at 800-1000 input characters; a 4000-token cap is ~4× that
+    # inflection point.
+    oversized_demotion_token_threshold: int = 0
 
 
 class PassResult(BaseModel):
@@ -387,42 +397,88 @@ def _demote_oversized_winner(
     incumbent_md: str,
     v_ab_md: str,
     ratio: float | None,
+    *,
+    v_b_md: str | None = None,
+    token_threshold: int = 0,
 ) -> tuple[WinnerLabel, dict[str, int]]:
-    """Demote an oversize AB winner to the next-best Borda winner.
+    """Demote an oversize winner to the next-best Borda winner.
 
-    The v0.6.2 cap on synthesizer growth: when the Borda winner is ``"AB"``
-    and the synthesizer's markdown line count exceeds ``ratio * incumbent
-    line count``, AB is demoted. The replacement winner is the higher-Borda
-    of {A, B}; on a tie we prefer ``"A"`` because the incumbent is the safe
-    fallback (no on-disk incumbent change → streak still increments).
+    Two demotion paths, both optional:
 
-    Returns ``(winner, scores)`` unchanged if any of:
-        - ``ratio`` is ``None`` (feature disabled);
-        - ``winner != "AB"`` (only the synthesizer can produce oversize);
-        - the line count is within the threshold.
+    1. **Legacy ratio-based (v0.6.2)**: when ``ratio`` is set AND the Borda
+       winner is ``"AB"`` AND the synthesizer's markdown line count
+       exceeds ``ratio * incumbent line count``, AB is demoted. The
+       replacement is the higher-Borda of {A, B}; on a tie we prefer
+       ``"A"`` because the incumbent is the safe fallback (no on-disk
+       incumbent change → streak still increments).
+
+    2. **Absolute token threshold (v0.22.0 Phase 4 anti-bloat)**: when
+       ``token_threshold > 0`` AND the chosen winner's markdown body
+       exceeds the threshold (estimated via ``len(text.split()) * 1.3``,
+       a deliberately rough proxy that avoids a tokenizer dependency), the
+       winner is demoted to the next-best Borda survivor that is itself
+       under the threshold. Applies to ANY winner label (A, B, or AB) —
+       generalizes the legacy AB-only check. Cites Li et al. 2025
+       ("Mitigating Verbosity Bias in LLM-as-Judge", arxiv 2506.09443,
+       Fig. 5): judges show sharp score-inflation at 800-1000 input
+       characters; a 4000-token cap is ~4× that inflection point.
+
+    Both demotion paths fire independently; the ratio path runs first
+    (preserves byte-identical legacy behavior), then the absolute check
+    runs over the survivor.
 
     The ``scores`` dict is returned as-is — only the winner label changes,
     not the underlying Borda counts. On-disk artifacts retain the original
     scores so post-hoc analysis can see the demotion happened.
     """
-    if ratio is None or winner != "AB":
-        return winner, scores
+    # ── Path 1: legacy ratio-based AB demotion ─────────────────────────
+    current = winner
+    if ratio is not None and current == "AB":
+        incumbent_lines = len(incumbent_md.splitlines())
+        ab_lines = len(v_ab_md.splitlines())
+        triggered = False
+        if incumbent_lines == 0 and ab_lines > 0:
+            triggered = True
+        elif incumbent_lines > 0 and ab_lines > ratio * incumbent_lines:
+            triggered = True
+        if triggered:
+            score_a = scores.get("A", 0)
+            score_b = scores.get("B", 0)
+            current = "A" if score_a >= score_b else "B"
 
-    incumbent_lines = len(incumbent_md.splitlines())
-    ab_lines = len(v_ab_md.splitlines())
-    # Edge case: 0 incumbent lines → any non-empty AB triggers demotion.
-    if incumbent_lines == 0:
-        if ab_lines == 0:
-            return winner, scores
-        # Fall through to demotion.
-    elif ab_lines <= ratio * incumbent_lines:
-        return winner, scores
+    # ── Path 2: absolute token threshold (v0.22.0 anti-bloat) ──────────
+    if token_threshold <= 0:
+        return current, scores
 
-    # AB is oversize: pick the next-best between A and B.
-    score_a = scores.get("A", 0)
-    score_b = scores.get("B", 0)
-    new_winner: WinnerLabel = "A" if score_a >= score_b else "B"
-    return new_winner, scores
+    label_to_md = {
+        "A": incumbent_md,
+        "B": v_b_md if v_b_md is not None else "",
+        "AB": v_ab_md,
+    }
+
+    def _est_tokens(text: str) -> float:
+        # Rough proxy: ~0.75 words per token → tokens ≈ words * 1.3.
+        return len(text.split()) * 1.3
+
+    if _est_tokens(label_to_md.get(current, "")) <= token_threshold:
+        return current, scores
+
+    # Current winner is over the cap. Walk down the Borda order picking
+    # the highest-scoring survivor that fits the cap. Tiebreak prefers
+    # "A" (incumbent) for safety, matching path-1 conventions.
+    candidates = sorted(
+        scores.items(),
+        key=lambda kv: (-kv[1], 0 if kv[0] == "A" else (1 if kv[0] == "B" else 2)),
+    )
+    for label, _score in candidates:
+        if label == current:
+            continue
+        if _est_tokens(label_to_md.get(label, "")) <= token_threshold:
+            return label, scores  # type: ignore[return-value]
+
+    # All candidates exceed the cap → no safe demotion target. Keep the
+    # original winner (avoid emitting an arbitrary fallback).
+    return current, scores
 
 
 def _winner_window_stable(history: list["PassResult"], window: int) -> bool:
@@ -1055,6 +1111,7 @@ class Tournament(Generic[T]):
         # post-hoc analysis can see exactly what the judges picked.
         elapsed = time.time() - t0
         incumbent_md_for_check = self.handler.render_as_markdown(incumbent)
+        v_b_md_for_check = self.handler.render_as_markdown(v_b)
         v_ab_md_for_check = self.handler.render_as_markdown(v_ab)
         effective_after_demotion, _scores_unchanged = _demote_oversized_winner(
             winner=raw_winner,  # type: ignore[arg-type]
@@ -1062,6 +1119,10 @@ class Tournament(Generic[T]):
             incumbent_md=incumbent_md_for_check,
             v_ab_md=v_ab_md_for_check,
             ratio=self.cfg.max_plan_lines_growth_ratio,
+            v_b_md=v_b_md_for_check,
+            token_threshold=getattr(
+                self.cfg, "oversized_demotion_token_threshold", 0
+            ),
         )
         ab_oversize_rejected = (
             raw_winner == "AB" and effective_after_demotion != "AB"

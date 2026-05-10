@@ -22,7 +22,9 @@ def test_default_config_validates() -> None:
     for role in REQUIRED_AGENT_ROLES:
         assert role in reloaded.agents
     assert reloaded.schema_version == "1.0.0"
-    assert reloaded.tournaments.impl.num_judges == 1
+    # v0.22.0 Phase 4 (anti-bloat): impl tournament default cohort bumped
+    # 1 → 3 (judge + judge_explorer + minimality_judge).
+    assert reloaded.tournaments.impl.num_judges == 3
     assert reloaded.tournaments.impl.convergence_k == 1
     assert reloaded.tournaments.impl.max_rounds == 3
     assert reloaded.tournaments.plan.enabled is True

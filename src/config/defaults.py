@@ -144,9 +144,20 @@ def default_config(platform: str = "auto") -> AutodevConfig:
             ),
             impl=TournamentPhaseConfig(
                 enabled=True,
-                # Impl tournament stays single-judge by convention — it's
-                # structurally different (git worktree variants).
-                num_judges=1,
+                # v0.22.0 Phase 4 (anti-bloat): default impl-tournament
+                # cohort is now a 3-judge specialist panel:
+                #   * ``judge``           — generic Borda (correctness +
+                #                           tests + plan-drift); weight 1.0
+                #   * ``judge_explorer``  — anti-slop FINDINGS specialist;
+                #                           weight 1.0
+                #   * ``minimality_judge`` — minimality specialist;
+                #                            weight 0.5 (advisory)
+                # The minimality judge is intentionally weighted BELOW
+                # correctness — when the two disagree, correctness wins.
+                # Weights apply via the existing ``BordaAggregator`` weight
+                # path. Operators can override either field in their config
+                # to revert to a single ``["judge"]`` cohort.
+                num_judges=3,
                 convergence_k=1,
                 max_rounds=3,
                 # max_rounds is small (3); window=2 still permits one normal
@@ -167,6 +178,12 @@ def default_config(platform: str = "auto") -> AutodevConfig:
                 # v0.12.0: impl tournament stays single-branch — branch
                 # fan-out isn't wired into the impl runner in this release.
                 num_branches=1,
+                judge_roles=["judge", "judge_explorer", "minimality_judge"],
+                judge_role_weights={
+                    "judge": 1.0,
+                    "judge_explorer": 1.0,
+                    "minimality_judge": 0.5,
+                },
             ),
             # v0.9.0: per-phase code review tournament. Default-on per the
             # user-locked-in design. Single-pass (``max_rounds=2``) keeps

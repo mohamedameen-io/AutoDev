@@ -217,6 +217,27 @@ class TournamentPhaseConfig(BaseModel):
     # ``{"test_engineer": 2.0}`` doubles the test engineer's Borda
     # contribution). Roles missing from the dict default to weight 1.0.
     judge_role_weights: dict[str, float] | None = None
+    # v0.22.0 Phase 4 (anti-bloat): optional model override for the
+    # ``minimality_judge`` specialist role. ``None`` (default) uses the
+    # cohort's resolved judge model — so the specialist runs on whatever
+    # the operator configured for ``cfg.agents["judge"].model`` (or the
+    # platform-default fallback). Setting this to a specific alias
+    # (e.g. ``"sonnet"``) forces the minimality judge onto a single
+    # model regardless of cohort defaults — useful when the operator
+    # wants the minimality judge to use a smaller/cheaper model than
+    # the correctness judges.
+    minimality_judge_model: str | None = None
+    # v0.22.0 Phase 4 (anti-bloat): absolute token-count threshold for
+    # the oversize-candidate demotion check. When > 0, ANY candidate
+    # whose markdown body exceeds this many estimated tokens is demoted
+    # to the next-best Borda winner — a generalization of the legacy
+    # AB-only ``max_plan_lines_growth_ratio`` check (which is preserved
+    # alongside this field; both fire independently).
+    # Default 4000 ≈ 4× the published 800-1000-character verbosity-bias
+    # inflection point reported in Li et al. 2025 ("Mitigating Verbosity
+    # Bias in LLM-as-Judge", arxiv 2506.09443, Fig. 5). Set to 0 to
+    # disable the absolute check (legacy ratio-based demotion still runs).
+    oversized_demotion_token_threshold: int = 4000
     # v0.18.0 B2: per-family plateau detection toggle. When True, the
     # multi-branch dispatcher checks
     # :class:`orchestrator.plateau_detector.PlateauDetector` for each

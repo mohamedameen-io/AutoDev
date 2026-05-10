@@ -419,6 +419,13 @@ async def run_impl_tournament(
         judge_role_weights=(
             dict(cfg.judge_role_weights) if cfg.judge_role_weights else None
         ),
+        # v0.22.0 Phase 4 (anti-bloat): forward the absolute-token-cap
+        # demotion threshold from the schema-level config to the runtime
+        # TournamentConfig. ``getattr`` with default keeps this safe if a
+        # legacy on-disk config doesn't carry the new field.
+        oversized_demotion_token_threshold=getattr(
+            cfg, "oversized_demotion_token_threshold", 0
+        ),
     )
 
     wt_mgr = WorktreeManager(main_repo=orch.cwd, tournament_dir=worktree_dir)

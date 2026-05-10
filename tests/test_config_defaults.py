@@ -104,12 +104,25 @@ def test_default_plan_tournament_uses_five_judges() -> None:
     assert cfg.tournaments.plan.num_judges == 5
 
 
-def test_default_impl_tournament_keeps_single_judge() -> None:
-    """Impl tournament stays at num_judges=1 — it's structurally different
-    (uses git worktree variants and is always-on, single-judge by convention).
+def test_default_impl_tournament_uses_phase4_specialist_cohort() -> None:
+    """v0.22.0 Phase 4 (anti-bloat): impl tournament default is now a
+    3-judge specialist cohort (judge + judge_explorer + minimality_judge).
+
+    Pre-Phase 4 default was num_judges=1 (single generic judge). Phase 4
+    flipped this so the minimality specialist participates in every
+    impl pass. Operators can revert to single-judge by overriding
+    ``cfg.tournaments.impl.judge_roles`` in their config.
     """
     cfg = default_config()
-    assert cfg.tournaments.impl.num_judges == 1
+    assert cfg.tournaments.impl.num_judges == 3
+    assert cfg.tournaments.impl.judge_roles == [
+        "judge", "judge_explorer", "minimality_judge"
+    ]
+    assert cfg.tournaments.impl.judge_role_weights == {
+        "judge": 1.0,
+        "judge_explorer": 1.0,
+        "minimality_judge": 0.5,
+    }
 
 
 def test_default_plan_tournament_has_score_stability_enabled() -> None:

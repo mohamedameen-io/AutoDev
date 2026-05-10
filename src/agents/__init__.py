@@ -35,6 +35,7 @@ _TOURNAMENT_DESCRIPTIONS: dict[str, str] = {
     "architect_b": "Tournament revision author. Addresses criticisms in a new draft.",
     "synthesizer": "Tournament synthesizer. Merges strongest elements of two versions.",
     "judge": "Tournament judge. Ranks proposals by how well they accomplish the task.",
+    "minimality_judge": "Specialist judge: evaluates only minimality / size economy.",
 }
 
 

@@ -239,12 +239,16 @@ _JUDGE_PROMPT_IMPL = """ORIGINAL TASK:
 ---
 
 Three implementations have been produced independently. Evaluate how well
-each accomplishes the stated task. Weight these roughly:
+each accomplishes the stated task. Focus on:
 
   1. Tests pass (larger passed, smaller failed is better)
   2. Correctness (logic matches the task description)
-  3. Minimalism (smaller diffs are better when correct)
-  4. Absence of plan-drift (no unrelated edits)
+  3. Absence of plan-drift (no unrelated edits)
+
+Note: minimality is evaluated by the dedicated `minimality_judge` specialist
+(when configured in ``cfg.tournaments.impl.judge_roles``). The generic
+judge should focus on tests-pass + correctness + plan-drift only — do
+NOT factor diff size or abstraction count into your ranking.
 
 Do not let timing, submission order, or any perceived authority influence
 your judgment — evaluate purely on merit.
