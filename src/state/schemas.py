@@ -121,6 +121,13 @@ class Task(BaseModel):
     description: str
     status: TaskStatus = "pending"
     files: list[str] = Field(default_factory=list)
+    # v0.24.3: paths the task itself will create. Parser strips a ``[new]``
+    # prefix off ``Files:`` entries and routes them here so the v0.24.3
+    # ``validate_files_exist`` check can skip them during the on-disk
+    # existence sweep. Empty list is the back-compat default — v0.24.2
+    # ``plan.json`` files deserialize cleanly with ``files_new=[]`` and
+    # behave identically to pre-v0.24.3 plans.
+    files_new: list[str] = Field(default_factory=list)
     # v0.20.0 C1: per-task additional path prefixes the task may modify on
     # top of ``Phase.edit_scope`` / ``Plan.edit_scope``. Architects emit
     # these via the ``Extended-scope:`` block when a task legitimately
@@ -141,7 +148,7 @@ class Task(BaseModel):
         """v0.20.0 C1: same validators as Plan/Phase ``edit_scope``."""
         return _validate_edit_scope_paths(v)
 
-    @field_validator("files", mode="after")
+    @field_validator("files", "files_new", mode="after")
     @classmethod
     def _validate_files_format(cls, v: list[str]) -> list[str]:
         """Permit glob entries; reject only structurally bogus paths.

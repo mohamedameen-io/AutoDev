@@ -2,6 +2,18 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.3] - 2026-05-10
+
+### Fixed
+- **Architect-emitted file paths are validated against the filesystem before delegation.** Previously, `parse_plan_markdown` accepted any string in a `Files:` line, including hallucinated paths that smashed directory prefixes together with C++ source content; the worker then died with `[Errno 63] File name too long` mid-task. New `src/orchestrator/file_existence_validator.py` walks every `Task.files`, `Task.extended_scope`, `Phase.edit_scope`, and `Plan.edit_scope` entry and raises `PathValidationError(reason="missing_on_disk")` on the first miss with a `difflib`-fuzzy "did you mean" suggestion sourced from `git ls-files`. The error flows into the existing v0.22.4 architect-retry envelope at `plan_phase.py:173-211`, so the architect self-corrects on the second pass. Validation is wired into both the first parse and the retry parse. No-ops on non-git trees / empty snapshots — without ground truth there's no basis to flag any path as missing.
+
+### Added
+- **`[new]` prefix on `Files:` lines marks paths that the task will create.** Parser strips the prefix and routes the path into a new `Task.files_new: list[str]` field; `validate_files_exist` skips those paths during existence checks. Lets create-new tasks coexist with strict path validation. Default empty list — back-compat with v0.24.2 `plan.json` on disk.
+
+### Tests
+- `tests/test_orchestrator_file_existence_validator.py` — 10 cases (happy path, missing file, fuzzy suggestion, `[new]` prefix, extended_scope, phase/plan edit_scope, snapshot caching).
+- Extends `tests/test_orchestrator_plan_phase.py` and `tests/test_orchestrator_plan_parser.py` with retry-hint and prefix-parsing assertions.
+
 ## [0.24.2] - 2026-05-10
 
 ### Changed

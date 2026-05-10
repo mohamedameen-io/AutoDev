@@ -48,6 +48,11 @@ _RE_PLAN_TITLE = re.compile(r"^#\s+Plan:\s*(.+?)\s*$", re.MULTILINE)
 _RE_PHASE = re.compile(r"^##\s+Phase\s+([0-9A-Za-z._-]+)\s*:\s*(.+?)\s*$")
 _RE_TASK = re.compile(r"^###\s+Task\s+([0-9A-Za-z._-]+)\s*:\s*(.+?)\s*$")
 _RE_FILES = re.compile(r"^\s*-\s*Files?\s*:\s*(.+?)\s*$", re.IGNORECASE)
+# v0.24.3: ``[new]`` prefix on a comma-split ``Files:`` entry marks the path
+# as one the task itself will create. Parser strips the prefix and routes
+# the path into ``Task.files_new`` so :func:`validate_files_exist` skips
+# it during the on-disk existence sweep.
+_RE_NEW_PREFIX = re.compile(r"^\s*\[new\]\s*", re.I)
 _RE_DESC = re.compile(r"^\s*-\s*Description\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _RE_ACCEPT_HEADER = re.compile(r"^\s*-\s*Acceptance\s*:?\s*$", re.IGNORECASE)
 _RE_ACCEPT_ITEM = re.compile(r"^\s*-\s*\[\s*[ xX]?\s*\]\s*(.+?)\s*$")
@@ -273,6 +278,10 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
                 "title": task_m.group(2).strip(),
                 "description": "",
                 "files": [],
+                # v0.24.3: paths the task will CREATE — parser routes
+                # ``[new] path`` entries from the ``Files:`` line here so
+                # validate_files_exist skips them during on-disk checks.
+                "files_new": [],
                 "acceptance": [],
                 "depends_on": [],
                 "requires": [],
@@ -351,9 +360,24 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
 
         files_m = _RE_FILES.match(line)
         if files_m:
-            current_task["files"] = [
-                s.strip() for s in files_m.group(1).split(",") if s.strip()
-            ]
+            # v0.24.3: partition each comma-split entry into ``files`` vs.
+            # ``files_new`` based on a leading ``[new]`` prefix. The prefix
+            # is stripped before storage; the routing decides whether
+            # ``validate_files_exist`` will require the path to exist.
+            files_existing: list[str] = []
+            files_to_create: list[str] = []
+            for raw_entry in files_m.group(1).split(","):
+                stripped = raw_entry.strip()
+                if not stripped:
+                    continue
+                if _RE_NEW_PREFIX.match(stripped):
+                    files_to_create.append(
+                        _RE_NEW_PREFIX.sub("", stripped, count=1).strip()
+                    )
+                else:
+                    files_existing.append(stripped)
+            current_task["files"] = files_existing
+            current_task["files_new"] = files_to_create
             in_acceptance_block = False
             continue
 
@@ -479,6 +503,10 @@ def _make_task(raw: dict, phase_id: str) -> Task:
         title=raw["title"],
         description=raw.get("description", "") or raw["title"],
         files=raw.get("files", []),
+        # v0.24.3: paths the task will CREATE (parsed from ``[new] <path>``
+        # entries on the ``Files:`` line). Skipped by validate_files_exist
+        # during the on-disk existence sweep.
+        files_new=raw.get("files_new", []),
         acceptance=crit,
         depends_on=raw.get("depends_on", []),
         requires=raw.get("requires", []),

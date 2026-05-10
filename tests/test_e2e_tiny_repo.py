@@ -43,7 +43,7 @@ PLAN_MD = """
 
 ### Task 1.2: Add pytest test for subtract
   - Description: Add a pytest covering positive and negative cases
-  - Files: test_math.py
+  - Files: [new] test_math.py
   - Acceptance:
     - [ ] tests pass
 """

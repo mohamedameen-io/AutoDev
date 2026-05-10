@@ -337,3 +337,25 @@ def test_phase_acceptance_with_xed_checkbox() -> None:
     assert len(items) == 2
     assert items[0].met is True
     assert items[1].met is False
+
+
+# ---------------------------------------------------------------------------
+# v0.24.3 — ``[new]`` prefix on Files: line
+# ---------------------------------------------------------------------------
+
+
+def test_parse_plan_markdown_strips_new_prefix() -> None:
+    """``Files: src/foo.cpp, [new] src/bar.cpp`` partitions into
+    ``Task.files == ["src/foo.cpp"]`` and ``Task.files_new == ["src/bar.cpp"]``.
+
+    The ``[new]`` prefix is stripped during parsing; the path itself is
+    routed into the new ``files_new`` list so :func:`validate_files_exist`
+    skips it during the on-disk existence sweep.
+    """
+    md = _plan_with_task_body(
+        "  - Files: src/foo.cpp, [new] src/bar.cpp\n"
+    )
+    plan = parse_plan_markdown(md)
+    task = plan.phases[0].tasks[0]
+    assert task.files == ["src/foo.cpp"]
+    assert task.files_new == ["src/bar.cpp"]

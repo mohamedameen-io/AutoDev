@@ -26,6 +26,7 @@ from errors import AutodevError, TournamentError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
 from orchestrator.inline_state import write_suspend_state
+from orchestrator.file_existence_validator import validate_files_exist
 from orchestrator.plan_parser import (
     PlanParseError,
     parse_plan_markdown,
@@ -172,6 +173,12 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
 
         try:
             plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
+            # v0.24.3: enforce that every architect-emitted file path
+            # actually exists on disk (modulo the ``[new]`` opt-out).
+            # Any miss raises ``PathValidationError`` with
+            # ``reason="missing_on_disk"`` which flows into the same
+            # architect-retry envelope as the v0.22.4 path-shape errors.
+            validate_files_exist(plan, cwd)
         except (
             PlanParseError,
             _PydValidationError,
@@ -186,6 +193,22 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                 "List one path per line in EDIT_SCOPE blocks, comma-separated "
                 "in `Files:` lines."
             )
+            # v0.24.3: when the failure was a missing-on-disk path,
+            # append a missing-file paragraph that documents the ``[new]``
+            # opt-out and embeds the closest tracked-file suggestion.
+            if getattr(exc, "reason", None) == "missing_on_disk":
+                suggestion = getattr(exc, "suggestion", None)
+                extra_hint += (
+                    "\n\nYour previous plan listed files that do not exist "
+                    "on disk. Either: (a) correct the path — closest "
+                    f"tracked match: {suggestion!r}, or (b) if you intend "
+                    "to CREATE this file in the task, prefix the path "
+                    "with [new] in the Files: line, e.g.:\n"
+                    "    Files: src/foo.cpp, [new] src/foo_test.cpp\n"
+                    "Do NOT smash directory paths and source code "
+                    "together — a path like `src/qa/cpp_symbols.py// "
+                    "...code...` is malformed and will be rejected."
+                )
             logger.warning("plan_phase.parse_failed_retrying", err=str(exc))
             retry_env = architect_env.model_copy(
                 update={
@@ -209,6 +232,9 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
             plan_md = retry_result.text
             plan_md = _try_read_plan_from_file(cwd, plan_md)
             plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
+            # v0.24.3: enforced on the retry parse too — the architect's
+            # second pass must satisfy on-disk existence as well.
+            validate_files_exist(plan, cwd)
 
         if orch.cfg.tournaments.plan.enabled:
             num_branches = orch.cfg.tournaments.plan.num_branches

@@ -457,6 +457,82 @@ async def test_plan_phase_dispatches_to_multi_branch_when_num_branches_gt_1(
 
 
 @pytest.mark.asyncio
+async def test_plan_phase_retries_on_missing_file_and_includes_hint(
+    tmp_path: Path,
+) -> None:
+    """v0.24.3: when the architect emits a plan with files that don't exist
+    on disk, the parse-retry envelope fires and the second-pass envelope's
+    ``context["hint"]`` carries the missing-file paragraph (with the ``[new]``
+    opt-out instructions and a "do not exist on disk" marker).
+
+    The first architect response references ``imaginary.cpp`` which won't be
+    found; the second references ``math.py`` (which we create + commit) so
+    the retry succeeds.
+    """
+    import subprocess
+
+    # Bootstrap a populated git repo so ``_RepoFileSnapshot`` has tracked
+    # files to validate against. A non-git or empty-git tree no-ops the
+    # validator and the retry path is never exercised.
+    subprocess.run(["git", "init", "-q"], cwd=str(tmp_path), check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "t@t"], cwd=str(tmp_path), check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "t"], cwd=str(tmp_path), check=True
+    )
+    (tmp_path / "math.py").write_text("def add(a, b): return a + b\n")
+    subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "init"], cwd=str(tmp_path), check=True
+    )
+
+    bad_plan_md = """
+# Plan: Add subtract
+
+## Phase 1: Implement
+
+### Task 1.1: bogus path
+  - Description: references a path that does not exist
+  - Files: imaginary.cpp
+  - Acceptance:
+    - [ ] something
+"""
+    good_plan_md = """
+# Plan: Add subtract
+
+## Phase 1: Implement
+
+### Task 1.1: real path
+  - Description: refs a real file
+  - Files: math.py
+  - Acceptance:
+    - [ ] passes
+"""
+    bad_then_good = [ok(bad_plan_md), ok(good_plan_md)]
+    adapter = StubAdapter(
+        {
+            "explorer": ok("found stuff"),
+            "domain_expert": ok("ok"),
+            "architect": bad_then_good,
+        }
+    )
+    orch = _make_orch(tmp_path, adapter)
+
+    plan = await orch.plan("Add subtract")
+    assert plan is not None
+    assert adapter.count("architect") == 2
+
+    # The second architect call's prompt must carry the missing-file hint
+    # paragraph with "do not exist on disk" + the [new] opt-out instructions.
+    architect_prompts = adapter.prompts_for("architect")
+    assert len(architect_prompts) == 2
+    second_prompt = architect_prompts[1]
+    assert "do not exist on disk" in second_prompt
+    assert "[new]" in second_prompt
+
+
+@pytest.mark.asyncio
 async def test_plan_phase_dispatches_to_single_branch_when_num_branches_eq_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

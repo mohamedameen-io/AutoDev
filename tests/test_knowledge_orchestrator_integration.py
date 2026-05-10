@@ -28,7 +28,7 @@ PLAN_MD = """
 
 ### Task 1.2: Second task
   - Description: Second step
-  - Files: util.py
+  - Files: [new] util.py
   - Acceptance:
     - [ ] done
 """
