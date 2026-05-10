@@ -1,0 +1,65 @@
+{
+  "_note": "Hand-counted v1 baselines. Phase 1 will regenerate via radon + vulture. comment_lines = '#' lines + docstring lines (rough). loc_executable = total - blank - pure-comment lines.",
+  "_methodology": {
+    "loc_executable": "non-blank, non-pure-comment lines",
+    "n_abstractions": "count of `class` and `def` declarations",
+    "n_imports": "count of `import` and `from ... import` statements",
+    "lines_total": "total line count including blanks and comments",
+    "comment_lines": "lines starting with `#` plus lines containing `\"\"\"` docstring delimiters"
+  },
+  "pair_01_speculative_abstraction": {
+    "verbose": {"loc_executable": 28, "n_abstractions": 10, "n_imports": 1, "lines_total": 43, "comment_lines": 2},
+    "lean": {"loc_executable": 2, "n_abstractions": 1, "n_imports": 0, "lines_total": 5, "comment_lines": 1},
+    "delta": {"loc_executable": -26, "n_abstractions": -9, "n_imports": -1, "lines_total": -38, "comment_lines": -1}
+  },
+  "pair_02_defensive_scaffolding": {
+    "verbose": {"loc_executable": 23, "n_abstractions": 1, "n_imports": 1, "lines_total": 28, "comment_lines": 2},
+    "lean": {"loc_executable": 3, "n_abstractions": 1, "n_imports": 1, "lines_total": 6, "comment_lines": 1},
+    "delta": {"loc_executable": -20, "n_abstractions": 0, "n_imports": 0, "lines_total": -22, "comment_lines": -1}
+  },
+  "pair_03_restated_comments": {
+    "verbose": {"loc_executable": 10, "n_abstractions": 1, "n_imports": 0, "lines_total": 22, "comment_lines": 10},
+    "lean": {"loc_executable": 2, "n_abstractions": 1, "n_imports": 0, "lines_total": 5, "comment_lines": 1},
+    "delta": {"loc_executable": -8, "n_abstractions": 0, "n_imports": 0, "lines_total": -17, "comment_lines": -9}
+  },
+  "pair_04_unused_config_knob": {
+    "verbose": {"loc_executable": 24, "n_abstractions": 1, "n_imports": 2, "lines_total": 27, "comment_lines": 1},
+    "lean": {"loc_executable": 2, "n_abstractions": 1, "n_imports": 0, "lines_total": 5, "comment_lines": 1},
+    "delta": {"loc_executable": -22, "n_abstractions": 0, "n_imports": -2, "lines_total": -22, "comment_lines": 0}
+  },
+  "pair_05_one_call_helper": {
+    "verbose": {"loc_executable": 8, "n_abstractions": 3, "n_imports": 0, "lines_total": 15, "comment_lines": 1},
+    "lean": {"loc_executable": 2, "n_abstractions": 1, "n_imports": 0, "lines_total": 5, "comment_lines": 1},
+    "delta": {"loc_executable": -6, "n_abstractions": -2, "n_imports": 0, "lines_total": -10, "comment_lines": 0}
+  },
+  "pair_06_redundant_try_except": {
+    "verbose": {"loc_executable": 20, "n_abstractions": 2, "n_imports": 1, "lines_total": 26, "comment_lines": 1},
+    "lean": {"loc_executable": 4, "n_abstractions": 2, "n_imports": 0, "lines_total": 9, "comment_lines": 1},
+    "delta": {"loc_executable": -16, "n_abstractions": 0, "n_imports": -1, "lines_total": -17, "comment_lines": 0}
+  },
+  "pair_07_dead_import": {
+    "verbose": {"loc_executable": 10, "n_abstractions": 1, "n_imports": 7, "lines_total": 16, "comment_lines": 4},
+    "lean": {"loc_executable": 4, "n_abstractions": 1, "n_imports": 1, "lines_total": 7, "comment_lines": 1},
+    "delta": {"loc_executable": -6, "n_abstractions": 0, "n_imports": -6, "lines_total": -9, "comment_lines": -3}
+  },
+  "pair_08_duplicate_logic": {
+    "verbose": {"loc_executable": 30, "n_abstractions": 3, "n_imports": 0, "lines_total": 37, "comment_lines": 1},
+    "lean": {"loc_executable": 9, "n_abstractions": 4, "n_imports": 0, "lines_total": 18, "comment_lines": 1},
+    "delta": {"loc_executable": -21, "n_abstractions": 1, "n_imports": 0, "lines_total": -19, "comment_lines": 0}
+  },
+  "pair_09_feature_envy": {
+    "verbose": {"loc_executable": 17, "n_abstractions": 5, "n_imports": 0, "lines_total": 26, "comment_lines": 2},
+    "lean": {"loc_executable": 14, "n_abstractions": 5, "n_imports": 0, "lines_total": 20, "comment_lines": 1},
+    "delta": {"loc_executable": -3, "n_abstractions": 0, "n_imports": 0, "lines_total": -6, "comment_lines": -1}
+  },
+  "pair_10_premature_dataclass": {
+    "verbose": {"loc_executable": 9, "n_abstractions": 3, "n_imports": 1, "lines_total": 16, "comment_lines": 1},
+    "lean": {"loc_executable": 2, "n_abstractions": 1, "n_imports": 0, "lines_total": 5, "comment_lines": 1},
+    "delta": {"loc_executable": -7, "n_abstractions": -2, "n_imports": -1, "lines_total": -11, "comment_lines": 0}
+  },
+  "_totals": {
+    "verbose": {"loc_executable": 179, "n_abstractions": 30, "n_imports": 13, "lines_total": 256, "comment_lines": 25},
+    "lean": {"loc_executable": 44, "n_abstractions": 18, "n_imports": 2, "lines_total": 85, "comment_lines": 10},
+    "delta": {"loc_executable": -135, "n_abstractions": -12, "n_imports": -11, "lines_total": -171, "comment_lines": -15}
+  }
+}
