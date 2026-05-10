@@ -39,10 +39,41 @@ module surface as plain :class:`ValueError` (per project convention).
 
 from __future__ import annotations
 
+import posixpath
 from pathlib import PurePosixPath
 
 from errors import AutodevError
 from state.schemas import Phase, Plan, Task
+
+
+def _normalize_for_diagnostic(path: str) -> str:
+    """v0.22.1 A4: minimal path normalization for error messages only.
+
+    Strips surrounding quotes / backticks, leading ``./``, trailing
+    whitespace and ``/``, then ``posixpath.normpath`` to collapse double
+    slashes and resolve internal ``.``. Surfaces the most common
+    architect-emitted malformations alongside the raw form so
+    ``EditScopeViolation`` ledger events name the specific malformation
+    instead of hiding it behind ``…`` truncation.
+
+    The full normalize_path pipeline (NFC unicode, control-char
+    rejection, structured ``PathValidationError``) lands in v0.22.2 B4.
+    """
+    if not path:
+        return path
+    s = path.strip()
+    # Strip matched outer quote pairs (single, double, backtick).
+    for q in ("'", '"', "`"):
+        if len(s) >= 2 and s[0] == q and s[-1] == q:
+            s = s[1:-1].strip()
+            break
+    if s.startswith("./"):
+        s = s[2:]
+    s = s.rstrip("/").rstrip()
+    try:
+        return posixpath.normpath(s) if s else s
+    except (TypeError, ValueError):
+        return s
 
 
 # v0.17.0 S5: characters that mark a Task.files entry as a glob pattern.
@@ -402,16 +433,20 @@ def validate_edit_scope(
                         if not is_in_scope(matched, effective_scope):
                             raise EditScopeViolation(
                                 f"task {task.id!r} (phase {phase.id!r}) declares "
-                                f"glob {file_path!r} which expands to "
-                                f"{matched!r} outside the resolved edit_scope "
-                                f"{resolved!r} (extended_scope={extended!r})"
+                                f"glob {file_path!r} (normalized: "
+                                f"{_normalize_for_diagnostic(file_path)!r}) "
+                                f"which expands to {matched!r} outside the "
+                                f"resolved edit_scope {resolved!r} "
+                                f"(extended_scope={extended!r})"
                             )
                     continue
                 if not is_in_scope(file_path, effective_scope):
                     raise EditScopeViolation(
                         f"task {task.id!r} (phase {phase.id!r}) declares file "
-                        f"{file_path!r} outside the resolved edit_scope "
-                        f"{resolved!r} (extended_scope={extended!r})"
+                        f"{file_path!r} (normalized: "
+                        f"{_normalize_for_diagnostic(file_path)!r}) "
+                        f"outside the resolved edit_scope {resolved!r} "
+                        f"(extended_scope={extended!r})"
                     )
 
 

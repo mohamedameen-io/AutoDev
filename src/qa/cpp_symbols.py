@@ -141,10 +141,15 @@ _CALL = re.compile(
 _QUALIFIED_CALL = re.compile(r"::\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 # Member access: ``.foo(`` or ``->foo(`` — likewise excluded.
 _MEMBER_CALL = re.compile(r"(?:\.|->)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
-# Function declarations / definitions in a header. Coarse: matches the
-# common ``RET name(...);`` and ``RET name(...) { ... }`` shapes.
-_DECL = re.compile(
-    r"(?:^|\n)\s*(?:[A-Za-z_][\w:<>* &]*\s+)+?([A-Za-z_]\w*)\s*\("
+# v0.22.1 A1: ``_DECL_LINE`` replaces a multi-line pattern with nested
+# unbounded quantifiers (``(?:[A-Za-z_][\w:<>* &]*\s+)+?``) that exposed
+# catastrophic backtracking on Unity-scale C++ headers (2026-05-09 stall:
+# 40+ min CPU pin in ``_sre_SRE_Pattern_findall``). The replacement scans
+# one line at a time, bounds the type-token repeat to ``{1,8}?``, and
+# drops the embedded space from the inner character class. Linear in
+# input length.
+_DECL_LINE = re.compile(
+    r"^\s*(?:[A-Za-z_][\w:<>*&]*\s+){1,8}?([A-Za-z_]\w*)\s*\("
 )
 
 
@@ -185,8 +190,16 @@ def extract_declarations(source: str) -> set[str]:
     The cost of a miss is a false positive on the call site, which we
     moderate via the include-chain breadth (any header providing the
     name suffices).
+
+    v0.22.1 A1: scans one line at a time so backtracking cannot span
+    multiple lines on long template / typedef chains.
     """
-    return set(_DECL.findall(source))
+    out: set[str] = set()
+    for line in source.splitlines():
+        m = _DECL_LINE.match(line)
+        if m is not None:
+            out.add(m.group(1))
+    return out
 
 
 def extract_macros(source: str) -> set[str]:

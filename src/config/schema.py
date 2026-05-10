@@ -368,6 +368,15 @@ class QAGatesConfig(BaseModel):
     # net-new findings vs. the baseline trip the gate. Refresh the baseline
     # via ``autodev secretscan baseline``.
     secretscan_baseline_enabled: bool = False
+    # v0.22.1 A2: minimal safety valve for huge repos. On 358K-file Unity,
+    # secretscan flagged 27K-50K false positives (Unity asset GUIDs clear
+    # the 4.5 entropy default). When True (default), the gate auto-skips
+    # with severity=warn on repos where ``runtime.repo_probe`` reports
+    # ``is_huge``. Override per-repo with ``secretscan_force_run_on_huge_repo=True``.
+    # Full FP redesign (entropy bump, ignore_paths, diff-mode default) is
+    # deferred to v0.23.0 C2.
+    secretscan_auto_skip_huge_repo: bool = True
+    secretscan_force_run_on_huge_repo: bool = False
     # v0.19.0: per-extension entropy override. ``None`` means "use module
     # default curve" (see ``qa.secretscan._DEFAULT_PER_EXTENSION_ENTROPY``).
     secretscan_per_extension_thresholds: dict[str, float] | None = None
@@ -388,6 +397,13 @@ class QAGatesConfig(BaseModel):
     code_size: bool = False
     code_size_baseline_enabled: bool = False
     code_size_thresholds: CodeSizeThresholds | None = None
+    # v0.22.1 A1: per-file timeout for regex-based QA gate scanners.
+    # Triggered for the ``hallucination_guard`` C++ scanner after the
+    # 2026-05-09 Unity stall (catastrophic regex backtracking on a
+    # 358K-file repo). When a single-file scan exceeds this wall-clock
+    # ceiling, the gate logs ``regex_timeout`` and skip-and-warns rather
+    # than pinning the orchestrator. Tune lower on huge repos.
+    regex_timeout_per_file_s: float = 10.0
 
 
 class GuardrailsConfig(BaseModel):

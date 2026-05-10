@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from adapters.base import PlatformAdapter
-from adapters.git_utils import _diff_files, _git_diff, _git_porcelain_set
+from adapters.git_utils import (
+    _diff_files,
+    _git_diff,
+    _git_diff_with_untracked,
+    _git_porcelain_set,
+)
 from adapters.types import AgentInvocation, AgentResult, AgentSpec
 from autologging import get_logger
 from state.paths import debug_dir
@@ -259,7 +264,13 @@ class ClaudeCodeAdapter(PlatformAdapter):
 
         files_after = _git_porcelain_set(inv.cwd)
         files_changed = _diff_files(files_before, files_after)
-        diff = _git_diff(inv.cwd) if files_changed else None
+        # v0.22.1 A5: ``_git_diff`` (``git diff HEAD``) omits untracked
+        # files; use the sibling helper that splices per-untracked
+        # ``--no-index`` blocks so evidence captures new-file work.
+        # Pre-A5 every developer task creating new files (notes/, etc.)
+        # had ``evidence.diff = null`` despite ``files_changed`` being
+        # populated — D-3 finding from the 2026-05-09 Unity stall.
+        diff = _git_diff_with_untracked(inv.cwd) if files_changed else None
 
         result = AgentResult(
             success=not is_error,

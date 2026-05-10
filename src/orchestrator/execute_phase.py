@@ -608,9 +608,16 @@ async def run_execute_phase(
             # Duck-type as WorktreeManager (it exposes the same surface).
             worktree_mgr = pool  # type: ignore[assignment]
         else:
+            # v0.22.1 A3: thread is_huge through so worktree-add gets the
+            # extended 600s timeout on Unity-scale repos where the historical
+            # 60s ceiling killed full-checkout creation (~80-180s observed).
+            _wm_huge_mode = bool(
+                getattr(getattr(orch, "_repo_capacity", None), "is_huge", False)
+            )
             worktree_mgr = WorktreeManager(
                 main_repo=orch.cwd,
                 tournament_dir=autodev_root(orch.cwd) / "execute_worktrees",
+                huge_mode=_wm_huge_mode,
             )
 
     try:
@@ -2911,6 +2918,31 @@ async def _run_qa_gates(
         getattr(orch.cfg, "hallucination_guard", True)
     )
 
+    # v0.22.1 A2: auto-skip secretscan on huge repos to avoid the
+    # false-positive avalanche observed on Unity (27K-50K FPs from asset
+    # GUIDs). Operators can force-enable via
+    # ``cfg.secretscan_force_run_on_huge_repo``.
+    repo_capacity = getattr(orch, "_repo_capacity", None)
+    secretscan_huge_skip = bool(
+        repo_capacity is not None
+        and getattr(repo_capacity, "is_huge", False)
+        and getattr(cfg, "secretscan_auto_skip_huge_repo", True)
+        and not getattr(cfg, "secretscan_force_run_on_huge_repo", False)
+    )
+    secretscan_enabled = cfg.secretscan and not secretscan_huge_skip
+    if secretscan_huge_skip and cfg.secretscan:
+        # Surface the skip so operators see it in the orchestrator log
+        # without having to dig into config. Mirrors the pattern of
+        # :func:`_surface_warning` used elsewhere for soft gate events.
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "qa.secretscan.auto_skipped_huge_repo file_count=%s total_bytes=%s; "
+            "set cfg.qa_gates.secretscan_force_run_on_huge_repo=True to override",
+            getattr(repo_capacity, "file_count", "?"),
+            getattr(repo_capacity, "total_bytes", "?"),
+        )
+
     # v0.22.0: gates are ``(name, enabled, callable)`` triples so the
     # warn-surface helper can attribute findings to a gate.
     gates: list[tuple[str, bool, Callable[[], Awaitable[GateResult]]]] = [
@@ -2920,7 +2952,7 @@ async def _run_qa_gates(
         ("test_runner", cfg.test_runner, lambda: run_tests(cwd)),
         (
             "secretscan",
-            cfg.secretscan,
+            secretscan_enabled,
             lambda: run_secretscan(
                 cwd,
                 paths=secretscan_paths,

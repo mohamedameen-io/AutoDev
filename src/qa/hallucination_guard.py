@@ -27,15 +27,27 @@ class.
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib
 import importlib.util
 import inspect
 import json
+import logging
 import re
 import sys
 from pathlib import Path
 
 from plugins.registry import GateResult
+
+
+_log = logging.getLogger(__name__)
+
+# v0.22.1 A1: per-file watchdog default. Operators can override via
+# ``cfg.qa_gates.regex_timeout_per_file_s``. Set conservatively (10 s)
+# on the assumption that a healthy single-file scan completes in <1 s
+# for repos under 1 GB. The 2026-05-09 Unity stall (358K files) showed
+# a single C++ header could pin the regex engine indefinitely.
+DEFAULT_PER_FILE_TIMEOUT_S = 10.0
 
 
 # Files / dirs we never walk (mirrors the secretscan skip set).
@@ -343,9 +355,39 @@ def _dispatch(path: Path, repo_root: Path) -> list[str]:
     return []
 
 
+async def _dispatch_with_timeout(
+    path: Path,
+    repo_root: Path,
+    timeout_s: float = DEFAULT_PER_FILE_TIMEOUT_S,
+) -> list[str]:
+    """Run :func:`_dispatch` in a worker thread with a wall-clock ceiling.
+
+    v0.22.1 A1: a single misbehaved regex (or pathologically long file)
+    used to pin the orchestrator's main thread for tens of minutes. We
+    now run each file in :func:`asyncio.to_thread` under
+    :func:`asyncio.wait_for`; on timeout we log a structured event and
+    skip-and-warn (return empty findings) so the gate cannot block the
+    task. The cost of skipping a slow file is a missed hallucination
+    finding — which the build / test gates downstream still catch.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_dispatch, path, repo_root),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        _log.warning(
+            "qa.hallucination_guard.regex_timeout path=%s timeout_s=%s",
+            str(path),
+            timeout_s,
+        )
+        return []
+
+
 async def run_hallucination_guard(
     cwd: Path,
     paths: list[Path] | None = None,
+    per_file_timeout_s: float = DEFAULT_PER_FILE_TIMEOUT_S,
 ) -> GateResult:
     """Scan *cwd* (or *paths*) for hallucinated API references.
 
@@ -354,6 +396,9 @@ async def run_hallucination_guard(
         paths: Optional diff-scope filter. When non-None, only the listed
             files are walked (Python / TypeScript / C++ extensions only).
             Mirrors v0.13.0's secretscan diff-scope signature.
+        per_file_timeout_s: v0.22.1 A1 — per-file wall-clock ceiling. On
+            timeout the file is skip-and-warn'd. Default
+            :data:`DEFAULT_PER_FILE_TIMEOUT_S`.
 
     Returns:
         :class:`GateResult` with ``passed=False`` and a finding list when
@@ -363,7 +408,10 @@ async def run_hallucination_guard(
     files = _iter_files(cwd, paths)
     all_findings: list[str] = []
     for f in files:
-        all_findings.extend(_dispatch(f, repo_root=cwd))
+        findings = await _dispatch_with_timeout(
+            f, repo_root=cwd, timeout_s=per_file_timeout_s
+        )
+        all_findings.extend(findings)
 
     if all_findings:
         detail_lines = all_findings[:20]

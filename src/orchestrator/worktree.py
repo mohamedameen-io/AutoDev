@@ -43,14 +43,40 @@ class WorktreeManager:
     ``tournament_dir/<label>``.
     """
 
-    def __init__(self, main_repo: Path, tournament_dir: Path) -> None:
+    def __init__(
+        self,
+        main_repo: Path,
+        tournament_dir: Path,
+        *,
+        huge_mode: bool = False,
+        huge_create_timeout_s: float = 600.0,
+    ) -> None:
+        """Initialize a worktree manager.
+
+        v0.22.1 A3: ``huge_mode`` flag from ``runtime.repo_probe.is_huge``
+        extends the ``git worktree add`` timeout from 60 s to
+        ``huge_create_timeout_s`` (default 600 s). On Unity-scale repos
+        (358K files, 3 GB) full-checkout worktree creation can take
+        80-180 s; the legacy 60 s ceiling killed it. Full sparse-by-default
+        lands in v0.23.0 C1.
+        """
         self._main = Path(main_repo)
         self._dir = Path(tournament_dir)
+        self._huge_mode = bool(huge_mode)
+        self._huge_create_timeout_s = float(huge_create_timeout_s)
         self._log = get_logger(
             component="worktree",
             main_repo=str(self._main),
             tournament_dir=str(self._dir),
         )
+
+    def _create_timeout_s(self) -> float:
+        """Per-call timeout for slow ``git worktree add`` operations.
+
+        Returns ``huge_create_timeout_s`` when ``huge_mode`` is on,
+        otherwise the historical 60 s default.
+        """
+        return self._huge_create_timeout_s if self._huge_mode else 60.0
 
     @property
     def main_repo(self) -> Path:
@@ -123,6 +149,7 @@ class WorktreeManager:
             rc, out, err = await _run_git(
                 self._main,
                 ["worktree", "add", "--no-checkout", "--detach", str(wt), base_ref],
+                timeout_s=self._create_timeout_s(),
             )
             if rc != 0:
                 raise WorktreeError(
@@ -166,6 +193,7 @@ class WorktreeManager:
         rc, out, err = await _run_git(
             self._main,
             ["worktree", "add", "--detach", str(wt), base_ref],
+            timeout_s=self._create_timeout_s(),
         )
         if rc != 0:
             raise WorktreeError(

@@ -2,6 +2,22 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.1] - 2026-05-10
+
+### Fixed (huge-repo crash patches)
+- **A1 — `qa.cpp_symbols` regex linearization + `hallucination_guard` watchdog.** Replaces the multi-line `_DECL` pattern (nested unbounded quantifier susceptible to catastrophic backtracking on Unity-scale C++ headers) with a per-line `_DECL_LINE` scan. Wraps `_dispatch` in `asyncio.wait_for(asyncio.to_thread(...))` with a per-file timeout (default 10 s, configurable via `qa_gates.regex_timeout_per_file_s`); on timeout the file is skip-and-warn'd. Resolves the 2026-05-09 Unity stall (40+ min CPU pin in `_sre_SRE_Pattern_findall`).
+- **A2 — `secretscan` auto-skip on huge repos.** When `runtime.repo_probe.RepoCapacity.is_huge` is `True`, the gate dispatcher disables `secretscan` and surfaces a structured warning. Override per-repo with `qa_gates.secretscan_force_run_on_huge_repo=True`. Avoids the 27K-50K false-positive avalanche observed on Unity (asset GUIDs cleared the 4.5 entropy default). Full FP redesign deferred to v0.23.0.
+- **A3 — `WorktreeManager` huge-repo create timeout.** Adds `huge_mode` and `huge_create_timeout_s` (default 600 s) to `WorktreeManager.__init__`. The orchestrator threads `is_huge` from the repo probe so `git worktree add` no longer hits the historical 60 s ceiling on Unity-scale full checkouts (~80-180 s observed).
+- **A4 — `EditScopeViolation` surfaces both raw and normalized paths.** Strips surrounding quotes/backticks/`./` and applies `posixpath.normpath` at the raise site so ledger events name the path malformation unambiguously rather than truncating with `…`. Full normalization pipeline (architect-retry, structured errors) lands in v0.22.2.
+- **A5 — `_git_diff_with_untracked` captures new files in adapter evidence.** New helper in `adapters.git_utils` mirrors the already-correct `WorktreeManager.get_diff_vs_base` (tracked diff + per-untracked `git diff --no-index` blocks). Switched the `claude_code` adapter call site so developer tasks creating new files (e.g. `notes/*.md`) now produce non-null `evidence.diff` instead of `null`.
+
+### Added
+- `QAGatesConfig.regex_timeout_per_file_s: float = 10.0` — per-file watchdog ceiling for content-scanning QA gates.
+- `QAGatesConfig.secretscan_auto_skip_huge_repo: bool = True` — auto-skip the secretscan gate on huge repos (default safety valve).
+- `QAGatesConfig.secretscan_force_run_on_huge_repo: bool = False` — operator override.
+
+Roadmap and per-item rationale: `thoughts/shared/plans/2026-05-10-huge-repo-stability-roadmap.md`.
+
 ## [0.21.1] - 2026-05-09
 
 ### Fixed

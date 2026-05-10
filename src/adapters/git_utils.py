@@ -8,6 +8,7 @@ __all__ = [
     "_git_porcelain_set",
     "_diff_files",
     "_git_diff",
+    "_git_diff_with_untracked",
     "_git_diff_range",
     "_git_rev_parse_head",
     "extract_files_from_diff",
@@ -87,6 +88,71 @@ def _git_diff(cwd: Path) -> str | None:
     if out.returncode != 0:
         return None
     return out.stdout or None
+
+
+def _list_untracked(cwd: Path) -> list[str]:
+    """v0.22.1 A5: paths of untracked, non-gitignored files in *cwd*.
+
+    Returns ``[]`` for non-repos / subprocess failure. Used by
+    :func:`_git_diff_with_untracked` to surface new files in adapter
+    evidence. Mirrors
+    :meth:`orchestrator.worktree.WorktreeManager._list_untracked`.
+    """
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [line for line in out.stdout.splitlines() if line.strip()]
+
+
+def _git_diff_with_untracked(cwd: Path) -> str | None:
+    """v0.22.1 A5: ``git diff HEAD`` plus a per-untracked-file diff block.
+
+    The legacy :func:`_git_diff` calls ``git diff HEAD`` only — that
+    omits untracked files. Every developer task that creates new files
+    (e.g. ``notes/foo.md``) ended up with ``evidence.diff = null``
+    despite ``files_changed`` being populated (D-3 finding from the
+    2026-05-09 Unity stall). This sibling helper appends per-untracked
+    ``git diff --no-color --no-index /dev/null <rel>`` blocks. ``git
+    diff --no-index`` returns rc=1 when files differ (the success case
+    here), so we accept rc in (0, 1). Returns ``None`` outside a git
+    repo or when there is genuinely nothing to diff. Mirrors
+    :meth:`orchestrator.worktree.WorktreeManager.get_diff_vs_base`.
+    """
+    import subprocess
+
+    cwd_path = Path(cwd)
+    if not (cwd_path / ".git").exists():
+        return None
+    # Tracked-side diff: empty string when clean (NOT the same as no-repo).
+    base = _git_diff(cwd) or ""
+    diff_text = base
+    for rel in _list_untracked(cwd):
+        try:
+            out = subprocess.run(
+                ["git", "diff", "--no-color", "--no-index", "/dev/null", rel],
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.returncode in (0, 1):
+            diff_text += out.stdout
+    return diff_text or None
 
 
 def _git_diff_range(cwd: Path, from_sha: str, to_sha: str) -> str | None:
