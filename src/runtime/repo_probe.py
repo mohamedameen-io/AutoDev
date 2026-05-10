@@ -87,6 +87,17 @@ class RepoCapacity:
     total_bytes: int
     depth_max: int
     is_huge: bool
+    # v0.24.0 D5: repo shape signals. Default 0 preserves back-compat for
+    # callers that build RepoCapacity directly. Computed by
+    # :func:`probe_repo` from the same file walk so the cost is amortized.
+    avg_file_size_bytes: int = 0
+    # The directory containing the most files (largest-fan-out hot spot).
+    # Useful for sparse-checkout target tuning: if 90% of files are in
+    # one subdir, the sparse default is "include it" rather than "exclude
+    # everything outside edit_scope". Captured as posix-style relative
+    # path; empty string when the probe could not determine a winner.
+    largest_dir: str = ""
+    largest_dir_file_count: int = 0
 
 
 def _count_files(cwd: Path) -> int:
@@ -173,6 +184,60 @@ def _max_depth(cwd: Path) -> int:
     return max_depth
 
 
+def _largest_directory(cwd: Path) -> tuple[str, int]:
+    """v0.24.0 D5: return ``(rel_path, file_count)`` for the busiest directory.
+
+    Walks tracked-only when the repo is git-initialized (mirrors
+    :func:`_count_files`'s git fast-path), otherwise falls back to
+    ``os.walk``. Best-effort: subprocess / IO failure returns
+    ``("", 0)`` so callers can downgrade gracefully. Returns the
+    immediate-parent directory of each file (top-level directory wins
+    when multiple files live in the same one).
+    """
+    import collections
+    import os
+    import subprocess
+
+    counter: dict[str, int] = collections.Counter()
+
+    git_dir = Path(cwd) / ".git"
+    if git_dir.exists():
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(cwd), "ls-files"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if out.returncode == 0:
+                for line in out.stdout.splitlines():
+                    rel = line.strip()
+                    if not rel:
+                        continue
+                    parent = os.path.dirname(rel) or "."
+                    counter[parent] += 1
+        except (OSError, subprocess.SubprocessError):
+            counter = collections.Counter()
+
+    if not counter:
+        for root, _dirs, files in os.walk(cwd):
+            try:
+                rel_root = str(Path(root).relative_to(cwd))
+            except ValueError:
+                continue
+            rel_root = rel_root.replace(os.sep, "/")
+            if any(p.startswith(".") for p in Path(rel_root).parts if p):
+                continue
+            if files:
+                counter[rel_root if rel_root != "." else "."] += len(files)
+
+    if not counter:
+        return "", 0
+    rel, n = counter.most_common(1)[0]
+    return rel, n
+
+
 def probe_repo(cwd: Path) -> RepoCapacity:
     """Read repo size signals and return a populated :class:`RepoCapacity`.
 
@@ -196,17 +261,29 @@ def probe_repo(cwd: Path) -> RepoCapacity:
         or total_bytes > _HUGE_TOTAL_BYTES_THRESHOLD
     )
 
+    # v0.24.0 D5: shape signals. avg_file_size guards against
+    # ZeroDivisionError on empty repos; largest_dir is computed via a
+    # lightweight directory-bucket count over the same walk surface.
+    avg_file_size = int(total_bytes // file_count) if file_count > 0 else 0
+    largest_dir, largest_dir_file_count = _largest_directory(cwd)
+
     logger.info(
         "tournament.repo_probed",
         file_count=file_count,
         total_bytes=total_bytes,
         depth_max=depth_max,
         is_huge=is_huge,
+        avg_file_size_bytes=avg_file_size,
+        largest_dir=largest_dir,
+        largest_dir_file_count=largest_dir_file_count,
     )
 
     return RepoCapacity(
         file_count=file_count,
         total_bytes=total_bytes,
+        avg_file_size_bytes=avg_file_size,
+        largest_dir=largest_dir,
+        largest_dir_file_count=largest_dir_file_count,
         depth_max=depth_max,
         is_huge=is_huge,
     )

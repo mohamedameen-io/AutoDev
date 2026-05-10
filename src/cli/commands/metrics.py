@@ -229,4 +229,164 @@ def anti_bloat_cmd(
         click.echo(_render_csv(records), nl=False)
 
 
-__all__ = ["metrics", "anti_bloat_cmd"]
+# v0.24.0 D3: regex-timeout telemetry surface.
+
+
+@metrics.command(name="regex-timeouts")
+@click.option(
+    "--cwd",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=Path.cwd,
+    show_default="current directory",
+    help="AutoDev workspace root (containing .autodev/).",
+)
+@click.option(
+    "--top",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Show the top N most-frequent offenders.",
+)
+@click.option(
+    "--report",
+    type=click.Choice(["table", "jsonl"], case_sensitive=False),
+    default="table",
+    show_default=True,
+    help="Output format. ``table`` is human; ``jsonl`` for piping.",
+)
+def regex_timeouts_cmd(cwd: Path, top: int, report: str) -> None:
+    """List ``regex_timeout`` audit ops from the ledger.
+
+    The :mod:`qa.hallucination_guard` watchdog (v0.22.1 A1) emits one
+    ``regex_timeout`` audit ledger op per file that hits the per-file
+    timeout. v0.24.0 D3 surfaces these as a queryable table so
+    operators can identify recurring offenders before they cascade into
+    a Unity-style stall.
+    """
+    from collections import Counter
+
+    from state.ledger import stream_entries
+
+    counter: Counter[str] = Counter()
+    raw_rows: list[dict] = []
+    try:
+        for entry in stream_entries(cwd):
+            if entry.op != "regex_timeout":
+                continue
+            path = entry.payload.get("path", "?")
+            counter[path] += 1
+            raw_rows.append(
+                {
+                    "seq": entry.seq,
+                    "ts": entry.timestamp.isoformat()
+                    if hasattr(entry, "timestamp") and entry.timestamp
+                    else None,
+                    "path": path,
+                    "timeout_s": entry.payload.get("timeout_s"),
+                    "gate": entry.payload.get("gate"),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — graceful when ledger missing
+        click.echo(f"could not read ledger: {exc}", err=True)
+        sys.exit(2)
+
+    if report == "jsonl":
+        for r in raw_rows:
+            click.echo(json.dumps(r))
+        return
+
+    if not counter:
+        click.echo("No regex_timeout events recorded.")
+        return
+
+    click.echo(f"{'count':>6}  path")
+    click.echo(f"{'-'*6}  {'-'*40}")
+    for path, n in counter.most_common(top):
+        click.echo(f"{n:>6}  {path}")
+
+
+# v0.24.0 D4: Phase 6 corpus export — minimality_judge findings + outcomes.
+
+
+@metrics.command(name="export-corpus")
+@click.option(
+    "--cwd",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=Path.cwd,
+    show_default="current directory",
+    help="AutoDev workspace root.",
+)
+@click.option(
+    "--out",
+    "out_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output JSONL path. Defaults to .autodev/phase6_corpus.jsonl.",
+)
+def export_corpus_cmd(cwd: Path, out_path: Path | None) -> None:
+    """Export Phase 6 longitudinal corpus (minimality findings + outcomes).
+
+    ADR-0042 ("Code the Transforms" deferred to v0.23.0+) requires a
+    longitudinal corpus of (finding → outcome) pairs spanning ≥2 months
+    + ≥3 distinct bloat patterns + >20% FP rate on at least one pattern
+    before the synthesis-based AST-rewrite pipeline triggers. v0.24.0
+    D4 ships the data-collection scaffolding: walk the ledger and the
+    on-disk anti-bloat history, emit a redacted JSONL of minimality
+    judgments + downstream merge outcomes, suitable for retrospective
+    analysis.
+
+    The export is **redacted**: source text is hashed (SHA256) rather
+    than included verbatim so the corpus is shareable across teams
+    without leaking proprietary code.
+    """
+    import hashlib
+
+    from state.ledger import stream_entries
+    from state.paths import autodev_root
+
+    out = out_path or (autodev_root(cwd) / "phase6_corpus.jsonl")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    try:
+        for entry in stream_entries(cwd):
+            # Capture impl-tournament + minimality-related ops.
+            if entry.op not in (
+                "impl_tournament_complete",
+                "multi_branch_impl_complete",
+                "phase_review_complete",
+            ):
+                continue
+            payload = entry.payload
+            redacted: dict = {
+                "seq": entry.seq,
+                "op": entry.op,
+                "task_id": payload.get("task_id"),
+            }
+            for k in ("n_branches", "n_survivors", "winner_diff_bytes",
+                      "passes", "winner", "accept_phase", "converged"):
+                if k in payload:
+                    redacted[k] = payload[k]
+            # Hash any text payload fields rather than surfacing them.
+            for k in ("final_md", "winner_text", "diff"):
+                if k in payload and isinstance(payload[k], str):
+                    redacted[f"{k}_sha256"] = hashlib.sha256(
+                        payload[k].encode("utf-8")
+                    ).hexdigest()[:16]
+            rows.append(redacted)
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"could not read ledger: {exc}", err=True)
+        sys.exit(2)
+
+    out.write_text(
+        "\n".join(json.dumps(r) for r in rows) + ("\n" if rows else ""),
+        encoding="utf-8",
+    )
+    click.echo(f"Exported {len(rows)} redacted rows to {out}")
+
+
+__all__ = [
+    "metrics",
+    "anti_bloat_cmd",
+    "regex_timeouts_cmd",
+    "export_corpus_cmd",
+]

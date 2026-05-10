@@ -28,6 +28,28 @@ All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepa
 
 All four are audit-only (NOT mutated by `_apply_op`).
 
+## [0.24.0] - 2026-05-10
+
+### Added (streaming + observability)
+- **D1 — Streaming ledger reader.** New `state.ledger.stream_entries(cwd)` yields `LedgerEntry` objects without buffering — useful for forensic walks on multi-MB ledgers (Unity's was 2.97 MB / 140 entries; production runs may push higher). The chain integrity invariants (seq monotonicity, `prev_hash` linkage, `self_hash` recompute) are validated incrementally; corruption raises `LedgerCorruptError` from either the streaming or the buffered surface. The legacy `read_entries` is now a thin `list(stream_entries(cwd))` wrapper.
+- **D2 — `qa.sandbox.run_sandboxed` for hard wall-clock isolation.** Asyncio thread watchdogs (v0.22.1 A1) cannot kill CPU-bound workers in CPython; the sandbox spawns a one-shot `multiprocessing.Process` (forkserver context where available) that the parent can `terminate()` / `kill()` on timeout. Optional `on_timeout` callback constructs synthetic fallback values so callers can produce gate-specific results. Opt-in per call site for v0.24.0; the in-process watchdog remains the first line of defense.
+- **D3 — `autodev metrics regex-timeouts` CLI subcommand.** Aggregates v0.22.3 C6 ledger telemetry into a top-N table (or JSONL for piping) so operators can identify recurring offenders before they cascade.
+- **D4 — `autodev metrics export-corpus` CLI subcommand.** Redacted JSONL export of impl-tournament + phase-review outcomes (text fields → SHA256 hashes) for ADR-0042's longitudinal Phase 6 corpus. Each row carries seq + op + task_id + per-op metadata; designed to be shareable across teams without leaking source.
+- **D5 — `RepoCapacity` shape signals.** Three new fields populated by `probe_repo`:
+  - `avg_file_size_bytes` (int) — aggregate `total_bytes // file_count`.
+  - `largest_dir` (str) — repo-relative path of the directory containing the most files.
+  - `largest_dir_file_count` (int) — file count in the busiest directory.
+  Useful for sparse-checkout pattern derivation and future shape-aware QA gate tuning. Default `0`/`""` preserves back-compat for callers constructing `RepoCapacity` directly.
+- **D6 — Anti-fragility playbook (`docs/anti_fragility_playbook.md`).** Field guide mapping symptoms to ledger ops + log events + canonical operator actions. Documents the recovery recipe for the abandoned Unity workspace (now end-to-end automatic with v0.22.1 + v0.22.2 + v0.22.3 + v0.23.0).
+
+### Notes on deferred items
+- B4 (full path normalization pipeline) shipped in v0.22.4 ahead of v0.23.0.
+- C2 (full default ignore_paths set + diff-mode default) — operator-tunable knobs landed in v0.22.3; opinionated defaults remain deferred. The anti-fragility playbook documents the tunable surface; defaults will land alongside Phase 6 corpus signals proving common fixture patterns.
+- ADR-0042 ("Code the Transforms" deferred to v0.23.0+) trigger criteria remain unchanged — v0.24.0 D4 ships the corpus-collection scaffolding so the longitudinal data accumulates passively while operators run AutoDev normally.
+
+### Deprecation
+- `worktree_sparse_checkout_enabled` flag (introduced v0.17.0, superseded by `worktree_huge_repo_mode` in v0.23.0) — emits no warning yet but is scheduled for removal in v0.25.0. Operators should migrate to `worktree_huge_repo_mode` semantics.
+
 ## [0.23.0] - 2026-05-10
 
 ### Added (huge-repo mode)

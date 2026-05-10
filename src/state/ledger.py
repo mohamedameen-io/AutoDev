@@ -31,7 +31,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -357,20 +357,23 @@ def _clone_file(src: Path, dst: Path) -> bool:
         return False
 
 
-def read_entries(cwd: Path) -> list[LedgerEntry]:
-    """Read + validate every ledger entry.
+def stream_entries(cwd: Path) -> "Iterator[LedgerEntry]":
+    """v0.24.0 D1: streaming line-by-line ledger reader.
 
-    Raises :class:`LedgerCorruptError` on:
-      - malformed JSON on any non-empty line
-      - validation failure for any entry
-      - broken prev_hash / self_hash chain
-      - non-monotonic ``seq``
+    Yields :class:`LedgerEntry` objects without materializing the full
+    list, while still validating each entry's schema and the
+    incremental hash chain in-flight. Use this for forensic walks on
+    multi-MB ledgers (Unity's 2026-05-09 ledger was 2.97 MB / 140
+    entries; future production runs may push this much higher).
+
+    For small ledgers and most code paths, :func:`read_entries` is the
+    convenient buffered alternative. Both functions share the chain
+    invariants — corruption raises :class:`LedgerCorruptError` from
+    either entry point.
     """
     lp = ledger_path(cwd)
     if not lp.exists():
-        return []
-
-    entries: list[LedgerEntry] = []
+        return
     prev_hash = ""
     prev_seq = 0
     with lp.open("r", encoding="utf-8") as fh:
@@ -392,7 +395,6 @@ def read_entries(cwd: Path) -> list[LedgerEntry]:
                     f"ledger line {idx} failed schema validation: {exc}"
                 ) from exc
 
-            # Chain integrity checks.
             if entry.seq != prev_seq + 1:
                 raise LedgerCorruptError(
                     f"ledger line {idx}: seq jumped from {prev_seq} to {entry.seq}"
@@ -410,10 +412,23 @@ def read_entries(cwd: Path) -> list[LedgerEntry]:
                     f"(computed {want}, stored {entry.self_hash})"
                 )
 
-            entries.append(entry)
+            yield entry
             prev_hash = entry.self_hash
             prev_seq = entry.seq
-    return entries
+
+
+def read_entries(cwd: Path) -> list[LedgerEntry]:
+    """Read + validate every ledger entry.
+
+    v0.24.0 D1: thin buffered wrapper around :func:`stream_entries`.
+
+    Raises :class:`LedgerCorruptError` on:
+      - malformed JSON on any non-empty line
+      - validation failure for any entry
+      - broken prev_hash / self_hash chain
+      - non-monotonic ``seq``
+    """
+    return list(stream_entries(cwd))
 
 
 def replay_ledger(cwd: Path) -> tuple[Plan | None, list[LedgerEntry]]:
@@ -798,6 +813,7 @@ __all__ = [
     "append_entry",
     "compute_hash",
     "read_entries",
+    "stream_entries",
     "replay_ledger",
     "snapshot_plan",
 ]
