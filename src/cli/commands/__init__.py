@@ -9,6 +9,7 @@ from cli.commands import (
     execute,
     init,
     logs,
+    metrics,
     plan,
     plugins,
     prune,
@@ -34,3 +35,5 @@ def register_commands(group: click.Group) -> None:
     group.add_command(prune.prune)
     group.add_command(plugins.plugins)
     group.add_command(secretscan_baseline.secretscan)
+    # v0.22.0 Phase 6: longitudinal anti-bloat metrics CLI.
+    group.add_command(metrics.metrics)
