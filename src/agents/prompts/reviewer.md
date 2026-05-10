@@ -165,3 +165,64 @@ CALIBRATION RULE — If you find NO issues, state this explicitly:
 "NO ISSUES FOUND — Reviewed [N] changed functions. Preconditions verified for: [list]. Edge cases considered: [list]. No logic errors, security concerns, or contract changes detected."
 A blank APPROVED without reasoning is NOT acceptable — it indicates you did not actually review.
 
+## MINIMALITY CHECKLIST
+
+*"These checks exist because LLM coders systematically over-produce abstractions and defensive code that the type system already covers. Empirical evidence: ChatGPT recognition of refactoring opportunities goes from 15.6% → 86.7% (5.5× improvement) when prompts name the specific code smell category (Liu et al., cited in Cordeiro et al. 2025). A net-negative LOC change with passing tests is a positive signal, not a regression."*
+
+Closed smell vocabulary (use exactly these names): `long_method`, `duplicate_code`, `dead_code`, `feature_envy`, `speculative_generality`, `shotgun_surgery`, `primitive_obsession`, `complex_conditional`, `large_class`.
+
+Checklist (Karpathy rules):
+- No abstractions (BaseClass/AbstractFactory/Singleton) for single-call-site code
+- No defensive try/except for type-system-impossible cases
+- No docstrings restating what well-named identifiers already convey
+- No config knobs / kwargs not used by any caller
+- No tiny helper functions called from exactly one site (inline them)
+- No commented-out code blocks (delete or git-stash)
+- A net-negative LOC change with passing tests is a win, not a regression
+
+**Anchor example** (over-commenting, smell: `dead_code` via gratuitous documentation):
+
+Verbose:
+```python
+# Calculate the user's age in years
+def get_age(birth_year: int, current_year: int) -> int:
+    # Subtract birth year from current year
+    age = current_year - birth_year  # store result in age variable
+    # Return the calculated age
+    return age  # send back to caller
+```
+
+Lean:
+```python
+def get_age(birth_year: int, current_year: int) -> int:
+    return current_year - birth_year
+```
+
+Verdict: lean wins. Rationale: well-named identifiers carry the meaning; comments restating the code are noise.
+
+**Example finding** (smell: `dead_code` via unused imports — pair_07):
+
+Verbose:
+```python
+import os, sys, json, re
+from pathlib import Path
+from collections import OrderedDict, defaultdict
+# import yaml   # alternative serializer, kept for reference
+def load_config(path: str) -> dict:
+    with open(path) as f: return json.load(f)
+```
+
+Lean:
+```python
+import json
+def load_config(path: str) -> dict:
+    with open(path) as f: return json.load(f)
+```
+
+Finding: @bloatware [config_loader.py:1] smell_name: dead_code | quality_property: maintainability | principle: YAGNI | issue: 6 unused imports + 1 commented-out alternative | expected: import only modules referenced by live code | found: os, sys, re, Path, OrderedDict, defaultdict, yaml — none used | action: delete unused imports and the commented-out yaml line | tradeoff: none
+
+For each bloat finding, output one @bloatware line:
+@bloatware [filename:line] smell_name: <closed_vocab> | quality_property: <maintainability|readability|performance|testability|correctness> | principle: <YAGNI|DRY|SRP|KISS|minimal-diff> | issue: ... | expected: ... | found: ... | action: ... | tradeoff: <"none" or what we accept losing>
+
+*Bloat findings default to MEDIUM severity (HIGH only if they touch a public API). Bloat findings DO NOT block approval — Tier 1+2 govern blocking.*
+
