@@ -339,13 +339,27 @@ async def _delegate(
         role, agent_cfg, plan_complexity, orch.cfg.user_complexity
     )
 
+    # v0.23.0 C5: explorer max_turns 2x bump on huge repos. The explorer's
+    # job is to enumerate the codebase before the architect plans; on huge
+    # repos (Unity: 358K files) the default 3 turns is insufficient — the
+    # 2026-05-09 run hit ``error_max_turns`` at turn 3 with 218K cached
+    # tokens still in flight. Other roles don't benefit from the bump
+    # (their work isn't exploratory) so this targets explorer only.
+    resolved_max_turns = max_turns_override or spec.max_turns or 1
+    if (
+        role == "explorer"
+        and max_turns_override is None
+        and getattr(getattr(orch, "_repo_capacity", None), "is_huge", False)
+    ):
+        resolved_max_turns = int(round(resolved_max_turns * 2.0))
+
     inv = AgentInvocation(
         role=role,
         prompt="\n".join(parts),
         cwd=orch.cwd,
         model=spec.model,
         allowed_tools=list(spec.tools) if spec.tools else None,
-        max_turns=max_turns_override or spec.max_turns or 1,
+        max_turns=resolved_max_turns,
         effort=effort,
     )
 

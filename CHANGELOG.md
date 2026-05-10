@@ -2,6 +2,23 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - v0.23.0 in progress
+
+### Added
+- **C5 — Explorer max_turns 2x on huge repos.** The explorer's job is to enumerate the codebase; on huge repos (Unity: 358K files) the default 3 turns is insufficient. P-7's investigation of the 2026-05-09 Unity `.autodev/debug/` showed the explorer hit `error_max_turns` at turn 3 with 218K cached tokens. Wired in `orchestrator/plan_phase.py:_delegate` against `orch._repo_capacity.is_huge`. Other roles unaffected.
+
+### Remaining for v0.23.0
+- C1 (`WorktreeConfig` huge_repo_mode + sparse-by-default + async removal)
+- C2 (secretscan diff-mode default, entropy bump, ignore_paths)
+- C3 (signal handlers + child-kill on cancel + lockfile PID)
+- C4 (plan-tournament huge fast-path: single-branch + reduced passes)
+- C6 (`regex_timeout` ledger op telemetry, building on v0.22.1 A1)
+- C7 (huge_repo_guide.md + ADR)
+
+### Remaining for v0.22.2
+- B3 (atomic evidence/ledger via `attempt_started` marker + `reconcile_evidence_vs_ledger`)
+- B4 (full path normalization pipeline + architect-retry envelope)
+
 ## [0.22.2] - 2026-05-10
 
 ### Fixed (FSM resilience)
