@@ -2,6 +2,22 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.2] - 2026-05-10
+
+### Fixed (FSM resilience)
+- **B1 — Resume reaper for orphan in-flight tasks.** New `PlanManager.reap_orphans()` walks the plan and reverts every task in `{in_progress, coded, auto_gated, reviewed, tested, tournamented}` back to `pending` via the existing `revert_task_to_pending` primitive. Wired into `run_execute_phase` before any dispatch — interrupted runs now self-heal on `autodev resume`. Idempotent. Resolves D-2's finding from the 2026-05-09 Unity stall (4 tasks frozen between `coded` and `complete`, unrecoverable without manual ledger surgery).
+- **B2 — `PhaseStuckError` replaces silent FSM stall.** `_execute_phase_dag` previously returned silently when a phase had zero pending but tasks remained non-terminal — runs looked like clean completions while data was wedged. Now raises `errors.PhaseStuckError(phase_id, stuck_task_ids)` so operators see the offending tasks and the recovery hint (`autodev resume`).
+
+### Added
+- `errors.PhaseStuckError` (subclass of `AutodevError`) with `phase_id` and `stuck_task_ids` fields.
+- `PlanManager.reap_orphans()` — orphan in-flight task sweeper.
+
+### Deferred to v0.23.0
+- Atomic evidence ↔ ledger barrier (`attempt_started` marker + `reconcile_evidence_vs_ledger`) — D-3's finding from the Unity stall, requires more design surface than a patch.
+- Full path normalization pipeline (`path_validator.normalize_path` + architect-retry envelope) — substantial new module.
+
+Roadmap: `thoughts/shared/plans/2026-05-10-huge-repo-stability-roadmap.md`.
+
 ## [0.22.1] - 2026-05-10
 
 ### Fixed (huge-repo crash patches)

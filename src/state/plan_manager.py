@@ -428,6 +428,63 @@ class PlanManager:
             )
             return task
 
+    async def reap_orphans(
+        self,
+        *,
+        reason: str = "orphan_reaped_on_resume",
+    ) -> list[str]:
+        """v0.22.2 B1: revert any non-terminal-non-pending task to ``pending``.
+
+        Walks the plan and identifies tasks wedged in
+        ``{"in_progress", "coded", "auto_gated", "reviewed", "tested",
+        "tournamented"}`` — states a healthy run never persists across
+        process boundaries. Calls :meth:`revert_task_to_pending` on each.
+        Idempotent (safe to call multiple times — second call is a no-op).
+
+        D-2 (the 2026-05-09 Unity stall investigation) showed that an
+        interrupted run leaves tasks frozen in non-terminal states, and
+        the dispatcher's ``next_pending_tasks`` filters on
+        ``status=="pending"`` only — wedged tasks were unrecoverable
+        without manual ledger surgery. This sweeper closes the loop.
+
+        Notes on lock ordering:
+            ``revert_task_to_pending`` re-acquires ``plan_lock`` per
+            call, so this method MUST NOT hold the lock around the
+            per-task loop. We snapshot the orphan IDs first (under no
+            lock — best-effort), then revert each.
+
+        Returns:
+            The list of reaped task IDs (in scan order).
+        """
+        plan = await self.load()
+        if plan is None:
+            return []
+        orphan_ids: list[str] = []
+        for phase in plan.phases:
+            for t in phase.tasks:
+                if (
+                    t.status not in _TERMINAL_TASK_STATUSES
+                    and t.status != "pending"
+                ):
+                    orphan_ids.append(t.id)
+        for tid in orphan_ids:
+            try:
+                await self.revert_task_to_pending(tid, reason=reason)
+            except PlanConcurrentModificationError:
+                # Concurrent edit raced us — safe to skip; the next
+                # caller will re-scan. Don't surface as fatal.
+                self._log.warning(
+                    "reap_orphans.skipped_concurrent_modification",
+                    task_id=tid,
+                )
+        if orphan_ids:
+            self._log.info(
+                "reap_orphans.complete",
+                count=len(orphan_ids),
+                reason=reason,
+            )
+        return orphan_ids
+
     async def speculable_candidate(
         self,
         in_flight_task_id: str,

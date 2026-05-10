@@ -569,6 +569,23 @@ async def run_execute_phase(
         await _maybe_run_phase_review(orch, task.phase_id)
         return processed
 
+    # v0.22.2 B1: reap orphan in-flight tasks before any dispatch. An
+    # interrupted run leaves tasks frozen in non-terminal-non-pending
+    # states (``coded``, ``in_progress``, ``reviewed``, etc.) — the
+    # dispatcher's pending-only filter cannot pick them up. The reaper
+    # reverts orphans to ``pending`` so they re-dispatch fresh. Idempotent
+    # (no-op when there are no orphans).
+    try:
+        reaped = await orch.plan_manager.reap_orphans()
+        if reaped:
+            logger.info(
+                "execute_phase.reaped_orphans",
+                count=len(reaped),
+                task_ids=reaped,
+            )
+    except Exception as exc:  # noqa: BLE001 — log + continue; do not block run
+        logger.warning("execute_phase.reap_orphans_failed", err=str(exc))
+
     # v0.11.0: DAG-aware worker pool over all phases.
     plan = await orch.plan_manager.load()
     if plan is None:
@@ -883,6 +900,7 @@ async def _execute_phase_dag(
             # Defensive: also break if the phase has ZERO pending tasks
             # at this point — there's nothing to wait for.
             phase_has_pending = False
+            stuck_task_ids: list[str] = []
             plan = await orch.plan_manager.load()
             if plan is not None:
                 phase_obj = next(
@@ -892,7 +910,26 @@ async def _execute_phase_dag(
                     phase_has_pending = any(
                         t.status == "pending" for t in phase_obj.tasks
                     )
+                    # v0.22.2 B2: collect non-terminal non-pending task IDs for
+                    # the PhaseStuckError surface.
+                    stuck_task_ids = [
+                        t.id
+                        for t in phase_obj.tasks
+                        if t.status not in _TERMINAL_TASK_STATUSES
+                        and t.status != "pending"
+                    ]
             if not phase_has_pending:
+                # v0.22.2 B2: if non-terminal non-pending tasks exist, this is
+                # a wedged FSM (typical cause: an interrupted run that left
+                # tasks in ``coded``/``in_progress``). Pre-B2 this returned
+                # silently and the dispatcher reported success. Now we raise
+                # PhaseStuckError so the operator sees the stuck tasks. If
+                # everything is genuinely terminal, the legacy clean return
+                # still applies.
+                if stuck_task_ids:
+                    from errors import PhaseStuckError
+
+                    raise PhaseStuckError(phase_id, stuck_task_ids)
                 return processed
             await asyncio.sleep(0.05)
             continue
