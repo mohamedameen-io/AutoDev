@@ -2,6 +2,11 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.1] - 2026-05-10
+
+### Fixed
+- **npm release pipeline.** `npm/scripts/bundle-wheel.js` now syncs `npm/package.json` `version` from `src/_version.py` at build time. The publish workflow had failed at the npm step for every release v0.22.1 → v0.24.0 because the npm manifest was hardcoded at `0.22.0`; PyPI publishes succeeded but npm rejected with "cannot publish over the previously published versions: 0.22.0". Future tag pushes will produce matching PyPI + npm releases automatically.
+
 ## [0.22.4] - 2026-05-10
 
 ### Added
