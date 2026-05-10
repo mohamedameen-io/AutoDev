@@ -38,7 +38,7 @@ _GO_PLAN_MD = """
 
 ### Task 1.2: Add Go test for Subtract
   - Description: Add a Go test covering Subtract
-  - Files: math_test.go
+  - Files: [new] math_test.go
   - Acceptance:
     - [ ] tests pass
 """

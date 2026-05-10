@@ -38,7 +38,7 @@ _NODEJS_PLAN_MD = """
 
 ### Task 1.2: Add Jest test for farewell
   - Description: Add a Jest test covering the farewell function
-  - Files: src/index.test.ts
+  - Files: [new] src/index.test.ts
   - Acceptance:
     - [ ] tests pass
 """
