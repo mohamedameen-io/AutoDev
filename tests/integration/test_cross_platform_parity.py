@@ -185,6 +185,9 @@ async def test_both_adapters_produce_same_phase_count(tmp_git_repo: Path) -> Non
         sp.run(["git", "config", "user.email", "t@t"], cwd=str(tmp_b), check=True)
         sp.run(["git", "config", "user.name", "t"], cwd=str(tmp_b), check=True)
         (tmp_b / "math_utils.py").write_text("def add(a, b):\n    return a + b\n")
+        (tmp_b / "test_math_utils.py").write_text(
+            "from math_utils import add\n\ndef test_add() -> None:\n    assert add(1, 2) == 3\n"
+        )
         sp.run(["git", "add", "."], cwd=str(tmp_b), check=True)
         sp.run(["git", "commit", "-qm", "initial"], cwd=str(tmp_b), check=True)
 
