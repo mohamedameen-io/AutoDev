@@ -47,33 +47,34 @@ from state.schemas import Phase, Plan, Task
 
 
 def _normalize_for_diagnostic(path: str) -> str:
-    """v0.22.1 A4: minimal path normalization for error messages only.
+    """v0.22.1 A4 / v0.22.4 B4: best-effort normalization for error messages.
 
-    Strips surrounding quotes / backticks, leading ``./``, trailing
-    whitespace and ``/``, then ``posixpath.normpath`` to collapse double
-    slashes and resolve internal ``.``. Surfaces the most common
-    architect-emitted malformations alongside the raw form so
-    ``EditScopeViolation`` ledger events name the specific malformation
-    instead of hiding it behind ``…`` truncation.
-
-    The full normalize_path pipeline (NFC unicode, control-char
-    rejection, structured ``PathValidationError``) lands in v0.22.2 B4.
+    Delegates to :func:`orchestrator.path_validator.normalize_path` so the
+    ``EditScopeViolation`` diagnostic surfaces the same canonical form
+    operators see in the architect-retry envelope. On any
+    :class:`PathValidationError` we degrade to the legacy minimal pass
+    so the error message never crashes — the validator's job is to
+    produce a forensic hint, not to enforce.
     """
     if not path:
         return path
-    s = path.strip()
-    # Strip matched outer quote pairs (single, double, backtick).
-    for q in ("'", '"', "`"):
-        if len(s) >= 2 and s[0] == q and s[-1] == q:
-            s = s[1:-1].strip()
-            break
-    if s.startswith("./"):
-        s = s[2:]
-    s = s.rstrip("/").rstrip()
     try:
-        return posixpath.normpath(s) if s else s
-    except (TypeError, ValueError):
-        return s
+        from orchestrator.path_validator import normalize_path
+
+        return normalize_path(path)
+    except Exception:  # noqa: BLE001 — diagnostic-only path: never crash
+        s = path.strip()
+        for q in ("'", '"', "`"):
+            if len(s) >= 2 and s[0] == q and s[-1] == q:
+                s = s[1:-1].strip()
+                break
+        if s.startswith("./"):
+            s = s[2:]
+        s = s.rstrip("/").rstrip()
+        try:
+            return posixpath.normpath(s) if s else s
+        except (TypeError, ValueError):
+            return s
 
 
 # v0.17.0 S5: characters that mark a Task.files entry as a glob pattern.

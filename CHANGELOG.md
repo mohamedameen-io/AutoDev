@@ -2,6 +2,15 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.4] - 2026-05-10
+
+### Added
+- **B4 — Structured path normalization pipeline.** New `src/orchestrator/path_validator.py` exposes `normalize_path(raw, allow_glob=True)` (NFC unicode → strip whitespace → strip outer quotes/backticks → strip trailing punctuation → strip `./` → reject control chars / empties / parent segments / absolute paths → `posixpath.normpath` → strip trailing `/`) and `validate_paths_batch(paths)` returning a `(normalized, errors)` partition. Errors are `PathValidationError(raw, reason, suggestion)` — machine-readable for the architect-retry envelope. The `dag.py` diagnostic helper now delegates to this module so error messages and the validator agree on the canonical form. The `plan_phase.py` retry loop catches `PathValidationError` and `pydantic.ValidationError` (in addition to the legacy `PlanParseError`) so malformed paths trigger architect self-correction with explicit format rules instead of wedging at execute time.
+
+### Tests
+- `tests/test_orchestrator_path_validator.py` — 32 cases covering well-formed inputs, all rejection reasons, glob handling, batch partitioning.
+- `tests/test_orchestrator_path_validator_nfc.py` — NFC-vs-NFD canonicalization.
+
 ## [0.22.3] - 2026-05-10
 
 ### Fixed (atomicity + observability)

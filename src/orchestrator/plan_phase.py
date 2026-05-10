@@ -162,9 +162,30 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         # try reading the plan from known file locations.
         plan_md = _try_read_plan_from_file(cwd, plan_md)
         plan: Plan
+        # v0.22.4 B4: also catch path-validator errors at parse time so
+        # the architect can self-correct malformed paths (backticks,
+        # parentheticals, trailing punctuation) on retry. The legacy
+        # PlanParseError path remains identical.
+        from pydantic import ValidationError as _PydValidationError
+
+        from orchestrator.path_validator import PathValidationError
+
         try:
             plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
-        except PlanParseError as exc:
+        except (
+            PlanParseError,
+            _PydValidationError,
+            PathValidationError,
+        ) as exc:
+            # Build a structured architect-retry envelope: the architect
+            # sees both the raw error AND a hint listing format rules so
+            # the second pass produces well-formed output.
+            extra_hint = (
+                "Paths must be plain repo-relative strings — no surrounding "
+                "backticks, quotes, parentheticals, or trailing punctuation. "
+                "List one path per line in EDIT_SCOPE blocks, comma-separated "
+                "in `Files:` lines."
+            )
             logger.warning("plan_phase.parse_failed_retrying", err=str(exc))
             retry_env = architect_env.model_copy(
                 update={
@@ -172,8 +193,11 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                         **architect_env.context,
                         "prior_attempt": plan_md[:2000],
                         "parse_error": str(exc),
-                        "hint": "Please use EXACTLY the canonical format. "
-                        "Return the plan as your text response, do NOT write to files.",
+                        "hint": (
+                            "Please use EXACTLY the canonical format. "
+                            "Return the plan as your text response, do NOT write to files. "
+                            f"{extra_hint}"
+                        ),
                     }
                 }
             )
