@@ -78,7 +78,7 @@ class CursorAdapter(PlatformAdapter):
         # configuration file equivalent to `.claude/agents/`. Agent constraints
         # are expressed via `.cursor/rules/` MDC files, which must be authored
         # manually for now.
-        # TODO(phase-3): render `.cursor/rules/<name>.mdc` from AgentSpec via
+        # TODO(v0.27+): render `.cursor/rules/<name>.mdc` from AgentSpec via
         # agents.render_cursor to automate rule generation.
         logger.info(
             "cursor.init_workspace_stub",

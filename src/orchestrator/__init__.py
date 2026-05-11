@@ -1,6 +1,6 @@
 """Top-level orchestrator that wires state, adapters, agents together.
 
-Phase 4 responsibilities:
+Responsibilities:
   - :meth:`plan` drives the plan-drafting FSM
     (:mod:`orchestrator.plan_phase`).
   - :meth:`execute` drives the per-task execute loop
@@ -8,8 +8,9 @@ Phase 4 responsibilities:
   - :meth:`resume` continues an in-progress execution from the ledger.
   - :meth:`status` produces a JSON-serializable snapshot for the CLI.
 
-Tournaments are NOT integrated in Phase 4. Hooks in the plan/execute
-modules leave ``TODO(phase-6)`` / ``TODO(phase-7)`` markers.
+Note: the impl-tournament module exists and works via the dedicated CLI
+surface, but is NOT yet integrated into :func:`execute_phase` itself.
+Hooks left in the plan/execute modules with ``TODO(v0.26+)`` markers.
 """
 
 from __future__ import annotations

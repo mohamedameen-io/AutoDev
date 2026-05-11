@@ -6,11 +6,13 @@ For each pending task (or a specific task when ``task_id`` is given):
   2. developer -> :class:`CoderEvidence`. Retry on adapter failure up to
      ``qa_retry_limit``; on exhaustion, escalate.
   3. test_engineer -> :class:`TestEvidence`. Any failure retries test_engineer.
-  4. auto-gates (syntax/lint/build/run_tests/secretscan). ``TODO(phase-8)``:
-     we pretend gates always pass and advance to ``auto_gated``.
+  4. auto-gates (syntax/lint/build/run_tests/secretscan). ``TODO(v0.26+)``:
+     replace the current always-pass placeholder with real gate execution.
   5. reviewer -> :class:`ReviewEvidence`. NEEDS_CHANGES / REJECTED counts
      as a retry back to developer with the issue list injected as context.
-  6. ``TODO(phase-7)``: :class:`ImplementationTournament`. Phase 4: skip.
+  6. ``TODO(v0.26+)``: wire :class:`ImplementationTournament` into the
+     execute-phase FSM. Today's execute path skips it; the impl-tournament
+     module itself exists and works via the dedicated CLI surface.
   7. Mark task complete.
 
 On retry exhaustion, call ``critic_sounding_board`` once, flag the task as

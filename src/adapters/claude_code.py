@@ -82,7 +82,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
         # `--prompt` flag passed directly to the subprocess in `_build_command`.
         # There is no workspace configuration file for `claude -p` to pick up,
         # so nothing needs to be written here.
-        # TODO(phase-3): render `.claude/agents/<name>.md` from AgentSpec via
+        # TODO(v0.27+): render `.claude/agents/<name>.md` from AgentSpec via
         # agents.render_claude to support persistent sub-agent configurations.
         logger.info(
             "claude_code.init_workspace_stub",
@@ -285,7 +285,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
         result = AgentResult(
             success=not is_error,
             text=text,
-            tool_calls=[],  # TODO(phase-3+): parse from stream-json if needed
+            tool_calls=[],  # TODO(v0.27+): parse tool_calls from claude-code stream-json output for an audit trail; today we keep it empty (no current consumer).
             files_changed=[Path(p) for p in files_changed],
             diff=diff,
             duration_s=duration,
