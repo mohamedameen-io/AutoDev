@@ -3,25 +3,32 @@
 **Status:** Implemented
 **Author:** Mohamed Ameen
 **Date:** 2026-04-17
-**Last Updated:** 2026-04-17
+**Last Updated:** 2026-05-12
 **Reviewers:** --
 **Package:** `src/adapters/`
 **Entry Point:** N/A (library-only, consumed by `src/orchestrator/`)
+
+## 0. Subprocess-only architecture (v0.26.0)
+
+**As of v0.26.0, every dispatch is subprocess.** The previous `InlineAdapter` (file-based delegation/response state machine, `DelegationPendingSignal`, suspend/resume to `.autodev/inline-state.json`) was deleted in v0.26.0. It existed to support running AutoDev *inside* an agent session without spawning subprocesses; v0.24.2's full CLI passthrough already made that obsolete because the `/autodev` slash command shells out to the `autodev` CLI for every dispatch via `Bash`. With InlineAdapter gone, the subprocess-vs-inline distinction has no daylight left and the orchestrator's plan/execute phases no longer carry the inline-mode branches that bloated `_delegate()` and `_execute_one_worker()`.
+
+Legacy `platform: "inline"` in `.autodev/config.json` is auto-migrated to `"claude_code"` by a Pydantic model validator with a `DeprecationWarning`. The `--inline` flag on `autodev init` is retained as a deprecated noop alias (removed in v0.27.0). The `.autodev/delegations/`, `.autodev/responses/`, and `.autodev/inline-state.json` paths are no longer written but are still purged on `autodev reset --hard` for migration cleanup.
+
+The remainder of this document describes the still-current `ClaudeCodeAdapter` / `CursorAdapter` design. Sections referring to InlineAdapter, `DelegationPendingSignal`, or suspend/resume are historical and apply only to <=v0.25.x.
 
 ## 1. Overview
 
 ### 1.1 Purpose
 
-The Platform Adapter Layer provides a uniform asynchronous interface for invoking LLM-backed coding agents across heterogeneous platforms. Every adapter speaks the same `PlatformAdapter` ABC regardless of whether the underlying transport is a Claude Code subprocess, a Cursor CLI subprocess, or an in-process file-based delegation. This decoupling lets the orchestrator, tournament engine, and QA gates treat agent invocation as a single operation without awareness of platform-specific concerns.
+The Platform Adapter Layer provides a uniform asynchronous interface for invoking LLM-backed coding agents across heterogeneous platforms. Every adapter speaks the same `PlatformAdapter` ABC regardless of whether the underlying transport is a Claude Code subprocess or a Cursor CLI subprocess. This decoupling lets the orchestrator, tournament engine, and QA gates treat agent invocation as a single operation without awareness of platform-specific concerns.
 
 ### 1.2 Scope
 
 **In scope:**
 - `PlatformAdapter` abstract base class and its four abstract methods
-- Three concrete adapters: `ClaudeCodeAdapter`, `CursorAdapter`, `InlineAdapter`
+- Two concrete adapters: `ClaudeCodeAdapter`, `CursorAdapter` (v0.26.0 removed `InlineAdapter`)
 - Platform auto-detection cascade (`detect_platform`, `get_adapter`)
 - Shared Pydantic v2 data models: `AgentInvocation`, `AgentResult`, `AgentSpec`, `ToolCall`, `StreamEvent`
-- Inline-mode types: `DelegationPendingSignal`, `InlineSuspendState`, `InlineResponseFile`
 - Git-based file-change detection utilities
 - Bounded parallel execution via `asyncio.Semaphore`
 
@@ -51,7 +58,7 @@ The orchestrator constructs an `AgentInvocation` and calls `adapter.execute()`. 
 - FR-1: Provide a single abstract interface (`PlatformAdapter`) with `execute()`, `parallel()`, `init_workspace()`, and `healthcheck()` methods.
 - FR-2: `ClaudeCodeAdapter` must invoke `claude -p` with JSON output parsing, model/tool/max-turns flags, and file-change detection via `git status --porcelain` before/after.
 - FR-3: `CursorAdapter` must invoke `cursor agent --print` with model fallback logic (primary model -> "auto" on rate-limit).
-- FR-4: `InlineAdapter` must write delegation files to `.autodev/delegations/`, raise `DelegationPendingSignal` to suspend the orchestrator, and collect response files from `.autodev/responses/` on resume.
+- FR-4: (REMOVED in v0.26.0) `InlineAdapter` formerly wrote delegation files to `.autodev/delegations/` and raised `DelegationPendingSignal` to suspend the orchestrator. With InlineAdapter deleted, every dispatch is now a subprocess and no suspend/resume state machine remains.
 - FR-5: `detect_platform()` must implement a four-tier cascade: CLI flag > `AUTODEV_PLATFORM` env var > `claude --version` probe > `cursor --version` probe.
 - FR-6: `parallel()` must run invocations concurrently, capped by `asyncio.Semaphore(max_concurrent)`, preserving input order.
 - FR-7: Every adapter must handle subprocess timeouts gracefully, returning a structured `AgentResult` with `success=False` rather than crashing.
@@ -85,34 +92,30 @@ flowchart TB
         BASE[PlatformAdapter ABC]
         CC[ClaudeCodeAdapter]
         CUR[CursorAdapter]
-        INL[InlineAdapter]
         DET[detect.py]
     end
 
     subgraph External
         CLAUDE["claude -p (subprocess)"]
         CURSOR["cursor agent --print (subprocess)"]
-        FS[".autodev/delegations/ & responses/"]
     end
 
     O -->|"AgentInvocation"| BASE
     BASE --> CC
     BASE --> CUR
-    BASE --> INL
     DET -->|"PlatformName"| O
 
     CC -->|"subprocess"| CLAUDE
     CUR -->|"subprocess"| CURSOR
-    INL -->|"file I/O"| FS
 
     CLAUDE -->|"JSON stdout"| CC
     CURSOR -->|"JSON stdout"| CUR
-    FS -->|"InlineResponseFile"| INL
 
     CC -->|"AgentResult"| O
     CUR -->|"AgentResult"| O
-    INL -->|"AgentResult / DelegationPendingSignal"| O
 ```
+
+(v0.26.0: `InlineAdapter` and the file-based delegation/response loop were removed. The diagram is now linear: orchestrator → adapter → subprocess.)
 
 ### 3.2 Component Structure
 
@@ -122,12 +125,12 @@ flowchart TB
 | `types.py` | Pydantic v2 models: `AgentInvocation`, `AgentResult`, `AgentSpec`, `ToolCall`, `StreamEvent` |
 | `claude_code.py` | `ClaudeCodeAdapter`: `claude -p` subprocess invocation, JSON parsing, git diff detection |
 | `cursor.py` | `CursorAdapter`: `cursor agent --print` subprocess invocation, model fallback, multi-binary probe |
-| `inline.py` | `InlineAdapter`: file-based delegation/response, `DelegationPendingSignal` for suspend/resume |
-| `inline_types.py` | `DelegationPendingSignal`, `InlineSuspendState`, `InlineResponseFile`, `InlineResponseError` |
-| `inline_config.py` | Renders auto-resume config into `.claude/CLAUDE.md` and `.cursor/rules/src.mdc` |
+| `inline_config.py` | Renders the `/autodev` slash-command template into `.claude/commands/autodev.md`. Retains the `update_claude_md()` migration helper for legacy `<!-- autodev-managed -->` sections in pre-v0.26.0 workspaces. |
 | `detect.py` | `detect_platform()`, `get_adapter()`: four-tier platform detection cascade |
 | `git_utils.py` | `_git_porcelain_set()`, `_diff_files()`, `_git_diff()`: shared file-change detection |
 | `__init__.py` | Re-exports all public symbols |
+
+(v0.26.0 removed `inline.py` and `inline_types.py`; their content — `InlineAdapter`, `DelegationPendingSignal`, `InlineSuspendState`, `InlineResponseFile`, `InlineResponseError` — is gone.)
 
 ### 3.3 Data Models
 
@@ -190,67 +193,11 @@ class StreamEvent(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 ```
 
-**Inline-mode models:**
-
-```python
-class DelegationPendingSignal(Exception):
-    """Raised by InlineAdapter.execute() to suspend the orchestrator.
-    NOT an error -- the orchestrator catches this and serializes state."""
-    task_id: str
-    role: str
-    delegation_path: Path
-
-
-class InlineSuspendState(BaseModel):
-    """Persisted to .autodev/inline-state.json when the process suspends."""
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: Literal["1.0"] = "1.0"
-    session_id: str
-    suspended_at: str
-    pending_task_id: str
-    pending_role: str
-    delegation_path: str
-    response_path: str
-    orchestrator_step: Literal[
-        "developer", "reviewer", "test_engineer",
-        "critic_sounding_board", "plan_explorer",
-        "plan_domain_expert", "plan_architect",
-    ]
-    retry_count: int = 0
-    last_issues: list[str] = Field(default_factory=list)
-
-
-class InlineResponseFile(BaseModel):
-    """Schema for the JSON file the agent writes after completing a delegation."""
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: Literal["1.0"] = "1.0"
-    task_id: str
-    role: str
-    success: bool
-    text: str
-    error: str | None = None
-    duration_s: float = 0.0
-    files_changed: list[str] = Field(default_factory=list)
-    diff: str | None = None
-```
+**Inline-mode models (REMOVED in v0.26.0):** the `DelegationPendingSignal`, `InlineSuspendState`, and `InlineResponseFile` types lived in `src/adapters/inline_types.py`. They drove a suspend/resume state machine where `InlineAdapter.execute()` wrote a delegation file and raised `DelegationPendingSignal`, the orchestrator persisted `.autodev/inline-state.json` and exited, the host agent responded by writing `.autodev/responses/<task>-<role>.json`, and `autodev resume` collected the response on the next invocation. All of this was deleted in v0.26.0 — every adapter is now synchronous (request -> subprocess -> response).
 
 ### 3.4 State Machine
 
-The `InlineAdapter` introduces a suspend/resume state machine at the adapter level:
-
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-    Idle --> DelegationWritten : execute() called
-    DelegationWritten --> Suspended : DelegationPendingSignal raised
-    Suspended --> ResponseCollected : autodev resume + response file exists
-    ResponseCollected --> Idle : collect_response() returns AgentResult
-    Suspended --> Error : response file missing on resume
-```
-
-The subprocess adapters (`ClaudeCodeAdapter`, `CursorAdapter`) have no state machine -- each `execute()` call is a synchronous request/response cycle.
+The subprocess adapters (`ClaudeCodeAdapter`, `CursorAdapter`) have no state machine — each `execute()` call is a synchronous request/response cycle. (v0.26.0 removed the `InlineAdapter` suspend/resume state machine alongside `InlineAdapter` itself.)
 
 ### 3.5 Protocol / Interface Contracts
 
@@ -280,7 +227,7 @@ class PlatformAdapter(ABC):
         """Return (ok, details) describing CLI presence / login status."""
 ```
 
-The `parallel()` method has a default implementation on the ABC that wraps `execute()` calls with `asyncio.Semaphore` and `asyncio.gather`. The `InlineAdapter` overrides it to raise `NotImplementedError` because inline mode is inherently sequential (one delegation at a time).
+The `parallel()` method has a default implementation on the ABC that wraps `execute()` calls with `asyncio.Semaphore` and `asyncio.gather`. (Pre-v0.26.0, `InlineAdapter` overrode it to raise `NotImplementedError` because inline mode was inherently sequential; with InlineAdapter gone, every adapter inherits the bounded-parallel default.)
 
 ### 3.6 Interfaces
 
@@ -294,8 +241,8 @@ The `parallel()` method has a default implementation on the ABC that wraps `exec
 | `PlatformAdapter.parallel(invs, max_concurrent)` | Runs multiple invocations concurrently |
 | `PlatformAdapter.init_workspace(cwd, agents)` | Renders platform-native agent config files |
 | `PlatformAdapter.healthcheck()` | Probes CLI availability and returns `(ok, details)` |
-| `InlineAdapter.collect_response(task_id, role)` | Reads and validates a response file (resume path) |
-| `InlineAdapter.has_pending_response(task_id, role)` | Checks if a response file exists |
+
+(v0.26.0 removed `InlineAdapter.collect_response` and `InlineAdapter.has_pending_response` alongside `InlineAdapter` itself.)
 
 ## 4. Design Decisions
 
@@ -305,15 +252,13 @@ The `parallel()` method has a default implementation on the ABC that wraps `exec
 |----------|-----------|------------------------|
 | Stateless subprocesses (no `--continue`) | Continuity lives in autodev's own state files, not in the LLM session. Each invocation is isolated and reproducible. (ADR-001) | Persistent LLM sessions with `--continue` -- rejected because it creates hidden coupling between orchestrator state and LLM session state. |
 | ABC instead of Protocol | Concrete `parallel()` implementation on the base class provides shared behavior. An ABC with abstract + concrete methods is more natural than a Protocol for this pattern. | `typing.Protocol` -- would require duplicating `parallel()` in each adapter or using a mixin. |
-| File-based inline delegation | When running inside an agent session, subprocess spawning would create a second agent session. File-based delegation lets the host agent read the task and respond. (ADR-006) | Direct function calls -- rejected because the host agent needs to use its own tools and context, which requires returning control to it. |
-| `DelegationPendingSignal` as exception | The signal must unwind the call stack to the orchestrator so it can serialize state and exit. A return value would require every intermediate caller to check and forward it. | Sentinel return value, callback pattern -- both add complexity to every caller in the chain. |
+| Subprocess-only dispatch (v0.26.0) | The `/autodev` slash command shells out to the `autodev` CLI for every invocation, so the file-based inline-delegation path (used when running *inside* an agent session) is redundant. Removing it deletes ~610 LOC of state machine and clarifies the adapter contract: `execute()` always returns an `AgentResult`. | Keep `InlineAdapter` as an alternate code path -- rejected because the slash-command transition in v0.24.2 made the inline distinction architectural dead-weight. (ADR-006 supersession noted.) |
 | Git-based file-change detection | Before/after `git status --porcelain` snapshots detect new files. `git diff HEAD` provides the unified diff. Works with any agent that modifies files. | Filesystem watchers (`watchdog`) -- rejected because they add a dependency and require event loop integration. Inotify is Linux-only. |
 | Model fallback in CursorAdapter | Rate-limit errors on `opus`/`sonnet` fall back to `auto`. This handles Cursor's subscription-based rate limits gracefully. | Fail immediately on rate limit -- rejected because it wastes the entire task's progress. |
 
 ### 4.2 Trade-offs
 
 - **File-change detection via `git status` snapshots misses modifications to already-dirty files.** A file that was modified before the invocation and is modified again during it will show up in both the before and after snapshots, so the delta is empty. This is acceptable for Phase 2 -- the orchestrator cares about new work the agent just did, not pre-existing modifications. Phase 3+ may switch to diff-based tracking.
-- **InlineAdapter does not support `parallel()`.** Inline mode suspends the process after each delegation, so parallelism is fundamentally impossible. The orchestrator must handle inline tasks sequentially.
 - **`ToolCall` list is always empty in Phase 2.** The `claude -p --output-format json` response only includes the final aggregated result, not individual tool calls. Populating this requires stream-json parsing (future enhancement).
 
 ## 5. Implementation Details
@@ -434,9 +379,9 @@ Key properties:
 
 ### 5.4 Atomic I/O Pattern
 
-The `InlineAdapter` writes delegation files atomically by using `Path.write_text()` (which on POSIX is effectively atomic for small files). The `InlineSuspendState` is written to `.autodev/inline-state.json` via Pydantic's `model_dump_json` + `Path.write_text`.
+(v0.26.0 removed the `InlineAdapter` and its delegation/response file writes; the subprocess adapters do not touch the filesystem directly except for `git status`/`git diff` reads.)
 
-The inline config module (`inline_config.py`) performs idempotent updates to `.claude/CLAUDE.md` by using HTML comment delimiters (`<!-- autodev-managed -->`) to mark the managed section. The `update_claude_md()` function replaces the section in-place if delimiters exist, or appends if they don't.
+The `inline_config` module retains the `update_claude_md()` helper for migrating pre-v0.26.0 workspaces. It performs idempotent updates to `.claude/CLAUDE.md` by using HTML comment delimiters (`<!-- autodev-managed -->`) to mark a managed section. The function replaces the section in-place if delimiters exist, or appends if they don't.
 
 ### 5.5 Error Handling
 
@@ -447,25 +392,25 @@ The inline config module (`inline_config.py`) performs idempotent updates to `.c
 | Non-zero exit code | Return `AgentResult(success=False, error="exited N: stderr")` |
 | JSON parse failure | Log warning, return `AgentResult(success=False, error="parse failed: ...")` |
 | Rate limit (Cursor) | Append fallback model to retry list; if exhausted, return error |
-| Response file missing (Inline) | Raise `InlineResponseError` |
-| Response file mismatch (Inline) | Raise `InlineResponseError` with task_id/role details |
 | Invalid preferred platform | Raise `AdapterError` |
 | No platform CLI found | Raise `AdapterError("No platform CLI found; install claude or cursor")` |
+
+(v0.26.0 removed the inline-response error paths — `InlineResponseError` and its missing/mismatched file cases — alongside `InlineAdapter`.)
 
 All error results preserve `raw_stdout` and `raw_stderr` for debugging.
 
 ### 5.6 Dependencies
 
-- **pydantic:** Model validation at all boundaries (`AgentInvocation`, `AgentResult`, `AgentSpec`, inline types)
+- **pydantic:** Model validation at all boundaries (`AgentInvocation`, `AgentResult`, `AgentSpec`)
 - **structlog:** Structured logging via `autologging.get_logger`
 - **yaml:** Used by `render_claude.py` and `render_cursor.py` for frontmatter generation (standard `PyYAML`)
-- **Internal:** `src/errors` for `AdapterError`, `src/state/paths` for delegation/response path resolution, `src/autologging` for logger factory
+- **Internal:** `src/errors` for `AdapterError`, `src/autologging` for logger factory
 
 ### 5.7 Configuration
 
 | Config Path | Description | Default |
 |-------------|-------------|---------|
-| `AutodevConfig.platform` | Preferred platform: `"claude_code"`, `"cursor"`, `"inline"`, `"auto"` | `"auto"` |
+| `AutodevConfig.platform` | Preferred platform: `"claude_code"`, `"cursor"`, `"auto"`. (Legacy `"inline"` is auto-migrated to `"claude_code"` with a `DeprecationWarning`; the Literal will drop `"inline"` in v0.27.0.) | `"auto"` |
 | `AUTODEV_PLATFORM` env var | Override platform selection | Not set |
 | `TournamentsConfig.max_parallel_subprocesses` | Semaphore bound for `parallel()` | `3` |
 | `AgentInvocation.timeout_s` | Per-invocation subprocess timeout | `600` (10 minutes) |
@@ -478,7 +423,7 @@ All error results preserve `raw_stdout` and `raw_stderr` for debugging.
 | Component | Dependency |
 |-----------|-----------|
 | `src/config/schema.py` | `AutodevConfig.platform` drives adapter selection |
-| `src/state/paths.py` | `delegation_path()`, `response_path()`, `inline_state_path()` |
+| `src/state/paths.py` | (Legacy v0.25.x: `delegation_path()`, `response_path()`, `inline_state_path()` retained for migration cleanup only; the subprocess adapters do not touch these paths.) |
 | `src/errors.py` | `AdapterError` base exception class |
 | `src/autologging.py` | `get_logger()` for structured logging |
 
@@ -508,27 +453,24 @@ The adapter layer does not write ledger events directly. Evidence and ledger wri
 | Claude Code CLI (`claude`) | Subprocess invocation via `claude -p --output-format json` |
 | Cursor CLI (`cursor`, `cursor-agent`) | Subprocess invocation via `cursor agent --print --output-format json` |
 | Git | `git status --porcelain`, `git diff HEAD` for file-change detection; `git --version` indirectly via healthcheck |
-| Filesystem | `.autodev/delegations/` and `.autodev/responses/` for inline mode |
 
 ## 7. Testing Strategy
 
 ### 7.1 Unit Tests
 
-- Round-trip serialization for all Pydantic models (`AgentInvocation`, `AgentResult`, `AgentSpec`, `ToolCall`, `StreamEvent`, `InlineSuspendState`, `InlineResponseFile`).
+- Round-trip serialization for all Pydantic models (`AgentInvocation`, `AgentResult`, `AgentSpec`, `ToolCall`, `StreamEvent`).
 - `extra="forbid"` rejection tests: verify that unknown fields raise `ValidationError`.
 - `_build_command()` tests for both `ClaudeCodeAdapter` and `CursorAdapter` with various flag combinations.
 - `_extract_text()` tests for Cursor's defensive multi-key JSON parsing.
 - `_diff_files()` and `_git_porcelain_set()` tests with mock subprocess output.
 - `detect_platform()` with mocked healthchecks and environment variables.
-- `can_transition()` for inline state transitions.
-- `update_claude_md()` idempotent section replacement tests.
+- `update_claude_md()` idempotent section replacement tests (migration helper for legacy CLAUDE.md sections).
 
 ### 7.2 Integration Tests
 
 - End-to-end `execute()` tests with mocked subprocess (monkeypatched `asyncio.create_subprocess_exec`).
 - Timeout behavior: verify that the adapter kills the subprocess and returns a structured error.
 - `parallel()` with semaphore: verify concurrent execution count does not exceed `max_concurrent`.
-- Inline adapter delegation round-trip: write delegation, create response file, call `collect_response()`.
 - Platform detection with real binary probes (CI-only, skipped when binaries are absent).
 
 ### 7.3 Property-Based Tests
@@ -545,7 +487,6 @@ The adapter layer does not write ledger events directly. Evidence and ledger wri
 ## 8. Security Considerations
 
 - **Prompt injection via subprocess args:** The prompt is passed as a positional argument to `claude -p`, not via shell interpolation. `asyncio.create_subprocess_exec` avoids shell expansion.
-- **File permission for inline mode:** Delegation and response files are written with default umask. No secrets are stored in these files -- they contain prompts and agent text output.
 - **Raw stdout/stderr preservation:** `AgentResult.raw_stdout` and `raw_stderr` may contain sensitive content from the LLM. These fields should not be logged at INFO level or exposed to end users without truncation.
 - **Binary path injection:** The `binary` parameter for `ClaudeCodeAdapter` defaults to `"claude"` and is resolved via PATH. If an attacker controls PATH, they could substitute a malicious binary. This is standard subprocess risk.
 
@@ -554,7 +495,6 @@ The adapter layer does not write ledger events directly. Evidence and ledger wri
 - **Subprocess overhead:** Each `execute()` call spawns a new OS process. The `claude` CLI has a cold-start time of approximately 1-3 seconds. For bulk operations, `parallel()` amortizes this.
 - **Semaphore bound:** The default `max_concurrent=3` limits resource consumption. This is configurable via `TournamentsConfig.max_parallel_subprocesses`.
 - **Git operations:** `_git_porcelain_set()` runs synchronously via `subprocess.run` (not async) with a 5-second timeout. This is acceptable because the operation is fast for typical repo sizes, but could become a bottleneck for very large monorepos. Phase 3+ may move to async subprocess.
-- **Inline mode latency:** The suspend/resume cycle adds human-in-the-loop latency (the agent must read the delegation, execute, write the response, and run `autodev resume`). This is inherent to the inline architecture and is not a performance concern for the adapter itself.
 
 ## 10. Installation & CLI Entry
 
@@ -565,7 +505,7 @@ The adapter layer is a library package under `src/adapters/`. It is imported by 
 ### 10.2 CLI Commands
 
 No direct CLI commands. The adapter is selected via:
-- `autodev run --platform <claude_code|cursor|inline|auto>`
+- `autodev plan --platform <claude_code|cursor|auto>` / `autodev execute --platform <claude_code|cursor|auto>` / `autodev resume --platform <...>` (v0.26.0: `inline` is no longer a valid value, though the schema migrator accepts legacy on-disk configs)
 - `AUTODEV_PLATFORM` environment variable
 - Auto-detection (default)
 
@@ -584,15 +524,13 @@ N/A -- this is the initial implementation.
 | `cursor.execute` | `role`, `model`, `binary`, `cwd` | Before subprocess spawn |
 | `cursor.rate_limit_fallback` | `role`, `from_model`, `to_model` | Model fallback on rate limit |
 | `cursor.allowed_tools_ignored` | `role`, `allowed_tools` | Cursor does not support `--allowed-tools` |
-| `inline.execute` | `role`, `task_id`, `delegation_path` | Delegation file written |
-| `inline.init_workspace` | `cwd`, `platform`, `agent_count` | Config files rendered |
 | `detect_platform.selected` | `platform`, `details` | Auto-detection result |
+
+(v0.26.0 removed the `inline.execute` and `inline.init_workspace` log events alongside the adapter that emitted them.)
 
 ### 11.2 Audit Artifacts
 
-- `.autodev/delegations/<task_id>-<role>.md` -- delegation files (inline mode)
-- `.autodev/responses/<task_id>-<role>.json` -- response files (inline mode)
-- `.autodev/inline-state.json` -- suspend state (inline mode, cleared on resume)
+(v0.26.0 removed `.autodev/delegations/`, `.autodev/responses/`, and `.autodev/inline-state.json` audit artifacts. The subprocess adapters do not write durable audit files of their own — `AgentResult.raw_stdout` / `raw_stderr` flow into the structlog event stream and the orchestrator's evidence files.)
 
 ### 11.3 Status Command
 
@@ -621,7 +559,6 @@ The adapter layer itself adds no LLM calls beyond what the orchestrator requests
 
 - [ ] Should `StreamEvent` be removed or promoted to a first-class concept with stream-JSON parsing?
 - [ ] Should `_git_porcelain_set()` be moved to async to avoid blocking the event loop for large repos?
-- [ ] Should the InlineAdapter support a "batch delegation" mode where multiple delegation files are written before suspend?
 
 ## 15. Related ADRs
 
@@ -639,3 +576,4 @@ The adapter layer itself adds no LLM calls beyond what the orchestrator requests
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-04-17 | Mohamed Ameen | Initial draft |
+| 2026-05-12 | Mohamed Ameen | v0.26.0: removed `InlineAdapter` and the file-based delegation/response state machine. Every dispatch is now subprocess; `DelegationPendingSignal`, `InlineSuspendState`, `InlineResponseFile`, `InlineResponseError` deleted. `platform: "inline"` auto-migrates to `"claude_code"` with a `DeprecationWarning`. `update_claude_md()` retained as a migration helper. |

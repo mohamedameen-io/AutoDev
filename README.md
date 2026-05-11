@@ -36,7 +36,7 @@ pip install ai-autodev
 
 ```bash
 cd /your/project
-autodev init --inline
+autodev init
 ```
 
 In your AI coding agent, invoke the `/autodev` skill with your feature request:
@@ -45,7 +45,7 @@ In your AI coding agent, invoke the `/autodev` skill with your feature request:
 /autodev Build a REST API with user registration, login, and JWT auth.
 ```
 
-Uses your existing AI coding agent's session — no API keys to wire up. Currently supports Claude Code and Cursor.
+AutoDev shells out to your AI coding agent (Claude Code or Cursor) via subprocess for every dispatch — no API keys to wire up, no embedded session state machine. The `/autodev` slash command is a thin dispatch layer that runs `autodev plan` / `autodev execute` for you.
 
 ---
 
@@ -210,7 +210,6 @@ flowchart TB
 
     subgraph Adapters["Platform Adapters (Protocol)"]
         direction LR
-        inline["Inline<br/>(delegation files)"]
         claude["Claude Code<br/>claude -p"]
         cursor["Cursor<br/>cursor agent --print"]
         web["Web Search<br/>(escalation rung)"]
@@ -501,7 +500,7 @@ Every decision is reconstructable from disk — why a judge ranked B above A, wh
 | Append-only CAS ledger | Yes — SHA-256 chained, replay-safe | No | No |
 | Crash-safe resume | Yes — `autodev resume` | No | No |
 | Speculative execution + crash-safe rollback | Yes — opt-in, per-phase cap | No | No |
-| Works inside your existing AI coding agent | Yes — inline mode | N/A | No |
+| Works inside your existing AI coding agent | Yes — subprocess shell-out from `/autodev` slash command | N/A | No |
 | Plugin ecosystem (`entry_points`) | Yes | No | No |
 | Subscription-based, zero per-token cost | Yes | — | — |
 | Cost guardrails (duration / calls / budget) | Yes — per-task + per-plan | No | No |
@@ -769,7 +768,7 @@ uv run python -c "from config.defaults import default_config; print(default_conf
 
 | Command | Purpose |
 |---|---|
-| `autodev init [--inline] [--platform …] [--force]` | Scaffold `.autodev/`, render agent files, write auto-resume config |
+| `autodev init [--platform …] [--force]` | Scaffold `.autodev/`, render agent files, render the `/autodev` slash command. `--inline` is a deprecated noop alias (removed in v0.27.0). |
 | `autodev plan "<intent>"` | PLAN phase: explore -> domain_expert -> architect-draft -> plan tournament -> critic_t-gate -> persist |
 | `autodev execute [--task ID] [--dry-run] [--no-impl-tournament]` | EXECUTE phase: developer -> QA gates -> review -> tests -> impl tournament -> advance |
 | `autodev resume` | Replay ledger, continue at last FSM edge |
@@ -838,17 +837,15 @@ See [`docs/design_documentation/plugin_system_design.md`](docs/design_documentat
 
 ## Platform support
 
-| Platform | Mode | Mechanism |
-|---|---|---|
-| **Claude Code** | Inline | `.claude/CLAUDE.md` managed section, delegation files |
-| **Claude Code** | Standalone | `claude -p "<prompt>" --output-format json` subprocess per role |
-| **Cursor** | Inline | `.cursor/rules/autodev.mdc` with `alwaysApply: true` |
-| **Cursor** | Standalone | `cursor agent "<prompt>" --print --output-format json` |
+| Platform | Mechanism |
+|---|---|
+| **Claude Code** | `claude -p "<prompt>" --output-format json` subprocess per role |
+| **Cursor** | `cursor agent "<prompt>" --print --output-format json` |
 
-Four shipped adapters: `claude_code.py`, `cursor.py`, `inline.py`, `web_search.py` (the last powers the WEB_SEARCH escalation rung).
+Three shipped adapters: `claude_code.py`, `cursor.py`, `web_search.py` (the last powers the WEB_SEARCH escalation rung). InlineAdapter and the file-based delegation/response state machine were removed in v0.26.0 — every dispatch is now subprocess, including from inside the `/autodev` slash command (which shells out via `Bash`).
 
 Platform selection precedence:
-1. `--inline` or `--platform` CLI flag
+1. `--platform` CLI flag
 2. `AUTODEV_PLATFORM` environment variable
 3. `config.json.platform` (when not `"auto"`)
 4. Auto-detect: `claude --version` succeeds -> `claude_code`; else `cursor --version` -> `cursor`; else `autodev doctor` surfaces a diagnostic

@@ -1,10 +1,15 @@
 # ADR-006: Platform Adapter Abstraction via Strategy Pattern ABC
 
-**Status:** Accepted
+**Status:** Accepted (partially superseded by v0.26.0 — see "Supersession" below)
 **Date:** 2026-04-17
+**Last Updated:** 2026-05-12
 **Deciders:** Mohamed Ameen
 **Tags:** adapters, platform-portability, strategy-pattern, abc, testability
 **Related ADRs:** ADR-005 (Protocol-Based Plugin System), ADR-007 (Git Worktree Isolation)
+
+## Supersession (v0.26.0)
+
+The core decision (uniform `PlatformAdapter` ABC for `ClaudeCodeAdapter` and `CursorAdapter`) still stands. **The InlineAdapter rationale in this ADR is historical only** — `InlineAdapter`, `src/adapters/inline.py`, `src/adapters/inline_types.py`, `DelegationPendingSignal`, `InlineSuspendState`, `InlineResponseFile`, and `InlineResponseError` were all deleted in v0.26.0. The v0.24.2 slash-command transition (every `/autodev` invocation shells out via `Bash` to the `autodev` CLI) made the inline distinction architectural dead-weight: there is no "running inside the agent session" case left to support. Sections below referring to `InlineAdapter`'s suspend/resume model, its `parallel()`-raises-`NotImplementedError` divergence, and its file-based delegation/response loop describe pre-v0.26.0 behavior only. The current contract is uniform: every `execute()` returns an `AgentResult` synchronously; `parallel()` inherits the ABC default.
 
 ## Context
 
