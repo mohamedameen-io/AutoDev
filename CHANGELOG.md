@@ -2,6 +2,41 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.1] - 2026-05-11
+
+Targeted fix release for four orchestrator bugs surfaced by a long-running real-world execute run on a Unity-scale C++ repo. All four cascade-failed Phase 2: a Phase 2 stuck-error tripped a worktree-cleanup that wiped sibling per-task worktrees, downstream tasks then dispatched against HEAD where their prerequisites didn't exist, agent output blobs leaked into path arguments, and the resume-loop burned the retry budget in milliseconds. Each bug is fixed in isolation with regression coverage; full test suite passes (2,396 / 2,396 + 7 expected skips).
+
+### Fixed (Bug #1 — `worktree.cleanup_all` parent-wipe)
+- **`WorktreeManager.cleanup_all` no longer treats the per-task `tasks/` parent directory as a worktree label.** Regression introduced when `create_per_task` adopted the `tasks/<task_id>` hierarchy without updating `cleanup_all`: the cleanup `iterdir()` walked the tournament dir, found `tasks/` alongside impl labels `a`/`b`/`ab`, fed `"tasks"` through `remove(label="tasks", force=True)` and ultimately `shutil.rmtree(<dir>/tasks)`, destroying every per-task worktree in one call (including in-flight ones with un-integrated patches). The unity run's Phase 2 cascade was the surface symptom; the log line `worktree.force_removed component=worktree path=…/execute_worktrees/tasks` was the smoking gun. Fix: `cleanup_all` filters `tasks/` out of the label sweep and iterates `tasks_dir.iterdir()` through `remove_per_task` instead. Defensive guards added in `remove()` and `_force_remove()` reject the reserved `tasks` path so future regressions can't reintroduce the bug. (`src/orchestrator/worktree.py`)
+
+### Fixed (Bug #2 — persistent integration via commit-per-task)
+- **`apply_patch_to_main` can now commit the patch atomically with the apply.** A new optional `commit_message: str | None = None` parameter routes the apply through `git apply --index` (stages exactly the diff's hunks) followed by `git commit -m <message>`. `None` preserves v0.25.0 working-tree-only behavior used by impl tournaments. `_apply_with_conflict_escalation` in `execute_phase.py` passes `commit_message=f"autodev: task {task.id} ({task.title})"` for both clean and `--3way` paths so each task lands as a separate commit on the main branch. Subsequent `create_per_task` calls (which default `base_ref="HEAD"`) now see prior tasks' changes, unlocking cross-task dependencies. Without this fix, Phase 2's later tasks were dispatched against the original HEAD where Phase 2.1's `ContextTimerQueryStateGLES` and `debugGroupDepth` symbols did not exist. (`src/orchestrator/worktree.py`, `src/orchestrator/worktree_pool.py`, `src/orchestrator/execute_phase.py`)
+
+### Fixed (Bug #3 — agent-output leak into path arguments)
+- **`extract_files_from_diff` rejects malformed diff "paths" before they reach QA gates.** When a developer agent emits a JSON-escaped multi-line code listing into the `diff` field of `.autodev/responses/{task_id}-{role}.json`, the unified-diff parser at `src/adapters/git_utils.py` treats the whole blob as one line and `+++ b/<path>` extracted a 4000+ char "path" containing literal `\n` escapes. That string flowed through `execute_phase.py` into `_iter_files` helpers in `qa/secretscan.py`, `qa/hallucination_guard.py`, and `qa/code_size.py`, where `resolved.is_file()` / `resolved.exists()` raised `OSError: [Errno 63] File name too long` and the worker died with `worker_exception` (the unity run had 10 tasks blocked this way across phases 0/1/2). Two-layer fix: (1) `extract_files_from_diff` now rejects paths longer than 255 bytes (POSIX `NAME_MAX`) or containing `\n` / `\\n` / `\x00`, logging the rejected prefix; (2) the three QA `_iter_files` helpers wrap `is_file()`/`exists()` in `try/except (OSError, ValueError)` so any future leak skips the path instead of crashing the worker.
+
+### Fixed (Bug #4 — retry backoff persistence across resume)
+- **Retry attempts now respect a minimum interval (`qa_retry_min_interval_s`, default `30.0` s).** v0.25.0 had no backoff anywhere in the retry loop — a task wedged at `retry_count=N` after `autodev resume` burned through retries N+1, N+2, … within milliseconds (the unity run observed sub-second ledger sequences seqs 349-356 for task 2.5). Fix: new `Task.last_retry_at: str | None` field, persisted via `PlanManager.mark_task_retry` and restored on ledger replay; new `_enforce_retry_backoff` helper in `execute_phase.py` sleeps for `min_interval_s - elapsed` at the top of `_try_retry_or_escalate` when the prior retry was within the interval. Helper takes injectable `now` and `sleep` so tests run instantly. Set `qa_retry_min_interval_s=0.0` to disable the guard entirely (v0.25.0 behavior; not recommended). (`src/state/schemas.py`, `src/state/plan_manager.py`, `src/orchestrator/execute_phase.py`, `src/config/schema.py`, `src/config/defaults.py`)
+
+### Added (config schema)
+- `AutodevConfig.qa_retry_min_interval_s: float = 30.0` — Bug #4 retry-interval floor.
+
+### Added (state schema)
+- `Task.last_retry_at: str | None = None` — UTC ISO timestamp of the most recent `mark_task_retry`. Older ledgers (pre-v0.25.1) restore as `None`, backward-compatible default.
+
+### Tests
+- 35 new tests across 4 new/extended test files:
+  - `tests/test_orchestrator_worktree.py` — 7 new (3 for Bug #1, 4 for Bug #2). Confirmed RED before fix, GREEN after.
+  - `tests/test_orchestrator_retry_backoff.py` — 8 new (Bug #4).
+  - `tests/qa/test_iter_files_long_path.py` — 9 new (Bug #3 Layer 3 guards).
+  - `tests/adapters/test_git_utils_extract_files_sanitize.py` — 7 new (Bug #3 Layer 2 sanitizer).
+  - `tests/test_orchestrator_conflict_escalation.py` — `FakeWorktreeMgr.apply_patch_to_main` signature updated to accept `commit_message`.
+
+### Migration / operator notes
+- The new commit-per-task behavior means every successful task on the execute path produces a commit on the main branch. Operators who relied on the prior "everything in one big uncommitted working tree" behavior should review their post-run review flow. The legacy behavior is preserved for impl tournaments (which don't pass `commit_message`).
+- `qa_retry_min_interval_s` defaults to 30 s. Set to a lower value in `.autodev/config.json` if you observe legitimate fast retries (e.g., transient adapter flakes); the value applies uniformly across all retry paths.
+- No on-disk schema migration is required; old plans deserialize with `last_retry_at=None` and the backoff guard is a no-op until the next `mark_task_retry` stamps it.
+
 ## [0.25.0] - 2026-05-10
 
 ### Added (planner substrate)
