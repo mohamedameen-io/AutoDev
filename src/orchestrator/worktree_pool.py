@@ -365,6 +365,7 @@ class WorktreePool:
         base_ref: str = "HEAD",
         three_way: bool = False,
         edit_scope: list[str] | None = None,
+        commit_message: str | None = None,
     ) -> None:
         """Forward to the underlying :class:`WorktreeManager`."""
         await self._mgr.apply_patch_to_main(
@@ -372,6 +373,7 @@ class WorktreePool:
             base_ref=base_ref,
             three_way=three_way,
             edit_scope=edit_scope,
+            commit_message=commit_message,
         )
 
     async def expand_sparse_paths(

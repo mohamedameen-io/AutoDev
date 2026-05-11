@@ -417,9 +417,14 @@ async def _apply_with_conflict_escalation(
     on pathological cases.
     """
     rewrite_rounds = 0
+    # v0.25.1 Bug #2: persistent integration. Commit per task so the next
+    # task's per-task worktree (created at HEAD) sees prior tasks' changes.
+    commit_msg = f"autodev: task {task.id} ({task.title})"
     while True:
         try:
-            await worktree_mgr.apply_patch_to_main(worktree, base_ref="HEAD")
+            await worktree_mgr.apply_patch_to_main(
+                worktree, base_ref="HEAD", commit_message=commit_msg
+            )
             return True
         except WorktreeError as exc:
             logger.warning(
@@ -446,7 +451,10 @@ async def _apply_with_conflict_escalation(
                 # abandon (no infinite loop on persistent conflicts).
                 try:
                     await worktree_mgr.apply_patch_to_main(
-                        worktree, base_ref="HEAD", three_way=True
+                        worktree,
+                        base_ref="HEAD",
+                        three_way=True,
+                        commit_message=commit_msg,
                     )
                     logger.info(
                         "execute_phase.conflict_resolved_3way",

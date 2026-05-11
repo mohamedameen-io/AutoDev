@@ -313,7 +313,20 @@ class WorktreeManager:
         (uncommitted edits, corruption) and ``force=True``, falls back to
         ``git worktree remove --force`` + filesystem ``shutil.rmtree`` and
         a final ``git worktree prune`` to clean stale metadata.
+
+        The literal label ``"tasks"`` is reserved: it names the parent
+        container for per-task worktrees created via :meth:`create_per_task`.
+        Routing it through ``remove`` would fall through to
+        ``shutil.rmtree(<dir>/tasks)`` and destroy every sibling per-task
+        worktree (regression fixed in v0.25.1). Use :meth:`remove_per_task`
+        for per-task teardown instead.
         """
+        if label == "tasks":
+            raise WorktreeError(
+                "remove() refused reserved label 'tasks' — this is the "
+                "parent container for per-task worktrees, not a worktree "
+                "itself. Use remove_per_task(task_id) instead."
+            )
         wt = self.worktree_path(label)
         if not wt.exists():
             # Best-effort prune so the admin DB is consistent if a previous
@@ -338,7 +351,22 @@ class WorktreeManager:
         self._log.info("worktree.removed", label=label, path=str(wt))
 
     async def _force_remove(self, wt: Path) -> None:
-        """Fallback cleanup when ``git worktree remove`` can't finish."""
+        """Fallback cleanup when ``git worktree remove`` can't finish.
+
+        Defensive guard (v0.25.1): refuse to rmtree the reserved
+        ``<tournament_dir>/tasks`` parent directory. Doing so would
+        destroy every in-flight per-task worktree at once. Callers must
+        hand individual worktree paths only; per-task removal goes
+        through :meth:`remove_per_task` which targets
+        ``<tournament_dir>/tasks/<task_id>``.
+        """
+        if wt.name == "tasks" and wt.parent == self._dir:
+            raise WorktreeError(
+                f"_force_remove() refused to rmtree per-task parent "
+                f"directory {wt!r}; doing so would destroy every "
+                f"in-flight per-task worktree. Use remove_per_task() "
+                f"for per-task teardown."
+            )
         # First try git's own force path (handles admin DB).
         await _run_git(
             self._main,
@@ -357,13 +385,32 @@ class WorktreeManager:
     async def cleanup_all(self) -> None:
         """Remove every worktree under ``tournament_dir`` and the dir itself.
 
+        Two on-disk layers are swept:
+
+        * Top-level impl-tournament label worktrees (``a`` / ``b`` /
+          ``ab``) — removed via :meth:`remove`.
+        * Per-task worktrees under ``tasks/<task_id>`` (created by
+          :meth:`create_per_task`) — removed via :meth:`remove_per_task`.
+
+        The ``tasks`` parent directory is **never** passed to
+        :meth:`remove` (regression fixed in v0.25.1). Treating it as a
+        label would fall through to ``shutil.rmtree(<dir>/tasks)`` and
+        destroy every sibling per-task worktree in one call — including
+        any with un-applied patches.
+
         Safe to call twice — subsequent calls are no-ops.
         """
         if not self._dir.exists():
             return
 
-        # List all label subdirs.
-        labels = [p.name for p in self._dir.iterdir() if p.is_dir()]
+        # Layer 1: top-level impl-tournament label worktrees. The
+        # reserved ``tasks`` subdirectory is a container for per-task
+        # worktrees, not a worktree itself — handled in layer 2.
+        labels = [
+            p.name
+            for p in self._dir.iterdir()
+            if p.is_dir() and p.name != "tasks"
+        ]
         for lbl in labels:
             try:
                 await self.remove(lbl, force=True)
@@ -373,7 +420,22 @@ class WorktreeManager:
                     "worktree.cleanup_remove_failed", label=lbl, err=str(exc)
                 )
 
-        # Remove whatever is left on disk (history.json, pass_NN/, etc).
+        # Layer 2: per-task worktrees under tasks/<task_id>.
+        tasks_dir = self._dir / "tasks"
+        if tasks_dir.exists():
+            task_ids = [p.name for p in tasks_dir.iterdir() if p.is_dir()]
+            for tid in task_ids:
+                try:
+                    await self.remove_per_task(tid, force=True)
+                except WorktreeError as exc:
+                    self._log.warning(
+                        "worktree.cleanup_remove_per_task_failed",
+                        task_id=tid,
+                        err=str(exc),
+                    )
+
+        # Remove whatever is left on disk (history.json, pass_NN/, empty
+        # ``tasks/`` shell, etc).
         try:
             shutil.rmtree(self._dir, ignore_errors=True)
         except OSError:
@@ -504,6 +566,7 @@ class WorktreeManager:
         base_ref: str = "HEAD",
         three_way: bool = False,
         edit_scope: list[str] | None = None,
+        commit_message: str | None = None,
     ) -> None:
         """Apply the worktree's diff to the main repo's working tree.
 
@@ -523,6 +586,14 @@ class WorktreeManager:
         is aborted with :class:`orchestrator.dag.EditScopeViolation`
         BEFORE any ``git apply`` runs (so main is never half-patched).
         ``None`` / empty list preserves legacy whole-repo behavior.
+
+        v0.25.1 Bug #2: ``commit_message`` enables persistent integration.
+        When supplied, the apply uses ``git apply --index`` so hunks are
+        staged as they land, and a follow-on ``git commit`` records the
+        change set on the main branch. Subsequent ``create_per_task``
+        calls (which default ``base_ref="HEAD"``) see the new commit,
+        unlocking cross-task dependencies. ``None`` (default) preserves
+        the v0.25.0 working-tree-only behavior used by impl tournaments.
         """
         diff_text = await self.get_diff_vs_base(worktree, base_ref=base_ref)
         if not diff_text.strip():
@@ -547,6 +618,11 @@ class WorktreeManager:
         if three_way:
             check_args.append("--3way")
             apply_args.append("--3way")
+        if commit_message is not None:
+            # v0.25.1 Bug #2: stage as we apply so the follow-on commit
+            # captures exactly the diff's hunks (no risk of sweeping
+            # unrelated dirty state via a later ``git add -A``).
+            apply_args.append("--index")
 
         # Pre-flight: ``git apply --check`` so we fail fast on conflicts.
         check_rc, _, check_err = await _run_git(
@@ -572,6 +648,36 @@ class WorktreeManager:
             "worktree.apply_patch.success",
             diff_bytes=len(diff_text),
             three_way=three_way,
+            committed=commit_message is not None,
+        )
+
+        # v0.25.1 Bug #2: persistent integration via commit-per-task.
+        if commit_message is None:
+            return
+        # Sanity: ``--index`` should have staged hunks. If the staged
+        # diff is empty (apply was a content-identical no-op), skip the
+        # commit rather than producing an empty change set.
+        staged_rc, _, _ = await _run_git(
+            self._main, ["diff", "--cached", "--quiet"]
+        )
+        if staged_rc == 0:
+            self._log.info(
+                "worktree.apply_patch.no_staged_changes",
+                commit_message=commit_message,
+            )
+            return
+        commit_rc, _, commit_err = await _run_git(
+            self._main,
+            ["commit", "-m", commit_message, "--no-verify"],
+        )
+        if commit_rc != 0:
+            raise WorktreeError(
+                f"git commit after apply failed (rc={commit_rc}): "
+                f"{commit_err.strip()}"
+            )
+        self._log.info(
+            "worktree.apply_patch.committed",
+            commit_message=commit_message,
         )
 
 

@@ -293,7 +293,11 @@ class FakeWorktreeMgr:
         self.attempt = 0
 
     async def apply_patch_to_main(
-        self, worktree, base_ref: str = "HEAD", three_way: bool = False
+        self,
+        worktree,
+        base_ref: str = "HEAD",
+        three_way: bool = False,
+        commit_message: str | None = None,
     ) -> None:
         from orchestrator.worktree import WorktreeError
 

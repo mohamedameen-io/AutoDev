@@ -266,3 +266,274 @@ async def test_apply_patch_to_main_rejects_out_of_scope_hunk_when_scope_set(
     assert not (repo / "docs_out.md").exists()
 
     await mgr.cleanup_all()
+
+
+# ---------------------------------------------------------------------------
+# v0.25.1 Bug #1 — cleanup_all must not treat the per-task ``tasks/`` parent
+# directory as a worktree label. Regression: cleanup_all iterdir()'d the
+# tournament dir, found ``tasks/`` alongside impl labels ``a/``/``b/``, fed
+# ``"tasks"`` through ``remove(label="tasks", force=True)`` and ultimately
+# ``shutil.rmtree(<dir>/tasks)``, destroying every per-task worktree in one
+# call along with any patches that hadn't yet been applied to main.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_remove_rejects_reserved_tasks_label(tmp_path: Path) -> None:
+    """``remove('tasks')`` must refuse — ``tasks`` is the parent container
+    for per-task worktrees, not a worktree label. Letting it through
+    caused ``cleanup_all`` to wipe all sibling per-task worktrees."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    wt_dir = tmp_path / "execute_worktrees"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+    pt = await mgr.create_per_task("1.1")
+    assert pt.exists()
+
+    with pytest.raises(WorktreeError, match="reserved"):
+        await mgr.remove("tasks", force=True)
+
+    # The per-task worktree must still be intact.
+    assert pt.exists()
+    await mgr.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_does_not_force_remove_tasks_parent(
+    tmp_path: Path,
+) -> None:
+    """``cleanup_all`` must not emit ``worktree.force_removed`` on the
+    ``tasks/`` parent directory. The buggy implementation treated
+    ``tasks/`` as a label and fell through to ``shutil.rmtree(tasks)``,
+    destroying every in-flight per-task worktree."""
+    import structlog
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    wt_dir = tmp_path / "execute_worktrees"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+
+    pt_a = await mgr.create_per_task("2.1")
+    pt_b = await mgr.create_per_task("2.3")
+    # Simulate uncommitted work that should NOT be lost via force_remove.
+    (pt_a / "scratch.txt").write_text("WIP 2.1\n")
+    (pt_b / "scratch.txt").write_text("WIP 2.3\n")
+
+    with structlog.testing.capture_logs() as cap:
+        await mgr.cleanup_all()
+
+    force_removed_on_parent = [
+        ev
+        for ev in cap
+        if ev.get("event") == "worktree.force_removed"
+        and ev.get("path", "").rstrip("/").endswith("/tasks")
+    ]
+    assert not force_removed_on_parent, (
+        "cleanup_all force-removed the tasks parent directory; "
+        f"events: {force_removed_on_parent}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# v0.25.1 Bug #2 — persistent integration (commit-per-task). Regression:
+# ``apply_patch_to_main`` left the patch in the main repo's uncommitted
+# working tree, so a downstream ``cleanup_all`` (Bug #1) or an operator
+# ``git reset`` lost the work. Without a commit, the *next* per-task
+# worktree created at HEAD also couldn't see prior tasks' changes, so
+# cross-task dependencies cascaded into "coder adapter failure".
+#
+# Fix: optional ``commit_message`` parameter on ``apply_patch_to_main``.
+# When supplied, the manager stages + commits the apply atomically with
+# the supplied message. Subsequent ``create_per_task`` calls default to
+# ``base_ref="HEAD"`` and therefore see the new commit. Empty / absent
+# message preserves the legacy v0.25.0 behavior (impl-tournament uses
+# the non-committing path).
+# ---------------------------------------------------------------------------
+
+
+def _head_sha(repo: Path) -> str:
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.strip()
+
+
+def _head_message(repo: Path) -> str:
+    out = subprocess.run(
+        ["git", "log", "-1", "--pretty=%B"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.strip()
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_to_main_does_not_commit_without_message(
+    tmp_path: Path,
+) -> None:
+    """Legacy behavior preserved: when ``commit_message`` is not
+    supplied, ``apply_patch_to_main`` leaves the apply uncommitted in
+    the working tree (impl-tournament path)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    head_before = _head_sha(repo)
+
+    wt_dir = tmp_path / "execute_worktrees"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+    wt = await mgr.create_per_task("1.1")
+    (wt / "README.md").write_text("# changed by 1.1\n")
+
+    await mgr.apply_patch_to_main(wt)
+    assert (repo / "README.md").read_text() == "# changed by 1.1\n"
+    assert _head_sha(repo) == head_before, "HEAD must not advance without a message"
+
+    await mgr.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_to_main_commits_when_message_given(
+    tmp_path: Path,
+) -> None:
+    """v0.25.1 Bug #2: with ``commit_message`` set, the apply lands on
+    main as a new commit. Uses ``git add -A`` + ``git commit`` so the
+    work is durable across any subsequent ``cleanup_all`` or operator
+    reset."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    head_before = _head_sha(repo)
+
+    wt_dir = tmp_path / "execute_worktrees"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+    wt = await mgr.create_per_task("1.1")
+    (wt / "README.md").write_text("# changed by 1.1\n")
+
+    await mgr.apply_patch_to_main(wt, commit_message="autodev: task 1.1")
+    assert (repo / "README.md").read_text() == "# changed by 1.1\n"
+    head_after = _head_sha(repo)
+    assert head_after != head_before, "commit must advance HEAD"
+    assert _head_message(repo) == "autodev: task 1.1"
+
+    await mgr.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_next_per_task_worktree_sees_prior_committed_patch(
+    tmp_path: Path,
+) -> None:
+    """v0.25.1 Bug #2: the root motivation. After task A commits via
+    ``apply_patch_to_main(commit_message=...)``, task B's per-task
+    worktree (created at ``HEAD``) must contain task A's changes. This
+    is the cross-task-dependency guarantee that was missing in v0.25.0
+    — the unity run's Phase 2 cascade was caused by Task 2.5 starting
+    from a worktree at the original HEAD where Task 2.1's prerequisites
+    didn't exist."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    wt_dir = tmp_path / "execute_worktrees"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+
+    # Task A — adds a new file that Task B will depend on.
+    wt_a = await mgr.create_per_task("A")
+    (wt_a / "shared.txt").write_text("from-A\n")
+    await mgr.apply_patch_to_main(wt_a, commit_message="autodev: task A")
+    await mgr.remove_per_task("A")
+
+    # Task B — opens a fresh worktree at HEAD. The file from A must be
+    # visible because A committed.
+    wt_b = await mgr.create_per_task("B")
+    assert (wt_b / "shared.txt").exists(), (
+        "task B's worktree does not see task A's prior commit — "
+        "cross-task accumulation is broken"
+    )
+    assert (wt_b / "shared.txt").read_text() == "from-A\n"
+
+    await mgr.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_to_main_commit_includes_only_diff_changes(
+    tmp_path: Path,
+) -> None:
+    """The committed change set must reflect the worktree's diff — no
+    spurious additions from main's working tree (which would mean a
+    bug-prone ``git add -A`` over an unrelated dirty state)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+    # Main repo working tree is clean (post _init_git_repo).
+
+    wt_dir = tmp_path / "execute_worktrees"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+    wt = await mgr.create_per_task("1.1")
+    (wt / "added.txt").write_text("hi\n")
+
+    await mgr.apply_patch_to_main(wt, commit_message="autodev: task 1.1")
+
+    # Inspect the commit's changed files.
+    out = subprocess.run(
+        ["git", "show", "--name-only", "--pretty=", "HEAD"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    changed = sorted(line for line in out.stdout.splitlines() if line.strip())
+    assert changed == ["added.txt"]
+
+    await mgr.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_routes_per_task_via_remove_per_task(
+    tmp_path: Path,
+) -> None:
+    """``cleanup_all`` must route per-task worktree teardown through the
+    ``remove_per_task`` API (which calls ``git worktree remove`` on the
+    individual subdir) rather than treating the ``tasks`` parent as a
+    label and rmtreeing the whole thing in one shot."""
+    import structlog
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    wt_dir = tmp_path / "tournament_dir"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+
+    # Mixed layout — impl labels alongside per-task subdirs (the exact
+    # layout that triggered the bug in the unity run).
+    a = await mgr.create("a")
+    pt_21 = await mgr.create_per_task("2.1")
+    pt_23 = await mgr.create_per_task("2.3")
+    assert a.exists() and pt_21.exists() and pt_23.exists()
+
+    with structlog.testing.capture_logs() as cap:
+        await mgr.cleanup_all()
+
+    # All worktrees gone (final-state guarantee unchanged).
+    assert not a.exists()
+    assert not pt_21.exists()
+    assert not pt_23.exists()
+
+    per_task_events = [
+        ev for ev in cap if ev.get("event") == "worktree.removed_per_task"
+    ]
+    removed_task_ids = {ev.get("task_id") for ev in per_task_events}
+    assert removed_task_ids >= {"2.1", "2.3"}, (
+        f"cleanup_all did not route per-task teardown through "
+        f"remove_per_task; saw task_ids={removed_task_ids}"
+    )
