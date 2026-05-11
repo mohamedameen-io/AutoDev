@@ -216,7 +216,14 @@ def default_config(platform: str = "auto") -> AutodevConfig:
             # entry. Distinct from max_parallel_subprocesses (which caps
             # the judge cohort fan-out inside one tournament).
             execute_max_parallel_tasks=None,
-            auto_disable_for_models=["opus"],
+            # v0.25.3: top-level fallback flipped to ``[]``. Per-tournament
+            # built-in defaults (plan=[], impl=["opus"],
+            # phase_review=["opus"]) are applied by the
+            # :meth:`TournamentsConfig._resolve_auto_disable` validator
+            # whenever a per-tournament slot is left ``None``. Existing
+            # on-disk configs that still pin ``["opus"]`` here continue
+            # to disable all three tournaments until refreshed.
+            auto_disable_for_models=[],
         ),
         qa_gates=QAGatesConfig(),
         qa_retry_limit=3,

@@ -216,7 +216,13 @@ async def run_plan_tournament(
         - Appends a ``plan_tournament_complete`` ledger entry at the end.
     """
     cfg = orch.cfg.tournaments.plan
-    auto_disable = orch.cfg.tournaments.auto_disable_for_models
+    # v0.25.3: consult the per-tournament auto-disable list. The top-level
+    # ``tournaments.auto_disable_for_models`` is deprecated; it is now
+    # inherited into each per-tournament slot at validation time and the
+    # resolved list lives on ``cfg.auto_disable_for_models``. The default
+    # for the plan tournament is ``[]`` so the README's #1 discipline
+    # mechanism runs even on Opus.
+    auto_disable = cfg.auto_disable_for_models or []
     model = _resolve_tournament_model(orch)
 
     if _is_auto_disabled(model, auto_disable):

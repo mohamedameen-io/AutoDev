@@ -52,7 +52,12 @@ def _orch_with_judge_model(
     # v0.12.0: this fixture tests auto-disable on the single-branch path.
     cfg.tournaments.plan.num_branches = 1
     if auto_disable is not None:
-        cfg.tournaments.auto_disable_for_models = auto_disable
+        # v0.25.3: the auto-disable list now lives per-tournament so each
+        # phase's policy can diverge. The test exercises the plan
+        # tournament's auto-disable path, so the override goes on
+        # ``tournaments.plan.auto_disable_for_models`` rather than the
+        # deprecated top-level field.
+        cfg.tournaments.plan.auto_disable_for_models = auto_disable
     cfg.tournaments.impl.enabled = False
     cfg.agents["judge"].model = judge_model
     registry = build_registry(cfg)

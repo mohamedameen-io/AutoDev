@@ -49,7 +49,9 @@ def _orch_with_judge_model(
     cfg.tournaments.impl.convergence_k = 1
     cfg.tournaments.impl.max_rounds = 3
     if auto_disable is not None:
-        cfg.tournaments.auto_disable_for_models = auto_disable
+        # v0.25.3: per-tournament auto-disable list. Set on impl directly
+        # so the operator-override path is exercised.
+        cfg.tournaments.impl.auto_disable_for_models = auto_disable
     cfg.tournaments.plan.enabled = False
     cfg.agents["judge"].model = judge_model
     registry = build_registry(cfg)

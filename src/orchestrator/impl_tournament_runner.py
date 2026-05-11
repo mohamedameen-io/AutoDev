@@ -316,7 +316,10 @@ async def run_impl_tournament(
             trajectory.
     """
     cfg = orch.cfg.tournaments.impl
-    auto_disable = orch.cfg.tournaments.auto_disable_for_models
+    # v0.25.3: per-tournament auto-disable list. impl defaults to
+    # ``["opus"]`` because impl tournaments fire once per task and can
+    # blow through budget on Opus.
+    auto_disable = cfg.auto_disable_for_models or []
     model = _resolve_tournament_model(orch)
 
     if _is_auto_disabled(model, auto_disable):

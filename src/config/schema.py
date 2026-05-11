@@ -107,6 +107,20 @@ class TournamentPhaseConfig(BaseModel):
     num_judges: int
     convergence_k: int
     max_rounds: int
+    # v0.25.3: per-tournament auto-disable list. Each runner consults the
+    # field on its own phase config. ``None`` (the default at the schema
+    # level) means "inherit from :attr:`TournamentsConfig.auto_disable_for_models`
+    # if that's non-empty, otherwise fall back to a per-phase built-in
+    # default applied in :meth:`TournamentsConfig._resolve_auto_disable`":
+    #
+    #   * plan defaults to ``[]`` (always run, even on Opus — plan errors
+    #     compound through every downstream task and the cost is justified).
+    #   * impl defaults to ``["opus"]`` (cost guard: one tournament per task).
+    #   * phase_review defaults to ``["opus"]`` (cost guard: per-phase fan-out).
+    #
+    # An explicit list at this level always wins over the top-level
+    # fallback — no silent inheritance.
+    auto_disable_for_models: list[str] | None = None
     # Optional runaway detector: terminate early when the per-pass Borda
     # scores barely change across ``score_stability_window`` consecutive
     # passes (sum of |Δscore| across A/B/AB is ≤ ``score_stability_max_delta``).
@@ -340,7 +354,49 @@ class TournamentsConfig(BaseModel):
     # task-worker fan-out inside execute_phase. Both can be set
     # independently.
     execute_max_parallel_tasks: int | None = None
-    auto_disable_for_models: list[str] = Field(default_factory=lambda: ["opus"])
+    # v0.25.3: deprecated top-level fallback. Existing on-disk configs
+    # (v0.25.2 and earlier) wrote ``["opus"]`` here to disable all three
+    # tournaments on Opus. v0.25.3 moves the policy into each
+    # :class:`TournamentPhaseConfig` so plan tournaments can run on Opus
+    # while impl / phase_review remain cost-guarded. The default flips
+    # to ``[]`` so fresh installs hit the new per-tournament defaults;
+    # legacy configs that still pin ``["opus"]`` here inherit it down
+    # into every per-tournament slot whose own value is ``None``.
+    auto_disable_for_models: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _resolve_auto_disable(self) -> "TournamentsConfig":
+        """v0.25.3: resolve each per-tournament ``auto_disable_for_models``.
+
+        AutoDev's goal is to improve the quality and consistency of
+        AI-generated code, regardless of model cost. Tournaments must
+        never be skipped by default. The auto-disable mechanism is
+        retained as an explicit operator override (for cost-controlled
+        development environments) but its built-in default is empty for
+        every tournament type.
+
+        Precedence (per phase config):
+
+        1. Explicit value at the per-tournament level (any non-``None``)
+           wins, even when the top-level list disagrees.
+        2. Otherwise, if the deprecated top-level
+           ``auto_disable_for_models`` is non-empty, inherit it
+           (back-compat with legacy on-disk configs from v0.25.2 and
+           earlier).
+        3. Otherwise, the per-phase built-in default is ``[]`` —
+           tournaments run on every model, including Opus.
+        """
+        for phase_name in ("plan", "impl", "phase_review"):
+            phase_cfg = getattr(self, phase_name)
+            if phase_cfg.auto_disable_for_models is not None:
+                continue  # explicit per-tournament value wins
+            if self.auto_disable_for_models:
+                phase_cfg.auto_disable_for_models = list(
+                    self.auto_disable_for_models
+                )
+            else:
+                phase_cfg.auto_disable_for_models = []
+        return self
 
 
 class CodeSizeThresholds(BaseModel):

@@ -240,7 +240,11 @@ async def run_phase_review_tournament(
             history=[],
         )
 
-    auto_disable = orch.cfg.tournaments.auto_disable_for_models
+    # v0.25.3: per-tournament auto-disable list. phase_review defaults to
+    # ``["opus"]`` (cost guard: one tournament per phase).
+    auto_disable = (
+        orch.cfg.tournaments.phase_review.auto_disable_for_models or []
+    )
     model = _resolve_tournament_model(orch)
     if _is_auto_disabled(model, auto_disable):
         logger.info(
