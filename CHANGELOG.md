@@ -2,6 +2,68 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.3] - 2026-05-11
+
+Tournaments must never be skipped by default. AutoDev's goal is to
+improve the quality and consistency of AI-generated code regardless of
+model cost; the prior built-in default of ``auto_disable_for_models:
+["opus"]`` silently turned off every tournament for every Claude Code
+install (because Claude Code's default model is Opus), defeating the
+README's #1 discipline mechanism and reducing the orchestrator to a
+single-pass dispatch.
+
+### Fixed
+- **All three tournament types (plan, impl, phase_review) run by
+  default on every model, including Opus.** The auto-disable mechanism
+  is retained as an explicit operator override for cost-controlled
+  development environments, but its built-in default is now ``[]`` for
+  every tournament type.
+- **Per-tournament ``auto_disable_for_models``.** The list moves from
+  the top-level :class:`TournamentsConfig` to each
+  :class:`TournamentPhaseConfig`, so operators can override one
+  tournament without touching the others. A v0.25.3 model-validator
+  resolves each per-tournament slot at validation time:
+  1. an explicit per-tournament value wins;
+  2. otherwise, if the deprecated top-level
+     ``tournaments.auto_disable_for_models`` is non-empty, it is
+     inherited down (back-compat path for legacy on-disk configs);
+  3. otherwise, the per-tournament default is ``[]``.
+- **Runner-side wiring**. ``plan_tournament_runner``,
+  ``impl_tournament_runner``, and ``phase_review_runner`` now consult
+  their own per-tournament list (``cfg.tournaments.<phase>.auto_disable_for_models``)
+  rather than the deprecated top-level. Regression tests assert the bare
+  top-level read is gone.
+
+### Changed
+- ``TournamentsConfig.auto_disable_for_models`` default flipped from
+  ``["opus"]`` to ``[]``. The field is kept for back-compat with v0.25.2
+  on-disk configs (an explicit non-empty value still inherits to
+  every per-tournament slot whose own value is ``None``).
+- ``default_config()`` in ``src/config/defaults.py`` updated to match.
+
+### Migration / operator notes
+- **Existing workspaces**: ``.autodev/config.json`` files written by
+  v0.25.2 and earlier pin ``tournaments.auto_disable_for_models:
+  ["opus"]`` to disk. Until refreshed, those workspaces keep the legacy
+  behavior (all tournaments skipped on Opus). To pick up the new
+  defaults, run ``autodev init --inline --force`` in the workspace, or
+  hand-edit ``config.json`` and remove the legacy line.
+- **Per-tournament override**: to skip a specific tournament for a cost
+  budget (e.g. dev environments), set ``tournaments.<phase>.auto_disable_for_models:
+  ["opus"]`` in ``.autodev/config.json``. The other two tournaments are
+  unaffected.
+
+### Tests
+- 10 new tests in ``tests/test_tournaments_auto_disable_per_phase.py``
+  covering the new defaults, back-compat inheritance, explicit override,
+  and runner-side wiring.
+- Two legacy fixtures
+  (``test_plan_phase_tournament_auto_disabled.py``,
+  ``test_impl_tournament_auto_disabled.py``) updated to set the per-
+  tournament field directly so the operator-override path is exercised
+  by the existing assertion suite.
+- Full suite: 2,437 passed / 7 expected skips (was 2,427 in v0.25.2).
+
 ## [0.25.2] - 2026-05-11
 
 Operator-toolkit release. Implements the four CLI subcommands that
