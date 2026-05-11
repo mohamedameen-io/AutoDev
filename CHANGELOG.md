@@ -2,6 +2,115 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] - 2026-05-12
+
+Subprocess-only architecture. ``InlineAdapter`` and the file-based
+delegation/response state machine that backed inline mode in <=v0.25.x
+are deleted; every dispatch is now a subprocess via ``ClaudeCodeAdapter``
+or ``CursorAdapter``. The ``/autodev`` slash command shells out to the
+``autodev`` CLI for every invocation (the v0.24.2 transition already
+made the inline distinction architectural dead-weight; v0.26.0 takes
+the deletion).
+
+This is a **public API removal**: ``platform: "inline"`` in
+``.autodev/config.json``, the ``--inline`` flag on ``autodev init``,
+the ``DelegationPendingSignal`` ↔ ``autodev resume`` flow,
+``.autodev/inline-state.json``, ``.autodev/delegations/``, and
+``.autodev/responses/`` are all gone. Legacy on-disk configs auto-migrate
+(see Migration notes below) and the ``--inline`` flag survives as a
+deprecated noop alias until v0.27.0.
+
+### Removed
+- ``src/adapters/inline.py`` (``InlineAdapter`` class — 270 LOC).
+- ``src/adapters/inline_types.py`` (``DelegationPendingSignal``,
+  ``InlineSuspendState``, ``InlineResponseFile``, ``InlineResponseError``
+  — 92 LOC).
+- ``src/orchestrator/inline_state.py`` (``write_suspend_state``,
+  ``load_suspend_state``, ``clear_suspend_state`` — 64 LOC).
+- ``src/orchestrator/preflight.py`` (introduced in v0.25.4 to guard the
+  InlineAdapter ↔ tournaments mismatch — now unrepresentable, so the
+  whole module is gone).
+- ``src/errors.py``: ``TournamentAdapterMismatchError`` class (same
+  reason — the mismatch can no longer happen).
+- Inline-mode branches in ``src/orchestrator/__init__.py`` (``resume``),
+  ``src/orchestrator/plan_phase.py`` (``_delegate`` suspend/resume),
+  ``src/orchestrator/execute_phase.py`` (``_delegate`` suspend/resume,
+  ``DelegationPendingSignal`` worker re-raises, ``run_execute_phase``
+  preflight call), and the defense-in-depth typed raise in each
+  tournament runner.
+- ``render_claude_resume_config`` and ``render_cursor_resume_config``
+  from ``src/adapters/inline_config.py`` (the auto-resume CLAUDE.md /
+  ``src.mdc`` renderers that told the host agent to read delegations
+  and run ``autodev resume``).
+- Inline-mode test files: ``tests/test_adapter_inline.py``,
+  ``tests/test_inline_state.py``, ``tests/test_inline_types.py``,
+  ``tests/test_orchestrator_inline_suspend.py`` (≈1,000 LOC). Plus
+  trims to ``test_inline_config.py``, ``test_paths_inline.py``,
+  ``test_cli_inline.py``, ``test_tournament_adapter_mismatch.py``.
+
+### Changed
+- ``autodev init`` defaults to ``platform: claude_code`` (was
+  ``"auto"``). The ``--inline`` flag is a deprecated noop alias: prints
+  a one-line deprecation warning and sets ``cfg.platform = "claude_code"``.
+  Removed in v0.27.0.
+- ``/autodev`` slash-command template (``.claude/commands/autodev.md``)
+  no longer references inline mode; both the ``--review`` and one-shot
+  flows now bootstrap via ``autodev init --force`` and dispatch via
+  ``autodev plan --platform claude_code`` / ``autodev execute --platform
+  claude_code``. The ``--platform`` flag is explicit at the slash-command
+  surface so even legacy on-disk configs with ``platform: inline`` cannot
+  leak through.
+- ``autodev resume`` no longer special-cases ``inline-state.json``. With
+  InlineAdapter gone, resume just continues from the ledger's first
+  non-terminal task; the inline suspend/resume entry path was
+  architectural dead-weight after v0.24.2.
+- ``autodev reset --hard`` continues to purge ``.autodev/delegations/``,
+  ``.autodev/responses/``, and ``inline-state.json`` as **legacy
+  migration cleanup** (marked as such in the help text and code
+  comments). Scheduled for removal from the ``--hard`` set in v0.27.0.
+
+### Migration
+- **``platform: "inline"`` in ``.autodev/config.json``** auto-migrates
+  to ``"claude_code"`` on config load. A Pydantic model validator
+  (``AutodevConfig._migrate_inline_platform``) emits a
+  ``DeprecationWarning`` and rewrites the field. The Literal still
+  accepts ``"inline"`` for one release; v0.27.0 will narrow it to
+  ``{"claude_code", "cursor", "auto"}`` and the migration helper will
+  be removed.
+- **``autodev init --inline``** still exits 0; it now prints a one-line
+  deprecation warning and writes ``platform: claude_code`` to config.
+- **Pre-v0.26.0 workspace residue** (``.autodev/delegations/``,
+  ``.autodev/responses/``, ``.autodev/inline-state.json``) is no longer
+  written but is still cleaned up by ``autodev reset --hard``.
+- **The ``/autodev`` slash command template** in pre-v0.26.0
+  ``.claude/commands/autodev.md`` references ``autodev init --inline``
+  on bootstrap. Re-run ``autodev init --force`` once to regenerate the
+  template with the subprocess-only routing.
+
+### Tests
+- Net change: **2,386 passed / 7 expected skips** (was 2,448 in
+  v0.25.4). ~50 inline-mode tests removed; a handful of subprocess-only
+  regression tests retained (``test_init_inline_flag_is_deprecated_noop``,
+  ``test_subprocess_adapter_with_all_tournaments_enabled_constructs_cleanly``).
+
+### Internal
+- ``src/adapters/__init__.py``: dropped the ``InlineAdapter``
+  re-export. The factory now returns only ``ClaudeCodeAdapter`` or
+  ``CursorAdapter``; the unknown-platform branch raises ``AdapterError``.
+- ``src/adapters/detect.py``: ``PlatformName`` Literal narrowed from
+  ``{"claude_code", "cursor", "inline"}`` to ``{"claude_code", "cursor"}``;
+  the env-var validator drops ``"inline"`` from the accept-set.
+- ``src/cli/commands/plan.py``, ``execute.py``, ``resume.py``: every
+  ``cast(... 'inline' ...)`` Literal was narrowed to drop the inline
+  arm. ``execute.py`` no longer catches ``DelegationPendingSignal``
+  (the only place that did).
+- ``docs/design_documentation/adapters_design.md``: revised to describe
+  the subprocess-only architecture; all InlineAdapter sections marked
+  as historical with explicit v0.26.0 supersession notes.
+- ``README.md``: updated the "Adapters" table and the "Quickstart"
+  snippet to drop the ``--inline`` flag and reframe the host-agent
+  story as "AutoDev shells out via subprocess for every dispatch".
+
 ## [0.25.4] - 2026-05-11
 
 Fail-fast guard for the InlineAdapter + tournaments mismatch surfaced
