@@ -2,6 +2,58 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.2] - 2026-05-11
+
+Operator-toolkit release. Implements the four CLI subcommands that
+``autodev --help`` and the README had advertised since the early
+project phases but were never landed (``reset``, ``logs``, ``prune``,
+``execute --dry-run``). The blocker that prompted this was the unity
+recovery flow at v0.25.1: ``/autodev reset --hard`` from inside Claude
+Code returned ``exit 1`` with no path forward. Now it works.
+
+### Added — `autodev reset [--hard]`
+- **Default** clears ``plan.json`` and ``plan-ledger.jsonl``. Frees ``autodev plan`` to write a fresh plan.
+- **`--hard`** additionally clears ``evidence/``, ``delegations/``, ``responses/``, ``inline-state.json``, ``tournaments/``, ``sessions/``, ``debug/``, the orphan ``.lock``, and the ``execute_worktrees`` / ``execute_worktrees_pool`` directories.
+- **Always preserved** (both modes): ``config.json``, ``spec.md``, ``secretscan-baseline.json``, ``.gitignore``, ``knowledge.jsonl``, ``rejected_lessons.jsonl``, and the v0.25.0 file index (``index.db`` + sidecars + ``index.state.json``). The file index is durable and expensive to rebuild; the knowledge ledger holds cross-run learning that should survive a reset.
+- Prints a Rich table of the removed paths so the operator can audit.
+- Idempotent on empty / partially-empty workspaces ("nothing to reset" message, exit 0).
+- **6 new tests** in ``tests/test_cli_reset.py``. (`src/cli/commands/reset.py`)
+
+### Added — `autodev logs [--session SID] [--follow]`
+- New per-session file sink at ``.autodev/sessions/{session_id}/events.jsonl``. The Orchestrator opens the file once after minting its session id; every structlog emission whose bound ``session_id`` matches is appended.
+- Without ``--session``, the command tails the session whose ``events.jsonl`` has the most recent mtime.
+- ``--follow`` (alias ``-f``) prints existing content then polls for new lines every 250 ms until Ctrl-C (tail -f style).
+- Exit 1 with a clear message when no sessions exist or the requested session has no events file — no stack traces.
+- **9 new tests** across ``tests/test_cli_logs.py`` (5) and ``tests/test_autologging.py`` (4 file-sink tests added to the existing 6).
+- (`src/autologging.py`, `src/cli/commands/logs.py`, `src/orchestrator/__init__.py`)
+
+### Added — `autodev prune [--older-than 30d] [--dry-run]`
+- Walks ``tournaments/``, ``sessions/``, and ``evidence/`` and removes children older than the threshold (per-child mtime).
+- ``--older-than`` accepts ``Ns`` / ``Nm`` / ``Nh`` / ``Nd``; default ``30d``. Invalid duration → exit 1 with the offending string echoed.
+- ``--dry-run`` lists what would be removed without deleting (separate from ``execute --dry-run``).
+- Always preserves ``plan.json``, ``plan-ledger.jsonl``, ``knowledge.jsonl``, ``rejected_lessons.jsonl``, ``config.json``, ``spec.md``, and the file index. Use ``autodev reset`` for those.
+- **16 new tests** in ``tests/test_cli_prune.py`` (4 functional + 12 parametrized parser cases). (`src/cli/commands/prune.py`)
+
+### Added — `autodev execute --dry-run`
+- Loads the plan, prints a Rich task table (Phase | Task | Title | Depends | Status), then a per-phase dispatch listing that respects ``depends_on``: tasks group into successive parallelism windows up to ``cfg.tournaments.execute_max_parallel_tasks`` (default 4).
+- Never invokes any agent adapter, never instantiates the Orchestrator — preview-only, zero LLM spend.
+- Exit 1 with a hint when no plan is on disk.
+- **4 new tests** in ``tests/test_cli_execute_dry_run.py``. (`src/cli/commands/execute.py`)
+
+### Changed — phase-tagged TODO markers retagged to version-based deferrals
+- `src/autologging.py:54-58` — **removed** (file sink shipped; the TODO is resolved).
+- `src/orchestrator/__init__.py:1-13` — module docstring rewritten to drop the "Phase 4" framing; the impl-tournament integration TODO retagged to ``TODO(v0.26+)``.
+- `src/orchestrator/execute_phase.py:9, 13` — ``TODO(phase-8)`` (auto-gates) and ``TODO(phase-7)`` (ImplementationTournament integration) retagged to ``TODO(v0.26+)`` with clearer wording.
+- `src/adapters/claude_code.py:85, 288` and `src/adapters/cursor.py:81` — ``TODO(phase-3)`` markers retagged to ``TODO(v0.27+)``. Version-based markers age more gracefully than phase numbers because anyone can compare against the current release.
+
+### Tests
+- **35 new tests** total (6 reset + 16 prune + 4 dry-run + 5 logs + 4 file-sink). Full suite: **2,427 / 2,427 + 7 expected skips** (was 2,396 in v0.25.1; +31 on the visible delta because some prune tests are parametrized).
+- Legacy "stub exits 1" tests in ``tests/test_cli_prune_reset.py``, ``tests/test_cli_smoke.py``, and ``tests/test_cli_execute.py`` rewritten to assert the new behavior (or replaced by the comprehensive per-command suites above).
+
+### Operator notes
+- Once installed, ``/autodev reset --hard`` from inside Claude Code now does what it advertises — the unity recovery flow is unblocked.
+- ``.autodev/sessions/`` will start accumulating one subdir per ``execute``/``plan``/``resume`` run. Use ``autodev prune --older-than 30d`` to GC.
+
 ## [0.25.1] - 2026-05-11
 
 Targeted fix release for four orchestrator bugs surfaced by a long-running real-world execute run on a Unity-scale C++ repo. All four cascade-failed Phase 2: a Phase 2 stuck-error tripped a worktree-cleanup that wiped sibling per-task worktrees, downstream tasks then dispatched against HEAD where their prerequisites didn't exist, agent output blobs leaked into path arguments, and the resume-loop burned the retry budget in milliseconds. Each bug is fixed in isolation with regression coverage; full test suite passes (2,396 / 2,396 + 7 expected skips).
