@@ -93,8 +93,10 @@ def test_execute_invalid_config_exits_1(tmp_path: Path) -> None:
     assert "config error" in result.output
 
 
-def test_execute_dry_run_exits_0(tmp_path: Path) -> None:
-    """Execute with --dry-run exits 0 with a message."""
+def test_execute_dry_run_without_plan_exits_1(tmp_path: Path) -> None:
+    """Execute --dry-run with config but no plan exits 1 with a hint
+    (v0.25.2 replaced the warning-only stub with real plan preview).
+    """
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
         cwd = Path(raw_cwd)
@@ -102,8 +104,8 @@ def test_execute_dry_run_exits_0(tmp_path: Path) -> None:
 
         result = runner.invoke(cli, ["execute", "--dry-run"], catch_exceptions=False)
 
-    assert result.exit_code == 0, result.output
-    assert "dry-run" in result.output.lower()
+    assert result.exit_code == 1
+    assert "plan" in result.output.lower()
 
 
 def test_execute_success_renders_table(tmp_path: Path) -> None:

@@ -20,6 +20,8 @@ from config.loader import load_config
 from errors import AutodevError
 from orchestrator import Orchestrator
 from state.paths import config_path, index_db_path
+from state.plan_manager import PlanManager
+from state.schemas import Plan, Task
 
 
 logger = get_logger(__name__)
@@ -93,10 +95,11 @@ def execute(
         sys.exit(1)
 
     if dry_run:
-        console.print(
-            "[yellow]--dry-run not yet implemented; no work will be done.[/yellow]"
-        )
-        sys.exit(0)
+        # v0.25.2: render plan + dispatch windows WITHOUT invoking any agent.
+        # Preview only; useful for validating depends_on ordering and
+        # confirming the architect's plan before committing real LLM spend.
+        _exit = _render_dry_run(console, cwd, cfg)
+        sys.exit(_exit)
 
     # v0.25.0: incremental file/symbol index refresh. Runs before
     # Orchestrator instantiation so the planner sees the latest tracked
@@ -129,6 +132,95 @@ def execute(
     except AutodevError as exc:
         console.print(f"[red]autodev execute failed[/red]: {exc}")
         sys.exit(2)
+
+
+def _render_dry_run(console: Console, cwd: Path, cfg) -> int:
+    """v0.25.2: render plan preview + per-phase dispatch windows.
+
+    Returns the intended process exit code (0 on success, 1 if no plan).
+    Does NOT invoke any agent adapter — preview only.
+    """
+    pm = PlanManager(cwd, session_id="execute-dry-run")
+    plan: Plan | None = asyncio.run(pm.load())
+    if plan is None:
+        console.print(
+            "[red]autodev execute --dry-run:[/red] no plan on disk. "
+            "Run [bold]autodev plan '<intent>'[/bold] first."
+        )
+        return 1
+
+    title = plan.metadata.get("title", plan.plan_id) if plan.metadata else plan.plan_id
+    console.print(f"[cyan]Plan:[/cyan] {title}")
+
+    task_table = Table(
+        title="Tasks (preview — no LLM calls will be made)",
+        show_header=True,
+        header_style="bold cyan",
+    )
+    task_table.add_column("Phase", justify="right")
+    task_table.add_column("Task", style="cyan")
+    task_table.add_column("Title")
+    task_table.add_column("Depends", style="dim")
+    task_table.add_column("Status", style="dim")
+    for phase in plan.phases:
+        for t in phase.tasks:
+            deps = ",".join(t.depends_on) if t.depends_on else "—"
+            task_table.add_row(phase.id, t.id, t.title, deps, t.status)
+    console.print(task_table)
+
+    parallelism = (
+        cfg.tournaments.execute_max_parallel_tasks
+        if getattr(cfg.tournaments, "execute_max_parallel_tasks", None)
+        else 4
+    )
+    console.print(
+        f"\n[bold]Dispatch order[/bold] (parallelism={parallelism}, "
+        "roles per task: developer → reviewer → test_engineer):"
+    )
+    for phase in plan.phases:
+        windows = _compute_dispatch_windows(phase.tasks, parallelism)
+        if not windows:
+            console.print(f"  Phase {phase.id}: [dim](no pending tasks)[/dim]")
+            continue
+        for i, window in enumerate(windows, start=1):
+            label = ", ".join(t.id for t in window)
+            console.print(f"  Phase {phase.id} · window {i}: [{label}]")
+    return 0
+
+
+def _compute_dispatch_windows(
+    tasks: list[Task], parallelism: int
+) -> list[list[Task]]:
+    """Group ``tasks`` into successive parallelism windows respecting
+    ``depends_on`` within the same phase.
+
+    A task lands in the first window whose preceding windows already
+    contain all of its in-phase dependencies. Inter-phase dependencies
+    are ignored here (the phase boundary itself enforces them).
+    """
+    phase_ids = {t.id for t in tasks}
+    ready: list[Task] = list(tasks)
+    placed: set[str] = set()
+    windows: list[list[Task]] = []
+    while ready:
+        window: list[Task] = []
+        rest: list[Task] = []
+        for t in ready:
+            in_phase_deps = [d for d in t.depends_on if d in phase_ids]
+            if all(d in placed for d in in_phase_deps) and len(window) < parallelism:
+                window.append(t)
+            else:
+                rest.append(t)
+        if not window:
+            # Unsatisfiable dependency (cycle or external); flush the rest
+            # into one final window so we don't loop forever.
+            windows.append(rest)
+            break
+        for t in window:
+            placed.add(t.id)
+        windows.append(window)
+        ready = rest
+    return windows
 
 
 def _render_execute_summary(console: Console, tasks: list) -> None:
