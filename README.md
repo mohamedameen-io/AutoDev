@@ -278,14 +278,14 @@ flowchart TD
     F --> G{"effective_winner == A?<br/>(winner==A OR<br/>hash unchanged)"}
     G -->|Yes| H["streak++"]
     G -->|No| I["streak = 0<br/>incumbent = winner"]
-    H --> J{streak >= k?}
+    H --> J{"streak >= k?"}
     J -->|Yes| K["Branch CONVERGED"]
-    J -->|No| S{score-stability<br/>scores stable over window?}
+    J -->|No| S{"score-stability<br/>scores stable over window?"}
     I --> S
     S -->|Yes| RUN1["RUNAWAY<br/>(score-stable)"]
-    S -->|No| W{winner-stability<br/>same winner over window?}
+    S -->|No| W{"winner-stability<br/>same winner over window?"}
     W -->|Yes| RUN2["RUNAWAY<br/>(winner-stable, e.g. AB x N)"]
-    W -->|No| P{plateau detected?<br/>(rules / regression)}
+    W -->|No| P{"plateau detected?<br/>(rules / regression)"}
     P -->|Yes| RUN3["PLATEAU<br/>(early termination)"]
     P -->|No| L["Next pass"]
     L --> B
