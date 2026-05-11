@@ -3,10 +3,10 @@
 Default scope: ``plan.json`` + ``plan-ledger.jsonl`` (the minimum to free
 ``autodev plan`` to write a fresh plan).
 
-``--hard``: additionally remove ``evidence/``, ``delegations/``,
-``responses/``, ``inline-state.json``, ``tournaments/``, ``sessions/``,
-``debug/``, the orphan ``.lock`` file, and the ``execute_worktrees`` pool
-directories.
+``--hard``: additionally remove ``evidence/``, ``tournaments/``,
+``sessions/``, ``debug/``, the orphan ``.lock`` file, the
+``execute_worktrees`` pool directories, and (legacy v0.25.x migration
+cleanup) ``delegations/``, ``responses/``, and ``inline-state.json``.
 
 Always preserved (both modes): ``config.json``, ``spec.md``,
 ``secretscan-baseline.json``, ``.gitignore``, ``knowledge.jsonl``,
@@ -50,10 +50,19 @@ def _default_targets(cwd: Path) -> list[Path]:
 
 
 def _hard_extra_targets(cwd: Path) -> list[Path]:
-    """Additional paths cleared by ``autodev reset --hard``."""
+    """Additional paths cleared by ``autodev reset --hard``.
+
+    The ``delegations_dir`` / ``responses_dir`` / ``inline_state_path``
+    entries are legacy v0.25.x paths retained for migration cleanup:
+    InlineAdapter was removed in v0.26.0 so these are no longer written,
+    but pre-existing workspaces may carry residue that ``--hard`` should
+    sweep. Scheduled for removal from this list in v0.27.0 alongside the
+    hard-removal of ``platform: inline`` from the schema Literal.
+    """
     root = autodev_root(cwd)
     return [
         evidence_dir(cwd),
+        # Legacy v0.25.x paths — migration cleanup only; remove in v0.27.0.
         delegations_dir(cwd),
         responses_dir(cwd),
         inline_state_path(cwd),
@@ -98,8 +107,9 @@ def _remove_paths(paths: list[Path]) -> list[tuple[Path, str]]:
     "--hard",
     is_flag=True,
     help=(
-        "Also remove evidence, delegations, responses, tournaments, "
-        "sessions, debug, .lock, and execute_worktrees pool directories."
+        "Also remove evidence, tournaments, sessions, debug, .lock, "
+        "execute_worktrees pool directories, and (legacy v0.25.x "
+        "migration cleanup) delegations, responses, inline-state.json."
     ),
 )
 def reset(hard: bool) -> None:

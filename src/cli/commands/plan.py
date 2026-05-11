@@ -94,8 +94,13 @@ def plan(intent: str, platform: str | None, complexity: str | None) -> None:
     _maybe_refresh_index(cwd, cfg)
 
     async def _run() -> None:
+        # v0.26.0: ``platform: inline`` is auto-migrated to ``claude_code``
+        # by the schema validator; ``cfg.platform`` is always one of
+        # {claude_code, cursor, auto} here.
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
-        adapter = await get_adapter(cast("Literal['claude_code', 'cursor', 'inline', 'auto']", platform_pref))
+        adapter = await get_adapter(
+            cast("Literal['claude_code', 'cursor', 'auto']", platform_pref)
+        )
         registry = build_registry(cfg)
         orch = Orchestrator(cwd=cwd, cfg=cfg, adapter=adapter, registry=registry)
         approved = await orch.plan(intent)

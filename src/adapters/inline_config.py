@@ -1,8 +1,11 @@
-"""Render auto-resume config files for Claude Code and Cursor.
+"""Render the ``/autodev`` slash-command template.
 
-These files instruct the agent to read delegation files from
-``.autodev/delegations/``, execute them, write responses to
-``.autodev/responses/``, and run ``autodev resume``.
+v0.26.0: InlineAdapter is gone, so this module no longer renders
+resume/CLAUDE.md sections that instructed agents to read delegation
+files and run ``autodev resume``. What remains is the subprocess-only
+slash-command template plus a small helper that preserves any legacy
+``<!-- autodev-managed -->`` section in a user's existing ``CLAUDE.md``
+when migrating workspaces from <=v0.25.x.
 """
 
 from __future__ import annotations
@@ -11,50 +14,13 @@ _CLAUDE_SECTION_START = "<!-- autodev-managed: do not edit this section -->"
 _CLAUDE_SECTION_END = "<!-- /autodev-managed -->"
 
 
-def render_claude_resume_config() -> str:
-    """Return the autodev-managed section for .claude/CLAUDE.md.
-
-    The section is delimited by HTML comments so init_workspace() can
-    idempotently update it without clobbering user content.
-    """
-    return f"""\
-{_CLAUDE_SECTION_START}
-## autodev
-
-autodev is an external multi-agent orchestrator installed in this project.
-The orchestrator drives planning, critique, implementation, review, tests, and
-tournament-based self-refinement. Claude Code is one of the executors.
-
-### Kickoff rule (passive)
-
-When the user describes a feature, bug fix, or refactor to build, do NOT
-implement it directly. First run:
-
-    autodev plan "<their intent>"
-
-This drafts a phased plan, runs a critic tournament, and writes a delegation
-file under `.autodev/delegations/`. Then follow the resume rule below.
-
-The user can also invoke `/autodev <intent>` explicitly — same flow.
-
-### Resume rule (post-delegation)
-
-When a file appears at `.autodev/delegations/`, read it and execute the task
-described. After writing your response JSON to the `response_path` specified in
-the delegation file's YAML frontmatter, run:
-
-    autodev resume
-
-**Delegation directory:** `.autodev/delegations/`
-**Response directory:** `.autodev/responses/`
-{_CLAUDE_SECTION_END}
-"""
-
-
 def render_claude_slash_command() -> str:
     """Return the full content for ``.claude/commands/autodev.md``.
 
-    v0.24.2: the slash command is now a **full CLI passthrough**.
+    v0.24.2: the slash command is a **full CLI passthrough**.
+    v0.26.0: every dispatch is subprocess (``--platform claude_code``);
+    InlineAdapter is gone, so the slash command never embeds itself in
+    the host agent's session — it always shells out to ``autodev``.
 
     * ``/autodev`` (no args) prints the subcommand list.
     * ``/autodev <subcommand> [...]`` (where ``<subcommand>`` is any
@@ -99,18 +65,20 @@ Inspect the FIRST whitespace-separated token of $ARGUMENTS:
 
 3. **First token is `--review`**: checkpointed feature flow.
    a. Strip the `--review` flag; treat the remainder as the feature intent.
-   b. If `.autodev/` does not exist, run `autodev init --inline --force`.
-   c. Run `autodev plan "<intent>"` and surface the plan summary (phases,
-      tasks, projected calls).
+   b. If `.autodev/` does not exist, run `autodev init --force`
+      (defaults to platform: claude_code in v0.26.0).
+   c. Run `autodev plan --platform claude_code "<intent>"` and surface the
+      plan summary (phases, tasks, projected calls).
    d. STOP. Tell the user to reply with `go` (or equivalent) to proceed.
-   e. On `go`, run `autodev execute`.
+   e. On `go`, run `autodev execute --platform claude_code`.
 
 4. **Otherwise** (first token is a free-text feature description): one-shot
    feature flow.
-   a. If `.autodev/` does not exist, run `autodev init --inline --force`.
-   b. Run `autodev plan "$ARGUMENTS"` and surface the plan summary.
-   c. Run `autodev execute` (or, in inline mode, follow the resume rule in
-      CLAUDE.md when delegation files appear). Surface progress + final
+   a. If `.autodev/` does not exist, run `autodev init --force`
+      (defaults to platform: claude_code in v0.26.0).
+   b. Run `autodev plan --platform claude_code "$ARGUMENTS"` and surface the
+      plan summary.
+   c. Run `autodev execute --platform claude_code`. Surface progress + final
       status.
 
 ## Error handling
@@ -121,44 +89,13 @@ diagnostics, and `/autodev resume` after fixing the underlying issue.
 """
 
 
-def render_cursor_resume_config() -> str:
-    """Return the full content for .cursor/rules/src.mdc."""
-    return """\
----
-description: autodev inline orchestration rules
-alwaysApply: true
----
-
-# autodev Inline Mode
-
-autodev is running in inline mode. When a file appears at
-`.autodev/delegations/`, read it and execute the task described.
-
-After writing your response JSON to the `response_path` specified
-in the delegation file's YAML frontmatter, run:
-
-```bash
-autodev resume
-```
-
-Response JSON schema:
-- `schema_version`: "1.0"
-- `task_id`: string (copy from delegation)
-- `role`: string (copy from delegation)
-- `success`: boolean
-- `text`: your prose response
-- `error`: null or error string
-- `duration_s`: float
-- `files_changed`: list of relative paths
-- `diff`: unified diff string or null
-"""
-
-
 def update_claude_md(content: str, section: str) -> str:
     """Replace or append the autodev-managed section in CLAUDE.md.
 
-    If the section delimiters exist, replace the content between them.
-    Otherwise, append the section at the end.
+    Retained for v0.26.0 so legacy ``<!-- autodev-managed -->`` sections
+    written by <=v0.25.x can be cleanly replaced or removed on the next
+    ``autodev init --force``. If the section delimiters exist, replace
+    the content between them. Otherwise, append the section at the end.
     """
     start_idx = content.find(_CLAUDE_SECTION_START)
     end_idx = content.find(_CLAUDE_SECTION_END)
@@ -177,8 +114,6 @@ def update_claude_md(content: str, section: str) -> str:
 
 
 __all__ = [
-    "update_claude_md",
-    "render_claude_resume_config",
     "render_claude_slash_command",
-    "render_cursor_resume_config",
+    "update_claude_md",
 ]

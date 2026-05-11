@@ -21,9 +21,7 @@ from __future__ import annotations
 import random
 from typing import TYPE_CHECKING
 
-from adapters import InlineAdapter
 from autologging import get_logger
-from errors import TournamentAdapterMismatchError
 from orchestrator.plan_parser import extract_complexity
 from runtime.resource_probe import probe_host, resolve_parallelism
 from state.knowledge import TournamentEvent
@@ -234,13 +232,9 @@ async def run_plan_tournament(
         )
         return initial_md
 
-    # v0.25.4: defense-in-depth typed raise (was a bare assert pre-v0.25.4,
-    # which gave no operator guidance and got stripped under ``python -O``).
-    # The preflight check at ``run_plan_phase`` entry catches this earlier,
-    # before the architect call.
-    if isinstance(orch.adapter, InlineAdapter):
-        raise TournamentAdapterMismatchError(["plan"])
-
+    # v0.26.0: the v0.25.4 InlineAdapter+tournaments defense-in-depth raise
+    # was removed alongside InlineAdapter itself — the mismatch can no
+    # longer happen.
     tournament_id = _plan_tournament_id(spec_hash, branch_index=branch_index)
     if branch_index is None:
         # Legacy single-branch path: tournaments/plan-{hash}/

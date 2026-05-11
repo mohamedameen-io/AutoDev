@@ -1,4 +1,10 @@
-"""Tests for inline adapter path helpers added to src.state.paths."""
+"""Tests for the legacy delegations/responses/inline-state path helpers.
+
+v0.26.0: InlineAdapter was removed. These path helpers are retained on
+:mod:`state.paths` so ``autodev reset --hard`` can clean up pre-v0.26.0
+workspace residue (delegations/, responses/, inline-state.json). The
+helpers themselves are scheduled for removal in v0.27.0.
+"""
 
 from __future__ import annotations
 

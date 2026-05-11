@@ -334,38 +334,17 @@ class Orchestrator:
         :meth:`execute` with ``task_id=None`` because the loop itself picks
         up the first pending task.
 
-        For the inline adapter, validates that the pending response file
-        exists before continuing and clears the suspend state file.
+        v0.26.0: the inline-adapter suspend-state branch (read
+        ``.autodev/inline-state.json``, validate the pending response
+        file, clear the state) was removed alongside InlineAdapter.
+        Every adapter is now subprocess; resume just picks up the
+        ledger's first non-terminal task.
         """
-        from adapters.inline import InlineAdapter
-        from errors import AutodevError as _AutodevError
         from orchestrator.execute_phase import run_execute_phase
-        from orchestrator.inline_state import (
-            clear_suspend_state,
-            load_suspend_state,
-        )
 
         # v0.13.0: probe lazily on resume entry (mirrors plan/execute).
         _ = self.repo_capacity
         await self._seed_hive_packs()
-
-        if isinstance(self._adapter, InlineAdapter):
-            state = load_suspend_state(self._cwd)
-            if state is not None:
-                if not self._adapter.has_pending_response(
-                    state.pending_task_id, state.pending_role
-                ):
-                    raise _AutodevError(
-                        f"Response file not yet written for "
-                        f"{state.pending_task_id}/{state.pending_role}. "
-                        f"Agent must complete the delegation first. "
-                        f"Check: .autodev/delegations/"
-                        f"{state.pending_task_id}-{state.pending_role}.md"
-                    )
-                clear_suspend_state(self._cwd)
-                # Continue with normal resume — the execute loop will pick up
-                # from the ledger checkpoint and the delegate() inline-resume
-                # path will collect the response file.
 
         plan = await self._plan_manager.load()
         if plan is None:

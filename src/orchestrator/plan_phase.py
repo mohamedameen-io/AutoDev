@@ -19,13 +19,10 @@ import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from adapters.inline import InlineAdapter
-from adapters.inline_types import DelegationPendingSignal
 from adapters.types import AgentInvocation, AgentResult
 from errors import AutodevError, TournamentError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
-from orchestrator.inline_state import write_suspend_state
 from orchestrator.file_existence_validator import validate_files_exist
 from orchestrator.plan_parser import (
     PlanParseError,
@@ -39,7 +36,6 @@ from orchestrator.plan_tournament_runner import (
     _plan_tournament_id,
     run_plan_tournament,
 )
-from orchestrator.preflight import check_tournament_adapter_compatibility
 from state.evidence import write_evidence
 from state.paths import autodev_root, ensure_autodev_dir, spec_path
 from state.schemas import (
@@ -90,12 +86,9 @@ def _try_read_plan_from_file(cwd: Path, text: str) -> str:
 
 async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
     """Execute the plan phase end-to-end and return the approved plan."""
-    # v0.25.4: fail fast — raise TournamentAdapterMismatchError before any
-    # file write or LLM call when InlineAdapter is paired with an enabled
-    # tournament. Avoids the operator paying for spec.md write + architect
-    # call only to crash inside the runner.
-    check_tournament_adapter_compatibility(orch)
-
+    # v0.26.0: the v0.25.4 InlineAdapter+tournaments preflight check was
+    # removed alongside InlineAdapter itself — no inline adapter exists,
+    # so no mismatch is possible.
     cwd = orch.cwd
 
     ensure_autodev_dir(cwd)
@@ -409,10 +402,10 @@ async def _delegate(
     - ``post_invocation`` after the adapter call (may raise GuardrailExceededError)
     - ``loop_detector.observe`` after post_invocation
 
-    For :class:`~adapters.inline.InlineAdapter`:
-    - If a response file already exists (resume path), collect and return it.
-    - Otherwise inject ``task_id`` into ``inv.metadata`` and re-raise
-      :class:`DelegationPendingSignal` after writing suspend state.
+    v0.26.0: InlineAdapter's suspend/resume special-cases (response-file
+    shortcut on the resume path, ``write_suspend_state`` on the
+    ``DelegationPendingSignal`` exit path) were removed. Every adapter
+    is now a subprocess adapter.
     """
     spec = orch.registry.get(role)
     if spec is None:
@@ -467,37 +460,8 @@ async def _delegate(
         effort=effort,
     )
 
-    if isinstance(orch.adapter, InlineAdapter):
-        if orch.adapter.has_pending_response(envelope.task_id, role):
-            result = orch.adapter.collect_response(envelope.task_id, role)
-            orch.guardrails.post_invocation(envelope.task_id, result)
-            if result.success and result.text:
-                orch.loop_detector.observe(envelope.task_id, role, result.text)
-            return result
-        inv = inv.model_copy(
-            update={"metadata": {**inv.metadata, "task_id": envelope.task_id}}
-        )
-
     orch.guardrails.pre_invocation(envelope.task_id, inv)
-    try:
-        result = await orch.adapter.execute(inv)
-    except DelegationPendingSignal as sig:
-        _plan_role_map: dict[str, str] = {
-            "explorer": "plan_explorer",
-            "domain_expert": "plan_domain_expert",
-            "architect": "plan_architect",
-        }
-        step = _plan_role_map.get(role, role)
-        write_suspend_state(
-            cwd=orch.cwd,
-            session_id=orch.session_id,
-            pending_task_id=envelope.task_id,
-            pending_role=role,
-            delegation_path=sig.delegation_path,
-            response_path=orch.adapter.response_path(envelope.task_id, role),  # type: ignore[attr-defined]
-            orchestrator_step=step,
-        )
-        raise
+    result = await orch.adapter.execute(inv)
     orch.guardrails.post_invocation(envelope.task_id, result)
     if result.success and result.text:
         orch.loop_detector.observe(envelope.task_id, role, result.text)

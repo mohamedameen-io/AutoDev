@@ -118,18 +118,30 @@ def test_init_platform_cursor_skips_slash_command(tmp_path: Path) -> None:
     assert not slash_path.exists()
 
 
-def test_init_inline_creates_slash_command_and_kickoff_rule(tmp_path: Path) -> None:
+def test_init_inline_flag_is_deprecated_noop_alias(tmp_path: Path) -> None:
+    """v0.26.0: ``--inline`` is a deprecated noop alias for ``platform:
+    claude_code``. The slash command is still rendered (it's the
+    default for claude_code platforms), but the InlineAdapter-only
+    CLAUDE.md kickoff section is no longer written."""
     runner = CliRunner()
     result, cwd = _invoke_init(runner, tmp_path, "--inline")
     assert result.exit_code == 0, result.output
 
+    # Slash command must still exist (claude_code platform default).
     slash_path = cwd / ".claude" / "commands" / "autodev.md"
     assert slash_path.exists()
 
-    claude_md = (cwd / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
-    assert "autodev plan" in claude_md
-    assert "do NOT" in claude_md
-    assert "implement it directly" in claude_md
+    # Config must record platform: claude_code (NOT "inline").
+    import json as _json
+
+    config = _json.loads(
+        (cwd / ".autodev" / "config.json").read_text(encoding="utf-8")
+    )
+    assert config["platform"] == "claude_code"
+
+    # Deprecation warning must be surfaced on stdout.
+    assert "deprecated" in result.output.lower()
+    assert "--inline" in result.output
 
 
 def test_init_force_regenerates_slash_command(tmp_path: Path) -> None:

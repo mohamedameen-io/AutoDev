@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from click.testing import CliRunner
 from rich.console import Console
 
-from adapters.inline_types import DelegationPendingSignal
 from cli import cli
 from cli.commands.execute import _render_execute_summary
 from config.defaults import default_config
@@ -135,41 +134,6 @@ def test_execute_success_renders_table(tmp_path: Path) -> None:
     assert "1.1" in result.output
     assert "1.2" in result.output
     assert "2.1" in result.output
-
-
-def test_execute_delegation_signal_exits_0(tmp_path: Path) -> None:
-    """Execute exits 0 when DelegationPendingSignal is raised."""
-    runner = CliRunner()
-    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
-        cwd = Path(raw_cwd)
-        _write_config(cwd, platform="inline")
-
-        delegation_file = cwd / ".autodev" / "delegations" / "1.1-developer.md"
-        delegation_file.parent.mkdir(parents=True, exist_ok=True)
-        delegation_file.touch()
-
-        sig = DelegationPendingSignal(
-            task_id="1.1",
-            role="developer",
-            delegation_path=delegation_file,
-        )
-
-        with (
-            patch("cli.commands.execute.get_adapter") as mock_get_adapter,
-            patch("cli.commands.execute.Orchestrator") as mock_orch_cls,
-        ):
-            mock_adapter = MagicMock()
-            mock_get_adapter.return_value = mock_adapter
-
-            mock_orch = MagicMock()
-            mock_orch.execute = AsyncMock(side_effect=sig)
-            mock_orch_cls.return_value = mock_orch
-
-            result = runner.invoke(cli, ["execute"], catch_exceptions=False)
-
-    assert result.exit_code == 0, result.output
-    assert "Delegation written" in result.output
-    assert "autodev resume" in result.output
 
 
 def test_execute_autodev_error_exits_2(tmp_path: Path) -> None:

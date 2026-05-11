@@ -26,8 +26,6 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from adapters import InlineAdapter
-from errors import TournamentAdapterMismatchError
 from autologging import get_logger
 from errors import TournamentError
 from orchestrator.delegation_envelope import DelegationEnvelope
@@ -331,10 +329,8 @@ async def run_impl_tournament(
         )
         return initial_bundle
 
-    # v0.25.4: defense-in-depth typed raise. See plan_tournament_runner.py.
-    if isinstance(orch.adapter, InlineAdapter):
-        raise TournamentAdapterMismatchError(["impl"])
-
+    # v0.26.0: the v0.25.4 InlineAdapter+tournaments defense-in-depth raise
+    # was removed alongside InlineAdapter itself.
     tournament_id = f"impl-{uuid.uuid4().hex[:8]}"
     # v0.18.0 A1: when a branch_config is supplied, suffix the artifact dir
     # with the lane label so the on-disk layout records each branch's

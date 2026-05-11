@@ -72,7 +72,11 @@ _SPEC_TEMPLATE = """# Project Intent
 @click.option(
     "--inline",
     is_flag=True,
-    help="Configure for inline (agent-embedded) mode.",
+    help=(
+        "DEPRECATED in v0.26.0: noop alias that prints a deprecation "
+        "warning and treats the workspace as ``platform: claude_code``. "
+        "Removed in v0.27.0."
+    ),
 )
 @click.option(
     "--rebuild-index",
@@ -87,6 +91,16 @@ def init(platform: str, force: bool, inline: bool, rebuild_index: bool) -> None:
     cwd = Path.cwd()
     console = Console()
 
+    # v0.26.0: ``--inline`` is a deprecated noop alias. Print a warning so
+    # operators upgrading from <=v0.25.x see why their workspace is now
+    # ``platform: claude_code``, then fall through to the normal flow.
+    if inline:
+        console.print(
+            "[yellow]autodev init --inline:[/yellow] "
+            "--inline is deprecated in v0.26.0 and is a noop alias for "
+            "platform: claude_code. The flag will be removed in v0.27.0."
+        )
+
     autodev_dir = cwd / ".autodev"
     if autodev_dir.exists() and not force and not rebuild_index:
         console.print(
@@ -100,17 +114,19 @@ def init(platform: str, force: bool, inline: bool, rebuild_index: bool) -> None:
 
     platform_normalized = platform.lower()
 
-    # Build config, overriding platform if the user asked for a specific one.
+    # Build config. v0.26.0: ``--inline`` no longer routes through
+    # InlineAdapter — it sets ``platform: claude_code`` and surfaces a
+    # deprecation warning above. The explicit ``--platform`` flag still
+    # wins over the noop alias.
     cfg = default_config()
-    if inline:
-        cfg.platform = "inline"
+    if platform_normalized == "claude":
+        cfg.platform = "claude_code"
+    elif platform_normalized == "cursor":
+        cfg.platform = "cursor"
+    elif inline:
+        cfg.platform = "claude_code"
     else:
-        if platform_normalized == "claude":
-            cfg.platform = "claude_code"
-        elif platform_normalized == "cursor":
-            cfg.platform = "cursor"
-        else:
-            cfg.platform = "auto"
+        cfg.platform = "auto"
 
     config_path = autodev_dir / "config.json"
     save_config(cfg, config_path)
@@ -133,14 +149,10 @@ def init(platform: str, force: bool, inline: bool, rebuild_index: bool) -> None:
         slash_path = commands_dir / "autodev.md"
         slash_path.write_text(render_claude_slash_command(), encoding="utf-8")
 
-    # For inline mode, also initialise the inline workspace.
-    if inline:
-        import asyncio
-
-        from adapters.inline import InlineAdapter
-
-        adapter = InlineAdapter(cwd=cwd, platform_hint="claude_code")
-        asyncio.run(adapter.init_workspace(cwd, list(specs.values())))
+    # v0.26.0: the inline workspace bootstrap (delegations/, responses/,
+    # auto-resume CLAUDE.md section) was removed alongside InlineAdapter.
+    # ``--inline`` is now a noop alias for ``platform: claude_code`` and
+    # the slash command shells out to ``autodev`` for every dispatch.
 
     # v0.25.0: build the file/symbol index (sqlite-FTS5 at .autodev/index.db).
     # Synchronous on small/medium repos; spawned in a background subprocess

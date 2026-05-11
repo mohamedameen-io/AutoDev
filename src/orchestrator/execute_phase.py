@@ -30,14 +30,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 from adapters.git_utils import _git_rev_parse_head, extract_files_from_diff
-from adapters.inline import InlineAdapter
-from adapters.inline_types import DelegationPendingSignal
 from adapters.types import AgentInvocation, AgentResult
 from errors import AutodevError, GuardrailExceededError, TournamentError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
-from orchestrator.inline_state import write_suspend_state
-from orchestrator.preflight import check_tournament_adapter_compatibility
 from orchestrator.worktree import WorktreeError, WorktreeManager
 from state.evidence import write_evidence, write_patch
 from qa import (
@@ -561,10 +557,9 @@ async def run_execute_phase(
     repo is git-initialized (otherwise falls back to running in
     ``orch.cwd`` directly).
     """
-    # v0.25.4: fail fast — raise TournamentAdapterMismatchError before any
-    # task dispatch when InlineAdapter is paired with an enabled tournament.
-    check_tournament_adapter_compatibility(orch)
-
+    # v0.26.0: the v0.25.4 InlineAdapter+tournaments preflight check was
+    # removed alongside InlineAdapter itself — no inline adapter exists,
+    # so no mismatch is possible.
     processed: list[Task] = []
 
     if task_id is not None:
@@ -994,11 +989,6 @@ async def _execute_phase_dag(
             try:
                 completed_task = d.result()
                 processed.append(completed_task)
-            except DelegationPendingSignal:
-                # Inline-adapter suspend: propagate to the caller so
-                # ``write_suspend_state`` runs and the CLI exits cleanly.
-                # The plan_manager already cleared in_flight for this id.
-                raise
             except Exception as exc:  # noqa: BLE001
                 # Worker raised — cascade-block descendants. The worker
                 # itself should have caught and routed to update_task_status,
@@ -1236,8 +1226,6 @@ async def _execute_cross_phase_dag(
                     pass  # caught by the speculative_parents check below
                 if completed_task.status == "blocked":
                     failed_parents.add(finished_id)
-            except DelegationPendingSignal:
-                raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "execute_phase.cross_phase_worker_unhandled_exception",
@@ -1336,18 +1324,14 @@ async def _execute_one_worker(
     The dispatcher reads the worker's return value (the final Task)
     and only sees "done, status was X".
 
-    EXCEPTION: :class:`DelegationPendingSignal` (raised by the inline
-    adapter to suspend the run pending external response) MUST
-    propagate to the dispatcher so the caller can persist suspend
-    state. We re-raise it untouched.
+    v0.26.0: previously, :class:`DelegationPendingSignal` (raised by
+    the inline adapter to suspend a run pending an external response)
+    was re-raised here so the caller could persist suspend state. With
+    InlineAdapter gone the special-case is gone; every exception is
+    routed through the cascade-block path.
     """
     try:
         return await _execute_one(orch, task, worktree_mgr)
-    except DelegationPendingSignal:
-        # Inline-adapter suspend signal — let the dispatcher / caller
-        # handle it. The plan_manager already recorded the task as
-        # in_progress; resume picks up where we left off.
-        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "execute_phase.worker_caught_exception",
@@ -2638,11 +2622,10 @@ async def delegate(
     - ``post_invocation`` after the adapter call (may raise GuardrailExceededError)
     - ``loop_detector.observe`` after post_invocation
 
-    For :class:`~adapters.inline.InlineAdapter`:
-    - If a response file already exists (resume path), collect and return it.
-    - Otherwise inject ``task_id`` into ``inv.metadata`` so the adapter can
-      name the delegation file, then re-raise :class:`DelegationPendingSignal`
-      after writing suspend state.
+    v0.26.0: InlineAdapter's suspend/resume special-cases (response-file
+    shortcut on the resume path, ``write_suspend_state`` on the
+    ``DelegationPendingSignal`` exit path) were removed. Every adapter
+    is now a subprocess adapter and the dispatch is a straight call.
 
     v0.8.0: when ``task`` is provided, the per-task complexity resolvers
     override ``max_turns`` and ``timeout_s`` on the constructed invocation.
@@ -2863,38 +2846,11 @@ async def delegate(
         timeout_s=timeout_s,
     )
 
-    # Inline adapter: check for existing response (resume shortcut) or inject
-    # task_id into metadata so the adapter can name the delegation file.
-    if isinstance(orch.adapter, InlineAdapter):
-        if orch.adapter.has_pending_response(envelope.task_id, role):
-            result = orch.adapter.collect_response(envelope.task_id, role)
-            orch.guardrails.post_invocation(envelope.task_id, result)
-            if result.success and result.text:
-                orch.loop_detector.observe(envelope.task_id, role, result.text)
-            return result
-        inv = inv.model_copy(
-            update={"metadata": {**inv.metadata, "task_id": envelope.task_id}}
-        )
-
     orch.guardrails.pre_invocation(envelope.task_id, inv)
     import time as _time
 
     _t0 = _time.time()
-    try:
-        result = await orch.adapter.execute(inv)
-    except DelegationPendingSignal as sig:
-        write_suspend_state(
-            cwd=orch.cwd,
-            session_id=orch.session_id,
-            pending_task_id=envelope.task_id,
-            pending_role=role,
-            delegation_path=sig.delegation_path,
-            response_path=orch.adapter.response_path(envelope.task_id, role),  # type: ignore[attr-defined]
-            orchestrator_step=role,
-            retry_count=retry_count,
-            last_issues=last_issues or [],
-        )
-        raise
+    result = await orch.adapter.execute(inv)
     orch.guardrails.post_invocation(envelope.task_id, result)
     if result.success and result.text:
         orch.loop_detector.observe(envelope.task_id, role, result.text)

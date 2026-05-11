@@ -1,4 +1,12 @@
-"""Platform auto-detection for adapter selection."""
+"""Platform auto-detection for adapter selection.
+
+v0.26.0: ``inline`` is no longer a valid platform — the file-based
+delegation adapter was removed. The schema migrator in
+``src/config/schema.py`` rewrites legacy ``platform: inline`` configs
+to ``platform: claude_code`` (with a ``DeprecationWarning``) so callers
+that resolve a config-loaded ``platform`` field still pass through here
+cleanly.
+"""
 
 from __future__ import annotations
 
@@ -15,9 +23,9 @@ from autologging import get_logger
 logger = get_logger(__name__)
 
 
-PlatformName = Literal["claude_code", "cursor", "inline"]
-_PreferredName = Literal["claude_code", "cursor", "inline", "auto"]
-_VALID_PLATFORMS = ("claude_code", "cursor", "inline")
+PlatformName = Literal["claude_code", "cursor"]
+_PreferredName = Literal["claude_code", "cursor", "auto"]
+_VALID_PLATFORMS = ("claude_code", "cursor")
 
 
 async def detect_platform(preferred: _PreferredName = "auto") -> PlatformName:
@@ -30,7 +38,7 @@ async def detect_platform(preferred: _PreferredName = "auto") -> PlatformName:
       4. Try `cursor --version`; if ok -> "cursor".
       5. Raise `AdapterError`.
     """
-    if preferred not in ("claude_code", "cursor", "inline", "auto"):
+    if preferred not in ("claude_code", "cursor", "auto"):
         raise AdapterError(f"invalid preferred platform: {preferred!r}")
 
     if preferred != "auto":
@@ -91,12 +99,4 @@ def _make_adapter(
         return ClaudeCodeAdapter()
     if name == "cursor":
         return CursorAdapter()
-    if name == "inline":
-        from adapters.inline import InlineAdapter
-
-        resolved_cwd = cwd if cwd is not None else Path.cwd()
-        return InlineAdapter(
-            cwd=resolved_cwd,
-            platform_hint=platform_hint or "claude_code",
-        )
     raise AdapterError(f"unknown platform: {name!r}")

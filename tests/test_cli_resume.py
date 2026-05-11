@@ -67,7 +67,6 @@ def test_resume_autodev_error_exits_2(tmp_path: Path) -> None:
         _write_config(cwd)
 
         with (
-            patch("orchestrator.inline_state.load_suspend_state", return_value=None),
             patch("cli.commands.resume.get_adapter") as mock_get_adapter,
             patch("cli.commands.resume.Orchestrator") as mock_orch_cls,
         ):
@@ -105,7 +104,6 @@ def test_resume_success_no_suspend_state(tmp_path: Path) -> None:
         ]
 
         with (
-            patch("orchestrator.inline_state.load_suspend_state", return_value=None),
             patch("cli.commands.resume.get_adapter") as mock_get_adapter,
             patch("cli.commands.resume.Orchestrator") as mock_orch_cls,
         ):

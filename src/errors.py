@@ -25,35 +25,10 @@ class ConfigError(AutodevError):
     """Invalid or missing `.autodev/config.json`."""
 
 
-class TournamentAdapterMismatchError(ConfigError):
-    """Tournaments are enabled but the resolved adapter cannot fan out.
-
-    Raised when ``platform`` resolves to ``inline`` but at least one
-    tournament (plan / impl / phase_review) is enabled. Tournaments
-    spawn IAG-isolated branches and N judges in parallel via
-    ``adapter.parallel()``; :class:`InlineAdapter` is single-process by
-    construction (its ``parallel()`` raises ``NotImplementedError``).
-    The two are architecturally incompatible. The fix is to set
-    ``platform: claude_code`` (or ``cursor``) in ``.autodev/config.json``,
-    or to disable tournaments under ``cfg.tournaments.<phase>.enabled``.
-    """
-
-    def __init__(self, enabled_phases: list[str]) -> None:
-        self.enabled_phases = list(enabled_phases)
-        super().__init__(
-            "Tournaments are enabled ("
-            + ", ".join(enabled_phases)
-            + ") but the resolved adapter is InlineAdapter, which is "
-            "inherently sequential. Tournaments fan out IAG-isolated "
-            "branches and judges in parallel via `adapter.parallel()`. "
-            "Fix one of:\n"
-            "  - Set `platform: claude_code` (or `cursor`) in "
-            "`.autodev/config.json`, OR\n"
-            "  - Disable tournaments via "
-            "`tournaments.plan.enabled: false`, "
-            "`tournaments.impl.enabled: false`, and "
-            "`tournaments.phase_review.enabled: false`."
-        )
+# v0.26.0: ``TournamentAdapterMismatchError`` was deleted. It existed to
+# guard the InlineAdapter ↔ tournaments mismatch (inline is single-process,
+# tournaments fan out in parallel). With InlineAdapter gone, the mismatch
+# is unrepresentable.
 
 
 class GuardrailExceededError(AutodevError):

@@ -76,31 +76,16 @@ def resume(platform: str | None) -> None:
     _maybe_refresh_index(cwd, cfg)
 
     async def _run() -> None:
+        # v0.26.0: the inline suspend-state branch (read
+        # ``.autodev/inline-state.json``, instantiate InlineAdapter, gate on
+        # ``has_pending_response``) was removed alongside InlineAdapter.
+        # The migrator in ``config.schema`` rewrites legacy
+        # ``platform: inline`` to ``platform: claude_code`` on load so
+        # ``cfg.platform`` is always one of {claude_code, cursor, auto}.
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
-
-        from orchestrator.inline_state import load_suspend_state
-
-        state = load_suspend_state(cwd)
-        adapter: PlatformAdapter
-        if state is not None:
-            from adapters.inline import InlineAdapter
-
-            adapter = InlineAdapter(
-                cwd=cwd,
-                platform_hint=cfg.platform if cfg.platform != "auto" else "claude_code",  # type: ignore[arg-type]
-            )
-            if not adapter.has_pending_response(
-                state.pending_task_id, state.pending_role
-            ):
-                console.print(
-                    f"[yellow]Waiting for agent response:[/yellow]\n"
-                    f"  Delegation: .autodev/delegations/{state.pending_task_id}-{state.pending_role}.md\n"
-                    f"  Response:   .autodev/responses/{state.pending_task_id}-{state.pending_role}.json"
-                )
-                sys.exit(0)  # Not an error — just waiting
-            # Response exists — continue with normal resume using inline adapter
-        else:
-            adapter = await get_adapter(cast("Literal['claude_code', 'cursor', 'inline', 'auto']", platform_pref))
+        adapter: PlatformAdapter = await get_adapter(
+            cast("Literal['claude_code', 'cursor', 'auto']", platform_pref)
+        )
 
         registry = build_registry(cfg)
         orch = Orchestrator(cwd=cwd, cfg=cfg, adapter=adapter, registry=registry)

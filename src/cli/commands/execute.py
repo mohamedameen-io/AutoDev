@@ -13,7 +13,6 @@ from rich.table import Table
 from typing import Literal, cast
 
 from adapters.detect import get_adapter
-from adapters.inline_types import DelegationPendingSignal
 from agents import build_registry
 from autologging import get_logger
 from config.loader import load_config
@@ -107,8 +106,14 @@ def execute(
     _maybe_refresh_index(cwd, cfg)
 
     async def _run() -> None:
+        # v0.26.0: ``platform: inline`` is auto-migrated to ``claude_code``
+        # by the schema validator. ``cfg.platform`` is always one of
+        # {claude_code, cursor, auto} here; no ``DelegationPendingSignal``
+        # path remains.
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
-        adapter = await get_adapter(cast("Literal['claude_code', 'cursor', 'inline', 'auto']", platform_pref))
+        adapter = await get_adapter(
+            cast("Literal['claude_code', 'cursor', 'auto']", platform_pref)
+        )
         registry = build_registry(cfg)
         orch = Orchestrator(
             cwd=cwd,
@@ -117,15 +122,8 @@ def execute(
             registry=registry,
             disable_impl_tournament=no_impl_tournament,
         )
-        try:
-            tasks = await orch.execute(task_id=task_id)
-            _render_execute_summary(console, tasks)
-        except DelegationPendingSignal as sig:
-            console.print(
-                f"[yellow]Delegation written:[/yellow] {sig.delegation_path}\n"
-                f"[yellow]Agent must respond, then run:[/yellow] autodev resume"
-            )
-            # Exit 0 — this is a normal inline exit, not an error.
+        tasks = await orch.execute(task_id=task_id)
+        _render_execute_summary(console, tasks)
 
     try:
         asyncio.run(_run())
