@@ -2223,6 +2223,54 @@ async def _maybe_expand_sparse_for_missing(
     return True
 
 
+async def _enforce_retry_backoff(
+    last_retry_at: str | None,
+    min_interval_s: float,
+    *,
+    now: Callable[[], "datetime"] | None = None,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
+) -> float:
+    """v0.25.1 Bug #4: pause until the retry interval has elapsed.
+
+    Returns the number of seconds actually slept (``0.0`` when no wait
+    was required). ``now`` and ``sleep`` are injectable so tests can
+    drive the helper deterministically.
+
+    The guard is a no-op when:
+
+    * ``last_retry_at`` is ``None`` (first retry of the task);
+    * ``min_interval_s <= 0`` (operator opted out);
+    * the elapsed time since ``last_retry_at`` already exceeds the
+      interval (legitimate slow retry, e.g. resume after a long pause).
+
+    Otherwise the helper sleeps for ``min_interval_s - elapsed`` so the
+    next dispatch lands at the earliest permissible instant. This stops
+    the resume-loop pathology where a task wedged at ``retry_count=N``
+    burns through ``N+1, N+2, …`` within milliseconds (sub-second
+    sequences observed in the unity run).
+    """
+    import asyncio
+    from datetime import datetime, timezone
+
+    if last_retry_at is None or min_interval_s <= 0:
+        return 0.0
+    try:
+        last_dt = datetime.fromisoformat(last_retry_at)
+    except (ValueError, TypeError):
+        # Malformed timestamp on disk — fail open rather than block
+        # forever. Subsequent mark_task_retry will overwrite with a
+        # well-formed value.
+        return 0.0
+    now_fn = now if now is not None else lambda: datetime.now(timezone.utc)
+    sleep_fn = sleep if sleep is not None else asyncio.sleep
+    elapsed = (now_fn() - last_dt).total_seconds()
+    if elapsed >= min_interval_s:
+        return 0.0
+    wait = min_interval_s - elapsed
+    await sleep_fn(wait)
+    return wait
+
+
 async def _try_retry_or_escalate(
     orch: "Orchestrator",
     task: Task,
@@ -2260,6 +2308,22 @@ async def _try_retry_or_escalate(
     """
     from orchestrator.escalation_ladder import next_step
     from state.knowledge import TournamentEvent
+
+    # v0.25.1 Bug #4: enforce the configured minimum retry interval
+    # BEFORE any state mutation. Stops the resume-loop pathology where
+    # a task wedged at retry_count=N burns through N+1, N+2, ... within
+    # milliseconds. Idempotent — re-entering with a fresh ``last_retry_at``
+    # naturally short-circuits via the elapsed-time check.
+    min_interval = getattr(orch.cfg, "qa_retry_min_interval_s", 30.0)
+    waited = await _enforce_retry_backoff(task.last_retry_at, min_interval)
+    if waited > 0:
+        logger.info(
+            "execute_phase.retry_backoff_enforced",
+            task_id=task.id,
+            waited_s=waited,
+            min_interval_s=min_interval,
+            last_retry_at=task.last_retry_at,
+        )
 
     # v0.15.0: bump the stuck-state discard counter under lock.
     stuck_state = await orch.plan_manager.increment_discard(task.id)

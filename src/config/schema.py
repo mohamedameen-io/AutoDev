@@ -632,6 +632,13 @@ class AutodevConfig(BaseModel):
     tournaments: TournamentsConfig
     qa_gates: QAGatesConfig = Field(default_factory=QAGatesConfig)
     qa_retry_limit: int = 3
+    # v0.25.1 Bug #4: minimum seconds between successive retries of the
+    # same task. Prevents the resume loop from burning through retries
+    # 1→2→3→4 within milliseconds when a wedged task wakes up with a
+    # preserved retry_count from a prior session. Default 30.0 s;
+    # configurable. Set to 0.0 to disable the guard (legacy v0.25.0
+    # behavior — not recommended).
+    qa_retry_min_interval_s: float = 30.0
     # User-declared task-complexity bucket. Drives the architect's effort
     # floor (``xhigh`` for {low, medium, high}, ``max`` for ``max``) and is
     # combined with the parsed ``Plan.complexity`` to derive per-role effort

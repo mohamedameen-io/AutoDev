@@ -303,6 +303,11 @@ class PlanManager:
                     task.blocked_reason = meta["blocked_reason"]
                 if "retry_count" in meta:
                     task.retry_count = int(meta["retry_count"])
+                if "last_retry_at" in meta:
+                    last_retry_at = meta["last_retry_at"]
+                    task.last_retry_at = (
+                        str(last_retry_at) if last_retry_at is not None else None
+                    )
                 if "escalated" in meta:
                     task.escalated = bool(meta["escalated"])
                 if "evidence_bundle" in meta:
@@ -903,6 +908,11 @@ class PlanManager:
 
         Does NOT change status — caller is responsible for transitioning
         back to ``in_progress`` (or escalating).
+
+        v0.25.1 Bug #4: also stamps ``task.last_retry_at`` with the
+        current UTC ISO timestamp and persists it in the ledger payload.
+        ``_try_retry_or_escalate`` reads this to enforce
+        ``qa_retry_min_interval_s`` across ``autodev resume`` boundaries.
         """
         async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
             plan = self._load_sync()
@@ -912,6 +922,7 @@ class PlanManager:
             if task is None:
                 raise PlanConcurrentModificationError(f"unknown task {task_id}")
             task.retry_count += 1
+            task.last_retry_at = _iso_now()
             new_count = task.retry_count
             await append_entry(
                 self._cwd,
@@ -920,6 +931,7 @@ class PlanManager:
                     "task_id": task_id,
                     "status": task.status,
                     "retry_count": new_count,
+                    "last_retry_at": task.last_retry_at,
                 },
                 session_id=self._session_id,
             )
@@ -1129,6 +1141,13 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
             task.blocked_reason = payload["blocked_reason"]
         if "retry_count" in payload:
             task.retry_count = int(payload["retry_count"])
+        if "last_retry_at" in payload:
+            # v0.25.1 Bug #4: restore last_retry_at on replay so
+            # autodev resume can enforce qa_retry_min_interval_s.
+            last_retry_at = payload["last_retry_at"]
+            task.last_retry_at = (
+                str(last_retry_at) if last_retry_at is not None else None
+            )
         if "escalated" in payload:
             task.escalated = bool(payload["escalated"])
         if "evidence_bundle" in payload:

@@ -196,6 +196,13 @@ class Task(BaseModel):
     # set from the trailing ``COMPLEXITY:`` directive.
     complexity: Literal["simple", "medium", "complex"] | None = None
     retry_count: int = 0
+    # v0.25.1 Bug #4: ISO-8601 UTC timestamp of the most recent
+    # ``mark_task_retry``. Persisted in the ledger so ``autodev resume``
+    # can enforce ``qa_retry_min_interval_s`` across sessions instead of
+    # burning through the retry budget within milliseconds. ``None``
+    # before the first retry; older ledgers (pre-v0.25.1) restore as
+    # ``None`` (backward-compatible default).
+    last_retry_at: str | None = None
     escalated: bool = False
     assigned_agent: str | None = None  # usually "developer"
     evidence_bundle: str | None = None  # path (relative to repo root) to evidence json
