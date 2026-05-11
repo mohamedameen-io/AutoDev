@@ -358,14 +358,25 @@ def _iter_files(cwd: Path, paths: list[Path] | None = None):
             candidate = cwd / raw
         else:
             candidate = raw
+        # Bug #3 (v0.25.1): ``resolve()`` raises ``ValueError`` on embedded
+        # NUL bytes (in addition to the existing ``OSError`` cases). Both
+        # mean "not a real path" — treat as skip.
         try:
             resolved = candidate.resolve()
-        except OSError:
+        except (OSError, ValueError):
             continue
         if resolved in seen:
             continue
         seen.add(resolved)
-        if not resolved.is_file():
+        # Bug #3 (v0.25.1): wrap ``is_file()`` in ``OSError`` guard. A 4000-char
+        # multi-line "path" extracted from a malformed diff resolves cleanly
+        # (pure-string op) but trips ``os.stat`` with ``[Errno 63] File name
+        # too long``. Treat any OSError as "not a file" and skip.
+        try:
+            is_file = resolved.is_file()
+        except OSError:
+            continue
+        if not is_file:
             continue
         if resolved.suffix in _SKIP_EXTENSIONS:
             continue

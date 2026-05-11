@@ -2,7 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+
+_log = logging.getLogger(__name__)
+
+
+# Bug #3 (v0.25.1): cap path length at POSIX ``NAME_MAX`` (255). Developer
+# agents occasionally emit a JSON-escaped multi-line code listing into the
+# ``diff`` field of ``.autodev/responses/{task_id}-{role}.json``; the entire
+# 4000+ char blob then arrives as a single ``+++ b/<path>`` line. The
+# downstream QA helpers' ``Path.is_file()`` then raises ``OSError [Errno 63]
+# File name too long``. Sanitising at the source keeps the rest of the
+# pipeline simple.
+_MAX_PATH_LEN = 255
 
 __all__ = [
     "_git_porcelain_set",
@@ -214,9 +228,30 @@ def extract_files_from_diff(diff: str) -> list[str]:
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
             path = line[len("+++ b/"):].strip()
-            if path and path not in seen:
-                files.append(path)
-                seen.add(path)
+            if not path or path in seen:
+                continue
+            # Bug #3 (v0.25.1): reject pathological paths. A 4000-char blob
+            # with embedded newlines / NUL bytes is never a real path; the
+            # downstream QA helpers' ``Path.is_file()`` raises
+            # ``OSError [Errno 63] File name too long`` on it.
+            reason: str | None = None
+            if len(path) > _MAX_PATH_LEN:
+                reason = f"len={len(path)} > {_MAX_PATH_LEN}"
+            elif "\n" in path or "\\n" in path:
+                reason = "embedded newline"
+            elif "\x00" in path:
+                reason = "embedded NUL"
+            if reason is not None:
+                _log.warning(
+                    "extract_files_from_diff.rejected_path",
+                    extra={
+                        "reason": reason,
+                        "path_prefix": path[:80],
+                    },
+                )
+                continue
+            files.append(path)
+            seen.add(path)
     return files
 
 
