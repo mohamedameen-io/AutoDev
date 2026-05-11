@@ -2,6 +2,71 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.4] - 2026-05-11
+
+Fail-fast guard for the InlineAdapter + tournaments mismatch surfaced
+by v0.25.3.
+
+After v0.25.3 made every tournament run by default (the README's #1
+discipline mechanism), the first ``/autodev <feature>`` from inside
+Claude Code on a workspace with ``platform: inline`` crashed with a
+bare ``AssertionError: "Tournament runners must use subprocess
+adapters, not InlineAdapter"``. The assert was deep inside the
+tournament runner — after spec.md was written and (sometimes) after
+the architect's first plan draft — and offered no recovery guidance.
+v0.26.0 will delete ``InlineAdapter`` entirely; v0.25.4 ships the
+clean failure mode users need *today*.
+
+### Fixed
+- **Typed exception with operator guidance.** Bare ``AssertionError``
+  on ``InlineAdapter`` + enabled tournament now raises
+  :class:`TournamentAdapterMismatchError` (a subclass of
+  :class:`ConfigError`). The message names every enabled tournament,
+  explains why the combination is architecturally incompatible
+  (InlineAdapter's ``parallel()`` raises ``NotImplementedError``;
+  tournaments fan out IAG-isolated branches via ``parallel()``), and
+  lists the two actionable fixes: set ``platform: claude_code`` (or
+  ``cursor``) in ``.autodev/config.json``, or disable tournaments
+  via ``tournaments.<phase>.enabled: false``.
+- **Preflight check at phase entry.** ``run_plan_phase`` and
+  ``run_execute_phase`` now call
+  :func:`orchestrator.preflight.check_tournament_adapter_compatibility`
+  before any file write or LLM call — so the operator hits the typed
+  error *immediately*, not after the architect has drafted a plan.
+- **Runner-level guards promoted to explicit raises.** The three
+  bare ``assert`` statements in ``plan_tournament_runner``,
+  ``impl_tournament_runner``, and ``phase_review_runner`` are now
+  ``if isinstance(...): raise TournamentAdapterMismatchError(...)``
+  — defense-in-depth that survives ``python -O``.
+
+### Added
+- ``src/errors.py``: :class:`TournamentAdapterMismatchError` extends
+  :class:`ConfigError`. Carries ``enabled_phases`` for callers that
+  want to render their own message.
+- ``src/orchestrator/preflight.py``: centralized adapter ↔ tournament
+  compatibility check. Called at the entry of both phase loops.
+
+### Tests
+- 11 new tests in ``tests/test_tournament_adapter_mismatch.py``
+  covering the new exception's shape, the preflight check on each
+  tournament type (plan / impl / phase_review), the negative path
+  (subprocess adapter, all tournaments disabled), and the runner-level
+  defense-in-depth raise.
+- ``tests/test_orchestrator_inline_suspend.py`` fixture updated to
+  also disable ``phase_review`` (added in v0.21.0) — the legacy
+  fixture only disabled ``plan`` and ``impl`` because the v0.25.3
+  preflight didn't exist when the test was written.
+- Full suite: **2,448 passed / 7 expected skips** (was 2,437 in
+  v0.25.3).
+
+### Migration / operator notes
+- **Workspaces with ``platform: inline`` and tournaments enabled**
+  will now fail at the *start* of ``autodev plan`` (or ``autodev
+  execute``) with the typed error and the actionable fix path. No
+  partial work, no crash deep in the call stack.
+- **v0.26.0** will delete ``InlineAdapter`` entirely and default
+  ``autodev init`` to ``platform: claude_code``.
+
 ## [0.25.3] - 2026-05-11
 
 Tournaments must never be skipped by default. AutoDev's goal is to
