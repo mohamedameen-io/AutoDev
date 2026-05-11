@@ -837,6 +837,31 @@ class AutodevConfig(BaseModel):
     # Set False to force synchronous initial build even on huge repos.
     index_huge_repo_async_init: bool = True
 
+    @model_validator(mode="after")
+    def _migrate_inline_platform(self) -> "AutodevConfig":
+        """v0.26.0: rewrite legacy ``platform: "inline"`` to ``"claude_code"``.
+
+        InlineAdapter was removed in v0.26.0. Existing workspaces with
+        ``.autodev/config.json`` carrying ``platform: "inline"`` would
+        otherwise be invalid on load. The Literal still includes
+        ``"inline"`` for one release so configs validate; this validator
+        emits a :class:`DeprecationWarning` and rewrites the field to
+        ``"claude_code"``. Scheduled for hard-removal in v0.27.0.
+        """
+        if self.platform == "inline":
+            import warnings
+
+            warnings.warn(
+                "platform: 'inline' is deprecated in v0.26.0 and will "
+                "be removed in v0.27.0. Treated as 'claude_code'. "
+                "Update .autodev/config.json or run "
+                "`autodev init --force` to refresh the workspace.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.platform = "claude_code"
+        return self
+
     def require_all_roles(self) -> None:
         """Raise ValueError if any required role is missing from `agents`."""
         missing = [r for r in REQUIRED_AGENT_ROLES if r not in self.agents]
