@@ -49,16 +49,17 @@ def test_doctor_in_empty_dir(tmp_path: Path) -> None:
     assert "autodev doctor" in result.output
 
 
-def test_stub_commands_exit_nonzero() -> None:
-    """``logs`` remains a stub after Phase 4 and must still exit with a
-    clear unimplemented message. ``resume`` and ``status`` are now
-    implemented (Phase 4); they exit 1 outside a project because there's
-    no ``.autodev/config.json``, but they must not report the stub text.
+def test_logs_outside_project_exits_clean(tmp_path: Path) -> None:
+    """``autodev logs`` outside a project (no .autodev/sessions/) exits 1
+    with an actionable message — NOT a stack trace or 'not yet
+    implemented' (v0.25.2 replaced the stub).
     """
     runner = CliRunner()
-    result = runner.invoke(cli, ["logs"])
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli, ["logs"])
     assert result.exit_code == 1
-    assert "not yet implemented" in result.output
+    assert "not yet implemented" not in result.output
+    assert "no session" in result.output.lower()
 
 
 def test_resume_and_status_require_project(tmp_path: Path) -> None:

@@ -22,7 +22,7 @@ from adapters.base import PlatformAdapter
 from adapters.types import AgentSpec
 from config.schema import AutodevConfig
 from guardrails import GuardrailEnforcer, LoopDetector
-from autologging import get_logger
+from autologging import attach_session_file_sink, get_logger
 from orchestrator.prm import TrajectoryStore
 from plugins.registry import PluginRegistry
 from runtime.repo_probe import RepoCapacity, probe_repo
@@ -54,6 +54,10 @@ class Orchestrator:
         self._adapter = adapter
         self._registry = registry
         self._session_id = session_id or f"sess-{uuid.uuid4().hex[:12]}"
+        # v0.25.2: open .autodev/sessions/<sid>/events.jsonl for the
+        # lifetime of this Orchestrator so ``autodev logs`` can tail
+        # structured events. Idempotent across re-entry on the same sid.
+        attach_session_file_sink(self._session_id, self._cwd)
         self._disable_impl_tournament = disable_impl_tournament
         self._plan_manager = PlanManager(
             self._cwd, self._session_id, lock_timeout_s=lock_timeout_s
