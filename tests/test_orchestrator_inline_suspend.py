@@ -68,6 +68,10 @@ async def _make_inline_orch(cwd: Path) -> Orchestrator:
     cfg = default_config()
     cfg.tournaments.plan.enabled = False
     cfg.tournaments.impl.enabled = False
+    # v0.25.4: phase_review must also be off — the new preflight check
+    # raises TournamentAdapterMismatchError when InlineAdapter is paired
+    # with ANY enabled tournament (plan / impl / phase_review).
+    cfg.tournaments.phase_review.enabled = False
     cfg.qa_gates.syntax_check = False
     cfg.qa_gates.lint = False
     cfg.qa_gates.build_check = False
@@ -278,6 +282,10 @@ async def test_subprocess_adapter_never_raises_signal(tmp_path: Path) -> None:
     cfg = default_config()
     cfg.tournaments.plan.enabled = False
     cfg.tournaments.impl.enabled = False
+    # v0.25.4: phase_review must also be off — the new preflight check
+    # raises TournamentAdapterMismatchError when InlineAdapter is paired
+    # with ANY enabled tournament (plan / impl / phase_review).
+    cfg.tournaments.phase_review.enabled = False
     cfg.qa_gates.syntax_check = False
     cfg.qa_gates.lint = False
     cfg.qa_gates.build_check = False

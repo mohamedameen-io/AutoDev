@@ -37,6 +37,7 @@ from errors import AutodevError, GuardrailExceededError, TournamentError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
 from orchestrator.inline_state import write_suspend_state
+from orchestrator.preflight import check_tournament_adapter_compatibility
 from orchestrator.worktree import WorktreeError, WorktreeManager
 from state.evidence import write_evidence, write_patch
 from qa import (
@@ -560,6 +561,10 @@ async def run_execute_phase(
     repo is git-initialized (otherwise falls back to running in
     ``orch.cwd`` directly).
     """
+    # v0.25.4: fail fast — raise TournamentAdapterMismatchError before any
+    # task dispatch when InlineAdapter is paired with an enabled tournament.
+    check_tournament_adapter_compatibility(orch)
+
     processed: list[Task] = []
 
     if task_id is not None:

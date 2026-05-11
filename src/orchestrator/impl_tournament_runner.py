@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from adapters import InlineAdapter
+from errors import TournamentAdapterMismatchError
 from autologging import get_logger
 from errors import TournamentError
 from orchestrator.delegation_envelope import DelegationEnvelope
@@ -330,9 +331,9 @@ async def run_impl_tournament(
         )
         return initial_bundle
 
-    assert not isinstance(orch.adapter, InlineAdapter), (
-        "Tournament runners must use subprocess adapters, not InlineAdapter"
-    )
+    # v0.25.4: defense-in-depth typed raise. See plan_tournament_runner.py.
+    if isinstance(orch.adapter, InlineAdapter):
+        raise TournamentAdapterMismatchError(["impl"])
 
     tournament_id = f"impl-{uuid.uuid4().hex[:8]}"
     # v0.18.0 A1: when a branch_config is supplied, suffix the artifact dir

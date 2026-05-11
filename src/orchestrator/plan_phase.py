@@ -39,6 +39,7 @@ from orchestrator.plan_tournament_runner import (
     _plan_tournament_id,
     run_plan_tournament,
 )
+from orchestrator.preflight import check_tournament_adapter_compatibility
 from state.evidence import write_evidence
 from state.paths import autodev_root, ensure_autodev_dir, spec_path
 from state.schemas import (
@@ -89,6 +90,12 @@ def _try_read_plan_from_file(cwd: Path, text: str) -> str:
 
 async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
     """Execute the plan phase end-to-end and return the approved plan."""
+    # v0.25.4: fail fast — raise TournamentAdapterMismatchError before any
+    # file write or LLM call when InlineAdapter is paired with an enabled
+    # tournament. Avoids the operator paying for spec.md write + architect
+    # call only to crash inside the runner.
+    check_tournament_adapter_compatibility(orch)
+
     cwd = orch.cwd
 
     ensure_autodev_dir(cwd)

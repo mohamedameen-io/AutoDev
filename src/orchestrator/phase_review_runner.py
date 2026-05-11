@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from adapters import InlineAdapter
+from errors import TournamentAdapterMismatchError
 from adapters.git_utils import _git_diff_range, extract_files_from_diff
 from autologging import get_logger
 from runtime.resource_probe import probe_host, resolve_parallelism
@@ -259,9 +260,9 @@ async def run_phase_review_tournament(
             history=[],
         )
 
-    assert not isinstance(orch.adapter, InlineAdapter), (
-        "Tournament runners must use subprocess adapters, not InlineAdapter"
-    )
+    # v0.25.4: defense-in-depth typed raise. See plan_tournament_runner.py.
+    if isinstance(orch.adapter, InlineAdapter):
+        raise TournamentAdapterMismatchError(["phase_review"])
 
     # Load plan to derive spec_hash for the deterministic tournament id.
     plan = await orch.plan_manager.load()
