@@ -202,7 +202,7 @@ def _git_diff_range(cwd: Path, from_sha: str, to_sha: str) -> str | None:
     return out.stdout or None
 
 
-def extract_files_from_diff(diff: str) -> list[str]:
+def extract_files_from_diff(diff: str, *, strict: bool = False) -> list[str]:
     """Pull file paths from a unified diff (lightweight, deterministic).
 
     Parses the ``+++ b/<path>`` lines from a unified diff, returning paths
@@ -214,12 +214,23 @@ def extract_files_from_diff(diff: str) -> list[str]:
     to import this function under the legacy private name to keep its
     callers stable.
 
+    v0.27.0 (audit §6): adds a ``strict`` mode. With ``strict=False`` (the
+    default — preserves v0.26.2 behaviour for legacy phase-review callers)
+    a non-empty diff with no parseable ``+++ b/`` headers returns ``[]``
+    silently. With ``strict=True`` the same condition raises
+    :class:`errors.DiffParseError` so the QA-gate site can fail-closed on
+    tasks declared as ``produces_diff=True`` rather than silently passing
+    every diff-scoped gate with ``paths=[]``.
+
     Args:
         diff: Unified diff text. May be empty.
+        strict: When ``True``, raise :class:`errors.DiffParseError` if the
+            diff text is non-empty but no ``+++ b/`` header is parseable.
 
     Returns:
         Repo-relative paths for each file the diff modifies. Empty list
-        when the diff is empty or contains no parseable headers.
+        when the diff is empty. With ``strict=False``, also empty when
+        the diff contains no parseable headers.
     """
     if not diff:
         return []
@@ -252,6 +263,13 @@ def extract_files_from_diff(diff: str) -> list[str]:
                 continue
             files.append(path)
             seen.add(path)
+    if not files and strict:
+        from errors import DiffParseError
+
+        raise DiffParseError(
+            f"diff has {len(diff)} chars but no parseable '+++ b/' headers "
+            f"(first 80 chars: {diff[:80]!r})"
+        )
     return files
 
 

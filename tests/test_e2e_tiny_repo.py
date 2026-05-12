@@ -81,7 +81,14 @@ def _coder_result() -> AgentResult:
     return AgentResult(
         success=True,
         text="added subtract",
-        diff="diff --git a/math.py b/math.py\n+def subtract(a,b): return a-b",
+        diff=(
+            "diff --git a/math.py b/math.py\n"
+            "--- a/math.py\n"
+            "+++ b/math.py\n"
+            "@@ -1 +1,2 @@\n"
+            " def add(a,b): return a+b\n"
+            "+def subtract(a,b): return a-b\n"
+        ),
         files_changed=[Path("math.py")],
         duration_s=0.01,
     )

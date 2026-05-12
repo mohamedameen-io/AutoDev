@@ -47,7 +47,13 @@ def _coder_ok() -> AgentResult:
     return AgentResult(
         success=True,
         text="done",
-        diff="diff --git a/math.py b/math.py\n+def noop(): pass",
+        diff=(
+            "diff --git a/math.py b/math.py\n"
+            "--- a/math.py\n"
+            "+++ b/math.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+def noop(): pass\n"
+        ),
         files_changed=[Path("math.py")],
         duration_s=0.01,
     )

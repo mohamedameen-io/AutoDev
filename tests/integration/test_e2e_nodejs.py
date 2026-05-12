@@ -54,6 +54,11 @@ def _make_stub(extras: Iterable[tuple[str, object]] | None = None) -> StubAdapte
             text="added farewell function",
             diff=(
                 "diff --git a/src/index.ts b/src/index.ts\n"
+                "--- a/src/index.ts\n"
+                "+++ b/src/index.ts\n"
+                "@@ -1,1 +1,5 @@\n"
+                " export function greet(name: string): string { return name; }\n"
+                "+\n"
                 "+export function farewell(name: string): string {\n"
                 "+  return `Goodbye, ${name}!`;\n"
                 "+}\n"

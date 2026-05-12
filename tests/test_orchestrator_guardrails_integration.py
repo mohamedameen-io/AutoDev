@@ -109,7 +109,13 @@ async def test_diff_size_cap_blocks_task(tmp_path: Path) -> None:
     coder_result = AgentResult(
         success=True,
         text="wrote code",
-        diff="diff --git a/foo.py b/foo.py\n+x = 1",
+        diff=(
+            "diff --git a/foo.py b/foo.py\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+x = 1\n"
+        ),
         duration_s=0.01,
     )
     adapter = StubAdapter({"developer": coder_result})

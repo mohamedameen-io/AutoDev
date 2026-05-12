@@ -56,7 +56,13 @@ def _coder_ok() -> AgentResult:
     return AgentResult(
         success=True,
         text="wrote foo",
-        diff="diff --git a/foo.py b/foo.py\n+def foo(): pass",
+        diff=(
+            "diff --git a/foo.py b/foo.py\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+def foo(): pass\n"
+        ),
         files_changed=[Path("foo.py")],
         duration_s=0.1,
     )

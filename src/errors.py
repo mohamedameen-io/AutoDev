@@ -35,6 +35,28 @@ class GuardrailExceededError(AutodevError):
     """Task exceeded a configured budget (tool calls, duration, diff size)."""
 
 
+class DiffParseError(AutodevError):
+    """Developer output had non-empty diff text with no parseable headers.
+
+    v0.27.0: previously a malformed/garbage ``diff`` body silently returned
+    ``[]`` from :func:`adapters.git_utils.extract_files_from_diff`. Diff-scoped
+    QA gates (secretscan, hallucination_guard, mutation_test, code_size) then
+    saw ``paths=[]`` and trivially passed — a silent skip that masked real
+    regressions (e.g. a corrupt diff body shipped via a stop-truncation).
+    Strict callers now raise this typed error so :func:`_run_qa_gates` can
+    fail-closed against tasks declared as ``produces_diff=True``.
+    """
+
+
+class EmptyDiffScopeError(AutodevError):
+    """Diff parsed cleanly but yielded zero files for a diff-producing task.
+
+    Distinct from :class:`DiffParseError` so callers can distinguish "garbage
+    in" (parser couldn't extract anything) from "developer returned an empty
+    but well-formed diff" (the developer didn't actually write any code).
+    """
+
+
 class PhaseStuckError(AutodevError):
     """v0.22.2 B2: phase has no pending tasks but tasks are non-terminal.
 

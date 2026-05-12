@@ -59,7 +59,13 @@ def _coder_ok(variant: int = 0) -> AgentResult:
     return AgentResult(
         success=True,
         text=f"wrote feature variant={variant}",
-        diff=f"diff --git a/feature.py b/feature.py\n+def feature_{variant}(): pass",
+        diff=(
+            f"diff --git a/feature.py b/feature.py\n"
+            f"--- a/feature.py\n"
+            f"+++ b/feature.py\n"
+            f"@@ -0,0 +1 @@\n"
+            f"+def feature_{variant}(): pass\n"
+        ),
         files_changed=[Path("feature.py")],
         duration_s=0.1,
     )

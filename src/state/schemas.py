@@ -208,6 +208,14 @@ class Task(BaseModel):
     evidence_bundle: str | None = None  # path (relative to repo root) to evidence json
     blocked_reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # v0.27.0 (audit §6): does this task's developer attempt produce a
+    # unified diff? Tasks that legitimately produce no diff (pure
+    # investigation, doc-only review, etc.) set this to ``False`` so the
+    # diff-scoped QA gate site skips its fail-closed check. Default
+    # ``True`` matches pre-v0.27 behaviour: every task is treated as a
+    # diff-producing task until the architect opts out via the
+    # ``produces_diff: false`` body line in the plan markdown.
+    produces_diff: bool = True
 
 
 class Phase(BaseModel):

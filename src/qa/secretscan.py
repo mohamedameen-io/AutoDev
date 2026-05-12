@@ -235,6 +235,18 @@ async def run_secretscan(
     Returns ``GateResult(passed=False, ...)`` if any secrets are found,
     ``GateResult(passed=True, ...)`` otherwise.
     """
+    # v0.27.0 (audit §6.3): explicit no-op when the caller has narrowed the
+    # diff scope to an empty list. Distinct from ``paths=None`` (legacy
+    # whole-tree walk). Mirrors :func:`qa.code_size.run_code_size`'s
+    # ``paths is not None and not paths`` guard so the gate ledger surface
+    # records "nothing to scan" rather than "scanned everything and passed".
+    if paths is not None and not paths:
+        return GateResult(
+            passed=True,
+            severity="info",
+            details="secretscan: no files in diff scope",
+            metrics={},
+        )
     findings: list[str] = []
 
     # Normalize the scope to "filter is active" iff non-empty list. Empty

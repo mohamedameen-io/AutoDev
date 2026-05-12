@@ -3504,11 +3504,7 @@ def _files_changed_for_secretscan(
 
     v0.26.1 patch C — contract simplified to always return a list:
 
-    * ``[]`` when the result is missing, has no diff text, or carries an
-      unparseable diff (no ``+++ b/`` headers). The downstream gate sees
-      "scan no files" rather than the legacy ``None`` → full-walk fallback,
-      which was a footgun on huge vendored trees (the 2026-05-11 Unity /
-      SDL2 incident).
+    * ``[]`` when the result is missing or has no diff text.
     * ``list[Path]`` of repo-relative paths in first-seen, deduped order
       when a parseable diff is present.
 
@@ -3516,10 +3512,19 @@ def _files_changed_for_secretscan(
     ``paths=[]`` through to ``run_secretscan`` / ``run_hallucination_guard``
     /``run_mutation_test`` / ``run_code_size`` produces a clean "scan
     nothing, pass the gate" outcome.
+
+    v0.27.0 (audit §6) — caller of last resort: when a non-empty diff
+    body has no parseable ``+++ b/`` headers (garbage payload, truncated
+    stream, etc.) this helper now raises :class:`errors.DiffParseError`
+    so :func:`_run_qa_gates` can fail-closed against tasks declared as
+    ``produces_diff=True`` rather than silently scan zero files.
     """
     if developer_result is None or not developer_result.diff:
         return []
-    return [Path(p) for p in extract_files_from_diff(developer_result.diff)]
+    return [
+        Path(p)
+        for p in extract_files_from_diff(developer_result.diff, strict=True)
+    ]
 
 
 def _surface_warning(task: "Task", gate_name: str, result: GateResult) -> None:
@@ -3596,13 +3601,29 @@ async def _run_qa_gates(
     gate dispatch continues. Existing gates that don't set ``severity``
     inherit the "block" default — pre-v0.22.0 behavior is preserved.
     """
+    from errors import DiffParseError
     from plugins.registry import QAContext
 
     cfg = orch.cfg.qa_gates
     cwd = orch.cwd
     language = detect_language(cwd)
 
-    secretscan_paths = _files_changed_for_secretscan(developer_result)
+    # v0.27.0 (audit §6): fail-closed when a diff-producing task ships a
+    # malformed diff body. Investigation tasks (``produces_diff=False``)
+    # legitimately have no diff — treat their unparseable diff as the
+    # legacy ``paths=[]`` no-op so the secretscan / hallucination_guard
+    # gates skip cleanly. For everyone else, the gate-set returns a
+    # blocking failure detail string before any gate runs.
+    try:
+        secretscan_paths = _files_changed_for_secretscan(developer_result)
+    except DiffParseError as exc:
+        if getattr(task, "produces_diff", True) is False:
+            secretscan_paths = []
+        else:
+            return (
+                "secretscan: developer diff unparseable, refusing to silently "
+                f"skip diff-scoped QA gates ({exc})"
+            )
     # v0.16.0: hallucination-guard reuses the diff-scope path list so the
     # AST walk only visits files the executor just touched. ``cfg.hallucination_guard``
     # is a top-level toggle (default True) — see :class:`AutodevConfig`.

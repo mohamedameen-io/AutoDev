@@ -54,6 +54,11 @@ def _make_stub(extras: Iterable[tuple[str, object]] | None = None) -> StubAdapte
             text="added Subtract function",
             diff=(
                 "diff --git a/math.go b/math.go\n"
+                "--- a/math.go\n"
+                "+++ b/math.go\n"
+                "@@ -1,2 +1,6 @@\n"
+                " package math\n"
+                "+\n"
                 "+func Subtract(a, b int) int {\n"
                 "+\treturn a - b\n"
                 "+}\n"

@@ -52,7 +52,14 @@ def _make_stub(extras: Iterable[tuple[str, object]] | None = None) -> StubAdapte
         "developer": AgentResult(
             success=True,
             text="added function",
-            diff="diff --git a/math_utils.py b/math_utils.py\n+def multiply(a,b): return a*b",
+            diff=(
+                "diff --git a/math_utils.py b/math_utils.py\n"
+                "--- a/math_utils.py\n"
+                "+++ b/math_utils.py\n"
+                "@@ -1 +1,2 @@\n"
+                " def add(a,b): return a+b\n"
+                "+def multiply(a,b): return a*b\n"
+            ),
             files_changed=[Path("math_utils.py")],
             duration_s=0.01,
         ),

@@ -85,8 +85,17 @@ def test_files_changed_for_secretscan_returns_empty_list_when_diff_empty() -> No
     assert _files_changed_for_secretscan(result) == []
 
 
-def test_files_changed_for_secretscan_returns_empty_when_no_paths_in_diff() -> None:
-    """A non-empty diff with no ``+++ b/`` headers (e.g. error output) → []."""
+def test_files_changed_for_secretscan_raises_when_no_paths_in_diff() -> None:
+    """v0.27.0 (audit §6) fail-closed: a non-empty diff with no ``+++ b/``
+    headers raises :class:`errors.DiffParseError` rather than returning
+    ``[]`` silently. The gate-site (``_run_qa_gates``) translates this
+    into a blocking failure detail string for ``produces_diff=True``
+    tasks, while investigation tasks (``produces_diff=False``) catch
+    the error and substitute ``paths=[]``.
+    """
+    import pytest as _pytest
+
+    from errors import DiffParseError
     from orchestrator.execute_phase import _files_changed_for_secretscan
 
     result = AgentResult(
@@ -95,7 +104,8 @@ def test_files_changed_for_secretscan_returns_empty_when_no_paths_in_diff() -> N
         duration_s=0.1,
         diff="some non-diff text",
     )
-    assert _files_changed_for_secretscan(result) == []
+    with _pytest.raises(DiffParseError):
+        _files_changed_for_secretscan(result)
 
 
 # ---------------------------------------------------------------------------
