@@ -104,6 +104,15 @@ LedgerOp = Literal[
     # sub-tasks landing from the architect's response are recorded via
     # the regular ``append_corrective_tasks`` op emitted alongside.
     "architect_consult",
+    # v0.26.2 Phase 3: persistent-failure drop fired during the
+    # architect-retry loop. Audit-only — does NOT mutate plan state on
+    # replay (the new plan with the dropped entry is persisted via
+    # ``init_plan`` alongside). Payload shape:
+    # ``{path: str, reason: str, suggestion: str, attempt: int,
+    #   recurrence_count: int}`` where ``attempt`` is 1-indexed
+    # architect-attempt number and ``recurrence_count`` is the
+    # number of times the same ``(path, reason)`` had recurred.
+    "scope_entry_dropped",
     # v0.16.0: drift-verifier complete. Audit-only — does NOT mutate plan
     # state. Payload shape: ``{phase_id, passed, drift_findings: list[str],
     # evidence_path}``. Replay treats it as a no-op; the actual outcome
@@ -526,6 +535,16 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         "stuck_pivot",
         "soft_blocker_handoff",
         "course_correction_emitted",
+        # v0.26.1: architect-consult rung audit op (registered in the
+        # Literal but missing a handler — added here to keep
+        # ``replay_ledger`` from crashing if anyone serializes a real
+        # session ledger and re-applies it).
+        "architect_consult",
+        # v0.26.2 Phase 3: persistent-failure drop audit op. Mutation
+        # of plan.edit_scope / task.files lives in the ``init_plan``
+        # entry emitted later in the same plan phase; this op is the
+        # forensic breadcrumb for "what got dropped".
+        "scope_entry_dropped",
     ):
         # v0.15.0: audit-only breadcrumbs for the stuck-recovery
         # escalation ladder + PRM. The task.status / blocked_reason

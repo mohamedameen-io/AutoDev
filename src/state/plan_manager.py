@@ -1247,6 +1247,12 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
         "stuck_pivot",
         "soft_blocker_handoff",
         "course_correction_emitted",
+        # v0.26.1: architect-consult audit op (parity with
+        # :func:`state.ledger._apply_op`).
+        "architect_consult",
+        # v0.26.2 Phase 3: persistent-failure drop audit op. Plan state
+        # is captured by the ``init_plan`` entry written alongside.
+        "scope_entry_dropped",
     ):
         # v0.15.0: ladder + PRM audit ops do not mutate plan state. Status
         # transitions are recorded by ``update_task_status`` separately.

@@ -16,8 +16,9 @@ Flow:
 from __future__ import annotations
 
 import hashlib
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from adapters.types import AgentInvocation, AgentResult
 from errors import AutodevError, TournamentError
@@ -37,11 +38,13 @@ from orchestrator.plan_tournament_runner import (
     run_plan_tournament,
 )
 from state.evidence import write_evidence
-from state.paths import autodev_root, ensure_autodev_dir, spec_path
+from state.paths import autodev_root, debug_dir, ensure_autodev_dir, spec_path
 from state.schemas import (
     ExploreEvidence,
+    Phase,
     Plan,
     SMEEvidence,
+    Task,
 )
 from tournament.effort import resolve_role_effort
 from tournament.state import (
@@ -55,6 +58,19 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+
+# v0.26.2 Phase 3: bounded retry loop constants. Two distinct names for
+# the same numeric value — they mean different things (per Plan-agent
+# feedback Q6 fix #5):
+#   - ``_MAX_ARCHITECT_ATTEMPTS``: how many times the architect is called
+#     before the orchestrator gives up (outer loop bound).
+#   - ``_DROP_AT_RECURRENCE``: how many times the SAME (raw, reason)
+#     pair must recur before the persistent-failure drop fires.
+# Keeping them separate prevents the "coincidence trap" where future
+# tuning of one bleeds into the other.
+_MAX_ARCHITECT_ATTEMPTS: int = 3
+_DROP_AT_RECURRENCE: int = 3
 
 
 def _spec_hash(text: str) -> str:
@@ -82,6 +98,245 @@ def _try_read_plan_from_file(cwd: Path, text: str) -> str:
                 )
                 return content
     return text
+
+
+def _persist_failed_architect_plan(cwd: Path, plan_md: str) -> Path:
+    """v0.26.2 Phase 1a: persist the architect's rejected markdown.
+
+    Writes to ``.autodev/debug/architect-failed-<unix-ms>.md`` so the
+    operator can inspect the exact output that failed validation.
+    Without this, the markdown lives only in memory and is lost on
+    retry/abort — making the 2026-05-12 Unity QNX failure undebuggable.
+
+    Returns the written path so the caller can log it.
+    """
+    dbg = debug_dir(cwd)
+    dbg.mkdir(parents=True, exist_ok=True)
+    out = dbg / f"architect-failed-{int(time.time() * 1000)}.md"
+    out.write_text(plan_md or "", encoding="utf-8")
+    return out
+
+
+def _retry_hint_text() -> str:
+    """v0.26.2 Phase 3: shared retry-hint text used by the retry-env
+    builder. Encodes both v0.22.4 path-shape feedback and the v0.26.2
+    typed retry-envelope contract."""
+    return (
+        "Please use EXACTLY the canonical format. "
+        "Return the plan as your text response, do NOT write to files. "
+        "Paths must be plain repo-relative strings — no surrounding "
+        "backticks, quotes, parentheticals, or trailing punctuation. "
+        "List one path per line in EDIT_SCOPE blocks, comma-separated "
+        "in `Files:` lines.\n\n"
+        "If your previous plan listed files that do not exist on disk, "
+        "either (a) correct the path, or (b) if you intend to CREATE "
+        "the file in the task, prefix the path with [new] in the "
+        "Files: line, e.g.:\n"
+        "    Files: src/foo.cpp, [new] src/foo_test.cpp\n\n"
+        "When path_error_raw / path_error_reason / path_error_suggestion "
+        "are present in the CONTEXT block, fix that single path — do "
+        "not re-draft the whole plan."
+    )
+
+
+def _build_retry_env(
+    base_env: DelegationEnvelope,
+    *,
+    prior_plan_md: str,
+    exc: Exception | None,
+    errors_seen: dict[tuple[str, str], int],
+    dropped_entries: list[str],
+) -> DelegationEnvelope:
+    """v0.26.2 Phase 3: build a retry envelope that carries:
+
+    * the prior architect attempt (truncated to 2000 chars),
+    * the stringified exception in ``parse_error`` (back-compat),
+    * the typed ``path_error_*`` fields when ``exc`` is a
+      :class:`PathValidationError` (Phase 1b),
+    * the accumulated ``prior_errors`` list so the architect can see
+      "you've now emitted this same path 2 times — fix it",
+    * the list of entries previously dropped on this plan-phase run.
+
+    Returns a new :class:`DelegationEnvelope` (does not mutate the input).
+    """
+    from orchestrator.path_validator import PathValidationError
+
+    ctx_extras: dict[str, Any] = {
+        "prior_attempt": prior_plan_md[:2000] if prior_plan_md else "",
+        "parse_error": str(exc) if exc is not None else "",
+        "prior_errors": [
+            {"raw": r, "reason": s, "count": n}
+            for (r, s), n in errors_seen.items()
+        ],
+        "dropped_entries": list(dropped_entries),
+        "hint": _retry_hint_text(),
+    }
+    if isinstance(exc, PathValidationError):
+        ctx_extras["path_error_raw"] = exc.raw
+        ctx_extras["path_error_reason"] = exc.reason
+        ctx_extras["path_error_suggestion"] = exc.suggestion or ""
+    return base_env.model_copy(
+        update={"context": {**base_env.context, **ctx_extras}}
+    )
+
+
+def _drop_entry_from_plan(
+    plan: Plan, bad_path: str
+) -> tuple[Plan, bool]:
+    """v0.26.2 Phase 3: drop ``bad_path`` from every validator-walked
+    scope site, returning ``(new_plan, was_dropped)``.
+
+    Drops from:
+      - ``plan.edit_scope``
+      - every ``phase.edit_scope`` (when non-None — ``None`` means inherit)
+      - every ``task.files``
+      - every ``task.extended_scope``
+
+    Does NOT touch ``task.files_new`` — those are the architect's declared
+    about-to-be-created files and the v0.24.3 validator already skips them.
+
+    A path matches if it equals an entry OR if it equals the entry with
+    a trailing ``/`` trimmed (the validator treats scope entries as
+    directory prefixes).
+
+    Uses ``model_copy(update=...)`` at every level so Pydantic field
+    validators re-fire on the new objects. Direct in-place mutation would
+    NOT re-trigger validation and would leave the new model in a
+    potentially-invalid state.
+    """
+    norm = bad_path.rstrip("/")
+    was_dropped = False
+
+    def _filter(entries: list[str]) -> tuple[list[str], bool]:
+        kept = [e for e in entries if e.rstrip("/") != norm]
+        return kept, len(kept) != len(entries)
+
+    new_plan_edit, dropped_at_plan_level = _filter(list(plan.edit_scope))
+    if dropped_at_plan_level:
+        was_dropped = True
+
+    new_phases: list[Phase] = []
+    for phase in plan.phases:
+        new_phase_edit: list[str] | None = phase.edit_scope
+        if phase.edit_scope is not None:
+            ph_kept, ph_dropped = _filter(list(phase.edit_scope))
+            if ph_dropped:
+                was_dropped = True
+                new_phase_edit = ph_kept
+
+        new_tasks: list[Task] = []
+        any_task_mutated = False
+        for task in phase.tasks:
+            t_files, t_files_dropped = _filter(list(task.files))
+            t_ext, t_ext_dropped = _filter(list(task.extended_scope))
+            if t_files_dropped or t_ext_dropped:
+                was_dropped = True
+                any_task_mutated = True
+                new_tasks.append(
+                    task.model_copy(
+                        update={
+                            "files": t_files,
+                            "extended_scope": t_ext,
+                        }
+                    )
+                )
+            else:
+                new_tasks.append(task)
+
+        if new_phase_edit is not phase.edit_scope or any_task_mutated:
+            new_phases.append(
+                phase.model_copy(
+                    update={
+                        "edit_scope": new_phase_edit,
+                        "tasks": new_tasks,
+                    }
+                )
+            )
+        else:
+            new_phases.append(phase)
+
+    if was_dropped:
+        new_plan = plan.model_copy(
+            update={
+                "edit_scope": new_plan_edit,
+                "phases": new_phases,
+            }
+        )
+        return new_plan, True
+    return plan, False
+
+
+async def _validate_with_persistent_drop(
+    orch: "Orchestrator",
+    plan: Plan,
+    cwd: Path,
+    errors_seen: dict[tuple[str, str], int],
+    dropped_entries: list[str],
+    attempt: int,
+) -> Plan:
+    """v0.26.2 Phase 3: validate ``plan`` against the filesystem.
+
+    On a :class:`PathValidationError`, this helper checks whether the
+    same ``(raw, reason)`` pair has ALREADY recurred at least
+    ``_DROP_AT_RECURRENCE`` times across prior architect attempts. If
+    so, drop the bad entry from every validator-walked site and
+    re-validate the new plan; otherwise re-raise to let the outer retry
+    loop fire a fresh architect call.
+
+    Note (Plan-agent fix #1): ``errors_seen[key]`` is **never mutated
+    here**. The outer ``except`` block in :func:`run_plan_phase` is the
+    sole writer of the counter — that ensures the architect gets exactly
+    ``_DROP_AT_RECURRENCE`` chances at the prompt level before any
+    auto-drop fires.
+
+    Hard empty-scope guard: if dropping would leave
+    ``plan.edit_scope == []`` (the documented whole-repo sentinel) the
+    drop is refused and the original :class:`PathValidationError` is
+    re-raised — silent widening to whole-repo would be a P0 risk.
+    """
+    from orchestrator.path_validator import PathValidationError
+
+    while True:
+        try:
+            validate_files_exist(plan, cwd)
+            return plan
+        except PathValidationError as exc:
+            key = (exc.raw, exc.reason)
+            # Read-only check: anticipate the next outer-loop increment.
+            # If we haven't met the recurrence threshold yet, bubble up
+            # so the outer except increments + retries the architect.
+            if errors_seen.get(key, 0) + 1 < _DROP_AT_RECURRENCE:
+                raise
+            # Threshold met — try to drop the bad entry.
+            new_plan, was_dropped = _drop_entry_from_plan(plan, exc.raw)
+            if not was_dropped:
+                # The bad path isn't in any validator-walked site we
+                # know how to drop from (e.g. it appears only as a
+                # task.files_new entry, which we deliberately preserve).
+                raise
+            # Hard empty-scope guard: only fires when plan.edit_scope
+            # was non-empty before AND would become empty after the
+            # drop. Empty plan.edit_scope is the whole-repo sentinel —
+            # silently widening here would be the P0 risk this entire
+            # phase guards against.
+            if plan.edit_scope and not new_plan.edit_scope:
+                raise
+            await orch.plan_manager.ledger_append(
+                op="scope_entry_dropped",
+                payload={
+                    "path": exc.raw,
+                    "reason": exc.reason,
+                    "suggestion": exc.suggestion or "",
+                    "attempt": attempt + 1,
+                    "recurrence_count": errors_seen.get(key, 0) + 1,
+                },
+            )
+            plan = new_plan
+            dropped_entries.append(exc.raw)
+            # Loop continues — re-validate the mutated plan. Because
+            # the path was just removed from every validator-walked
+            # site, the next call CANNOT raise on the same key —
+            # guaranteed termination.
 
 
 async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
@@ -179,85 +434,89 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                 "candidate_files": candidate_digest_str,
             },
         )
-        architect_result = await _delegate(orch, "architect", architect_env)
-
-        plan_md = architect_result.text
-        # Fallback: if architect wrote to a file instead of returning text,
-        # try reading the plan from known file locations.
-        plan_md = _try_read_plan_from_file(cwd, plan_md)
-        plan: Plan
-        # v0.22.4 B4: also catch path-validator errors at parse time so
-        # the architect can self-correct malformed paths (backticks,
-        # parentheticals, trailing punctuation) on retry. The legacy
-        # PlanParseError path remains identical.
+        # v0.26.2 Phase 3: bounded architect-retry loop with persistent-
+        # failure drop. Replaces v0.22.4's single-shot retry. The
+        # architect is called up to ``_MAX_ARCHITECT_ATTEMPTS`` times;
+        # on each failure the rejected markdown is archived (Phase 1a)
+        # and a structured retry env is built (Phase 1b). When the SAME
+        # ``(raw, reason)`` recurs ``_DROP_AT_RECURRENCE`` times,
+        # ``_validate_with_persistent_drop`` drops the bad entry from
+        # every validator-walked scope site and re-validates — with a
+        # hard empty-scope guard that refuses to silently widen to
+        # whole-repo.
         from pydantic import ValidationError as _PydValidationError
 
         from orchestrator.path_validator import PathValidationError
 
-        try:
-            plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
-            # v0.24.3: enforce that every architect-emitted file path
-            # actually exists on disk (modulo the ``[new]`` opt-out).
-            # Any miss raises ``PathValidationError`` with
-            # ``reason="missing_on_disk"`` which flows into the same
-            # architect-retry envelope as the v0.22.4 path-shape errors.
-            validate_files_exist(plan, cwd)
-        except (
-            PlanParseError,
-            _PydValidationError,
-            PathValidationError,
-        ) as exc:
-            # Build a structured architect-retry envelope: the architect
-            # sees both the raw error AND a hint listing format rules so
-            # the second pass produces well-formed output.
-            extra_hint = (
-                "Paths must be plain repo-relative strings — no surrounding "
-                "backticks, quotes, parentheticals, or trailing punctuation. "
-                "List one path per line in EDIT_SCOPE blocks, comma-separated "
-                "in `Files:` lines."
-            )
-            # v0.24.3: when the failure was a missing-on-disk path,
-            # append a missing-file paragraph that documents the ``[new]``
-            # opt-out and embeds the closest tracked-file suggestion.
-            if getattr(exc, "reason", None) == "missing_on_disk":
-                suggestion = getattr(exc, "suggestion", None)
-                extra_hint += (
-                    "\n\nYour previous plan listed files that do not exist "
-                    "on disk. Either: (a) correct the path — closest "
-                    f"tracked match: {suggestion!r}, or (b) if you intend "
-                    "to CREATE this file in the task, prefix the path "
-                    "with [new] in the Files: line, e.g.:\n"
-                    "    Files: src/foo.cpp, [new] src/foo_test.cpp\n"
-                    "Do NOT smash directory paths and source code "
-                    "together — a path like `src/qa/cpp_symbols.py// "
-                    "...code...` is malformed and will be rejected."
+        plan: Plan
+        plan_md: str = ""
+        errors_seen: dict[tuple[str, str], int] = {}
+        dropped_entries: list[str] = []
+        last_exc: Exception | None = None
+        architect_spec = orch.registry.get("architect")
+        retry_max = (
+            (architect_spec.max_turns or 5) + 2 if architect_spec else 7
+        )
+
+        for attempt in range(_MAX_ARCHITECT_ATTEMPTS):
+            if attempt == 0:
+                env = architect_env
+                max_turns_override: int | None = None
+            else:
+                env = _build_retry_env(
+                    architect_env,
+                    prior_plan_md=plan_md,
+                    exc=last_exc,
+                    errors_seen=errors_seen,
+                    dropped_entries=dropped_entries,
                 )
-            logger.warning("plan_phase.parse_failed_retrying", err=str(exc))
-            retry_env = architect_env.model_copy(
-                update={
-                    "context": {
-                        **architect_env.context,
-                        "prior_attempt": plan_md[:2000],
-                        "parse_error": str(exc),
-                        "hint": (
-                            "Please use EXACTLY the canonical format. "
-                            "Return the plan as your text response, do NOT write to files. "
-                            f"{extra_hint}"
-                        ),
-                    }
-                }
+                max_turns_override = retry_max
+            architect_result = await _delegate(
+                orch, "architect", env, max_turns_override=max_turns_override
             )
-            architect_spec = orch.registry.get("architect")
-            retry_max = (architect_spec.max_turns or 5) + 2 if architect_spec else 7
-            retry_result = await _delegate(
-                orch, "architect", retry_env, max_turns_override=retry_max
-            )
-            plan_md = retry_result.text
+            plan_md = architect_result.text
+            # Fallback: if architect wrote to a file instead of returning
+            # text, try reading the plan from known file locations.
             plan_md = _try_read_plan_from_file(cwd, plan_md)
-            plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
-            # v0.24.3: enforced on the retry parse too — the architect's
-            # second pass must satisfy on-disk existence as well.
-            validate_files_exist(plan, cwd)
+
+            try:
+                plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
+                # v0.26.2 Phase 3: validate via the persistent-drop
+                # helper — on recurrence threshold the bad entry is
+                # dropped + a ``scope_entry_dropped`` ledger op is
+                # appended. The empty-scope guard re-raises the
+                # original error if dropping would empty plan.edit_scope.
+                plan = await _validate_with_persistent_drop(
+                    orch,
+                    plan,
+                    cwd,
+                    errors_seen,
+                    dropped_entries,
+                    attempt,
+                )
+                break  # success — exit the outer retry loop
+            except (
+                PlanParseError,
+                _PydValidationError,
+                PathValidationError,
+            ) as exc:
+                last_exc = exc
+                # Phase 1a: archive the rejected markdown for diagnostics.
+                archived = _persist_failed_architect_plan(cwd, plan_md)
+                if isinstance(exc, PathValidationError):
+                    key = (exc.raw, exc.reason)
+                    errors_seen[key] = errors_seen.get(key, 0) + 1
+                logger.warning(
+                    "plan_phase.parse_failed_retrying",
+                    err=str(exc),
+                    archived_to=str(archived),
+                    attempt=attempt + 1,
+                    max_attempts=_MAX_ARCHITECT_ATTEMPTS,
+                )
+                if attempt == _MAX_ARCHITECT_ATTEMPTS - 1:
+                    # Exhausted retries — surface the original error
+                    # so the operator can inspect the archived markdown.
+                    raise
 
         if orch.cfg.tournaments.plan.enabled:
             num_branches = orch.cfg.tournaments.plan.num_branches

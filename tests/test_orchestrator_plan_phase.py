@@ -532,6 +532,185 @@ async def test_plan_phase_retries_on_missing_file_and_includes_hint(
     assert "[new]" in second_prompt
 
 
+# --- v0.26.2 Phase 1a/1b: failed-markdown persistence + typed retry envelope ---
+
+
+def _bootstrap_git_repo_with_math_py(tmp_path: Path) -> None:
+    """Helper: bootstrap a populated git repo with a single tracked ``math.py``.
+    Required so :func:`validate_files_exist` engages instead of short-circuiting
+    on an empty snapshot.
+    """
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=str(tmp_path), check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "t@t"], cwd=str(tmp_path), check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "t"], cwd=str(tmp_path), check=True
+    )
+    (tmp_path / "math.py").write_text("def add(a, b): return a + b\n")
+    subprocess.run(["git", "add", "-A"], cwd=str(tmp_path), check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "init"], cwd=str(tmp_path), check=True
+    )
+
+
+_BAD_FILE_PLAN_MD = """
+# Plan: Add subtract
+
+## Phase 1: Implement
+
+### Task 1.1: bogus path
+  - Description: references a path that does not exist
+  - Files: imaginary.cpp
+  - Acceptance:
+    - [ ] something
+"""
+
+_GOOD_FILE_PLAN_MD = """
+# Plan: Add subtract
+
+## Phase 1: Implement
+
+### Task 1.1: real path
+  - Description: refs a real file
+  - Files: math.py
+  - Acceptance:
+    - [ ] passes
+"""
+
+
+@pytest.mark.asyncio
+async def test_plan_phase_persists_failed_markdown_on_path_validation_error(
+    tmp_path: Path,
+) -> None:
+    """v0.26.2 Phase 1a: when the architect emits a plan that fails
+    :func:`validate_files_exist`, the rejected markdown is written to
+    ``.autodev/debug/architect-failed-<ts>.md`` so the operator can
+    inspect the bad output without re-running.
+    """
+    from state.paths import debug_dir
+
+    _bootstrap_git_repo_with_math_py(tmp_path)
+    adapter = StubAdapter(
+        {
+            "explorer": ok("found stuff"),
+            "domain_expert": ok("ok"),
+            "architect": [ok(_BAD_FILE_PLAN_MD), ok(_GOOD_FILE_PLAN_MD)],
+        }
+    )
+    orch = _make_orch(tmp_path, adapter)
+
+    plan = await orch.plan("Add subtract")
+    assert plan is not None
+
+    archived = list(debug_dir(tmp_path).glob("architect-failed-*.md"))
+    assert archived, "Phase 1a: no archived markdown landed in .autodev/debug/"
+    contents = archived[0].read_text(encoding="utf-8")
+    assert "imaginary.cpp" in contents, (
+        "Phase 1a: archived markdown must contain the architect's raw output"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_phase_persists_failed_markdown_on_parse_error(
+    tmp_path: Path,
+) -> None:
+    """v0.26.2 Phase 1a: parse-failure path also persists the rejected
+    markdown (not just on PathValidationError). The architect's malformed
+    markdown is lost on retry today; this test guards the persistence."""
+    from state.paths import debug_dir
+
+    # Malformed-then-clean sequence. The first response has no plan title,
+    # so ``parse_plan_markdown`` raises PlanParseError; the second is the
+    # canonical valid plan.
+    bad_md = "NO HEADING AT ALL\nthis is not a plan"
+    adapter = StubAdapter(
+        {
+            "explorer": ok("found stuff"),
+            "domain_expert": ok("ok"),
+            "architect": [ok(bad_md), ok(CANONICAL_PLAN_MD)],
+        }
+    )
+    orch = _make_orch(tmp_path, adapter)
+
+    plan = await orch.plan("Add subtract")
+    assert plan is not None
+
+    archived = list(debug_dir(tmp_path).glob("architect-failed-*.md"))
+    assert archived, "Phase 1a: parse-failed markdown must also be archived"
+    contents = archived[0].read_text(encoding="utf-8")
+    assert "NO HEADING AT ALL" in contents
+
+
+@pytest.mark.asyncio
+async def test_retry_env_has_unpacked_path_error_fields(
+    tmp_path: Path,
+) -> None:
+    """v0.26.2 Phase 1b: on a :class:`PathValidationError`, the retry
+    envelope's CONTEXT block must carry ``path_error_raw``,
+    ``path_error_reason``, and ``path_error_suggestion`` as separate keys
+    so the architect can correct the single bad path instead of re-drafting.
+    """
+    _bootstrap_git_repo_with_math_py(tmp_path)
+    adapter = StubAdapter(
+        {
+            "explorer": ok("found stuff"),
+            "domain_expert": ok("ok"),
+            "architect": [ok(_BAD_FILE_PLAN_MD), ok(_GOOD_FILE_PLAN_MD)],
+        }
+    )
+    orch = _make_orch(tmp_path, adapter)
+
+    plan = await orch.plan("Add subtract")
+    assert plan is not None
+    architect_prompts = adapter.prompts_for("architect")
+    assert len(architect_prompts) >= 2
+    second_prompt = architect_prompts[1]
+    # The envelope renders context keys as ``  key: value`` lines.
+    assert "path_error_raw: imaginary.cpp" in second_prompt
+    assert "path_error_reason: missing_on_disk" in second_prompt
+    # Suggestion is rendered as well (string form — may be empty string
+    # if no fuzzy match clears the threshold, but the key must be present).
+    assert "path_error_suggestion:" in second_prompt
+
+
+@pytest.mark.asyncio
+async def test_retry_env_lacks_path_fields_on_parse_error(
+    tmp_path: Path,
+) -> None:
+    """v0.26.2 Phase 1b: when the failure is a :class:`PlanParseError`
+    (not PathValidationError), the typed ``path_error_*`` CONTEXT keys
+    must be ABSENT — only the legacy ``parse_error`` key is set.
+
+    The hint body may reference the field NAMES for the LLM's benefit;
+    the assertion is on the CONTEXT key rendering (``  key: value`` form)
+    which the :class:`DelegationEnvelope` produces.
+    """
+    bad_md = "NO HEADING AT ALL\nthis is not a plan"
+    adapter = StubAdapter(
+        {
+            "explorer": ok("found stuff"),
+            "domain_expert": ok("ok"),
+            "architect": [ok(bad_md), ok(CANONICAL_PLAN_MD)],
+        }
+    )
+    orch = _make_orch(tmp_path, adapter)
+
+    plan = await orch.plan("Add subtract")
+    assert plan is not None
+    architect_prompts = adapter.prompts_for("architect")
+    assert len(architect_prompts) >= 2
+    second_prompt = architect_prompts[1]
+    assert "parse_error:" in second_prompt
+    # Assert the CONTEXT key rendering (two-space indent + key + colon-space
+    # value) is ABSENT; the hint body may mention the field names.
+    assert "  path_error_raw:" not in second_prompt
+    assert "  path_error_reason:" not in second_prompt
+    assert "  path_error_suggestion:" not in second_prompt
+
+
 @pytest.mark.asyncio
 async def test_plan_phase_dispatches_to_single_branch_when_num_branches_eq_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
