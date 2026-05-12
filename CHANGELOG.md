@@ -2,6 +2,70 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.2] - 2026-05-12
+
+Architect-retry diagnostic + persistent-failure drop. v0.26.1's first
+real-world Unity QNX run failed when the architect emitted `notes` as a
+literal `EDIT_SCOPE:` entry, the validator correctly rejected it on
+attempt #1 + retry #1, and the run died with **zero recoverable
+diagnostics** — the architect's failed markdown was never persisted, and
+the retry envelope passed `str(exc)` instead of the structured `(raw,
+reason, suggestion)` fields the architect needed to fix the path.
+v0.26.2 ships four phases that close this failure class without
+loosening any existing safety property.
+
+### Fixed
+- Architect plan-validation failures now persist the rejected markdown
+  to `.autodev/debug/architect-failed-<unix-ms>.md` so the operator can
+  diagnose the bad output without re-running the entire plan phase.
+  Triggered on `PlanParseError`, `PydValidationError`, AND
+  `PathValidationError`. New helper:
+  `orchestrator.plan_phase._persist_failed_architect_plan`. (Phase 1a)
+
+### Improved
+- When the architect emits a path that fails `validate_files_exist`,
+  the retry envelope now passes typed `path_error_raw`,
+  `path_error_reason`, and `path_error_suggestion` fields as separate
+  context keys. The architect can correct just the bad path instead of
+  re-drafting the whole plan from the stringified exception. (Phase 1b)
+- Architect prompt (`src/agents/prompts/architect.md`) carries a
+  positive-only validation note clarifying that `EDIT_SCOPE:` entries
+  are tested against `git ls-files` and pointing the architect at the
+  new `path_error_*` retry fields. NO forbid-list — per the `/critic`
+  finding, negation phrasing risks both schema-contradiction and
+  LLM-negation-inflation. (Phase 4)
+
+### Added
+- Bounded architect-retry loop with persistent-failure drop. After 3
+  architect attempts where the same `(raw, reason)` recurs, the
+  orchestrator drops the bad scope entry from `plan.edit_scope`,
+  `phase.edit_scope`, `task.files`, and `task.extended_scope`, appends
+  a typed `scope_entry_dropped` ledger op, and continues. New
+  module-level constants `_MAX_ARCHITECT_ATTEMPTS = 3` and
+  `_DROP_AT_RECURRENCE = 3` (distinct names for the same numeric value
+  — they mean different things). New helpers in
+  `orchestrator.plan_phase`: `_validate_with_persistent_drop`,
+  `_drop_entry_from_plan`, `_build_retry_env`. (Phase 3)
+- **Hard empty-scope guard**: drops that would leave
+  `plan.edit_scope == []` (the documented whole-repo sentinel) are
+  refused — the original `PathValidationError` is re-raised. Silent
+  widening to whole-repo is a P0 risk this guard prevents. Two of the
+  six Phase-3 tests assert this guard fires. (Phase 3)
+- `LedgerOp` Literal extends with `"scope_entry_dropped"`. Audit-only —
+  no plan mutation on replay (the new plan with the dropped entry is
+  persisted via the `init_plan` op alongside). Payload shape:
+  `{path, reason, suggestion, attempt, recurrence_count}`. Also adds
+  the missing no-op handler for `"architect_consult"` (v0.26.1 op that
+  was registered in the Literal but had no `_apply_op` handler — would
+  crash on `replay_ledger`). (Phase 3)
+
+### Migration
+- Zero on-disk migration. Existing configs and plans load identically.
+  The new ledger op is append-only; no schema migration needed.
+- Operator-facing: when a run hits the new drop path, look in
+  `.autodev/debug/` for `architect-failed-*.md` files AND grep the
+  plan-ledger for `scope_entry_dropped` ops to see what got dropped.
+
 ## [0.26.1] - 2026-05-12
 
 QA-gate encoding fix + diagnostic surfacing + architect-consult escalation
