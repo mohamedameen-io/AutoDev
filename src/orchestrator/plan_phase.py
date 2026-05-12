@@ -147,36 +147,46 @@ def _build_retry_env(
     errors_seen: dict[tuple[str, str], int],
     dropped_entries: list[str],
 ) -> DelegationEnvelope:
-    """v0.26.2 Phase 3: build a retry envelope that carries:
+    """v0.26.2 Phase 3 / v0.27 Phase 4: build a retry envelope that carries:
 
     * the prior architect attempt (truncated to 2000 chars),
     * the stringified exception in ``parse_error`` (back-compat),
     * the typed ``path_error_*`` fields when ``exc`` is a
-      :class:`PathValidationError` (Phase 1b),
+      :class:`PathValidationError`,
     * the accumulated ``prior_errors`` list so the architect can see
       "you've now emitted this same path 2 times — fix it",
     * the list of entries previously dropped on this plan-phase run.
 
+    v0.27 (Commit 6) refactor: the context payload is now constructed
+    through :class:`orchestrator.retry_envelope.TypedRetryEnvelope`.
+    Behaviour is unchanged — the model is serialised via
+    :meth:`TypedRetryEnvelope.as_context_dict` so the wire JSON
+    matches v0.26.2 byte-for-byte.
+
     Returns a new :class:`DelegationEnvelope` (does not mutate the input).
     """
     from orchestrator.path_validator import PathValidationError
+    from orchestrator.retry_envelope import PriorError, TypedRetryEnvelope
 
-    ctx_extras: dict[str, Any] = {
-        "prior_attempt": prior_plan_md[:2000] if prior_plan_md else "",
-        "parse_error": str(exc) if exc is not None else "",
-        "prior_errors": [
-            {"raw": r, "reason": s, "count": n}
+    envelope = TypedRetryEnvelope(
+        prior_attempt=prior_plan_md[:2000] if prior_plan_md else "",
+        parse_error=str(exc) if exc is not None else "",
+        prior_errors=[
+            PriorError(raw=r, reason=s, count=n)
             for (r, s), n in errors_seen.items()
         ],
-        "dropped_entries": list(dropped_entries),
-        "hint": _retry_hint_text(),
-    }
-    if isinstance(exc, PathValidationError):
-        ctx_extras["path_error_raw"] = exc.raw
-        ctx_extras["path_error_reason"] = exc.reason
-        ctx_extras["path_error_suggestion"] = exc.suggestion or ""
+        dropped_entries=list(dropped_entries),
+        hint=_retry_hint_text(),
+        path_error_raw=exc.raw if isinstance(exc, PathValidationError) else "",
+        path_error_reason=(
+            exc.reason if isinstance(exc, PathValidationError) else ""
+        ),
+        path_error_suggestion=(
+            (exc.suggestion or "") if isinstance(exc, PathValidationError) else ""
+        ),
+    )
     return base_env.model_copy(
-        update={"context": {**base_env.context, **ctx_extras}}
+        update={"context": {**base_env.context, **envelope.as_context_dict()}}
     )
 
 
