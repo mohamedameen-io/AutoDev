@@ -216,6 +216,14 @@ LedgerOp = Literal[
     "task_auto_skipped",
     "architect_persistent_parse_error",
     "architect_persistent_pyd_error",
+    # v0.27 Phase 5 (audit §5): post-tournament structural-validity
+    # gate rejected the refined plan markdown. Audit-only; the plan
+    # state falls back to the pre-tournament version (already
+    # captured in the prior ``init_plan`` op). Payload:
+    # ``{reason: str, attempt: int}`` where reason is a short
+    # category ("parse_error" | "validate_files_exist" |
+    # "persistent_drop_refused").
+    "tournament_output_rejected_structurally",
 ]
 
 
@@ -640,8 +648,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         "task_auto_skipped",
         "architect_persistent_parse_error",
         "architect_persistent_pyd_error",
+        # v0.27 Phase 5: post-tournament structural-validity gate
+        # rejection. Audit-only — the plan-state falls back to the
+        # pre-tournament snapshot.
+        "tournament_output_rejected_structurally",
     ):
-        # v0.27 Phase 4: granular drop / persistent-error telemetry.
+        # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
+        # post-tournament structural-validity rejection.
         # All audit-only — the plan-state mutation flows through the
         # ``init_plan`` / ``snapshot`` op emitted in the same
         # plan-phase. ``task_auto_skipped`` is paired with an

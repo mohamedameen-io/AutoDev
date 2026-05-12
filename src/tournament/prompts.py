@@ -124,6 +124,8 @@ Worked example: Proposal 1 is 200 lines covering 12 phases; Proposal 2 is
 350 lines covering the same 12 phases plus restated rationale. Correct
 ranking: 1, 3, 2 (proposal 1 wins on length given equivalent coverage).
 
+A proposal whose ``EDIT_SCOPE:`` and ``Files:`` entries are concrete repo-relative paths that already exist on disk (or are clearly tagged ``[new]``) ranks higher than one that lists hedge text, placeholders, or paths the downstream validator would reject — the orchestrator's post-tournament structural-validity gate will reject the hedge variant outright, so picking it as the winner just burns the run.
+
 Then rank all three from best to worst:
 
 RANKING: [best], [second], [worst]

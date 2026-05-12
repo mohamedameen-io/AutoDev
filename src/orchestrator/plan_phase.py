@@ -842,19 +842,66 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                         err=str(recovery_exc),
                     )
             if refined_md and refined_md != plan_md:
+                # v0.27 Phase 5 (audit §5): structural-validity gate on
+                # the tournament-refined markdown. Three rejection modes:
+                #   1. parse_error — refined_md isn't a parseable plan.
+                #   2. validate_files_exist — parses, but lists paths
+                #      that don't exist on disk.
+                #   3. persistent_drop_refused — validation failed and
+                #      the empty-scope guard refused the drop.
+                # On any rejection, log + emit
+                # ``tournament_output_rejected_structurally`` and fall
+                # back to the pre-tournament plan (already in ``plan``
+                # and ``plan_md``).
+                fallback_plan = plan
+                fallback_plan_md = plan_md
+                rejection_reason: str | None = None
                 try:
-                    plan = parse_plan_markdown(refined_md, spec_hash=spec_hash)
-                    plan_md = refined_md
-                    logger.info(
-                        "plan_phase.tournament_applied",
-                        pre_bytes=len(plan_md),
-                        post_bytes=len(refined_md),
+                    candidate_plan = parse_plan_markdown(
+                        refined_md, spec_hash=spec_hash
                     )
                 except PlanParseError as exc:
+                    rejection_reason = "parse_error"
                     logger.warning(
                         "plan_phase.tournament_refined_unparseable",
                         err=str(exc),
                     )
+                else:
+                    try:
+                        candidate_plan = await _validate_with_persistent_drop(
+                            orch,
+                            candidate_plan,
+                            cwd,
+                            # Fresh counters: the tournament gate is its
+                            # own pass — pre-tournament error history
+                            # shouldn't immediately trigger a drop.
+                            errors_seen={},
+                            dropped_entries=[],
+                            attempt=0,
+                        )
+                        plan = candidate_plan
+                        plan_md = refined_md
+                        logger.info(
+                            "plan_phase.tournament_applied",
+                            pre_bytes=len(plan_md),
+                            post_bytes=len(refined_md),
+                        )
+                    except PathValidationError as exc:
+                        rejection_reason = "validate_files_exist"
+                        logger.warning(
+                            "plan_phase.tournament_refined_invalid_paths",
+                            err=str(exc),
+                        )
+                if rejection_reason is not None:
+                    await orch.plan_manager.ledger_append(
+                        op="tournament_output_rejected_structurally",
+                        payload={
+                            "reason": rejection_reason,
+                            "attempt": 0,
+                        },
+                    )
+                    plan = fallback_plan
+                    plan_md = fallback_plan_md
             else:
                 logger.info("plan_phase.tournament_no_change")
 
