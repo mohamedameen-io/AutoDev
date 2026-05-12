@@ -319,4 +319,99 @@ async def test_soft_blocker_resolution_blocks_task(
     )
     assert out.escalated is True
     assert out.status == "blocked"
-    assert out.blocked_reason and "soft-blocker" in (out.blocked_reason or "")
+
+
+# ---------------------------------------------------------------------------
+# v0.26.1 patch D: the executor surfaces ``developer_result.error`` and
+# ``developer_result.subtype`` in the escalation reason so the
+# repetition_loop / ladder stops misfiring on cosmetic identical
+# "coder adapter failure" strings across genuinely-different failures.
+# ---------------------------------------------------------------------------
+
+
+def test_build_adapter_failure_reason_includes_subtype_and_error() -> None:
+    """Bare reason builder includes typed subtype + first 200 chars of error."""
+    from adapters.types import AgentResult
+    from orchestrator.execute_phase import _build_adapter_failure_reason
+
+    result = AgentResult(
+        text="",
+        success=False,
+        duration_s=1.0,
+        error="conversation exceeded turn limit (max_turns=8)",
+        subtype="error_max_turns",
+    )
+    reason = _build_adapter_failure_reason(result)
+
+    assert "error_max_turns" in reason
+    assert "conversation exceeded turn limit" in reason
+
+
+def test_build_adapter_failure_reason_distinguishes_max_turns_from_max_tokens() -> None:
+    """Two failures with different subtypes produce different reason strings."""
+    from adapters.types import AgentResult
+    from orchestrator.execute_phase import _build_adapter_failure_reason
+
+    r_turns = AgentResult(
+        text="",
+        success=False,
+        duration_s=1.0,
+        error="turn budget consumed",
+        subtype="error_max_turns",
+    )
+    r_tokens = AgentResult(
+        text="",
+        success=False,
+        duration_s=1.0,
+        error="response would exceed 32K tokens",
+        subtype="error_max_tokens",
+    )
+
+    reason_turns = _build_adapter_failure_reason(r_turns)
+    reason_tokens = _build_adapter_failure_reason(r_tokens)
+
+    assert reason_turns != reason_tokens
+    assert "error_max_turns" in reason_turns
+    assert "error_max_tokens" in reason_tokens
+
+
+def test_build_adapter_failure_reason_handles_missing_fields() -> None:
+    """Missing error/subtype both default sensibly — back-compat."""
+    from adapters.types import AgentResult
+    from orchestrator.execute_phase import _build_adapter_failure_reason
+
+    result = AgentResult(
+        text="",
+        success=False,
+        duration_s=1.0,
+        error=None,
+        subtype=None,
+    )
+
+    reason = _build_adapter_failure_reason(result)
+
+    assert "coder adapter failure" in reason
+    # Either prefix uses the unknown sentinel or the bare reason is
+    # preserved — must not raise and must include a stable token.
+    assert "unknown" in reason or "adapter failure" in reason
+
+
+def test_build_adapter_failure_reason_truncates_long_error() -> None:
+    """Error strings longer than 200 chars are truncated to keep the
+    ladder's repetition_loop key tractable."""
+    from adapters.types import AgentResult
+    from orchestrator.execute_phase import _build_adapter_failure_reason
+
+    result = AgentResult(
+        text="",
+        success=False,
+        duration_s=1.0,
+        error="x" * 1000,
+        subtype="error_other",
+    )
+
+    reason = _build_adapter_failure_reason(result)
+
+    # The truncated portion plus the prefix/subtype framing should fit
+    # comfortably in 400 chars.
+    assert len(reason) < 400

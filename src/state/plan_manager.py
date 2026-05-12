@@ -805,6 +805,7 @@ class PlanManager:
                 pivot_count=existing.pivot_count,
                 search_count=existing.search_count,
                 last_search_iter=existing.last_search_iter,
+                architect_count=existing.architect_count,
                 last_event=existing.last_event,
             )
 
@@ -825,6 +826,7 @@ class PlanManager:
                 pivot_count=existing.pivot_count,
                 search_count=existing.search_count,
                 last_search_iter=existing.last_search_iter,
+                architect_count=existing.architect_count,
                 last_event="discard",
             )
             self._stuck_state[task_id] = updated
@@ -833,6 +835,7 @@ class PlanManager:
                 pivot_count=updated.pivot_count,
                 search_count=updated.search_count,
                 last_search_iter=updated.last_search_iter,
+                architect_count=updated.architect_count,
                 last_event=updated.last_event,
             )
 
@@ -852,6 +855,7 @@ class PlanManager:
                 pivot_count=existing.pivot_count + 1,
                 search_count=existing.search_count,
                 last_search_iter=existing.last_search_iter,
+                architect_count=existing.architect_count,
                 last_event="pivot",
             )
             self._stuck_state[task_id] = updated
@@ -860,6 +864,7 @@ class PlanManager:
                 pivot_count=updated.pivot_count,
                 search_count=updated.search_count,
                 last_search_iter=updated.last_search_iter,
+                architect_count=updated.architect_count,
                 last_event=updated.last_event,
             )
 
@@ -883,6 +888,7 @@ class PlanManager:
                 pivot_count=existing.pivot_count,
                 search_count=existing.search_count + 1,
                 last_search_iter=existing.last_search_iter + 1,
+                architect_count=existing.architect_count,
                 last_event="web_search",
             )
             self._stuck_state[task_id] = updated
@@ -891,6 +897,39 @@ class PlanManager:
                 pivot_count=updated.pivot_count,
                 search_count=updated.search_count,
                 last_search_iter=updated.last_search_iter,
+                architect_count=updated.architect_count,
+                last_event=updated.last_event,
+            )
+
+    async def increment_architect_consult(self, task_id: str) -> "StuckState":
+        """v0.26.1 patch G: bump ``architect_count`` for ``task_id``.
+
+        Mirrors :meth:`increment_pivot` / :meth:`increment_search`. Used
+        by the escalation ladder when the ARCHITECT_CONSULT rung fires.
+        Threshold is 1 (one-shot per task) — after this call the next
+        :func:`next_step` returns ``"SOFT_BLOCKER"``.
+        """
+        from orchestrator.escalation_ladder import StuckState
+
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            existing = self._stuck_state.get(task_id)
+            if existing is None:
+                existing = StuckState()
+            updated = StuckState(
+                discard_count=existing.discard_count,
+                pivot_count=existing.pivot_count,
+                search_count=existing.search_count,
+                last_search_iter=existing.last_search_iter,
+                architect_count=existing.architect_count + 1,
+                last_event="architect_consult",
+            )
+            self._stuck_state[task_id] = updated
+            return StuckState(
+                discard_count=updated.discard_count,
+                pivot_count=updated.pivot_count,
+                search_count=updated.search_count,
+                last_search_iter=updated.last_search_iter,
+                architect_count=updated.architect_count,
                 last_event=updated.last_event,
             )
 

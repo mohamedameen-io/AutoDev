@@ -21,8 +21,12 @@ from state.schemas import TaskStatus
 
 
 TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
+    # v0.26.1 patch G: ``in_progress`` -> ``skipped`` is now allowed so
+    # the ARCHITECT_CONSULT "refine-tasks" resolution can supersede a
+    # failing task with corrective sub-tasks. Metadata ``architect_consult_action="refine"``
+    # distinguishes the architect-driven skip from a user-driven one.
     "pending": {"in_progress", "skipped", "blocked"},
-    "in_progress": {"coded", "blocked", "in_progress"},
+    "in_progress": {"coded", "blocked", "in_progress", "skipped"},
     # auto-gates retry back to in_progress on failure
     "coded": {"auto_gated", "in_progress", "blocked"},
     "auto_gated": {"reviewed", "in_progress", "blocked"},

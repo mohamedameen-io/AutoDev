@@ -97,6 +97,13 @@ LedgerOp = Literal[
     "stuck_pivot",
     "soft_blocker_handoff",
     "course_correction_emitted",
+    # v0.26.1 patch G: architect-consult rung fired for a task. Audit-only
+    # — does NOT mutate plan state. Payload shape:
+    # ``{task_id, reason, architect_response_excerpt}`` (mirrors
+    # ``stuck_pivot`` / ``soft_blocker_handoff`` shape). The corrective
+    # sub-tasks landing from the architect's response are recorded via
+    # the regular ``append_corrective_tasks`` op emitted alongside.
+    "architect_consult",
     # v0.16.0: drift-verifier complete. Audit-only — does NOT mutate plan
     # state. Payload shape: ``{phase_id, passed, drift_findings: list[str],
     # evidence_path}``. Replay treats it as a no-op; the actual outcome

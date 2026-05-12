@@ -617,3 +617,144 @@ def test_developer_envelope_context_contains_complexity_hint() -> None:
     )
     env_legacy = _developer_envelope(untagged_task, extra_issues=[])
     assert env_legacy.context["complexity"] == "medium"
+
+
+# ---------------------------------------------------------------------------
+# v0.26.1 patch E: worker exception classification + traceback persistence.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_unicode_decode_error_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ``_execute_one`` raises ``UnicodeDecodeError``, the worker
+    classifies it as ``qa_gate_encoding_error`` in ``blocked_reason``.
+    """
+    from orchestrator import execute_phase as ep
+
+    async def boom(*_a: object, **_kw: object) -> object:
+        raise UnicodeDecodeError("utf-8", b"\xe8", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(ep, "_execute_one", boom)
+
+    adapter = StubAdapter(responses={})
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    task = await orch.plan_manager.get_task("1.1")
+    assert task is not None
+
+    out = await ep._execute_one_worker(orch, task, worktree_mgr=None)
+
+    assert out.status == "blocked"
+    reason = out.blocked_reason or ""
+    assert reason.startswith("qa_gate_encoding_error"), reason
+
+
+@pytest.mark.asyncio
+async def test_worker_os_error_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``OSError`` (file IO) maps to ``qa_gate_io_error``."""
+    from orchestrator import execute_phase as ep
+
+    async def boom(*_a: object, **_kw: object) -> object:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(ep, "_execute_one", boom)
+
+    adapter = StubAdapter(responses={})
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    task = await orch.plan_manager.get_task("1.1")
+    assert task is not None
+
+    out = await ep._execute_one_worker(orch, task, worktree_mgr=None)
+
+    assert out.status == "blocked"
+    reason = out.blocked_reason or ""
+    assert reason.startswith("qa_gate_io_error"), reason
+
+
+@pytest.mark.asyncio
+async def test_worker_timeout_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``asyncio.TimeoutError`` (and ``TimeoutError``) map to
+    ``qa_gate_timeout``.
+    """
+    import asyncio
+
+    from orchestrator import execute_phase as ep
+
+    async def boom(*_a: object, **_kw: object) -> object:
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(ep, "_execute_one", boom)
+
+    adapter = StubAdapter(responses={})
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    task = await orch.plan_manager.get_task("1.1")
+    assert task is not None
+
+    out = await ep._execute_one_worker(orch, task, worktree_mgr=None)
+
+    assert out.status == "blocked"
+    reason = out.blocked_reason or ""
+    assert reason.startswith("qa_gate_timeout"), reason
+
+
+@pytest.mark.asyncio
+async def test_worker_generic_exception_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unrecognised exception types keep the legacy ``worker_exception:``
+    prefix — back-compat with v0.25.* operators grepping log lines."""
+    from orchestrator import execute_phase as ep
+
+    class WeirdError(Exception):
+        pass
+
+    async def boom(*_a: object, **_kw: object) -> object:
+        raise WeirdError("something unusual")
+
+    monkeypatch.setattr(ep, "_execute_one", boom)
+
+    adapter = StubAdapter(responses={})
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    task = await orch.plan_manager.get_task("1.1")
+    assert task is not None
+
+    out = await ep._execute_one_worker(orch, task, worktree_mgr=None)
+
+    assert out.status == "blocked"
+    reason = out.blocked_reason or ""
+    assert reason.startswith("worker_exception"), reason
+
+
+@pytest.mark.asyncio
+async def test_worker_exception_writes_traceback_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Patch E: traceback is persisted to ``.autodev/debug/`` so operators
+    can diagnose without re-running with verbose logging."""
+    from orchestrator import execute_phase as ep
+    from state.paths import debug_dir
+
+    async def boom(*_a: object, **_kw: object) -> object:
+        raise UnicodeDecodeError("utf-8", b"\xe8", 0, 1, "trace it")
+
+    monkeypatch.setattr(ep, "_execute_one", boom)
+
+    adapter = StubAdapter(responses={})
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    task = await orch.plan_manager.get_task("1.1")
+    assert task is not None
+
+    await ep._execute_one_worker(orch, task, worktree_mgr=None)
+
+    dbg = debug_dir(tmp_path)
+    assert dbg.exists()
+    files = sorted(dbg.glob("worker-exception-1.1-*.txt"))
+    assert files, f"no worker-exception-1.1 traceback in {dbg}"
+    content = files[0].read_text(encoding="utf-8", errors="replace")
+    # Traceback should reference the exception type name.
+    assert "UnicodeDecodeError" in content

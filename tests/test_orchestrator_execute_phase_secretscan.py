@@ -46,8 +46,14 @@ def test_files_changed_for_secretscan_extracts_from_diff() -> None:
     assert paths == [Path("foo.py"), Path("bar.py")]
 
 
-def test_files_changed_for_secretscan_returns_none_when_no_diff() -> None:
-    """No diff → None (caller should fall back to legacy full-walk)."""
+def test_files_changed_for_secretscan_returns_empty_list_when_no_diff() -> None:
+    """No diff → empty list (v0.26.1 patch C: callers scan nothing).
+
+    Previously the function returned ``None`` to signal "fall back to a
+    legacy full-walk". On huge vendored trees the full-walk was a
+    footgun (the 2026-05-11 Unity / SDL2 incident). The new contract:
+    "no diff → scan no files".
+    """
     from orchestrator.execute_phase import _files_changed_for_secretscan
 
     result = AgentResult(
@@ -56,7 +62,14 @@ def test_files_changed_for_secretscan_returns_none_when_no_diff() -> None:
         duration_s=0.1,
         diff=None,
     )
-    assert _files_changed_for_secretscan(result) is None
+    assert _files_changed_for_secretscan(result) == []
+
+
+def test_files_changed_for_secretscan_returns_empty_list_when_developer_result_none() -> None:
+    """v0.26.1 patch C: ``None`` developer_result also yields an empty list."""
+    from orchestrator.execute_phase import _files_changed_for_secretscan
+
+    assert _files_changed_for_secretscan(None) == []
 
 
 def test_files_changed_for_secretscan_returns_empty_list_when_diff_empty() -> None:
@@ -69,7 +82,7 @@ def test_files_changed_for_secretscan_returns_empty_list_when_diff_empty() -> No
         duration_s=0.1,
         diff="",
     )
-    assert _files_changed_for_secretscan(result) is None
+    assert _files_changed_for_secretscan(result) == []
 
 
 def test_files_changed_for_secretscan_returns_empty_when_no_paths_in_diff() -> None:
@@ -165,11 +178,11 @@ async def test_secretscan_invoked_with_developer_diff_paths(
 
 
 @pytest.mark.asyncio
-async def test_secretscan_invoked_without_paths_when_no_developer_result(
+async def test_secretscan_invoked_with_empty_paths_when_no_developer_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Backward-compat: when developer_result is None (e.g. a future
-    gate-only path), secretscan runs with paths=None (full walk)."""
+    """v0.26.1 patch C: when developer_result is None, secretscan receives
+    ``paths=[]`` ("scan nothing") instead of ``None`` (legacy full walk)."""
     from plugins.registry import GateResult
 
     captured: dict = {}
@@ -223,4 +236,70 @@ async def test_secretscan_invoked_without_paths_when_no_developer_result(
 
     out = await ep._run_qa_gates(orch, FakeTask(), developer_result=None)
     assert out is None
-    assert captured["paths"] is None
+    assert captured["paths"] == []
+
+
+@pytest.mark.asyncio
+async def test_hallucination_guard_passes_empty_paths_when_no_developer_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.26.1 patch C: hallucination_guard receives ``paths=[]`` when there
+    is no developer diff. Previously it walked the full tree (the v0.13.0
+    legacy fallback) which on huge vendored trees both wasted budget and
+    surfaced encoding crashes.
+    """
+    from plugins.registry import GateResult
+
+    captured: dict = {}
+
+    async def fake_hallucination_guard(
+        cwd: Path,
+        paths: list[Path] | None = None,
+        **_k: object,
+    ) -> GateResult:
+        captured["paths"] = paths
+        return GateResult(passed=True, details="ok")
+
+    async def fake_pass(*_a: object, **_k: object) -> GateResult:
+        return GateResult(passed=True, details="ok")
+
+    from orchestrator import execute_phase as ep
+
+    monkeypatch.setattr(ep, "run_hallucination_guard", fake_hallucination_guard)
+    monkeypatch.setattr(ep, "run_syntax_check", lambda *a, **k: fake_pass())
+    monkeypatch.setattr(ep, "run_lint", lambda *a, **k: fake_pass())
+    monkeypatch.setattr(ep, "run_build_check", lambda *a, **k: fake_pass())
+    monkeypatch.setattr(ep, "run_tests", lambda *a, **k: fake_pass())
+    monkeypatch.setattr(ep, "run_secretscan", lambda *a, **k: fake_pass())
+    monkeypatch.setattr(ep, "detect_language", lambda *a, **k: "python")
+
+    class FakeCfg:
+        hallucination_guard = True
+
+        class qa_gates:
+            syntax_check = True
+            lint = True
+            build_check = True
+            test_runner = True
+            secretscan = False  # disable so we observe hallucination_guard
+            secretscan_baseline_enabled = False
+            secretscan_per_extension_thresholds = None
+            mutation_test_enabled = False
+            mutation_test_threshold = 0.7
+
+    orch = type(
+        "OrchStub",
+        (),
+        {
+            "cfg": FakeCfg(),
+            "cwd": tmp_path,
+            "plugin_registry": None,
+        },
+    )()
+
+    class FakeTask:
+        id = "1.1"
+
+    out = await ep._run_qa_gates(orch, FakeTask(), developer_result=None)
+    assert out is None
+    assert captured["paths"] == []

@@ -21,9 +21,22 @@ def test_web_search_remains_until_budget_exhausted() -> None:
     assert next_step(state) == "WEB_SEARCH"
 
 
-def test_search_count_3_promotes_to_soft_blocker() -> None:
-    """The 3-per-task cooldown caps autonomous escalation."""
+def test_search_count_3_promotes_to_architect_consult() -> None:
+    """v0.26.1 patch G: the 3-per-task search cooldown previously
+    promoted to SOFT_BLOCKER directly. The new ladder routes through
+    ARCHITECT_CONSULT first — the architect gets one shot before the
+    task is handed off to the human."""
     state = StuckState(discard_count=5, pivot_count=2, search_count=3)
+    assert next_step(state) == "ARCHITECT_CONSULT"
+
+
+def test_search_count_3_with_architect_already_consulted_promotes_to_soft_blocker() -> None:
+    """v0.26.1 patch G: once architect_count >= 1, the ladder exits to
+    SOFT_BLOCKER on subsequent escalations — the architect rung is
+    one-shot."""
+    state = StuckState(
+        discard_count=5, pivot_count=2, search_count=3, architect_count=1
+    )
     assert next_step(state) == "SOFT_BLOCKER"
 
 

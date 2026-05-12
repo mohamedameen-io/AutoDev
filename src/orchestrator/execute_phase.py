@@ -283,6 +283,419 @@ def _parse_stuck_resolution(critic_response: str) -> StuckResolution:
     return StuckResolution(action=action, guidance=guidance)
 
 
+# v0.26.1 patch G: architect-consult parser + helper. The directive set
+# is distinct from the critic's STUCK RECOVERY MODE ("refine" / "pivot"
+# / "soft-blocker"). The architect emits ONE of three outcomes:
+#
+# * ``refine-tasks`` — bullet list of sub-tasks. Orchestrator injects
+#   them via the existing ``parse_corrective_direction`` pipeline.
+# * ``infrastructure`` — environment / tooling failure; orchestrator
+#   flags ``escalated_infra`` and falls through to SOFT_BLOCKER.
+# * ``continue`` — the developer was on the right track; reset the
+#   retry budget once and let it try again.
+
+ArchitectAction = Literal[
+    "architect-refine",
+    "architect-infra",
+    "architect-continue",
+]
+
+
+@dataclass
+class ArchitectResolution:
+    """Parsed result from ``architect_b`` in CONSULT MODE.
+
+    Attributes:
+        action: One of ``architect-refine`` / ``architect-infra`` /
+            ``architect-continue``. Defaults to ``architect-infra`` —
+            the least-trusting fallback if the parser cannot extract a
+            directive (treats an unparseable response as an environment
+            problem and routes to human action via the SOFT_BLOCKER
+            follow-up).
+        guidance: Free-form text from the architect. For
+            ``architect-refine`` this is the bullet list passed to
+            :func:`parse_corrective_direction`. For ``architect-infra``
+            it's the one-line diagnosis surfaced as ``blocked_reason``.
+            For ``architect-continue`` it's the approval line surfaced
+            in the next developer's ``last_issues`` context.
+    """
+
+    action: ArchitectAction = "architect-infra"
+    guidance: str = ""
+
+
+# Regex matching the trailing ``RESOLUTION: <action>`` directive on its
+# own line. The architect emits ``refine-tasks`` / ``infrastructure`` /
+# ``continue`` (without the ``architect-`` prefix); the parser maps
+# them onto the typed ``ArchitectAction`` values.
+_ARCHITECT_DIRECTIVE_RE = re.compile(
+    r"^RESOLUTION:\s*(refine-tasks|infrastructure|continue)\s*$",
+    re.MULTILINE,
+)
+_ARCHITECT_ACTION_MAP: dict[str, ArchitectAction] = {
+    "refine-tasks": "architect-refine",
+    "infrastructure": "architect-infra",
+    "continue": "architect-continue",
+}
+
+
+def _parse_architect_resolution(architect_response: str) -> ArchitectResolution:
+    """Extract an :class:`ArchitectResolution` from the architect's text.
+
+    Looks for a ``RESOLUTION: <action>`` line, anchored to its own line.
+    On parse failure (no directive, unrecognised action, etc.) returns
+    ``ArchitectResolution(action="architect-infra", guidance=<raw response>)``
+    — the most conservative fallback that routes to human action rather
+    than silently retrying.
+
+    The guidance captured is everything FOLLOWING the matched directive
+    line. The architect_b_consult.md prompt format places the
+    actionable content (corrective sub-task bullets / one-line
+    diagnosis / one-line approval) AFTER the directive — distinct from
+    the critic's STUCK RECOVERY MODE format where the analysis lives
+    BEFORE the directive. The full response is preserved as guidance on
+    parse failure so operators can inspect what the architect said.
+    """
+    if not architect_response:
+        return ArchitectResolution(action="architect-infra", guidance="")
+
+    matches = list(_ARCHITECT_DIRECTIVE_RE.finditer(architect_response))
+    if not matches:
+        return ArchitectResolution(
+            action="architect-infra",
+            guidance=architect_response.strip(),
+        )
+    last = matches[-1]
+    action_raw = last.group(1)
+    action = _ARCHITECT_ACTION_MAP.get(action_raw)
+    if action is None:
+        return ArchitectResolution(
+            action="architect-infra",
+            guidance=architect_response.strip(),
+        )
+
+    # Guidance lives AFTER the directive line (architect prompt format).
+    guidance = architect_response[last.end():].strip()
+    return ArchitectResolution(action=action, guidance=guidance)
+
+
+async def _escalate_stuck_to_architect(
+    orch: "Orchestrator",
+    task: Task,
+    *,
+    stuck_state: object,
+    ladder_step: str,
+    recent_evidence: str = "",
+    prior_attempts: list[str] | None = None,
+    typed_errors: list[str] | None = None,
+    web_search_summary: str = "",
+    reviewer_feedback: str = "",
+) -> ArchitectResolution:
+    """v0.26.1 patch G: invoke ``architect_b`` in CONSULT MODE.
+
+    Mirrors :func:`_escalate_stuck_to_critic` but targets the architect
+    (the agent that designed the plan in the first place) and uses a
+    structurally different directive set (``refine-tasks`` /
+    ``infrastructure`` / ``continue``). The consult-mode prompt is
+    injected via ``extra_context`` since the existing :func:`delegate`
+    flow does not support per-call prompt swapping.
+
+    Args:
+        orch: Orchestrator instance.
+        task: Failing task whose autonomous budget is exhausted.
+        stuck_state: :class:`StuckState` for the task — counters surface
+            in the ARCHITECT_CONTEXT block.
+        ladder_step: Always ``"ARCHITECT_CONSULT"`` for the canonical
+            entry point. Stamped into the context block for forensics.
+        recent_evidence: Freshest excerpt of failing-test / adapter
+            output. Empty string allowed.
+        prior_attempts: Optional list of one-line summaries of the
+            most recent coder attempts.
+        typed_errors: Optional list of typed error signatures
+            (``qa_gate_encoding_error`` / ``error_max_turns`` / etc.)
+            extracted from prior worker exceptions or adapter results.
+        web_search_summary: Optional rendered summary of WEB_SEARCH rung
+            results from the prior escalations. Empty when none.
+        reviewer_feedback: Most recent reviewer output if any.
+
+    Returns the parsed :class:`ArchitectResolution`. On any delegate /
+    parse failure the result falls back to
+    ``ArchitectResolution(action="architect-infra", guidance=<raw>)``,
+    which causes the caller to route to SOFT_BLOCKER with the typed
+    flag — the conservative "we asked, and we did not get a usable
+    answer" path.
+    """
+    # Load the consult-mode prompt once; failure to read it is a
+    # build-time bug (the file ships in the package) but we degrade
+    # safely if a downstream operator has removed it.
+    try:
+        from agents import load_prompt as _load_prompt
+
+        consult_prompt = _load_prompt("architect_b_consult")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.architect_consult_prompt_load_failed",
+            err=str(exc),
+        )
+        consult_prompt = ""
+
+    # Indented YAML-ish prior_attempts block; empty when no attempts.
+    if prior_attempts:
+        attempts_block = "\n".join(f"  - {a}" for a in prior_attempts)
+    else:
+        attempts_block = "  - (no prior attempts recorded)"
+
+    typed_errors_block = (
+        "\n".join(f"  - {e}" for e in typed_errors) if typed_errors else "  - (none)"
+    )
+
+    discard_count = int(getattr(stuck_state, "discard_count", 0))
+    pivot_count = int(getattr(stuck_state, "pivot_count", 0))
+    search_count = int(getattr(stuck_state, "search_count", 0))
+    architect_count = int(getattr(stuck_state, "architect_count", 0))
+    last_event = str(getattr(stuck_state, "last_event", "") or "")
+
+    # Surface the original task definition verbatim so the architect
+    # does not need to re-derive intent from the failing diffs.
+    task_definition_block = (
+        f"  title: {task.title}\n"
+        f"  description: |\n{_indent_block(task.description, prefix='    ')}\n"
+        f"  files: {list(task.files)}\n"
+        f"  acceptance:\n"
+        + (
+            "\n".join(f"    - {ac.description}" for ac in task.acceptance)
+            if task.acceptance
+            else "    - (none declared)"
+        )
+        + "\n"
+    )
+
+    architect_context = (
+        (consult_prompt + "\n\n---\n\n" if consult_prompt else "")
+        + "ARCHITECT_CONTEXT:\n"
+        f"failing_task_id: {task.id}\n"
+        f"discard_count: {discard_count}\n"
+        f"pivot_count: {pivot_count}\n"
+        f"search_count: {search_count}\n"
+        f"architect_count: {architect_count}\n"
+        f"last_event: {last_event}\n"
+        f"ladder_step: {ladder_step}\n"
+        f"task_definition:\n{task_definition_block}"
+        f"developer_attempts:\n{attempts_block}\n"
+        f"typed_errors:\n{typed_errors_block}\n"
+        "reviewer_feedback: |\n"
+        f"{_indent_block(reviewer_feedback)}\n"
+        "web_search_summary: |\n"
+        f"{_indent_block(web_search_summary)}\n"
+        "recent_evidence: |\n"
+        f"{_indent_block(recent_evidence)}\n"
+    )
+
+    env = DelegationEnvelope(
+        task_id=task.id,
+        target_agent="architect_b",
+        action="consult",
+        acceptance=(
+            "End your response with exactly one RESOLUTION: directive "
+            "(refine-tasks / infrastructure / continue)."
+        ),
+        context={
+            "task_id": task.id,
+            "architect_consult_marker": True,
+            "ladder_step": ladder_step,
+        },
+    )
+    try:
+        result = await delegate(
+            orch,
+            "architect_b",
+            env,
+            extra_context=architect_context,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.architect_consult_delegate_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return ArchitectResolution(
+            action="architect-infra",
+            guidance=f"architect_b delegate raised: {exc}",
+        )
+
+    return _parse_architect_resolution(result.text or "")
+
+
+async def _dispatch_architect_consult(
+    orch: "Orchestrator",
+    task: Task,
+    *,
+    stuck_state: object,
+    reason: str,
+    prior_attempts: list[str] | None,
+    web_context_block: str,
+) -> Task | None:
+    """v0.26.1 patch G: drive the ARCHITECT_CONSULT rung end-to-end.
+
+    Increments the per-task ``architect_count`` (so the next ladder step
+    routes to SOFT_BLOCKER), invokes :func:`_escalate_stuck_to_architect`,
+    applies the parsed :class:`ArchitectResolution`, and returns the
+    updated :class:`Task` (or ``None`` if the dispatch must fall through
+    to the legacy retry path — e.g. the delegate raised before the
+    architect could weigh in).
+
+    The three return paths:
+
+    * ``architect-refine`` — corrective sub-tasks injected via
+      :meth:`PlanManager.append_corrective_tasks`. The failing task is
+      transitioned to ``skipped`` with ``metadata.reason =
+      "architect_consult_refine_replacement"``. Task is returned.
+    * ``architect-infra`` — task marked ``escalated`` + ``blocked``
+      (mirrors the soft-blocker path). The ``blocked_reason`` carries
+      the architect's one-line diagnosis with an ``architect_consult:``
+      prefix and an ``infrastructure`` flag in the metadata.
+    * ``architect-continue`` — retry budget reset; task transitioned to
+      ``in_progress`` so the outer loop picks it up again. Resolution's
+      guidance is appended to the next developer ``last_issues``.
+    """
+    from orchestrator.corrective_parser import parse_corrective_direction
+
+    # 1) Bump the counter under lock + emit the audit ledger op so the
+    # ladder's one-shot accounting holds across crash / replay.
+    await orch.plan_manager.increment_architect_consult(task.id)
+
+    # 2) Invoke the architect in consult mode.
+    arch_resolution = await _escalate_stuck_to_architect(
+        orch,
+        task,
+        stuck_state=stuck_state,
+        ladder_step="ARCHITECT_CONSULT",
+        recent_evidence=(
+            web_context_block + reason if web_context_block else reason
+        ),
+        prior_attempts=prior_attempts,
+    )
+
+    # 3) Always log the architect_consult ledger op, regardless of the
+    # action taken — operators want a single grep target for "did the
+    # consult fire on this task?".
+    try:
+        await orch.plan_manager.ledger_append(
+            op="architect_consult",
+            payload={
+                "task_id": task.id,
+                "reason": reason,
+                "action": arch_resolution.action,
+                "architect_response_excerpt": (arch_resolution.guidance or "")[:500],
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.ledger_append_failed",
+            op="architect_consult",
+            err=str(exc),
+        )
+
+    # 4) Branch on the resolution action.
+    if arch_resolution.action == "architect-refine":
+        # Inject corrective sub-tasks via the existing pipeline.
+        phase_id = task.phase_id
+        try:
+            plan = await orch.plan_manager.load()
+            base_task_count = 0
+            if plan is not None:
+                phase = next((p for p in plan.phases if p.id == phase_id), None)
+                if phase is not None:
+                    base_task_count = len(phase.tasks)
+            corrective_tasks = parse_corrective_direction(
+                arch_resolution.guidance,
+                phase_id=phase_id,
+                base_task_count=base_task_count,
+                phase_complexity=task.complexity,
+            )
+            if corrective_tasks:
+                await orch.plan_manager.append_corrective_tasks(
+                    phase_id, corrective_tasks
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.architect_refine_inject_failed",
+                task_id=task.id,
+                err=str(exc),
+            )
+        # Mark the failing task as ``skipped`` so the executor moves on
+        # to the corrective sub-tasks. (``superseded`` is not a valid
+        # TaskStatus — we use ``skipped`` with a typed metadata reason
+        # per the v0.26.1 plan's risk mitigation.)
+        try:
+            return await orch.plan_manager.update_task_status(
+                task.id,
+                "skipped",
+                meta={
+                    "blocked_reason": (
+                        f"architect_consult: refined into corrective sub-tasks "
+                        f"(see phase {phase_id})"
+                    ),
+                    "architect_consult_action": "refine",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.architect_refine_skip_failed",
+                task_id=task.id,
+                err=str(exc),
+            )
+            return task
+
+    if arch_resolution.action == "architect-infra":
+        # Mark escalated + blocked with the typed infra flag. Mirrors
+        # the SOFT_BLOCKER outcome path so downstream operators see a
+        # consistent shape, with the ``escalated_infra`` marker in
+        # metadata distinguishing the architect-diagnosed case from the
+        # plain soft-blocker.
+        await orch.plan_manager.mark_escalated(task.id)
+        diagnosis = arch_resolution.guidance or "architect diagnosed infrastructure failure"
+        return await orch.plan_manager.update_task_status(
+            task.id,
+            "blocked",
+            meta={
+                "blocked_reason": f"architect_consult: infrastructure: {diagnosis}",
+                "architect_consult_action": "infrastructure",
+                "escalated_infra": True,
+            },
+        )
+
+    if arch_resolution.action == "architect-continue":
+        # Reset the developer's retry budget once and put the task back
+        # into ``in_progress`` so the outer loop picks it up. The
+        # ``update_task_status`` meta carries the retry reset; the
+        # caller's ``last_issues`` is appended on the next iteration.
+        target_status = "in_progress" if task.status != "in_progress" else task.status
+        await orch.plan_manager.update_task_status(
+            task.id,
+            target_status,
+            meta={
+                "retry_count": 0,
+                "architect_consult_action": "continue",
+            },
+        )
+        return await orch.plan_manager.get_task(task.id) or task
+
+    # Defensive default — should be unreachable given the parser's
+    # exhaustive fallback. Treat as infrastructure so the operator sees
+    # the architect's raw output and can act.
+    return await orch.plan_manager.update_task_status(
+        task.id,
+        "blocked",
+        meta={
+            "blocked_reason": (
+                f"architect_consult: unparseable response — {(arch_resolution.guidance or '')[:200]}"
+            ),
+            "architect_consult_action": "unparseable",
+        },
+    )
+
+
 async def _escalate_stuck_to_critic(
     orch: "Orchestrator",
     task: Task,
@@ -1329,20 +1742,60 @@ async def _execute_one_worker(
     was re-raised here so the caller could persist suspend state. With
     InlineAdapter gone the special-case is gone; every exception is
     routed through the cascade-block path.
+
+    v0.26.1 patch E: exceptions are classified by ``isinstance`` so the
+    ``blocked_reason`` prefix carries typed semantics (encoding error vs
+    IO error vs timeout vs generic). The full traceback is persisted to
+    ``.autodev/debug/worker-exception-<task>-<ts>.txt`` for operator
+    diagnosis.
     """
     try:
         return await _execute_one(orch, task, worktree_mgr)
     except Exception as exc:  # noqa: BLE001
+        import asyncio
+        import traceback
+
+        from state.paths import debug_dir
+
+        if isinstance(exc, UnicodeDecodeError):
+            prefix = "qa_gate_encoding_error"
+        elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            prefix = "qa_gate_timeout"
+        elif isinstance(exc, OSError):
+            prefix = "qa_gate_io_error"
+        else:
+            prefix = "worker_exception"
+        blocked_reason = f"{prefix}: {exc}"
+
+        # Persist traceback for operator diagnosis. Failure to write is
+        # logged but never re-raised — the block path is already a
+        # degraded-mode return.
+        try:
+            dbg = debug_dir(orch.cwd)
+            dbg.mkdir(parents=True, exist_ok=True)
+            ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+            safe_id = task.id.replace("/", "_").replace(" ", "_")
+            tb_path = dbg / f"worker-exception-{safe_id}-{ts}.txt"
+            tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            tb_path.write_text(tb_text, encoding="utf-8", errors="replace")
+        except Exception as exc_tb:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.worker_traceback_write_failed",
+                task_id=task.id,
+                err=str(exc_tb),
+            )
+
         logger.warning(
             "execute_phase.worker_caught_exception",
             task_id=task.id,
+            prefix=prefix,
             err=str(exc),
         )
         try:
             blocked = await orch.plan_manager.update_task_status(
                 task.id,
                 "blocked",
-                meta={"blocked_reason": f"worker_exception: {exc}"},
+                meta={"blocked_reason": blocked_reason},
             )
         except Exception as exc2:  # noqa: BLE001
             logger.warning(
@@ -1891,7 +2344,10 @@ async def _execute_one(
                         ]
                         continue
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason="coder adapter failure"
+                    orch,
+                    task,
+                    retry_limit,
+                    reason=_build_adapter_failure_reason(developer_result),
                 )
                 if task.escalated:
                     return task
@@ -2384,6 +2840,22 @@ async def _try_retry_or_escalate(
                     task_id=task.id,
                     err=str(exc),
                 )
+
+        # v0.26.1 patch G: ARCHITECT_CONSULT rung — re-delegate to
+        # architect_b in consult mode. Branches before the regular
+        # critic dispatch because the response format + action set is
+        # distinct (refine-tasks / infrastructure / continue).
+        if step == "ARCHITECT_CONSULT":
+            arch_resolution = await _dispatch_architect_consult(
+                orch,
+                task,
+                stuck_state=stuck_state,
+                reason=reason,
+                prior_attempts=prior_attempts,
+                web_context_block=web_context_block,
+            )
+            if arch_resolution is not None:
+                return arch_resolution
 
         try:
             resolution = await _escalate_stuck_to_critic(
@@ -2997,23 +3469,56 @@ def _parse_test_counts(text: str) -> tuple[int, int, int]:
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
+def _build_adapter_failure_reason(
+    developer_result: AgentResult | None,
+) -> str:
+    """v0.26.1 patch D: surface ``developer_result.error`` + ``subtype`` in
+    the escalation reason so the repetition_loop / stuck-recovery ladder
+    sees semantic variation across genuinely-different failures.
+
+    Prior to this patch every coder-adapter failure produced the
+    identical string ``"coder adapter failure"`` regardless of the
+    underlying cause (``error_max_turns`` vs ``error_max_tokens`` vs
+    parser failure vs subprocess crash), so the repetition_loop course-
+    correction misfired by matching on the cosmetic symptom.
+
+    The returned reason starts with the legacy literal so any
+    case-insensitive matcher still recognises adapter-class failures,
+    appends the typed subtype, and the first 200 chars of the adapter's
+    own error message.
+    """
+    base = "coder adapter failure"
+    if developer_result is None:
+        return f"{base} (unknown)"
+    subtype = developer_result.subtype or "unknown"
+    raw_error = developer_result.error or "adapter failure"
+    truncated = raw_error[:200]
+    return f"{base} ({subtype}): {truncated}"
+
+
 def _files_changed_for_secretscan(
     developer_result: AgentResult | None,
-) -> list[Path] | None:
+) -> list[Path]:
     """Extract repo-relative paths from a developer ``AgentResult`` for the
     v0.13.0 diff-scoped secretscan.
 
-    Returns:
-        * ``None`` when the result is missing or has no diff text — the
-          caller falls back to the legacy full-walk behavior.
-        * ``[]`` when the diff is non-empty but contains no parseable
-          ``+++ b/`` headers (e.g. error output) — caller may choose to
-          skip the gate entirely (empty list scans nothing).
-        * ``list[Path]`` of repo-relative paths in first-seen, deduped
-          order.
+    v0.26.1 patch C — contract simplified to always return a list:
+
+    * ``[]`` when the result is missing, has no diff text, or carries an
+      unparseable diff (no ``+++ b/`` headers). The downstream gate sees
+      "scan no files" rather than the legacy ``None`` → full-walk fallback,
+      which was a footgun on huge vendored trees (the 2026-05-11 Unity /
+      SDL2 incident).
+    * ``list[Path]`` of repo-relative paths in first-seen, deduped order
+      when a parseable diff is present.
+
+    Callers do not need to special-case the empty case; passing
+    ``paths=[]`` through to ``run_secretscan`` / ``run_hallucination_guard``
+    /``run_mutation_test`` / ``run_code_size`` produces a clean "scan
+    nothing, pass the gate" outcome.
     """
     if developer_result is None or not developer_result.diff:
-        return None
+        return []
     return [Path(p) for p in extract_files_from_diff(developer_result.diff)]
 
 
@@ -3149,7 +3654,13 @@ async def _run_qa_gates(
         (
             "hallucination_guard",
             hallucination_guard_enabled,
-            lambda: run_hallucination_guard(cwd, paths=secretscan_paths),
+            lambda: run_hallucination_guard(
+                cwd,
+                paths=secretscan_paths,
+                extra_skip_dirs=getattr(
+                    cfg, "hallucination_guard_skip_dirs", None
+                ),
+            ),
         ),
         (
             "mutation_test",

@@ -58,7 +58,7 @@ async def test_hallucination_guard_invoked_with_developer_diff_paths(
     ``paths=[diff paths]``."""
     captured: dict = {}
 
-    async def fake_guard(cwd: Path, paths: list[Path] | None = None) -> GateResult:
+    async def fake_guard(cwd: Path, paths: list[Path] | None = None, **_kw: object) -> GateResult:
         captured["cwd"] = cwd
         captured["paths"] = paths
         return GateResult(passed=True, details="ok")
@@ -98,7 +98,7 @@ async def test_hallucination_guard_skipped_when_disabled(
     """``cfg.hallucination_guard=False`` short-circuits the guard."""
     invoked: dict = {"called": False}
 
-    async def fake_guard(cwd: Path, paths: list[Path] | None = None) -> GateResult:
+    async def fake_guard(cwd: Path, paths: list[Path] | None = None, **_kw: object) -> GateResult:
         invoked["called"] = True
         return GateResult(passed=True, details="ok")
 
@@ -126,7 +126,7 @@ async def test_hallucination_guard_failure_returns_detail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed guard run surfaces its details as the gate failure reason."""
-    async def fake_guard(cwd: Path, paths: list[Path] | None = None) -> GateResult:
+    async def fake_guard(cwd: Path, paths: list[Path] | None = None, **_kw: object) -> GateResult:
         return GateResult(
             passed=False,
             details="potential hallucinated API references:\nbad.py:1: hallucinated reference — fake not found in os",

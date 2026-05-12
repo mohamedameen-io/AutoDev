@@ -48,6 +48,7 @@ StuckStepLabel = Literal[
     "REFINE",
     "PIVOT",
     "WEB_SEARCH",
+    "ARCHITECT_CONSULT",
     "SOFT_BLOCKER",
 ]
 
@@ -62,6 +63,17 @@ _DISCARD_PIVOT_THRESHOLD: int = 5
 _PIVOT_WEB_SEARCH_THRESHOLD: int = 2
 _PIVOT_SOFT_BLOCKER_THRESHOLD: int = 3
 _SEARCH_COOLDOWN_CAP: int = 3
+# v0.26.1 patch G: one-shot architect consult rung. When the autonomous
+# search budget is exhausted (``search_count >= _SEARCH_ARCHITECT_THRESHOLD``)
+# and the architect has not yet been consulted on this task
+# (``architect_count < _ARCHITECT_SOFT_BLOCKER_THRESHOLD``), the ladder
+# routes to ``ARCHITECT_CONSULT`` for a final structured intervention.
+# After the architect's advice has been applied (``architect_count >= 1``)
+# the next escalation falls through to SOFT_BLOCKER. This mirrors human-
+# team behavior: junior dev struggles → asks the senior who designed the
+# plan → applies their guidance → escalates to human if still stuck.
+_SEARCH_ARCHITECT_THRESHOLD: int = 3
+_ARCHITECT_SOFT_BLOCKER_THRESHOLD: int = 1
 
 
 @dataclass
@@ -97,6 +109,11 @@ class StuckState:
     # Used for the 2-iteration cooldown (the ladder won't return
     # ``WEB_SEARCH`` twice in a row).
     last_search_iter: int = 0
+    # v0.26.1 patch G: number of times the ARCHITECT_CONSULT rung has
+    # fired for this task. Threshold is 1 — the rung is one-shot. Once
+    # the architect has weighed in, subsequent escalations fall through
+    # to SOFT_BLOCKER. Persisted via :meth:`PlanManager.increment_architect_consult`.
+    architect_count: int = 0
     last_event: str = ""
 
 
@@ -115,17 +132,29 @@ def next_step(state: StuckState) -> StuckStepLabel:
     * ``"WEB_SEARCH"`` — fetch top-3 search results and splice them as
       a ``WEB_CONTEXT:`` block into the next critic prompt. Bumps
       ``search_count``. v0.17.0 S2.
+    * ``"ARCHITECT_CONSULT"`` — v0.26.1 patch G. One-shot per task. Fires
+      when the web-search budget is exhausted (``search_count >= 3``) AND
+      the architect hasn't been consulted yet (``architect_count < 1``).
     * ``"SOFT_BLOCKER"`` — terminate the task with a human-decision
       handoff (no further autonomous escalation).
     """
-    # SOFT_BLOCKER beats every other step. v0.17.0: also fires when the
-    # web-search budget (3 per task) is exhausted — after three searches
-    # the ladder concludes the task is genuinely beyond autonomous reach.
+    # SOFT_BLOCKER beats every other step. v0.26.1 patch G: also fires
+    # once the architect has been consulted (architect_count >= 1) —
+    # the one-shot rung's exit path. The legacy v0.17.0 condition
+    # ``search_count >= _SEARCH_COOLDOWN_CAP`` no longer routes directly
+    # to SOFT_BLOCKER; it routes through ARCHITECT_CONSULT first.
     if (
         state.pivot_count >= _PIVOT_SOFT_BLOCKER_THRESHOLD
-        or state.search_count >= _SEARCH_COOLDOWN_CAP
+        or state.architect_count >= _ARCHITECT_SOFT_BLOCKER_THRESHOLD
     ):
         return "SOFT_BLOCKER"
+    # v0.26.1 patch G: ARCHITECT_CONSULT — the web-search budget is
+    # exhausted and the architect hasn't weighed in yet. One-shot.
+    if (
+        state.search_count >= _SEARCH_ARCHITECT_THRESHOLD
+        and state.architect_count < _ARCHITECT_SOFT_BLOCKER_THRESHOLD
+    ):
+        return "ARCHITECT_CONSULT"
     # WEB_SEARCH: pivot_count just past the threshold AND budget remaining.
     # v0.17.0 S2 — opt-in via cfg.web_search_enabled at the executor's
     # dispatch site; the ladder itself unconditionally returns the label
