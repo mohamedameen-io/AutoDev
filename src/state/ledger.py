@@ -231,6 +231,11 @@ LedgerOp = Literal[
     # flows through the regular ``update_task_status`` op emitted
     # alongside. Payload: ``{task_id, phase_id, file_path, message}``.
     "task_blocked_scope_violation",
+    # v0.27 Phase 7 (audit §7): role agent emitted an ``ESCALATE:``
+    # line at the start of its response. Audit-only; the actual
+    # routing to the architect-consult rung lives in the orchestrator
+    # caller. Payload: ``{role: str, reason: str, raw_response: str}``.
+    "agent_escalated",
 ]
 
 
@@ -663,6 +668,8 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # Audit-only — the task transitions to ``blocked`` via the
         # regular ``update_task_status`` op emitted alongside.
         "task_blocked_scope_violation",
+        # v0.27 Phase 7: role agent emitted ESCALATE: line. Audit-only.
+        "agent_escalated",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.
