@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -190,20 +191,51 @@ def _build_retry_env(
     )
 
 
+@dataclass(frozen=True)
+class _DropReport:
+    """v0.27 Phase 4: per-site record of where ``_drop_entry_from_plan``
+    removed an entry. Used by the caller to emit granular ledger ops
+    (``task_files_entry_dropped`` vs. ``phase_edit_scope_entry_dropped``
+    etc.) instead of the v0.26.2 catch-all ``scope_entry_dropped``.
+    """
+
+    plan_edit_scope: bool = False
+    phase_edit_scope_phase_ids: tuple[str, ...] = ()
+    task_files_task_ids: tuple[str, ...] = ()
+    task_files_new_task_ids: tuple[str, ...] = ()
+    task_extended_scope_task_ids: tuple[str, ...] = ()
+
+    @property
+    def any_dropped(self) -> bool:
+        return (
+            self.plan_edit_scope
+            or bool(self.phase_edit_scope_phase_ids)
+            or bool(self.task_files_task_ids)
+            or bool(self.task_files_new_task_ids)
+            or bool(self.task_extended_scope_task_ids)
+        )
+
+
 def _drop_entry_from_plan(
-    plan: Plan, bad_path: str
-) -> tuple[Plan, bool]:
-    """v0.26.2 Phase 3: drop ``bad_path`` from every validator-walked
-    scope site, returning ``(new_plan, was_dropped)``.
+    plan: Plan,
+    bad_path: str,
+    *,
+    include_files_new: bool = False,
+) -> tuple[Plan, bool, _DropReport]:
+    """v0.26.2 Phase 3 / v0.27 Phase 4: drop ``bad_path`` from every
+    validator-walked scope site, returning ``(new_plan, was_dropped,
+    drop_report)``.
 
     Drops from:
       - ``plan.edit_scope``
       - every ``phase.edit_scope`` (when non-None — ``None`` means inherit)
       - every ``task.files``
       - every ``task.extended_scope``
+      - every ``task.files_new`` (v0.27 — opt-in via ``include_files_new``)
 
-    Does NOT touch ``task.files_new`` — those are the architect's declared
-    about-to-be-created files and the v0.24.3 validator already skips them.
+    Defaults preserve v0.26.2 behaviour (``files_new`` untouched). The
+    persistent-drop helper uses ``include_files_new=True`` as a
+    fallback when no other site contains the bad path.
 
     A path matches if it equals an entry OR if it equals the entry with
     a trailing ``/`` trimmed (the validator treats scope entries as
@@ -213,25 +245,30 @@ def _drop_entry_from_plan(
     validators re-fire on the new objects. Direct in-place mutation would
     NOT re-trigger validation and would leave the new model in a
     potentially-invalid state.
+
+    The third tuple element :class:`_DropReport` records which sites
+    were touched so the caller can emit granular ledger ops.
     """
     norm = bad_path.rstrip("/")
-    was_dropped = False
 
     def _filter(entries: list[str]) -> tuple[list[str], bool]:
         kept = [e for e in entries if e.rstrip("/") != norm]
         return kept, len(kept) != len(entries)
 
     new_plan_edit, dropped_at_plan_level = _filter(list(plan.edit_scope))
-    if dropped_at_plan_level:
-        was_dropped = True
 
     new_phases: list[Phase] = []
+    phase_edit_scope_phase_ids: list[str] = []
+    task_files_task_ids: list[str] = []
+    task_files_new_task_ids: list[str] = []
+    task_extended_scope_task_ids: list[str] = []
+
     for phase in plan.phases:
         new_phase_edit: list[str] | None = phase.edit_scope
         if phase.edit_scope is not None:
             ph_kept, ph_dropped = _filter(list(phase.edit_scope))
             if ph_dropped:
-                was_dropped = True
+                phase_edit_scope_phase_ids.append(phase.id)
                 new_phase_edit = ph_kept
 
         new_tasks: list[Task] = []
@@ -239,14 +276,27 @@ def _drop_entry_from_plan(
         for task in phase.tasks:
             t_files, t_files_dropped = _filter(list(task.files))
             t_ext, t_ext_dropped = _filter(list(task.extended_scope))
-            if t_files_dropped or t_ext_dropped:
-                was_dropped = True
+            if include_files_new:
+                t_files_new, t_files_new_dropped = _filter(
+                    list(task.files_new)
+                )
+            else:
+                t_files_new, t_files_new_dropped = list(task.files_new), False
+            if t_files_dropped:
+                task_files_task_ids.append(task.id)
+            if t_ext_dropped:
+                task_extended_scope_task_ids.append(task.id)
+            if t_files_new_dropped:
+                task_files_new_task_ids.append(task.id)
+
+            if t_files_dropped or t_ext_dropped or t_files_new_dropped:
                 any_task_mutated = True
                 new_tasks.append(
                     task.model_copy(
                         update={
                             "files": t_files,
                             "extended_scope": t_ext,
+                            "files_new": t_files_new,
                         }
                     )
                 )
@@ -265,15 +315,22 @@ def _drop_entry_from_plan(
         else:
             new_phases.append(phase)
 
-    if was_dropped:
+    report = _DropReport(
+        plan_edit_scope=dropped_at_plan_level,
+        phase_edit_scope_phase_ids=tuple(phase_edit_scope_phase_ids),
+        task_files_task_ids=tuple(task_files_task_ids),
+        task_files_new_task_ids=tuple(task_files_new_task_ids),
+        task_extended_scope_task_ids=tuple(task_extended_scope_task_ids),
+    )
+    if report.any_dropped:
         new_plan = plan.model_copy(
             update={
                 "edit_scope": new_plan_edit,
                 "phases": new_phases,
             }
         )
-        return new_plan, True
-    return plan, False
+        return new_plan, True, report
+    return plan, False, report
 
 
 async def _validate_with_persistent_drop(
@@ -317,12 +374,21 @@ async def _validate_with_persistent_drop(
             # so the outer except increments + retries the architect.
             if errors_seen.get(key, 0) + 1 < _DROP_AT_RECURRENCE:
                 raise
-            # Threshold met — try to drop the bad entry.
-            new_plan, was_dropped = _drop_entry_from_plan(plan, exc.raw)
+            # Threshold met — try to drop the bad entry. First pass
+            # leaves ``files_new`` alone (v0.26.2 contract); if nothing
+            # came off, retry with the files_new opt-in so v0.27 can
+            # also clean up bogus ``[new]``-tagged paths the v0.26.2
+            # logic stranded.
+            new_plan, was_dropped, report = _drop_entry_from_plan(
+                plan, exc.raw, include_files_new=False
+            )
             if not was_dropped:
-                # The bad path isn't in any validator-walked site we
-                # know how to drop from (e.g. it appears only as a
-                # task.files_new entry, which we deliberately preserve).
+                new_plan, was_dropped, report = _drop_entry_from_plan(
+                    plan, exc.raw, include_files_new=True
+                )
+            if not was_dropped:
+                # Bad path nowhere in the plan — caller must surface
+                # the original error.
                 raise
             # Hard empty-scope guard: only fires when plan.edit_scope
             # was non-empty before AND would become empty after the
@@ -331,6 +397,21 @@ async def _validate_with_persistent_drop(
             # phase guards against.
             if plan.edit_scope and not new_plan.edit_scope:
                 raise
+            # v0.27 Phase 4 empty-guards: a phase-level edit_scope
+            # override that becomes empty (was non-None and non-empty,
+            # now an empty list) silently widens the phase back to the
+            # plan's whole scope — also a P0 silent-widen risk. Refuse.
+            for old_phase, new_phase in zip(plan.phases, new_plan.phases):
+                if (
+                    old_phase.edit_scope is not None
+                    and old_phase.edit_scope
+                    and new_phase.edit_scope is not None
+                    and not new_phase.edit_scope
+                ):
+                    raise
+            # v0.26.2 back-compat: keep emitting the catch-all
+            # ``scope_entry_dropped`` op so existing forensics tools
+            # (and ledgers replayed by older versions) still work.
             await orch.plan_manager.ledger_append(
                 op="scope_entry_dropped",
                 payload={
@@ -341,12 +422,119 @@ async def _validate_with_persistent_drop(
                     "recurrence_count": errors_seen.get(key, 0) + 1,
                 },
             )
+            # v0.27 Phase 4 granular telemetry: one op per site
+            # touched, with payload pinning which task/phase id lost
+            # the entry. The ``init_plan`` op emitted later carries
+            # the actual state mutation.
+            await _emit_granular_drop_ops(
+                orch,
+                report,
+                bad_path=exc.raw,
+                reason=exc.reason,
+                attempt=attempt + 1,
+                recurrence_count=errors_seen.get(key, 0) + 1,
+            )
             plan = new_plan
             dropped_entries.append(exc.raw)
+            # v0.27 Phase 4: a task that lost ALL its files (both
+            # ``files`` and ``files_new`` are empty post-drop) has no
+            # work left — auto-skip it rather than dispatching an
+            # empty worker.
+            plan = await _auto_skip_empty_tasks(orch, plan)
             # Loop continues — re-validate the mutated plan. Because
             # the path was just removed from every validator-walked
             # site, the next call CANNOT raise on the same key —
             # guaranteed termination.
+
+
+async def _emit_granular_drop_ops(
+    orch: "Orchestrator",
+    report: _DropReport,
+    *,
+    bad_path: str,
+    reason: str,
+    attempt: int,
+    recurrence_count: int,
+) -> None:
+    """Emit one granular ledger op per site touched by a drop.
+
+    Pairs with the catch-all ``scope_entry_dropped`` op so v0.26.2 forensics
+    tools keep working; the granular ops let v0.27+ telemetry point at the
+    specific (task_id, phase_id) that lost an entry.
+    """
+    base = {
+        "path": bad_path,
+        "reason": reason,
+        "attempt": attempt,
+        "recurrence_count": recurrence_count,
+    }
+    if report.plan_edit_scope:
+        # The plan-level drop is already covered by the catch-all op —
+        # no granular variant needed (the v0.26.2 schema is sufficient).
+        pass
+    for phase_id in report.phase_edit_scope_phase_ids:
+        await orch.plan_manager.ledger_append(
+            op="phase_edit_scope_entry_dropped",
+            payload={**base, "phase_id": phase_id},
+        )
+    for task_id in report.task_files_task_ids:
+        await orch.plan_manager.ledger_append(
+            op="task_files_entry_dropped",
+            payload={**base, "task_id": task_id},
+        )
+    for task_id in report.task_files_new_task_ids:
+        await orch.plan_manager.ledger_append(
+            op="task_files_new_entry_dropped",
+            payload={**base, "task_id": task_id},
+        )
+    for task_id in report.task_extended_scope_task_ids:
+        await orch.plan_manager.ledger_append(
+            op="task_extended_scope_entry_dropped",
+            payload={**base, "task_id": task_id},
+        )
+
+
+async def _auto_skip_empty_tasks(
+    orch: "Orchestrator", plan: Plan
+) -> Plan:
+    """v0.27 Phase 4: tasks whose ``files`` AND ``files_new`` lists are
+    both empty after a drop have no work left for the developer to do —
+    auto-transition them to ``status="skipped"`` rather than dispatching
+    a worker that would produce an empty diff.
+
+    Emits ``task_auto_skipped`` (audit-only) for each transition.
+    Returns the mutated plan (no-op when nothing was auto-skipped).
+    """
+    new_phases: list[Phase] = []
+    any_skipped = False
+    for phase in plan.phases:
+        new_tasks: list[Task] = []
+        phase_changed = False
+        for task in phase.tasks:
+            if (
+                not task.files
+                and not task.files_new
+                and task.status == "pending"
+            ):
+                phase_changed = True
+                any_skipped = True
+                new_tasks.append(task.model_copy(update={"status": "skipped"}))
+                await orch.plan_manager.ledger_append(
+                    op="task_auto_skipped",
+                    payload={
+                        "task_id": task.id,
+                        "reason": "all_files_dropped",
+                    },
+                )
+            else:
+                new_tasks.append(task)
+        if phase_changed:
+            new_phases.append(phase.model_copy(update={"tasks": new_tasks}))
+        else:
+            new_phases.append(phase)
+    if any_skipped:
+        return plan.model_copy(update={"phases": new_phases})
+    return plan
 
 
 async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
@@ -516,6 +704,31 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                 if isinstance(exc, PathValidationError):
                     key = (exc.raw, exc.reason)
                     errors_seen[key] = errors_seen.get(key, 0) + 1
+                else:
+                    # v0.27 Phase 4: route PlanParseError /
+                    # PydValidationError through a typed error-class
+                    # counter so the third recurrence emits a
+                    # ``architect_persistent_*_error`` ledger op (caller
+                    # can surface this in the doctor / metrics CLI).
+                    err_class_key = (type(exc).__name__, "")
+                    errors_seen[err_class_key] = (
+                        errors_seen.get(err_class_key, 0) + 1
+                    )
+                    if errors_seen[err_class_key] >= _DROP_AT_RECURRENCE:
+                        op_name = (
+                            "architect_persistent_parse_error"
+                            if isinstance(exc, PlanParseError)
+                            else "architect_persistent_pyd_error"
+                        )
+                        await orch.plan_manager.ledger_append(
+                            op=op_name,
+                            payload={
+                                "exc_class": type(exc).__name__,
+                                "attempt": attempt + 1,
+                                "recurrence_count": errors_seen[err_class_key],
+                                "archived_path": str(archived),
+                            },
+                        )
                 logger.warning(
                     "plan_phase.parse_failed_retrying",
                     err=str(exc),

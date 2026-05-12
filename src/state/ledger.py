@@ -198,6 +198,24 @@ LedgerOp = Literal[
     # surface common offenders via ``autodev metrics regex-timeouts``
     # rather than reading raw stderr.
     "regex_timeout",
+    # v0.27 Phase 4 (audit §4): granular persistent-drop telemetry. All
+    # audit-only — the mutation of plan state lives in the regular
+    # ``init_plan`` / ``snapshot`` op emitted alongside. Payload shape:
+    # ``{path: str, reason: str, attempt: int, recurrence_count: int}``
+    # for the four ``_dropped`` variants; ``{task_id: str, reason: str}``
+    # for ``task_auto_skipped``; ``{exc_class: str, attempt: int,
+    # recurrence_count: int, archived_path: str | None}`` for the
+    # ``architect_persistent_*_error`` variants. The v0.26.2 catch-all
+    # ``scope_entry_dropped`` op is preserved for back-compat (older
+    # ledgers replay cleanly); new code emits the granular variant
+    # alongside so forensics can see exactly which site lost the entry.
+    "task_files_entry_dropped",
+    "task_files_new_entry_dropped",
+    "task_extended_scope_entry_dropped",
+    "phase_edit_scope_entry_dropped",
+    "task_auto_skipped",
+    "architect_persistent_parse_error",
+    "architect_persistent_pyd_error",
 ]
 
 
@@ -612,6 +630,23 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # alongside (or the per-task ``revert_task_to_pending`` path for
         # reap_orphans). Replay treats these as no-ops — they are
         # forensics for "what did the resume / watchdog do".
+        return plan
+
+    if op in (
+        "task_files_entry_dropped",
+        "task_files_new_entry_dropped",
+        "task_extended_scope_entry_dropped",
+        "phase_edit_scope_entry_dropped",
+        "task_auto_skipped",
+        "architect_persistent_parse_error",
+        "architect_persistent_pyd_error",
+    ):
+        # v0.27 Phase 4: granular drop / persistent-error telemetry.
+        # All audit-only — the plan-state mutation flows through the
+        # ``init_plan`` / ``snapshot`` op emitted in the same
+        # plan-phase. ``task_auto_skipped`` is paired with an
+        # ``update_task_status`` op that transitions the task to
+        # ``skipped``; the telemetry op records *why*.
         return plan
 
     if plan is None:
