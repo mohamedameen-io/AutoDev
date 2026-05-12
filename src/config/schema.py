@@ -483,6 +483,12 @@ class QAGatesConfig(BaseModel):
     # ceiling, the gate logs ``regex_timeout`` and skip-and-warns rather
     # than pinning the orchestrator. Tune lower on huge repos.
     regex_timeout_per_file_s: float = 10.0
+    # v0.26.1 patch B: operator-extensible vendor-tree skip list for the
+    # hallucination_guard whole-tree walk. UNIONED with the built-in
+    # default (``External``, ``Tools``, ``vendor``, ``third_party``,
+    # ``third-party``, plus the build-artifact set). Use for project-
+    # specific vendor directories not covered by the defaults.
+    hallucination_guard_skip_dirs: list[str] = Field(default_factory=list)
 
 
 class GuardrailsConfig(BaseModel):
@@ -494,7 +500,14 @@ class GuardrailsConfig(BaseModel):
     # parsing (Phase 3 functionality) to be fully enforced; currently
     # tool_calls are populated only when stream-json is used.
     max_tool_calls_per_task: int = 60
-    max_duration_s_per_task: int = 900
+    # v0.26.1 patch F: bumped from 900s → 2400s. The 900s default
+    # predated the v0.8.0 per-complexity timeout escalation
+    # (``tournament.task_overrides.TASK_TIMEOUT_S_DEFAULTS["complex"] =
+    # 1800``). With 1800s available for a single complex developer call
+    # plus reviewer headroom (~600s), 2400s is the new floor below
+    # which legitimate runs trip on the guardrail rather than on the
+    # subprocess timeout. Operators with explicit values are unaffected.
+    max_duration_s_per_task: int = 2400
     max_diff_bytes: int = 5_242_880
     cost_budget_usd_per_plan: float | None = None
 

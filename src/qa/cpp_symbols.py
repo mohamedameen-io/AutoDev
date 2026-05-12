@@ -277,9 +277,10 @@ def scan_cpp_file(path: Path, repo_root: Path) -> list[str]:
     includes (no local headers), we do NOT emit findings — system headers
     are not parsed.
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+    from qa._io import safe_read_source
+
+    text = safe_read_source(path)
+    if text is None:
         return []
 
     local_includes = extract_local_includes(text)

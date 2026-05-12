@@ -493,3 +493,18 @@ def test_legacy_config_without_num_branches_loads() -> None:
     legacy.pop("num_branches", None)
     reloaded = TournamentPhaseConfig.model_validate(legacy)
     assert reloaded.num_branches == 1
+
+
+def test_max_duration_s_per_task_default_is_2400() -> None:
+    """v0.26.1 patch F: GuardrailsConfig default bumped from 900s → 2400s.
+
+    Rationale: the 900s default predated the v0.8.0 per-complexity
+    timeout escalation. ``TASK_TIMEOUT_S_DEFAULTS["complex"] = 1800`` so
+    a single legitimate complex developer call can consume more than the
+    whole-task wall clock; the reviewer never gets to run. 2400s = 4x
+    the previous default (1800 complex + 600 reviewer headroom).
+    """
+    from config.schema import GuardrailsConfig
+
+    cfg = GuardrailsConfig()
+    assert cfg.max_duration_s_per_task == 2400

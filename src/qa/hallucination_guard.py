@@ -51,6 +51,13 @@ DEFAULT_PER_FILE_TIMEOUT_S = 10.0
 
 
 # Files / dirs we never walk (mirrors the secretscan skip set).
+# v0.26.1 patch B: extended with vendored-tree conventions
+# (``External``, ``Tools``, ``vendor``, ``third_party``, ``third-party``)
+# after the 2026-05-11 Unity / SDL2 incident showed those trees both
+# wasted scan budget and carried encoding traps. Operators with
+# project-specific ``External/`` directories (rare) extend the set via
+# ``cfg.qa_gates.hallucination_guard_skip_dirs`` — the operator list is
+# UNIONED with this default, never replacing it.
 _SKIP_DIRS: frozenset[str] = frozenset(
     {
         ".git",
@@ -63,6 +70,12 @@ _SKIP_DIRS: frozenset[str] = frozenset(
         "dist",
         "build",
         ".tox",
+        # v0.26.1 patch B — vendored trees.
+        "External",
+        "Tools",
+        "vendor",
+        "third_party",
+        "third-party",
     }
 )
 
@@ -83,14 +96,28 @@ _CPP_EXTS: frozenset[str] = frozenset(
 
 
 def _iter_files(
-    cwd: Path, paths: list[Path] | None
+    cwd: Path,
+    paths: list[Path] | None,
+    *,
+    extra_skip_dirs: frozenset[str] | None = None,
 ) -> list[Path]:
     """Yield source files under *cwd* or in the *paths* whitelist.
 
     v0.19.0: returns Python, TypeScript / JavaScript, and C++ source files
     (the dispatcher routes by extension).
+
+    v0.26.1 patch B / C: ``extra_skip_dirs`` extends the module-level
+    ``_SKIP_DIRS`` constant with operator-configured directories. ``paths``
+    semantics:
+
+    * ``None`` — full ``cwd`` walk respecting ``_SKIP_DIRS``.
+    * ``[]`` — empty whitelist; scan nothing. (Patch C contract: when no
+      developer diff is available, the caller passes ``paths=[]`` to mean
+      "skip the gate entirely" rather than degrading to a full walk.)
+    * non-empty list — scan only those paths (subject to existence checks).
     """
     accepted = _PY_EXTS | _TS_EXTS | _CPP_EXTS
+    skip = _SKIP_DIRS if not extra_skip_dirs else _SKIP_DIRS | extra_skip_dirs
     if paths is not None:
         out: list[Path] = []
         seen: set[Path] = set()
@@ -124,7 +151,7 @@ def _iter_files(
     out = []
     for ext in accepted:
         for item in cwd.rglob(f"*{ext}"):
-            if any(part in _SKIP_DIRS for part in item.parts):
+            if any(part in skip for part in item.parts):
                 continue
             out.append(item)
     return out
@@ -169,9 +196,10 @@ def _module_has_attr(module: object, attr: str) -> bool:
 
 def _scan_python_file(path: Path, repo_root: Path) -> list[str]:
     """Return a list of finding strings for one Python file."""
-    try:
-        source = path.read_text(encoding="utf-8")
-    except OSError:
+    from qa._io import safe_read_source
+
+    source = safe_read_source(path)
+    if source is None:
         return []
     try:
         tree = ast.parse(source, filename=str(path))
@@ -312,9 +340,10 @@ def _resolve_ts_package(cwd: Path, package: str) -> bool:
 
 def _scan_typescript_file(path: Path, repo_root: Path) -> list[str]:
     """Return findings for one TypeScript / JavaScript file."""
-    try:
-        source = path.read_text(encoding="utf-8")
-    except OSError:
+    from qa._io import safe_read_source
+
+    source = safe_read_source(path)
+    if source is None:
         return []
     try:
         rel = path.relative_to(repo_root).as_posix()
@@ -428,24 +457,38 @@ async def run_hallucination_guard(
     cwd: Path,
     paths: list[Path] | None = None,
     per_file_timeout_s: float = DEFAULT_PER_FILE_TIMEOUT_S,
+    *,
+    extra_skip_dirs: list[str] | frozenset[str] | None = None,
 ) -> GateResult:
     """Scan *cwd* (or *paths*) for hallucinated API references.
 
     Args:
         cwd: Repository root.
-        paths: Optional diff-scope filter. When non-None, only the listed
-            files are walked (Python / TypeScript / C++ extensions only).
-            Mirrors v0.13.0's secretscan diff-scope signature.
+        paths: Optional diff-scope filter. When ``None``, walk *cwd*
+            respecting :data:`_SKIP_DIRS`. When ``[]`` (v0.26.1 patch C),
+            scan nothing — the caller signalled "no developer diff, skip
+            this gate". Non-empty list whitelists those files only.
         per_file_timeout_s: v0.22.1 A1 — per-file wall-clock ceiling. On
             timeout the file is skip-and-warn'd. Default
             :data:`DEFAULT_PER_FILE_TIMEOUT_S`.
+        extra_skip_dirs: v0.26.1 patch B — operator-configured directory
+            names UNIONED with :data:`_SKIP_DIRS`. Pass-through from
+            ``cfg.qa_gates.hallucination_guard_skip_dirs``. Has no effect
+            when ``paths`` is non-None (the whitelist path doesn't walk).
 
     Returns:
         :class:`GateResult` with ``passed=False`` and a finding list when
         any hallucinations are detected. Otherwise ``passed=True`` with a
         benign details string.
     """
-    files = _iter_files(cwd, paths)
+    skip_set: frozenset[str] | None
+    if extra_skip_dirs is None:
+        skip_set = None
+    elif isinstance(extra_skip_dirs, frozenset):
+        skip_set = extra_skip_dirs
+    else:
+        skip_set = frozenset(extra_skip_dirs)
+    files = _iter_files(cwd, paths, extra_skip_dirs=skip_set)
     all_findings: list[str] = []
     for f in files:
         findings = await _dispatch_with_timeout(
