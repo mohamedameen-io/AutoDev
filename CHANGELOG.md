@@ -2,6 +2,132 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0] - 2026-05-12
+
+Autonomy-stability audit. v0.26.2's persistent-failure drop closed one
+class of architect-output failure; the v0.27 chain hardens every adjacent
+layer so plans run end-to-end on the standard architect-output failure
+modes with zero operator intervention. Eleven phases shipped across nine
+commits (mutmut gate deferred to v0.28 — see Out of scope).
+
+### Fixed
+- Diff-scoped QA gates (secretscan, hallucination_guard, mutation_test,
+  code_size) no longer silently pass when the developer ships a
+  non-empty but unparseable diff body. `extract_files_from_diff(strict=True)`
+  raises `DiffParseError`; `_run_qa_gates` translates that into a
+  blocking failure for diff-producing tasks. Investigation tasks opt
+  out via the new `Task.produces_diff=False` field. (Phase 6 / audit §6)
+- secretscan emits an explicit info-severity skip when `paths=[]`
+  instead of silently scanning nothing. (Audit §6.3)
+- edit_scope violations now block only the offending task instead of
+  every pending task across every phase. The v0.26.2 blanket-block
+  fallback still fires when every pending task violates the scope
+  (preserves safety for truly-broken plans). (Phase 3 / audit §3)
+
+### Improved
+- Plan parser strips hedge text from architect-emitted paths at parse
+  time (paren-hedge, inline comments, placeholder tokens like `TBD`,
+  multi-word phrases without slashes). Closes a family of "architect
+  emitted hedge, persistent-drop cleaned it up after three retries"
+  failures upstream — most plans now validate on the first architect
+  attempt. Legitimate paths with spaces (e.g. `docs/My File.md`) are
+  preserved via the explicit "has slash" check. (Phase 1 / audit §1)
+- Persistent-failure drop now also walks `task.files_new` as a fallback,
+  enforces an empty-guard at the phase-edit_scope level (refuses to
+  silently widen back to plan scope), and auto-skips tasks whose
+  files + files_new are both empty after a drop. Phase-level granular
+  ledger ops let forensics pin which `(task_id, phase_id)` lost an
+  entry. (Phase 4 / audit §4)
+- Architect retry-envelope payload is now a Pydantic
+  `TypedRetryEnvelope` model rather than an inline dict, catching
+  field-name typos at construction time. Wire format unchanged.
+  (Phase 4 prep / audit §4)
+- Hedge-repro integration test pinned to the v0.27 fixed-behaviour
+  spec: paren-hedged `Task.files` recovers via Phase 1 parser in one
+  architect attempt; bare-token EDIT_SCOPE entries recover via the
+  v0.26.2 persistent-drop in three. (Phase 0 → Phase 11)
+
+### Added
+- Phase 0 test infrastructure: hedge-text fixture library at
+  `tests/fixtures/`, exhaustive LedgerOp handler check (would have
+  caught v0.26.1's missing `architect_consult` handler at PR time),
+  deterministic hedge-pattern reproducer. No `src/` changes — the
+  regression spec every later v0.27 phase tightens against.
+  (Phase 0)
+- `Task.produces_diff: bool = True` field. Investigation tasks set
+  `False` to opt out of the fail-closed diff-scoped gate.
+- `errors.DiffParseError`, `errors.EmptyDiffScopeError` typed exceptions.
+- `orchestrator.plan_parser.ParsedFilesReport` dataclass +
+  `_normalize_path_entry` helper. Drop reasons are structured strings
+  (`paren_hedge`, `bracket_hedge`, `placeholder`, `space_without_slash`,
+  etc.) logged with `task_id` for forensics.
+- `orchestrator.retry_envelope.TypedRetryEnvelope` + `PriorError`
+  Pydantic models. `extra="forbid"` so typos surface at construction
+  time.
+- Post-tournament structural-validity gate. The refined plan markdown
+  must parse cleanly AND every listed path must exist on disk (or
+  be `[new]`-tagged) — failures fall back to the pre-tournament
+  plan and emit `tournament_output_rejected_structurally` for
+  forensics. (Phase 5 / audit §5)
+- `dag.collect_edit_scope_violations`: returns a list of violations
+  with task / phase / file_path metadata attached, replacing the
+  raise-first-then-discard contract used internally before v0.27.
+- `orchestrator.escalation_envelope.parse_escalation_line`: detects
+  the `ESCALATE: <reason>` line every role prompt is now instructed
+  to emit when genuinely blocked. Pairs the prompt-level autonomy
+  clause (see Changed) with the runtime detector so blocked agents
+  route to architect-consult instead of burning a retry cycle.
+  (Phase 7 / audit §7)
+- `Makefile` with `test`, `test-stability`, `mutate-parser` targets.
+- 10 new audit-only ledger ops: `task_files_entry_dropped`,
+  `task_files_new_entry_dropped`, `task_extended_scope_entry_dropped`,
+  `phase_edit_scope_entry_dropped`, `task_auto_skipped`,
+  `architect_persistent_parse_error`, `architect_persistent_pyd_error`,
+  `tournament_output_rejected_structurally`,
+  `task_blocked_scope_violation`, `agent_escalated`. All emitted
+  alongside existing catch-all ops so v0.26.2 forensics tooling keeps
+  working.
+
+### Changed
+- Architect prompts now embed a structured-field-discipline section
+  spelling out the parser's hedge-text drop rules and the three
+  supported ways to express uncertainty (omit, `[new]`, or
+  Extended-scope+Justification). Pairs with the parser hardening in
+  Phase 1. (Phase 2 / audit §2)
+- All 14 role prompts embed a shared autonomy clause: roles do not
+  ask clarifying questions; when genuinely blocked they emit a
+  single `ESCALATE: <reason>` line that the orchestrator routes to
+  architect-consult. The legacy "would you like to create a spec?"
+  prompt in `architect.md` is reworked into a one-shot decision.
+  (Phase 7 / audit §7)
+- `extract_files_from_diff` accepts a new `strict=False` keyword
+  argument. Default preserves v0.26.2 behaviour for legacy callers
+  (phase_review_runner). The QA-gate site opts in via `strict=True`
+  to fail-closed on garbage diff bodies.
+
+### Migration
+- **Ledger forward-compatibility**: v0.27 introduces 10 new audit-only
+  ledger ops. A user who runs `autodev` under v0.27 and then downgrades
+  to v0.26.2 cannot `autodev resume` — v0.26.2's `_apply_op` raises
+  `LedgerCorruptError` on the new op names. To downgrade, first run
+  `autodev reset --hard` (destroys plan state) OR manually edit
+  `.autodev/plan-ledger.jsonl` to remove lines whose `op` field matches
+  any of the 10 new op names listed above. Forward compatibility within
+  the v0.27.x series is preserved.
+- No on-disk schema migrations. Existing `.autodev/config.json`,
+  `plan.json`, and pre-v0.27 ledgers load unchanged.
+
+### Out of scope
+- `mutmut` kill-rate gate (Commit 4) deferred to v0.28: mutmut 3.x's
+  CLI differs from the original plan's expected interface (config-file
+  driven rather than `--paths-to-mutate` flag). Phase 0's unit
+  coverage on `plan_parser` gives enough confidence to ship without
+  mutation testing in v0.27.
+- P1 phases 8 (pipeline-wide typed retry envelope), 9 (doctor --deep
+  + ledger integrity validator), and 10 (cost cap + BOM + drain
+  timeout + plateau-on-default) are not in this release. Tracked for
+  v0.28.
+
 ## [0.26.2] - 2026-05-12
 
 Architect-retry diagnostic + persistent-failure drop. v0.26.1's first
