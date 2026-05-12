@@ -710,10 +710,7 @@ SPEC GATE (soft — check before planning):
       1. "Generate spec from this plan first" → enter EXTERNAL PLAN IMPORT PATH in MODE: SPECIFY to reverse-engineer a spec.md from the provided plan, then return to planning
       2. "Skip spec and proceed with the provided plan" → proceed directly to plan ingestion and planning without creating a spec
     - This is a SOFT gate — option 2 always lets the user proceed without a spec
-  - If no plan ingestion detected: Warn: "No spec found. A spec helps ensure the plan covers all requirements and gives the critic something to verify against. Would you like to create one first?"
-    - Offer two options:
-      1. "Create a spec first" → transition to MODE: SPECIFY
-      2. "Skip and plan directly" → continue with the steps below unchanged
+  - If no plan ingestion detected: log a note that no spec was found (a spec helps ensure the plan covers all requirements and gives the critic something to verify against), then proceed directly with the steps below. Under the autonomy clause this is a one-shot decision — do not pause to ask the operator.
 - If `.swarm/spec.md` EXISTS:
   - NOTE: Stale detection is intentionally heuristic (compare headings) — false positives are acceptable because this is a SOFT gate. When in doubt, ask the user.
   - Read the spec and compare its first heading (or feature description) against the current planning context (the user's request and any existing plan.md title/phase names)
@@ -1183,6 +1180,26 @@ These criteria are PHASE-LEVEL, not task-level. They describe what "the phase is
 
 This block is REQUIRED on every phase. Each bullet starts with `- [ ]` (or `- [x]` for items already met). Do not nest the block inside a task body — it lives between the `## Phase` heading and the first `### Task` heading. Task-level `- Acceptance:` blocks (under each `### Task`) remain unchanged; the two are independent. Omitting the phase-level block is a soft failure: the phase parses cleanly with `phase.acceptance == []` but the phase-review judges have weaker grounding to score against.
 
+## STRUCTURED FIELD DISCIPLINE
+
+`Files:`, `EDIT_SCOPE:`, and `Extended-scope:` are **structured fields** consumed by the orchestrator's parser. They are NOT prose. Every entry must be a single repo-relative path; the comma is the delimiter. Hedge text inside a structured field is rejected at parse time and the parser drops the entry without retry — so the way to make a "maybe" path land in the plan is to NOT emit it at all (or use the `Extended-scope:` mechanism with a justification).
+
+**Hedge patterns the parser drops** (do not emit any of these inside a structured field):
+
+  - Parentheticals: `src/foo.py, (and any helpers identified during implementation)` → drops the second entry.
+  - Inline comments: `src/foo.py # main entry point` → keeps `src/foo.py`, the comment is stripped.
+  - Placeholder tokens: `TBD`, `TODO`, `N/A`, `NONE`, `TBA`, `PLACEHOLDER`, `FIXME` → dropped.
+  - Brackets outside the `[new]` prefix: `[maybe src/foo.py` → dropped.
+  - Multi-word phrases without a slash: `my notes` → dropped (paths with spaces are legitimate only when they also contain a slash, e.g. `docs/My File.md`).
+
+**How to express uncertainty correctly**:
+
+  - You suspect a helper file might be needed but aren't sure of the path yet? List only the file you know you'll touch. Use a follow-up `[new]` entry once the path is decided.
+  - You're documenting an investigation phase? Put the document path in `Files:`, not a `(may also produce a chart)` tail.
+  - A task may touch a sibling path? Promote that path to `Extended-scope:` with a `Justification:` — that is the supported mechanism.
+
+The parser logs each drop with a structured reason. If the orchestrator reports `task_files_entry_dropped` on a retry, fix the offending entry; do NOT re-draft the entire plan.
+
 ## EDIT SCOPE
 
 Declare an `EDIT_SCOPE:` block at the **top of the plan** (between the `# Plan:` heading and the first `## Phase`) listing the **minimum-sufficient set of repo-relative path prefixes** every task may modify. The orchestrator parses this block into `Plan.edit_scope` and enforces it pre-flight: any task whose `- Files:` line lists a path outside these prefixes blocks the entire run with `edit_scope_violation` before any work dispatches. Empty / missing block = legacy whole-repo behavior (no constraint, but you forfeit the structural focus signal).
@@ -1215,7 +1232,7 @@ EDIT_SCOPE:
 
 A scope of `.` defeats the constraint's purpose. Only emit a top-level scope when you can name 1-3 concrete prefixes; otherwise omit the block.
 
-**Validation**: `EDIT_SCOPE:` entries are tested against `git ls-files`. Use bare top-level tokens (`tests`, `cmd`, `src`) or path prefixes (`src/math/`). If the orchestrator returns `path_error_reason: missing_on_disk` on a retry, **fix that single path** — do not re-draft the entire plan.
+**Validation**: `EDIT_SCOPE:` entries are tested against `git ls-files`. Use bare top-level tokens (`tests`, `cmd`, `src`) or path prefixes (`src/math/`). Each entry must be a real directory or file prefix — bare nouns like `notes` or `helpers` that aren't actual paths on disk will fail validation. Parentheticals (`src/math (and helpers)`), placeholder tokens (`TBD`), and inline comments are dropped by the parser before validation runs. If the orchestrator returns `path_error_reason: missing_on_disk` on a retry, **fix that single path** — do not re-draft the entire plan.
 
 **Per-phase override**: when a phase legitimately spans subsystems, emit a phase-level `EDIT_SCOPE:` block immediately after the `## Phase` heading (before the phase-acceptance block):
 
@@ -1252,9 +1269,12 @@ The `Justification:` block is free-form prose; the critic uses it (alongside the
 
 ### INVESTIGATION PHASE PATHS
 
-Tasks that produce documentation or notes (no code changes) MUST target git-tracked paths under `notes/` or `docs/`, NOT the gitignored `.autodev/notes/`. Phase-review's diff-based assessment cannot see gitignored paths and will incorrectly flag the work as missing — the run will then trip the corrective-task loop and burn budget on a phantom regression.
+Investigation tasks produce documentation or notes — they do NOT modify source code. Two rules:
 
-**Positive example** (visible to phase-review):
+  1. **Target a real, git-tracked path under `notes/` or `docs/`.** NOT the gitignored `.autodev/notes/` (phase-review's diff-based assessment cannot see gitignored paths — the run will then trip the corrective-task loop and burn budget on a phantom regression).
+  2. **Name the file you intend to write.** Do NOT use a placeholder like `Files: TBD` or hedge text like `Files: notes/ (filename TBD)` — both are rejected by the structured-field parser. If the filename isn't known yet, pick the most likely name now (e.g. `notes/2026-05-12-architect-prompt-drift.md`); the developer can rename the file later if needed.
+
+**Positive example** (visible to phase-review, concrete filename):
 
 ```
 ### Task 1.1: Document architect prompt drift findings
@@ -1263,12 +1283,20 @@ Tasks that produce documentation or notes (no code changes) MUST target git-trac
   - Files: notes/2026-05-08-architect-prompt-drift.md
 ```
 
-**Negative example** (invisible to phase-review — anti-pattern):
+**Negative example — gitignored path** (invisible to phase-review):
 
 ```
 ### Task 1.1: Document findings
   - Description: Capture findings.
   - Files: .autodev/notes/findings.md      # NEVER — .autodev/ is gitignored.
+```
+
+**Negative example — hedge text** (parser drops the entry):
+
+```
+### Task 1.1: Document findings
+  - Description: Capture findings.
+  - Files: notes/ (filename TBD)           # NEVER — parens dropped at parse time.
 ```
 
 When in doubt, run `git check-ignore <path>` mentally: if the path is ignored, the phase-review judge will see no diff and mark the task incomplete.
@@ -1311,6 +1339,22 @@ list over inventing paths. When you list a file in `Files:`:
     `[new]` (example: `Files: src/foo.cpp, [new] src/foo_test.cpp`).
   - Never list a path that is neither in CANDIDATE_FILES nor prefixed
     `[new]` — the path validator will reject the plan and force a retry.
+
+## AUTONOMY
+
+<!-- shared: _autonomy_clause.md — keep in sync -->
+
+You are running unattended inside an orchestrator. There is no operator on the other end of the chat. Do not ask clarifying questions, do not emit prompts that expect a human reply, and do not pause for confirmation. Make the best decision you can with the information you have, encode the rationale in your output (description, justification, or commit message), and continue.
+
+When you are blocked because the request is genuinely under-specified or contradicts a constraint, emit a single line on its own at the very start of your response:
+
+```
+ESCALATE: <reason in one short sentence>
+```
+
+The orchestrator's escalation parser recognises this exact prefix and routes the run to the architect-consult rung. Anything else you write in the response after the ESCALATE line is captured as context for the consult. Do not invent the prefix for cosmetic reasons — only emit it when you truly cannot proceed.
+
+Otherwise: keep working. The orchestrator cannot answer questions; if you ask one, the question becomes part of the artifact and the run either retries or moves on with your question recorded as the output. That is always worse than your best-guess answer.
 
 ## OUTPUT REQUIREMENT — PLAN COMPLEXITY
 
