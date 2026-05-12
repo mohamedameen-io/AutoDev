@@ -2,6 +2,115 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.1] - 2026-05-12
+
+QA-gate encoding fix + diagnostic surfacing + architect-consult escalation
+rung. The first full Unity-scale C++ run on v0.26.0 (2026-05-11) exposed
+six concrete defects in the QA-gate + escalation layer plus one missing
+feature; v0.26.1 ships all seven as one release. Orchestrator core
+behavior (subprocess dispatch, tournaments, FSM) is unchanged.
+
+### Fixed
+- UTF-8 decode crash on user source files with non-ASCII bytes (Latin-1
+  surnames in vendored copyright headers, mixed-encoding ASCII art, etc.).
+  Introduces ``qa._io.safe_read_source`` which centralizes the
+  ``read_text(errors="replace")`` contract; three scanners
+  (``qa.cpp_symbols.scan_cpp_file``,
+  ``qa.hallucination_guard._scan_python_file``,
+  ``qa.hallucination_guard._scan_typescript_file``) previously crashed
+  on the first non-UTF-8 byte instead of substituting ``U+FFFD``.
+  (patches A, B, C)
+- ``qa.hallucination_guard._SKIP_DIRS`` extended to skip vendored trees
+  (``External``, ``Tools``, ``vendor``, ``third_party``, ``third-party``)
+  in addition to the legacy ``.git`` / ``.venv`` / ``node_modules`` /
+  build-artifact set. Operators with project-specific vendor directories
+  can extend the default set via ``cfg.qa_gates.hallucination_guard_skip_dirs``
+  (the operator list is UNIONED with the default, never replacing it).
+  (patch B)
+- ``_files_changed_for_secretscan`` contract flipped from "``None`` when
+  no diff → callers do a legacy full-walk" to "``[]`` when no diff →
+  callers scan nothing". The full-walk fallback was a footgun on huge
+  vendored trees. Affected downstream gates: ``secretscan``,
+  ``hallucination_guard``, ``mutation_test``, ``code_size``. (patch C)
+
+### Improved
+- Adapter failure modes now surface with the typed ``subtype`` (e.g.
+  ``error_max_turns``, ``error_max_tokens``) and the first 200 chars of
+  the adapter's error in the escalation reason. Previously every
+  coder-adapter failure produced the identical literal
+  ``"coder adapter failure"`` regardless of underlying cause, so the
+  repetition_loop course-correction misfired by matching on the
+  cosmetic symptom. New helper:
+  ``orchestrator.execute_phase._build_adapter_failure_reason``.
+  (patch D)
+- ``_execute_one_worker`` now classifies caught exceptions by
+  ``isinstance`` and emits a typed ``blocked_reason`` prefix
+  (``qa_gate_encoding_error`` / ``qa_gate_io_error`` /
+  ``qa_gate_timeout`` / ``worker_exception``). The full traceback is
+  persisted to ``.autodev/debug/worker-exception-<task>-<ts>.txt`` via
+  ``state/paths.py:debug_dir`` for operator action without re-running
+  with verbose logging. (patch E)
+
+### Changed
+- ``GuardrailsConfig.max_duration_s_per_task`` default bumped from
+  ``900`` to ``2400`` seconds. The 900s default predated the v0.8.0
+  per-complexity timeout escalation (``TASK_TIMEOUT_S_DEFAULTS["complex"]
+  = 1800``); legitimate complex tasks could consume their entire
+  subprocess budget and trip the wall-clock guardrail before the
+  reviewer could run. Operators with explicit values are unaffected —
+  only the default changed. (patch F)
+- FSM extension: ``in_progress -> skipped`` transition is now allowed
+  (was ``pending -> skipped`` only) so the architect-consult
+  ``refine-tasks`` resolution can supersede a failing task with
+  corrective sub-tasks. (patch G)
+
+### Added
+- ``ARCHITECT_CONSULT`` escalation rung
+  (``orchestrator.escalation_ladder``). When the developer cannot
+  figure out a failing task and the autonomous escalation budget is
+  exhausted (``search_count >= 3``), the orchestrator re-delegates to
+  ``architect_b`` in CONSULT MODE for a final structured intervention
+  before terminal handoff. One-shot per task — after the architect has
+  weighed in (``architect_count >= 1``), the next escalation falls
+  through to SOFT_BLOCKER. New prompt:
+  ``src/agents/prompts/architect_b_consult.md``. New ledger op:
+  ``architect_consult``. The architect returns one of three
+  resolutions:
+  - ``RESOLUTION: refine-tasks`` — bullet list of corrective sub-tasks.
+    Orchestrator appends them via the existing
+    ``plan_manager.append_corrective_tasks`` pipeline and marks the
+    failing task as ``skipped`` with metadata
+    ``architect_consult_action="refine"``.
+  - ``RESOLUTION: infrastructure`` — environment / tooling diagnosis.
+    Orchestrator marks the task ``escalated`` + ``blocked`` with
+    ``escalated_infra=True`` in metadata; surfaces the architect's
+    diagnosis in ``blocked_reason``.
+  - ``RESOLUTION: continue`` — the developer was on the right track.
+    Orchestrator resets ``retry_count`` to 0 and puts the task back to
+    ``in_progress``.
+  Mimics human-team behavior: junior dev struggles → asks the senior
+  who designed the plan → applies their guidance → escalates to human
+  only if still stuck. (patch G)
+- ``StuckState.architect_count`` field +
+  ``PlanManager.increment_architect_consult`` mirror the existing
+  ``pivot_count`` / ``search_count`` per-task accounting. (patch G)
+
+### Migration
+- Zero on-disk migration needed. Existing ``.autodev/config.json`` and
+  ``.autodev/plan.json`` files load and run identically. Operators
+  with ``cfg.guardrails.max_duration_s_per_task`` set explicitly retain
+  their value (only the default changed).
+- ``_files_changed_for_secretscan`` return-type tightened from
+  ``list[Path] | None`` to ``list[Path]``. The function is module-
+  private (underscore-prefixed); no public consumers exist.
+- ``run_hallucination_guard`` accepts a new ``extra_skip_dirs`` keyword
+  argument (default ``None``). Existing callers continue to work.
+
+### Tests
+~25 new tests (4 qa_io + 3 _SKIP_DIRS + 5 secretscan/hallucination_guard
+contract flip + 4 retry-reason + 5 worker-exception + 1 config + 11
+architect_consult + 5 ladder regressions). Total suite: ~2,411 passed.
+
 ## [0.26.0] - 2026-05-12
 
 Subprocess-only architecture. ``InlineAdapter`` and the file-based
