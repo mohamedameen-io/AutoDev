@@ -1215,6 +1215,8 @@ EDIT_SCOPE:
 
 A scope of `.` defeats the constraint's purpose. Only emit a top-level scope when you can name 1-3 concrete prefixes; otherwise omit the block.
 
+**Validation**: `EDIT_SCOPE:` entries are tested against `git ls-files`. Use bare top-level tokens (`tests`, `cmd`, `src`) or path prefixes (`src/math/`). If the orchestrator returns `path_error_reason: missing_on_disk` on a retry, **fix that single path** — do not re-draft the entire plan.
+
 **Per-phase override**: when a phase legitimately spans subsystems, emit a phase-level `EDIT_SCOPE:` block immediately after the `## Phase` heading (before the phase-acceptance block):
 
 ```

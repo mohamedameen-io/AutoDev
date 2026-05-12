@@ -40,3 +40,26 @@ def test_architect_prompt_documents_notes_path_convention() -> None:
     assert ".autodev/notes" in body
     # Positive guidance — the git-tracked alternative.
     assert "notes/" in body or "docs/" in body
+
+
+def test_architect_prompt_has_edit_scope_validation_note() -> None:
+    """v0.26.2 Phase 4: the architect prompt carries a positive-only
+    validation note clarifying that ``EDIT_SCOPE`` entries are tested
+    against ``git ls-files`` and that the typed ``path_error_*`` retry
+    fields are the architect's repair signal. NO forbid-list — per the
+    /critic finding, negation phrasing risks both schema-contradiction
+    and LLM-negation-inflation.
+    """
+    body = _read()
+    # Positive validation note must mention the validation source AND
+    # the retry-field name.
+    assert "git ls-files" in body
+    assert "path_error_reason: missing_on_disk" in body
+    # Hard guard: NO forbid-list phrasing slipped in (per /critic).
+    forbid_phrases = ["never include", "must not include", "forbidden"]
+    for phrase in forbid_phrases:
+        assert phrase not in body, (
+            f"forbid-list phrasing {phrase!r} must not appear in the "
+            "architect prompt — use positive guidance only (per "
+            "v0.26.2 Phase 4 /critic finding)."
+        )
