@@ -364,6 +364,79 @@ def is_in_scope(file_path: str, scope: list[str]) -> bool:
     return False
 
 
+def collect_edit_scope_violations(
+    plan: Plan,
+    tracked_files: set[str] | None = None,
+) -> list["EditScopeViolation"]:
+    """v0.27 Phase 3 (audit §3): return every per-task edit_scope
+    violation in ``plan`` instead of raising on the first one.
+
+    Used by :mod:`orchestrator.execute_phase` to block ONLY the
+    offending tasks (task-scoped) rather than the entire run
+    (blanket-block, which was the v0.26.2 behaviour). The wrapper
+    :func:`validate_edit_scope` retains the v0.26.2 raise-first
+    semantics for back-compat with callers that want a fast-fail.
+
+    The returned list is in deterministic task-iteration order so
+    forensics surfacing the list (e.g. doctor --deep) gets a stable
+    diff between runs.
+    """
+    plan_scope = plan.edit_scope or []
+    violations: list[EditScopeViolation] = []
+
+    for phase in plan.phases:
+        if phase.edit_scope is None:
+            resolved = plan_scope
+        else:
+            resolved = phase.edit_scope
+        if not resolved:
+            continue
+
+        for task in phase.tasks:
+            extended = list(getattr(task, "extended_scope", []) or [])
+            effective_scope = list(resolved) + extended
+            for file_path in task.files:
+                if _is_glob(file_path) and tracked_files is not None:
+                    expanded = _expand_files([file_path], tracked_files)
+                    for matched in expanded:
+                        if not is_in_scope(matched, effective_scope):
+                            violations.append(
+                                EditScopeViolation(
+                                    f"task {task.id!r} (phase {phase.id!r}) declares "
+                                    f"glob {file_path!r} (normalized: "
+                                    f"{_normalize_for_diagnostic(file_path)!r}) "
+                                    f"which expands to {matched!r} outside the "
+                                    f"resolved edit_scope {resolved!r} "
+                                    f"(extended_scope={extended!r})"
+                                )
+                            )
+                            # Attach task / phase metadata on the
+                            # exception instance so callers don't have
+                            # to re-parse the message.
+                            violations[-1].task_id = task.id  # type: ignore[attr-defined]
+                            violations[-1].phase_id = phase.id  # type: ignore[attr-defined]
+                            violations[-1].file_path = file_path  # type: ignore[attr-defined]
+                            # First out-of-scope expansion is enough —
+                            # no point producing N violations for the
+                            # same glob.
+                            break
+                    continue
+                if not is_in_scope(file_path, effective_scope):
+                    violations.append(
+                        EditScopeViolation(
+                            f"task {task.id!r} (phase {phase.id!r}) declares file "
+                            f"{file_path!r} (normalized: "
+                            f"{_normalize_for_diagnostic(file_path)!r}) "
+                            f"outside the resolved edit_scope {resolved!r} "
+                            f"(extended_scope={extended!r})"
+                        )
+                    )
+                    violations[-1].task_id = task.id  # type: ignore[attr-defined]
+                    violations[-1].phase_id = phase.id  # type: ignore[attr-defined]
+                    violations[-1].file_path = file_path  # type: ignore[attr-defined]
+    return violations
+
+
 def validate_edit_scope(
     plan: Plan,
     tracked_files: set[str] | None = None,
@@ -401,54 +474,15 @@ def validate_edit_scope(
     + ``task.extended_scope``. Empty ``extended_scope`` (default)
     preserves v0.17.0 behavior — no extension, only the resolved scope
     matters.
+
+    v0.27 Phase 3: thin wrapper around
+    :func:`collect_edit_scope_violations` for back-compat (raises
+    first violation). The execute_phase site uses the collector
+    directly so it can block only the offending tasks.
     """
-    plan_scope = plan.edit_scope or []
-
-    for phase in plan.phases:
-        # ``None`` means inherit; an empty list is an explicit per-phase
-        # override that resets to whole-repo. Distinguish carefully.
-        if phase.edit_scope is None:
-            resolved = plan_scope
-        else:
-            resolved = phase.edit_scope
-
-        # No-op shortcut: empty resolved scope means no constraint —
-        # but only if no task has an extended_scope (which would still
-        # be a non-empty constraint to honor). When the resolved scope
-        # is empty, every path is implicitly in scope anyway, so the
-        # extended_scope is harmless. Skip is safe.
-        if not resolved:
-            continue
-
-        for task in phase.tasks:
-            # v0.20.0 C1: union resolved scope with per-task extended_scope.
-            extended = list(getattr(task, "extended_scope", []) or [])
-            effective_scope = list(resolved) + extended
-            for file_path in task.files:
-                # v0.17.0 S5: glob expansion. With a tracked-files cache,
-                # validate every expanded file individually; without one,
-                # validate the glob string literally (legacy behavior).
-                if _is_glob(file_path) and tracked_files is not None:
-                    expanded = _expand_files([file_path], tracked_files)
-                    for matched in expanded:
-                        if not is_in_scope(matched, effective_scope):
-                            raise EditScopeViolation(
-                                f"task {task.id!r} (phase {phase.id!r}) declares "
-                                f"glob {file_path!r} (normalized: "
-                                f"{_normalize_for_diagnostic(file_path)!r}) "
-                                f"which expands to {matched!r} outside the "
-                                f"resolved edit_scope {resolved!r} "
-                                f"(extended_scope={extended!r})"
-                            )
-                    continue
-                if not is_in_scope(file_path, effective_scope):
-                    raise EditScopeViolation(
-                        f"task {task.id!r} (phase {phase.id!r}) declares file "
-                        f"{file_path!r} (normalized: "
-                        f"{_normalize_for_diagnostic(file_path)!r}) "
-                        f"outside the resolved edit_scope {resolved!r} "
-                        f"(extended_scope={extended!r})"
-                    )
+    violations = collect_edit_scope_violations(plan, tracked_files)
+    if violations:
+        raise violations[0]
 
 
 async def validate_edit_scope_with_critic_review(
@@ -501,6 +535,7 @@ async def validate_edit_scope_with_critic_review(
 __all__ = [
     "DagValidationError",
     "EditScopeViolation",
+    "collect_edit_scope_violations",
     "find_blocked_descendants",
     "find_file_overlaps",
     "is_in_scope",

@@ -224,6 +224,13 @@ LedgerOp = Literal[
     # category ("parse_error" | "validate_files_exist" |
     # "persistent_drop_refused").
     "tournament_output_rejected_structurally",
+    # v0.27 Phase 3 (audit §3): one task in the plan declared a file
+    # outside its resolved edit_scope. The granular per-task block
+    # replaces v0.26.2's blanket "block every pending task in every
+    # phase" behaviour. Audit-only; the actual status transition
+    # flows through the regular ``update_task_status`` op emitted
+    # alongside. Payload: ``{task_id, phase_id, file_path, message}``.
+    "task_blocked_scope_violation",
 ]
 
 
@@ -652,6 +659,10 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # rejection. Audit-only — the plan-state falls back to the
         # pre-tournament snapshot.
         "tournament_output_rejected_structurally",
+        # v0.27 Phase 3: granular per-task edit_scope violation block.
+        # Audit-only — the task transitions to ``blocked`` via the
+        # regular ``update_task_status`` op emitted alongside.
+        "task_blocked_scope_violation",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

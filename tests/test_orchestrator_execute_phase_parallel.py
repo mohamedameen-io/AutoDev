@@ -441,11 +441,14 @@ def _mk_plan_with_scope(
 
 
 @pytest.mark.asyncio
-async def test_run_execute_phase_blocks_tasks_on_edit_scope_violation(
+async def test_run_execute_phase_blocks_only_offending_task_on_edit_scope_violation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A plan with edit_scope=['src/'] but a task touching docs/ blocks
-    the run with reason=edit_scope_violation before any task dispatches."""
+    """v0.27 Phase 3 (audit §3): a plan with edit_scope=['src/'] but
+    a single task touching docs/ blocks ONLY that task — the sibling
+    in-scope task is left pending. Pre-v0.27 the blanket-block
+    blocked every pending task; v0.27 narrows to the offending id.
+    """
     pm = PlanManager(tmp_path, session_id="s1")
     await pm.init_plan(
         _mk_plan_with_scope(
@@ -464,13 +467,15 @@ async def test_run_execute_phase_blocks_tasks_on_edit_scope_violation(
     plan = await pm.load()
     assert plan is not None
     by_id = {t.id: t for t in plan.phases[0].tasks}
-    # Both pending tasks blocked because the validation runs before dispatch.
-    for tid in ("1.1", "1.2"):
-        assert by_id[tid].status == "blocked"
-        assert (
-            by_id[tid].blocked_reason is not None
-            and "edit_scope" in by_id[tid].blocked_reason
-        )
+    # v0.27 task-scoped block: only 1.2 is blocked.
+    assert by_id["1.2"].status == "blocked"
+    assert (
+        by_id["1.2"].blocked_reason is not None
+        and "edit_scope" in by_id["1.2"].blocked_reason
+    )
+    # 1.1 is in scope and stays pending (the dispatch stub returned
+    # early; the cascade short-circuits the run via ``return processed``).
+    assert by_id["1.1"].status == "pending"
 
 
 @pytest.mark.asyncio

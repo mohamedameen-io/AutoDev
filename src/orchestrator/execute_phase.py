@@ -1100,42 +1100,80 @@ async def run_execute_phase(
         from orchestrator.dag import (
             DagValidationError,
             EditScopeViolation,
-            validate_edit_scope,
+            collect_edit_scope_violations,
             validate_phase_dag,
         )
 
-        try:
-            # v0.17.0 S5: pass the orchestrator's tracked-files cache so
-            # glob entries in ``Task.files`` are expanded before scope
-            # validation. Empty set / missing cache preserves legacy
-            # literal-string behavior. ``getattr`` tolerates legacy
-            # OrchStub fixtures that pre-date the cache.
-            validate_edit_scope(
-                plan, tracked_files=getattr(orch, "tracked_files", None)
-            )
-        except EditScopeViolation as exc:
-            logger.warning(
-                "execute_phase.edit_scope_violation",
-                err=str(exc),
-            )
-            # Block every pending task in every phase: an edit_scope
-            # violation typically points at a structural plan error
-            # (architect declared too-narrow scope, or a task slipped
-            # in with the wrong files), and partial execution past the
-            # violation is unsafe.
+        # v0.27 Phase 3 (audit §3): per-task scoped block. The v0.26.2
+        # behaviour was to block EVERY pending task in EVERY phase on a
+        # single violation, which over-reached when only one task was
+        # mis-scoped. The collector returns every violation; we block
+        # only the offending task ids and emit a granular ledger op
+        # per block. The blanket-block fallback fires only when ALL
+        # pending tasks across all phases are in the violation set.
+        violations = collect_edit_scope_violations(
+            plan, tracked_files=getattr(orch, "tracked_files", None)
+        )
+        if violations:
+            violator_ids: set[str] = set()
+            for v in violations:
+                logger.warning(
+                    "execute_phase.edit_scope_violation",
+                    err=str(v),
+                )
+                tid = getattr(v, "task_id", None)
+                if isinstance(tid, str):
+                    violator_ids.add(tid)
+            pending_ids = {
+                t.id
+                for phase in plan.phases
+                for t in phase.tasks
+                if t.status == "pending"
+            }
+            # If every pending task is a violator, preserve the v0.26.2
+            # blanket-block contract — there's nothing safe left to run.
+            block_all = pending_ids and violator_ids >= pending_ids
+            to_block = pending_ids if block_all else violator_ids
+
             for phase in plan.phases:
                 for t in phase.tasks:
-                    if t.status == "pending":
-                        try:
-                            await orch.plan_manager.update_task_status(
-                                t.id,
-                                "blocked",
-                                meta={
-                                    "blocked_reason": f"edit_scope_violation: {exc}"
-                                },
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
+                    if t.status != "pending" or t.id not in to_block:
+                        continue
+                    # Find the specific violation for this task to
+                    # carry into the ledger payload (best-effort: a
+                    # task may have multiple violations; pick the first).
+                    matching = next(
+                        (
+                            v
+                            for v in violations
+                            if getattr(v, "task_id", None) == t.id
+                        ),
+                        None,
+                    )
+                    msg = (
+                        f"edit_scope_violation: {matching}"
+                        if matching is not None
+                        else f"edit_scope_violation (blanket): {violations[0]}"
+                    )
+                    try:
+                        await orch.plan_manager.update_task_status(
+                            t.id,
+                            "blocked",
+                            meta={"blocked_reason": msg},
+                        )
+                        await orch.plan_manager.ledger_append(
+                            op="task_blocked_scope_violation",
+                            payload={
+                                "task_id": t.id,
+                                "phase_id": getattr(matching, "phase_id", "")
+                                or t.phase_id,
+                                "file_path": getattr(matching, "file_path", "")
+                                or "",
+                                "message": str(matching or violations[0]),
+                            },
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
             return processed
 
         # v0.21.0 B1: when cross-phase parallelism is enabled, ``Task.
