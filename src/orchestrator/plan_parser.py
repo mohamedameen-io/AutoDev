@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as _dt
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Literal, cast
 
 from errors import AutodevError
@@ -116,6 +117,101 @@ _RE_EDIT_SCOPE_HEADER = re.compile(
 _RE_EDIT_SCOPE_ITEM = re.compile(
     r"^\s*-\s*([^#\n]+?)\s*(?:#.*)?$",
 )
+
+
+@dataclass(frozen=True)
+class ParsedFilesReport:
+    """Per-entry result of :func:`_normalize_path_entry`.
+
+    ``path`` is non-None when the entry survived the v0.27 Phase 1
+    shape-check; ``drop_reason`` is non-None when the parser stripped
+    the entry as hedge text. Callers typically materialise a list of
+    these reports, then partition into kept-paths + dropped-entries so
+    the dropped set can be logged for forensics.
+    """
+
+    raw: str
+    path: str | None
+    drop_reason: str | None
+
+
+# v0.27 Phase 1: tokens the architect sometimes emits as a placeholder
+# instead of a real path. Compared case-insensitively against the
+# whole-string after stripping.
+_PATH_PLACEHOLDER_TOKENS: frozenset[str] = frozenset(
+    {"TBD", "TODO", "N/A", "NONE", "TBA", "PLACEHOLDER", "FIXME"}
+)
+
+
+def _normalize_path_entry(raw: str) -> ParsedFilesReport:
+    """Normalise a single architect-emitted path entry.
+
+    v0.27 audit §1 hardening: the parser previously preserved hedge
+    text (paren-tails, comment-tails, bare placeholder tokens) so the
+    on-disk validator + the v0.26.2 persistent-drop loop had to clean
+    them up downstream. Phase 1 rejects them at parse time so the
+    plan structure is canonical before validation runs.
+
+    Drop rules (returns ``path=None`` with ``drop_reason``):
+
+      * Empty after strip.
+      * Inline ``# comment`` reduces the entry to nothing.
+      * Contains ``(`` or ``)`` (paren-hedge).
+      * Contains ``[`` or ``]`` (bracket-hedge; the ``[new]`` prefix is
+        stripped upstream by :data:`_RE_NEW_PREFIX`).
+      * Whole-string matches a placeholder token (case-insensitive).
+      * Contains a space but no ``/`` — a multi-word phrase rather
+        than a path. Legitimate paths with spaces have at least one
+        slash (e.g. ``docs/My File.md``).
+
+    Preserved entries: stripped of trailing ``/`` and inline
+    ``# comment`` tails; everything else returned verbatim.
+    """
+    s = raw.strip()
+    if not s:
+        return ParsedFilesReport(raw=raw, path=None, drop_reason="empty")
+
+    # Strip inline `# comment` tail; legitimate paths never include `#`.
+    if "#" in s:
+        head = s.split("#", 1)[0].rstrip()
+        if not head:
+            return ParsedFilesReport(
+                raw=raw, path=None, drop_reason="comment_only"
+            )
+        s = head
+
+    # Paren-hedge: legitimate repo-relative paths never contain parens.
+    if "(" in s or ")" in s:
+        return ParsedFilesReport(
+            raw=raw, path=None, drop_reason="paren_hedge"
+        )
+
+    # Bracket-hedge: the `[new]` prefix is stripped upstream via
+    # :data:`_RE_NEW_PREFIX`. Anything else with brackets is malformed.
+    if "[" in s or "]" in s:
+        return ParsedFilesReport(
+            raw=raw, path=None, drop_reason="bracket_hedge"
+        )
+
+    # Placeholder token (case-insensitive whole-string match).
+    if s.upper() in _PATH_PLACEHOLDER_TOKENS:
+        return ParsedFilesReport(
+            raw=raw, path=None, drop_reason="placeholder"
+        )
+
+    # Space-without-slash: prose phrase, not a path. Legitimate paths
+    # with spaces are kept iff they also contain a ``/`` separator.
+    if " " in s and "/" not in s:
+        return ParsedFilesReport(
+            raw=raw, path=None, drop_reason="space_without_slash"
+        )
+
+    s = s.rstrip("/")
+    if not s:
+        return ParsedFilesReport(
+            raw=raw, path=None, drop_reason="empty_after_strip"
+        )
+    return ParsedFilesReport(raw=raw, path=s, drop_reason=None)
 
 
 def _iso_now() -> str:
@@ -317,18 +413,26 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
         if in_edit_scope_block:
             item_m = _RE_EDIT_SCOPE_ITEM.match(line)
             if item_m:
-                entry = item_m.group(1).strip().rstrip("/")
-                if entry:
+                # v0.27 Phase 1: route every entry through the shared
+                # shape-check. Hedge text (parens, brackets, placeholder
+                # tokens) is dropped here so the validator + persistent-
+                # drop loop don't have to clean it up downstream.
+                report = _normalize_path_entry(item_m.group(1))
+                if report.path is not None:
                     if current_phase is None:
-                        plan_edit_scope.append(entry)
+                        plan_edit_scope.append(report.path)
                     elif current_task is None:
-                        # We initialized to [] when the header opened —
-                        # safe to .append.
                         scope_list = current_phase.get("edit_scope")
                         if scope_list is None:
                             scope_list = []
                             current_phase["edit_scope"] = scope_list
-                        scope_list.append(entry)
+                        scope_list.append(report.path)
+                else:
+                    logger.warning(
+                        "plan_parser.edit_scope_entry_dropped",
+                        raw=report.raw,
+                        reason=report.drop_reason,
+                    )
                 continue
             # Non-item line ends the block.
             in_edit_scope_block = False
@@ -364,6 +468,10 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
             # ``files_new`` based on a leading ``[new]`` prefix. The prefix
             # is stripped before storage; the routing decides whether
             # ``validate_files_exist`` will require the path to exist.
+            # v0.27 Phase 1: each remainder is shape-checked via
+            # :func:`_normalize_path_entry` so hedge text (paren-tails,
+            # comment-tails, placeholder tokens) is rejected before
+            # the path reaches the validator.
             files_existing: list[str] = []
             files_to_create: list[str] = []
             for raw_entry in files_m.group(1).split(","):
@@ -371,11 +479,30 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
                 if not stripped:
                     continue
                 if _RE_NEW_PREFIX.match(stripped):
-                    files_to_create.append(
-                        _RE_NEW_PREFIX.sub("", stripped, count=1).strip()
-                    )
+                    remainder = _RE_NEW_PREFIX.sub(
+                        "", stripped, count=1
+                    ).strip()
+                    report = _normalize_path_entry(remainder)
+                    if report.path is not None:
+                        files_to_create.append(report.path)
+                    else:
+                        logger.warning(
+                            "plan_parser.task_files_new_entry_dropped",
+                            raw=report.raw,
+                            reason=report.drop_reason,
+                            task_id=current_task["id"],
+                        )
                 else:
-                    files_existing.append(stripped)
+                    report = _normalize_path_entry(stripped)
+                    if report.path is not None:
+                        files_existing.append(report.path)
+                    else:
+                        logger.warning(
+                            "plan_parser.task_files_entry_dropped",
+                            raw=report.raw,
+                            reason=report.drop_reason,
+                            task_id=current_task["id"],
+                        )
             current_task["files"] = files_existing
             current_task["files_new"] = files_to_create
             in_acceptance_block = False
@@ -418,15 +545,28 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
         # ``Files:`` parser — comma-separated single-line list. Each
         # entry is normalized via the schema validator (trim trailing /,
         # reject absolute, reject ``..``).
+        # v0.27 Phase 1: each entry runs through the shared shape-check
+        # so hedge text is rejected at parse time.
         ext_scope_m = _RE_EXTENDED_SCOPE.match(line)
         if ext_scope_m:
             payload = ext_scope_m.group(1).strip()
             if payload:
-                current_task["extended_scope"] = [
-                    s.strip().rstrip("/")
-                    for s in payload.split(",")
-                    if s.strip()
-                ]
+                surviving: list[str] = []
+                for raw_entry in payload.split(","):
+                    stripped = raw_entry.strip()
+                    if not stripped:
+                        continue
+                    report = _normalize_path_entry(stripped)
+                    if report.path is not None:
+                        surviving.append(report.path)
+                    else:
+                        logger.warning(
+                            "plan_parser.extended_scope_entry_dropped",
+                            raw=report.raw,
+                            reason=report.drop_reason,
+                            task_id=current_task["id"],
+                        )
+                current_task["extended_scope"] = surviving
             in_acceptance_block = False
             continue
 
@@ -521,4 +661,8 @@ def _make_task(raw: dict, phase_id: str) -> Task:
     )
 
 
-__all__ = ["PlanParseError", "parse_plan_markdown"]
+__all__ = [
+    "PlanParseError",
+    "ParsedFilesReport",
+    "parse_plan_markdown",
+]

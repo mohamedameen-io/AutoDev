@@ -74,7 +74,7 @@ EDIT_SCOPE:
   - Acceptance:
     - [ ] subtract function exported
 """,
-    v026_behavior="parse_ok_validate_fail",
+    v026_behavior="parse_drops_then_validate_ok",
     phase_1_target="parse_drops_then_validate_ok",
 )
 
@@ -101,7 +101,7 @@ EDIT_SCOPE:
   - Acceptance:
     - [ ] subtract function exported
 """,
-    v026_behavior="parse_ok_validate_ok",
+    v026_behavior="parse_drops_then_validate_ok",
     phase_1_target="parse_drops_then_validate_ok",
 )
 
@@ -124,7 +124,7 @@ EDIT_SCOPE:
   - Acceptance:
     - [ ] subtract function exported
 """,
-    v026_behavior="parse_ok_validate_fail",
+    v026_behavior="parse_drops_then_validate_ok",
     phase_1_target="parse_drops_then_validate_ok",
 )
 
@@ -172,7 +172,7 @@ EDIT_SCOPE:
   - Acceptance:
     - [ ] subtract function exported
 """,
-    v026_behavior="parse_ok_validate_fail",
+    v026_behavior="parse_drops_then_validate_ok",
     phase_1_target="parse_drops_then_validate_ok",
 )
 
@@ -200,7 +200,10 @@ EDIT_SCOPE:
 )
 
 
-# 7. Empty entry inside the list: ``a, , b``.
+# 7. Empty entry inside the list: ``a, , b``. The trailing comma /
+#    empty middle entry is already stripped at the comma-split layer
+#    in v0.26.2 (no Phase 1 change required); the bug class here is
+#    purely "second path is bogus and fails validation".
 EMPTY_ENTRY = HedgeFixture(
     name="empty_entry",
     bug_class="empty entry in comma list",
@@ -218,7 +221,7 @@ EDIT_SCOPE:
     - [ ] subtract function exported
 """,
     v026_behavior="parse_ok_validate_fail",
-    phase_1_target="parse_drops_then_validate_ok",
+    phase_1_target="parse_ok_validate_fail",
 )
 
 
@@ -241,7 +244,7 @@ EDIT_SCOPE:
   - Acceptance:
     - [ ] subtract function exported
 """,
-    v026_behavior="parse_ok_validate_fail",
+    v026_behavior="parse_drops_then_validate_ok",
     phase_1_target="parse_drops_then_validate_ok",
 )
 
@@ -286,7 +289,7 @@ EDIT_SCOPE:
   - Acceptance:
     - [ ] subtract function exported
 """,
-    v026_behavior="parse_ok_validate_fail",
+    v026_behavior="parse_drops_then_validate_ok",
     phase_1_target="parse_drops_then_validate_ok",
 )
 

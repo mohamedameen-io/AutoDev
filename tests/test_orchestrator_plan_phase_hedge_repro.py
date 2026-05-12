@@ -108,53 +108,42 @@ async def test_notes_in_edit_scope_recovers_via_v026_drop(
 
 
 @pytest.mark.asyncio
-async def test_parens_in_task_files_baseline_behavior(
+async def test_parens_in_task_files_recovered_by_phase_1_parser(
     tmp_path: Path,
 ) -> None:
-    """v0.26.2 BASELINE: the paren-hedged ``Task.files`` entry is the
-    bug class Phase 1 (Commit 3) closes upstream.
-
-    Today the architect emits the paren-hedge three times; v0.26.2
-    Phase 3 extended the drop to walk ``Task.files``, so the drop
-    fires and removes the bad entry. The test pins that behavior so
-    Commit 11 can flip to "Phase 1 stripped the hedge upstream on
-    attempt #1; no drop op fired."
+    """v0.27 Phase 1 (Commit 3) outcome: the paren-hedged ``Task.files``
+    entry is stripped upstream by ``_normalize_path_entry`` BEFORE the
+    on-disk validator runs. The architect is called exactly once
+    (no retry needed) and the surviving ``task.files`` is just the
+    real path. No ``scope_entry_dropped`` ledger op fires — that
+    drop is the v0.26.2 fallback, now superseded by parser hardening.
     """
     _init_git_repo_with_math(tmp_path)
     adapter = StubAdapter(
         {
             "explorer": ok("found stuff"),
             "domain_expert": ok("ok"),
-            "architect": [
-                ok(ARCHITECT_PARENS_IN_TASK_FILES),
-                ok(ARCHITECT_PARENS_IN_TASK_FILES),
-                ok(ARCHITECT_PARENS_IN_TASK_FILES),
-            ],
+            "architect": ok(ARCHITECT_PARENS_IN_TASK_FILES),
         }
     )
     orch = _make_orch(tmp_path, adapter)
 
     plan = await orch.plan("Add subtract")
     assert plan is not None
-    # v0.26.2 baseline: drop walked Task.files and removed the
-    # paren-hedged entry. The surviving task.files is just the real
-    # path. The architect was called three times.
-    assert adapter.count("architect") == 3
-    task = plan.phases[0].tasks[0]
-    assert task.files == ["src/math/__init__.py"], (
-        f"v0.26.2 baseline: expected only the real file to survive "
-        f"the drop, got {task.files!r}"
+    assert adapter.count("architect") == 1, (
+        "Phase 1 parser strips the hedge upstream: no retry needed."
     )
+    task = plan.phases[0].tasks[0]
+    assert task.files == ["src/math/__init__.py"]
 
     from state.ledger import read_entries
 
     ledger = read_entries(tmp_path)
     drop_ops = [e for e in ledger if e.op == "scope_entry_dropped"]
-    # v0.26.2 baseline: exactly one drop op fires (for the paren
-    # entry). Commit 11 flips this to ``len(drop_ops) == 0`` once
-    # Phase 1's parser shape-check strips the paren upstream.
-    assert len(drop_ops) == 1
-    assert "(and any helper file" in drop_ops[0].payload["path"]
+    assert drop_ops == [], (
+        "Phase 1 stripped at parse time — the v0.26.2 persistent-drop "
+        "should not have fired."
+    )
 
 
 @pytest.mark.asyncio
