@@ -2,6 +2,135 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] - 2026-05-13
+
+Structured recovery surface — typed data model. v0.28.0 stopped the
+bleed (manual ``autodev requeue`` + classifier/probe foundation);
+v0.29.0 makes the data model match the recovery semantics so the
+v0.30.0 structural guarantees in the next release have something
+typed to enforce against. Three bugs land: typed
+``block_reason_class`` stamped at every block site (Bug 6), the new
+``quarantined`` ``TaskStatus`` + ``paused`` ``Phase.review_status``
+pair (Bug 7) so ``AuthenticationFailedError`` halts auto-resume
+cleanly without the operator needing an explicit ``requeue``, and
+``autodev rewind --to-phase`` (Bug 9) for undoing prior force-accepts
+that pre-date the v0.28.0 classifier fix.
+
+### Added
+- ``Task.block_reason_class: Literal["verdict","infrastructure","cap"] | None``
+  field (``src/state/schemas.py``). Stamped at every block site:
+  upstream-failure cascade (``plan_manager.py:763``, inherits parent's
+  class), architect-consult infrastructure escalation
+  (``execute_phase.py:658-666``, ``"infrastructure"``), QA-gate
+  timeout / worker exception (``execute_phase.py:1806/1836``, network
+  + auth + timeout exceptions classify as ``"infrastructure"``, all
+  others ``"verdict"``), and guardrail-exceeded
+  (``execute_phase.py:2330-2334``, inspects the orchestrator's
+  ``_last_adapter_subtype`` — ``auth_failed``, ``rate_limited``, or
+  ``server_error`` → ``"infrastructure"``, else ``"cap"``). Legacy
+  plans backfill the class on load by classifying ``blocked_reason``
+  against the keyword set in the new ``src/state/infra_patterns.py``
+  module (conservative default: ``"verdict"`` when no pattern matches).
+- ``src/state/infra_patterns.py`` (new): exports ``INFRA_PATTERNS``,
+  ``looks_infrastructure``, and ``classify_blocked_reason`` —
+  shared between ``autodev requeue --infrastructure`` (replaces the
+  v0.28.0 inline heuristic) and the v0.29.0 plan-load backfill so
+  the classification rules live in exactly one place.
+- ``Orchestrator._last_adapter_subtype`` and
+  ``_last_adapter_api_error_status`` instance fields. Stashed after
+  every ``delegate()`` call so the guardrail block sites — fired by
+  a different code path than the adapter call — can attribute the
+  guardrail to whatever adapter failure preceded it.
+- ``TaskStatus.quarantined`` (non-terminal) — ``Orchestrator.resume()``
+  picks up quarantined tasks automatically via
+  ``_find_in_progress_task`` (extended to include the new status).
+  ``AuthenticationFailedError`` catch sites (added in v0.28.0) now
+  mark the in-flight task ``quarantined`` instead of ``blocked``;
+  ``block_reason_class`` is intentionally NOT stamped on quarantined
+  tasks — that field is reserved for true ``blocked`` (a quarantined
+  task is awaiting recovery, not classification). Forensic
+  ``blocked_reason="auth_failed: <error>"`` is retained.
+- ``Phase.review_status="paused"`` — phase aggregator
+  (``_maybe_run_phase_review``) refuses to auto-accept a phase
+  containing any quarantined task, stamps ``"paused"`` instead, and
+  defers the phase-review tournament until ``autodev resume`` clears
+  the quarantine. Both auth-halt helpers
+  (``_halt_task_for_auth_failed`` and ``_halt_for_auth_failed``)
+  ALSO stamp the owning phase ``"paused"`` directly so the post-halt
+  plan state is consistent at catch-time — defense-in-depth alongside
+  the aggregator's check, idempotent.
+- ``autodev rewind`` CLI command — undoes prior force-accepts of
+  bogus phases (the v0.28.0 classifier prevents new force-accepts;
+  ``rewind`` cleans up the ones that landed before the upgrade).
+  ``detect_last_stable_phase()`` (``src/state/rewind.py``) walks
+  the ledger and identifies the most recent phase whose
+  ``update_phase_meta review_status="accepted"`` was preceded by a
+  ``phase_review_complete`` event with matching ``phase_id`` AND
+  ``accept_phase=True`` — a force-accept (no preceding tournament)
+  is skipped. ``apply_rewind()`` resets affected tasks to ``pending``,
+  clears phase ``review_status`` to ``None`` via direct ledger op,
+  and MOVES (not deletes) evidence/tournament artifacts to
+  ``.autodev/rewound/<YYYYMMDDTHHMMSSZ>-<target_phase_id>/``
+  preserving the original sub-tree shape for forensics. Idempotent.
+  Flags: ``--to-phase``, ``--dry-run``, ``--yes``.
+- New ``LedgerOp`` value ``"rewind"`` — single audit-only entry per
+  ``apply_rewind`` call capturing the target phase + before/after
+  counts. Replay reproduces the per-task transitions purely through
+  the ``update_task_status`` ops emitted alongside.
+- Three new task-state transitions registered in
+  ``src/orchestrator/task_state.py``: ``in_progress → quarantined``,
+  ``blocked → quarantined`` (operator/auth-recovery upgrade path),
+  ``quarantined → in_progress`` (back into the normal flow on
+  resume).
+
+### Changed
+- ``Orchestrator.resume()`` now walks ``paused`` phases first and
+  clears the stamp via a direct ``update_phase_meta`` ledger op (the
+  canonical helper short-circuits ``None`` as "leave unchanged" —
+  same workaround already used by ``PlanManager.requeue_tasks``).
+  The in-flight scan then finds the quarantined task via the
+  extended ``_find_in_progress_task``. After the task lands, the
+  existing post-task ``_maybe_run_phase_review`` poll fires the
+  tournament cleanly.
+- ``autodev requeue --infrastructure`` keyword list extended with
+  the v0.29.0-stamped prefixes (``auth_failed``, ``rate_limited``,
+  ``server_error``, ``architect_consult: infrastructure``). The
+  legacy public function names ``_INFRA_PATTERNS`` and
+  ``_looks_infrastructure`` are kept as compatibility re-exports
+  from ``src/cli/commands/requeue.py`` so the v0.28.0 import surface
+  is unchanged.
+- v0.28.0's ``test_orchestrator_auth_failed_halt`` test contract
+  flips from ``blocked`` + ``review_status: None`` to ``quarantined``
+  + ``review_status: "paused"``. Documented inline.
+
+### Migration
+- No on-disk schema migrations required. Pre-v0.29 plans load
+  unchanged; the ``block_reason_class`` field defaults to ``None``
+  and is backfilled on load for legacy ``blocked`` tasks via the
+  ``classify_blocked_reason`` shim. Pre-v0.29 ledgers replay
+  unchanged.
+- Forward-compatibility: v0.29 adds ``"rewind"`` to the ``LedgerOp``
+  Literal and ``"quarantined"``/``"paused"`` to the
+  ``TaskStatus``/``Phase.review_status`` Literals respectively. A
+  user who runs ``autodev`` under v0.29 and then downgrades to
+  v0.28.x cannot ``autodev resume`` — pre-v0.29 ``_apply_op`` raises
+  ``LedgerCorruptError`` on the new op name, and pre-v0.29 Pydantic
+  models reject the new status values. Same downgrade procedure as
+  the v0.28 migration note (``autodev reset --hard`` OR remove the
+  offending ledger lines manually + revert task statuses).
+
+### Out of scope
+- v0.30.0 (final release in this triplet) covers the structural
+  guarantees that turn the v0.28+v0.29 classifier+data-model
+  foundation into compile-time safety: phase aggregator refuses to
+  auto-accept ANY phase containing a task with
+  ``block_reason_class="infrastructure"`` (extends the v0.29.0
+  quarantined-only check), ledger payload records
+  ``api_error_status`` for post-mortems without grepping
+  ``.autodev/debug/*.txt``, and a cross-task circuit breaker halts
+  a run after N infrastructure failures in a rolling window so a
+  single dead token can't burn an entire run before guardrails fire.
+
 ## [0.28.0] - 2026-05-13
 
 Infrastructure-failure recovery surface — foundation. A real-world run
