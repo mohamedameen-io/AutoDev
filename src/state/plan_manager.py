@@ -322,6 +322,17 @@ class PlanManager:
         ``meta`` may include ``blocked_reason``, ``retry_count``,
         ``escalated``, or ``evidence_bundle`` — any provided keys are merged
         into the payload and applied to the task.
+
+        v0.30.0 Bug 4: ``meta`` may also carry forensic-only
+        ``api_error_status`` (int) and ``last_adapter_subtype`` (str)
+        keys propagated from the orchestrator's most recent adapter
+        result. They flow into the ledger payload verbatim via
+        :py:meth:`dict.update` below but are NOT applied to any
+        :class:`Task` field — the Task model has no slot for them and
+        they exist purely so post-mortems can grep block-class
+        ``update_task_status`` entries for the API status / subtype
+        that triggered the block, without diving into
+        ``.autodev/debug/*.txt`` traceback dumps.
         """
         from orchestrator.task_state import assert_transition
 

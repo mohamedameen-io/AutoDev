@@ -14,7 +14,23 @@ Supported ops:
   - ``init_plan``: embeds the initial Plan payload so the ledger is
     self-sufficient (no plan.json required for replay).
   - ``update_plan``: overwrites Plan with a new payload (coarse-grained).
-  - ``update_task_status``: mutates a single task's status.
+  - ``update_task_status``: mutates a single task's status. v0.30.0 Bug
+    4: payload may also carry forensic-only ``api_error_status`` (int)
+    and ``last_adapter_subtype`` (str) keys propagated from the most
+    recent adapter result. These are NOT mutated onto :class:`Task`
+    (the model has no field for them) — they live on the ledger entry
+    purely so post-mortems can grep ``op="update_task_status" status="blocked"``
+    entries for the API status / subtype that triggered the block,
+    without diving into ``.autodev/debug/*.txt`` traceback dumps.
+  - ``adapter_failure``: v0.30.0 Bug 4 audit-only op. Appended once
+    per ``AgentResult`` with ``success=False`` from the
+    :func:`execute_phase.delegate` call site (regardless of whether
+    the failure is fatal, transient, or eventually retried). Payload
+    shape: ``{task_id: str, api_error_status: int | None,
+    subtype: str | None, error: str | None, attempt_n: int}``.
+    Replay treats it as a no-op — it is forensics for "how many
+    transient failures preceded the block / completion" without
+    grepping ``.autodev/debug/``.
   - ``append_evidence``: audit-only record that evidence was produced.
   - ``mark_blocked`` / ``mark_complete``: task terminals.
   - ``snapshot``: embeds the current Plan — lets replay short-circuit from
@@ -258,6 +274,19 @@ LedgerOp = Literal[
     # quarantined evidence/tournament artifacts (``None`` when nothing
     # needed archiving — idempotent re-run).
     "rewind",
+    # v0.30.0 Bug 4: per-adapter-failure audit breadcrumb. Appended
+    # by :func:`execute_phase.delegate` whenever the adapter returns
+    # ``success=False`` (regardless of whether the worker eventually
+    # retries the call, escalates to the architect, or blocks the
+    # task). Audit-only — does NOT mutate plan state. Payload shape:
+    # ``{task_id: str, api_error_status: int | None,
+    # subtype: str | None, error: str | None, attempt_n: int}``.
+    # The ``attempt_n`` is the developer's retry_count at dispatch
+    # time so post-mortems can correlate "Nth retry that failed"
+    # against the regular ``update_task_status`` retry-count bumps.
+    # Best-effort write — ledger append failures here MUST NOT mask
+    # the underlying adapter failure for the caller.
+    "adapter_failure",
 ]
 
 
@@ -703,6 +732,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # alongside (one per affected task / phase); replay treats the
         # breadcrumb itself as a no-op.
         "rewind",
+        # v0.30.0 Bug 4: per-adapter-failure audit breadcrumb. The
+        # actual task-status transitions (retry / block) flow through
+        # the regular ``update_task_status`` ops emitted alongside
+        # by the orchestrator's retry/escalation FSM; this op is a
+        # forensic counter for "how many transient adapter failures
+        # preceded the eventual outcome".
+        "adapter_failure",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

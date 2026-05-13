@@ -2141,6 +2141,15 @@ async def _execute_one_worker(
                 meta={
                     "blocked_reason": blocked_reason,
                     "block_reason_class": block_reason_class,
+                    # v0.30.0 Bug 4: forensic-only payload extension —
+                    # carry the most recent adapter status / subtype
+                    # so post-mortems can grep the ledger directly.
+                    "api_error_status": getattr(
+                        orch, "_last_adapter_api_error_status", None
+                    ),
+                    "last_adapter_subtype": getattr(
+                        orch, "_last_adapter_subtype", None
+                    ),
                 },
             )
         except Exception as exc2:  # noqa: BLE001
@@ -2780,6 +2789,15 @@ async def _execute_one(
                         "block_reason_class": _classify_guardrail_block(
                             getattr(orch, "_last_adapter_subtype", None)
                         ),
+                        # v0.30.0 Bug 4: forensic-only payload extension —
+                        # carry the most recent adapter status / subtype
+                        # so post-mortems can grep the ledger directly.
+                        "api_error_status": getattr(
+                            orch, "_last_adapter_api_error_status", None
+                        ),
+                        "last_adapter_subtype": getattr(
+                            orch, "_last_adapter_subtype", None
+                        ),
                     },
                 )
                 return task
@@ -2890,6 +2908,15 @@ async def _execute_one(
                         "block_reason_class": _classify_guardrail_block(
                             getattr(orch, "_last_adapter_subtype", None)
                         ),
+                        # v0.30.0 Bug 4: forensic-only payload extension —
+                        # carry the most recent adapter status / subtype
+                        # so post-mortems can grep the ledger directly.
+                        "api_error_status": getattr(
+                            orch, "_last_adapter_api_error_status", None
+                        ),
+                        "last_adapter_subtype": getattr(
+                            orch, "_last_adapter_subtype", None
+                        ),
                     },
                 )
                 return task
@@ -2942,6 +2969,15 @@ async def _execute_one(
                         "blocked_reason": f"guardrail_exceeded: {exc}",
                         "block_reason_class": _classify_guardrail_block(
                             getattr(orch, "_last_adapter_subtype", None)
+                        ),
+                        # v0.30.0 Bug 4: forensic-only payload extension —
+                        # carry the most recent adapter status / subtype
+                        # so post-mortems can grep the ledger directly.
+                        "api_error_status": getattr(
+                            orch, "_last_adapter_api_error_status", None
+                        ),
+                        "last_adapter_subtype": getattr(
+                            orch, "_last_adapter_subtype", None
                         ),
                     },
                 )
@@ -3833,6 +3869,33 @@ async def delegate(
     # ``in_flight`` map at the call site rather than the orchestrator.
     orch._last_adapter_subtype = result.subtype
     orch._last_adapter_api_error_status = result.api_error_status
+    # v0.30.0 Bug 4: per-adapter-failure audit breadcrumb. Append one
+    # ``adapter_failure`` ledger op for every ``success=False`` result
+    # (transient OR fatal) so post-mortems can grep the ledger directly
+    # for the count + shape of failures preceding a block, instead of
+    # combing through ``.autodev/debug/*.txt`` tracebacks. Best-effort:
+    # a ledger write failure here MUST NOT mask the underlying adapter
+    # failure for the caller — the retry / escalate / block FSM
+    # downstream still needs to see ``result`` exactly as the adapter
+    # returned it.
+    if not result.success and getattr(orch, "plan_manager", None) is not None:
+        try:
+            await orch.plan_manager.ledger_append(
+                op="adapter_failure",
+                payload={
+                    "task_id": envelope.task_id,
+                    "api_error_status": result.api_error_status,
+                    "subtype": result.subtype,
+                    "error": result.error,
+                    "attempt_n": int(retry_count),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — forensics only, never fatal
+            logger.warning(
+                "execute_phase.adapter_failure_ledger_append_failed",
+                task_id=envelope.task_id,
+                err=str(exc),
+            )
     if result.success and result.text:
         orch.loop_detector.observe(envelope.task_id, role, result.text)
 
