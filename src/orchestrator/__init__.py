@@ -349,6 +349,16 @@ class Orchestrator:
         file, clear the state) was removed alongside InlineAdapter.
         Every adapter is now subprocess; resume just picks up the
         ledger's first non-terminal task.
+
+        v0.29.0 Bug 7: ``quarantined`` tasks are non-terminal so
+        :func:`_find_in_progress_task` returns them — the existing
+        retry-in-progress branch walks them back through ``in_progress``
+        and re-dispatches. Additionally, when no quarantined tasks
+        remain in a phase that was previously parked at
+        ``review_status="paused"`` (because an earlier auth_failed halt
+        forced the phase aggregator to bail), we clear the paused state
+        and re-enter the execute loop so ``_maybe_run_phase_review``
+        re-fires the phase-review tournament fresh.
         """
         from orchestrator.execute_phase import run_execute_phase
 
@@ -361,6 +371,42 @@ class Orchestrator:
             self._log.warning("orchestrator.resume.no_plan")
             return []
 
+        # v0.29.0 Bug 7: clear ``review_status="paused"`` for any phase
+        # whose only blocking signal was quarantined work that has now
+        # been resolved (or that we are about to re-dispatch). Done
+        # BEFORE the in-flight scan so the post-dispatch
+        # ``_maybe_run_phase_review`` poll sees a clean slate and
+        # re-fires the tournament fresh. ``update_phase_meta`` treats
+        # ``None`` as "leave unchanged"; we emit the clear-op directly
+        # (mirrors the pattern used by ``PlanManager.requeue_tasks``).
+        paused_phase_ids: list[str] = [
+            p.id for p in plan.phases if p.review_status == "paused"
+        ]
+        if paused_phase_ids:
+            from state.lockfile import plan_lock as _plan_lock
+            from state.ledger import append_entry as _append_entry
+
+            for phase_id in paused_phase_ids:
+                self._log.info(
+                    "orchestrator.resume.clear_paused_phase",
+                    phase_id=phase_id,
+                )
+                async with _plan_lock(self._plan_manager.cwd, timeout_s=30.0):
+                    await _append_entry(
+                        self._plan_manager.cwd,
+                        op="update_phase_meta",
+                        payload={
+                            "phase_id": phase_id,
+                            "review_status": None,
+                        },
+                        session_id=self._session_id,
+                    )
+            # Re-load so the post-clear plan is what we route on.
+            plan = await self._plan_manager.load()
+            if plan is None:
+                self._log.warning("orchestrator.resume.no_plan_post_clear")
+                return []
+
         in_progress = _find_in_progress_task(plan)
         if in_progress is not None:
             # Re-seed status so the execute loop will pick it up as pending.
@@ -368,9 +414,12 @@ class Orchestrator:
             self._log.info(
                 "orchestrator.resume.retry_in_progress",
                 task_id=in_progress.id,
+                prior_status=in_progress.status,
             )
             # Mark it in_progress -> in_progress is a legal self-loop.
             # But to trigger the pending-scan, briefly park it at pending.
+            # v0.29.0 Bug 7: ``quarantined`` -> ``in_progress`` is the
+            # documented resume edge (see :data:`TASK_TRANSITIONS`).
             await self._plan_manager.update_task_status(in_progress.id, "in_progress")
             # Drive the execute loop for this specific task so it is picked
             # up regardless of next_pending_task() filtering.
@@ -432,6 +481,13 @@ def _find_in_progress_task(plan: Plan) -> Task | None:
                 "reviewed",
                 "tested",
                 "tournamented",
+                # v0.29.0 Bug 7: ``quarantined`` is non-terminal — a task
+                # halted by an infrastructure failure (auth_failed etc.)
+                # is eligible to resume once the operator clears the
+                # underlying issue. Including it here means
+                # ``Orchestrator.resume()`` picks the task up
+                # automatically without operator intervention.
+                "quarantined",
             ):
                 return task
     return None

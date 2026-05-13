@@ -242,11 +242,13 @@ def test_phase_baseline_commit_default_none() -> None:
 
 
 def test_phase_review_status_states() -> None:
-    """All five literal values are accepted on ``Phase.review_status``.
+    """All literal values are accepted on ``Phase.review_status``.
 
     The state machine: ``None`` → ``"in_progress"`` → terminal
     (``"accepted"`` | ``"corrective_required"`` | ``"skipped"``). The
-    ``"pending"`` value is reserved for future use.
+    ``"pending"`` value is reserved for future use. v0.29.0 Bug 7 adds
+    the non-terminal ``"paused"`` value, set by the phase aggregator
+    when a quarantined task halts the phase.
     """
     for status in (
         "pending",
@@ -254,6 +256,7 @@ def test_phase_review_status_states() -> None:
         "accepted",
         "corrective_required",
         "skipped",
+        "paused",
     ):
         phase = Phase(
             id="1",

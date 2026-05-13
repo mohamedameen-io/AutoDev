@@ -66,6 +66,13 @@ TaskStatus = Literal[
     "complete",
     "blocked",
     "skipped",
+    # v0.29.0 Bug 7: non-terminal halt state for tasks stopped by an
+    # infrastructure failure (e.g. ``AuthenticationFailedError``). Unlike
+    # ``blocked``, ``quarantined`` is NOT in the terminal set used by
+    # depends_on satisfaction or phase-aggregate checks — the task remains
+    # eligible for re-execution and ``Orchestrator.resume()`` picks it up
+    # automatically once the operator clears the underlying infra issue.
+    "quarantined",
 ]
 """Allowed states for a :class:`Task`. See :mod:`orchestrator.task_state`."""
 
@@ -275,8 +282,21 @@ class Phase(BaseModel):
     # the next observation of all-terminal task state does NOT re-fire the
     # tournament. Corrective tasks landing terminal transition the status
     # from ``"corrective_required"`` → ``"accepted"`` directly.
+    # v0.29.0 Bug 7: ``"paused"`` is a non-terminal review state set by
+    # the phase aggregator when one or more tasks in the phase are in the
+    # new ``quarantined`` task state. The aggregator refuses to fire the
+    # phase-review tournament on a partial / halted phase; instead it
+    # parks the phase here so :meth:`Orchestrator.resume` can re-trigger
+    # the review once the quarantined tasks resolve.
     review_status: (
-        Literal["pending", "in_progress", "accepted", "corrective_required", "skipped"]
+        Literal[
+            "pending",
+            "in_progress",
+            "accepted",
+            "corrective_required",
+            "skipped",
+            "paused",
+        ]
         | None
     ) = None
     # v0.9.0: ids of corrective tasks injected by ``parse_corrective_direction``

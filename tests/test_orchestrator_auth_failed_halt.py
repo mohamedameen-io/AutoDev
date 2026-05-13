@@ -1,5 +1,5 @@
-"""Tests for v0.28.0 Bug 2: orchestrator halts cleanly on
-:class:`AuthenticationFailedError`.
+"""Tests for the orchestrator halt-on-:class:`AuthenticationFailedError`
+contract.
 
 When the tournament classifier raises :class:`AuthenticationFailedError`
 (``subtype="auth_failed"`` from the upstream API), the orchestrator's
@@ -7,16 +7,21 @@ top-level loop in :func:`orchestrator.execute_phase.run_execute_phase`
 must:
 
   1. Catch the typed exception.
-  2. Mark the in-flight task as ``blocked`` with
-     ``blocked_reason="auth_failed: <error>"``.
+  2. Mark the in-flight task as ``quarantined`` with
+     ``blocked_reason="auth_failed: <error>"`` (v0.29.0 Bug 7
+     superseded the v0.28.0 ``blocked`` contract — quarantined is
+     non-terminal so :meth:`Orchestrator.resume` picks the task back
+     up automatically once the operator clears the underlying issue).
   3. Re-raise so the CLI surface returns a non-zero exit code.
-  4. NOT mark the phase as ``accepted`` or ``skipped`` (the
-     phase-review tournament must not fire on a halt path; that would
-     force-accept an empty / partial phase, which is the production
-     stall this fix exists to prevent).
+  4. NOT mark the phase as ``accepted`` or ``skipped`` — the phase
+     aggregator parks the phase at ``review_status="paused"`` instead
+     so the resume path can re-trigger the tournament fresh once the
+     quarantined task resolves. Force-accepting a partial phase on a
+     halt path is the production stall this fix exists to prevent.
 
-Bug 7 in v0.29.0 will replace ``blocked`` with ``quarantined`` so the
-halt becomes resumable; the test below pins the v0.28.0 contract.
+The complementary v0.29.0 contract (resume re-dispatches quarantined,
+phase-review re-fires) is exercised in
+``test_orchestrator_auth_failed_quarantine.py``.
 """
 
 from __future__ import annotations
@@ -98,12 +103,19 @@ async def test_auth_failed_during_phase_aborts_loop_without_force_accept(
 
       * :func:`run_execute_phase` re-raises the typed exception (so the
         CLI driver returns a non-zero exit code);
-      * the in-flight task ends up in ``status="blocked"`` with a
-        ``blocked_reason`` carrying the ``auth_failed:`` prefix;
-      * the phase's ``review_status`` stays ``None`` — NOT
-        ``"accepted"`` or ``"skipped"``. (The phase-review tournament
-        must not fire on a halt path; force-accepting a half-empty
-        phase is the production stall Bug 2 exists to prevent.)
+      * the in-flight task ends up in ``status="quarantined"`` with a
+        ``blocked_reason`` carrying the ``auth_failed:`` prefix
+        retained for forensics (v0.29.0 Bug 7 changed this from the
+        v0.28.0 ``blocked`` contract — quarantined is non-terminal so
+        :meth:`Orchestrator.resume` can pick the task back up
+        automatically);
+      * the phase's ``review_status`` is parked at ``"paused"`` —
+        NOT ``None``, ``"accepted"`` or ``"skipped"``. (The phase-
+        review tournament must not fire on a halt path; force-
+        accepting a half-empty phase is the production stall Bug 2
+        / Bug 7 exists to prevent. The aggregator's pause guard
+        replaces v0.28.0's "leave at None" behaviour so the resume
+        path has a clear signal to re-trigger the review.)
     """
     pm = PlanManager(tmp_path, session_id="sess-init")
     await pm.init_plan(_mk_single_phase_plan())
@@ -131,11 +143,14 @@ async def test_auth_failed_during_phase_aborts_loop_without_force_accept(
     phase = plan.phases[0]
     task = phase.tasks[0]
 
-    # Task is blocked with the typed reason (Bug 7 in v0.29.0 will
-    # change this to "quarantined").
-    assert task.status == "blocked"
+    # v0.29.0 Bug 7: was ``blocked`` in v0.28.0; now ``quarantined`` so
+    # ``Orchestrator.resume`` picks the task up automatically once the
+    # operator clears the underlying auth issue.
+    assert task.status == "quarantined"
     assert task.blocked_reason is not None
     assert task.blocked_reason.startswith("auth_failed:")
 
-    # Phase review NEVER fired — no force-accept on the halt path.
-    assert phase.review_status is None
+    # v0.29.0 Bug 7: phase parked at ``paused`` (was left at ``None``
+    # in v0.28.0). Phase-review tournament never fired — no force-
+    # accept on the halt path.
+    assert phase.review_status == "paused"

@@ -1030,13 +1030,17 @@ async def run_execute_phase(
         try:
             processed.append(await _execute_one(orch, task))
         except AuthenticationFailedError as exc:
-            # v0.28.0 Bug 2: typed halt on auth failure. Stamp the
-            # offending task as ``blocked`` (idempotent — ``_execute_one``
-            # may have already done so when raised mid-pipeline), log
-            # the structured halt event, surface a clear console
+            # v0.29.0 Bug 7: typed halt on auth failure. Stamp the
+            # offending task as ``quarantined`` (non-terminal so
+            # ``Orchestrator.resume`` picks it back up) with the
+            # typed ``auth_failed:`` reason retained for forensics,
+            # log the structured halt event, surface a clear console
             # message, and re-raise so the CLI driver exits non-zero.
-            # Do NOT call ``_maybe_run_phase_review`` — the phase must
-            # not be force-accepted on the halt path.
+            # Do NOT call ``_maybe_run_phase_review`` — the phase
+            # must not be force-accepted on the halt path; the
+            # aggregator's pause-on-quarantined check would short-
+            # circuit anyway, but skipping the call entirely is the
+            # belt-and-suspenders form.
             await _halt_task_for_auth_failed(orch, task.id, exc)
             raise
         # Single-task path also triggers review when the targeted task
@@ -1321,22 +1325,30 @@ async def run_execute_phase(
                     )
                     if latest_phase is None:
                         break
-                    if latest_phase.review_status in ("accepted", "skipped"):
+                    # v0.29.0 Bug 7: ``"paused"`` joins the terminal-for-
+                    # this-loop set so a quarantine-induced halt cannot
+                    # spin the round-loop. The phase will resume via
+                    # :meth:`Orchestrator.resume` instead.
+                    if latest_phase.review_status in (
+                        "accepted",
+                        "skipped",
+                        "paused",
+                    ):
                         break
                     # Any new pending tasks? If not, stop looping.
                     if not any(t.status == "pending" for t in latest_phase.tasks):
                         break
     except AuthenticationFailedError as exc:
-        # v0.28.0 Bug 2: typed halt on auth failure during the
+        # v0.29.0 Bug 7: typed halt on auth failure during the
         # whole-plan loop. The worker has already stamped its own
-        # task as ``blocked`` with the ``auth_failed:`` prefix; we
-        # idempotently re-stamp here as a defensive net for the
-        # case where the exception came up a path that bypassed the
-        # worker's stamp (cross-phase cancellation, etc.). Then log
-        # the structured halt event and re-raise so the CLI driver
-        # exits non-zero. Phase review is NOT triggered for any
-        # in-flight phase — force-accepting on a halt path is the
-        # production stall this fix exists to prevent.
+        # task as ``quarantined`` with the ``auth_failed:`` reason
+        # retained for forensics; we just emit the structured halt
+        # event and re-raise so the CLI driver exits non-zero. Phase
+        # review is NOT triggered for any in-flight phase — the
+        # phase aggregator's pause-on-quarantined check parks the
+        # phase at ``review_status="paused"`` instead of force-
+        # accepting on a halt path (the production stall this fix
+        # exists to prevent).
         await _halt_for_auth_failed(orch, exc)
         raise
     finally:
@@ -1353,31 +1365,64 @@ async def run_execute_phase(
 async def _halt_task_for_auth_failed(
     orch: "Orchestrator", task_id: str, exc: AuthenticationFailedError
 ) -> None:
-    """v0.28.0 Bug 2: shared halt routine for the typed auth-failure path.
+    """v0.29.0 Bug 7: shared halt routine for the typed auth-failure path.
 
-    Idempotently stamps the task as ``blocked`` with a structured
-    ``blocked_reason="auth_failed: <error>"`` and emits the
-    :data:`execute_phase.auth_failed_halt` structured-log event so the
-    operator sees one clear line in the run log linking the failure to
-    the halt. Failures inside this helper are swallowed (logged) so we
-    never mask the original :class:`AuthenticationFailedError` on the
-    way back up to the CLI driver.
+    Idempotently stamps the task as ``quarantined`` (NOT ``blocked``)
+    with a structured ``blocked_reason="auth_failed: <error>"`` retained
+    for forensics, and emits the :data:`execute_phase.auth_failed_halt`
+    structured-log event so the operator sees one clear line in the run
+    log linking the failure to the halt. Failures inside this helper
+    are swallowed (logged) so we never mask the original
+    :class:`AuthenticationFailedError` on the way back up to the CLI
+    driver.
+
+    v0.29.0 supersedes the v0.28.0 contract: the halt is now resumable.
+    ``quarantined`` is non-terminal so :meth:`Orchestrator.resume` picks
+    the task up automatically once the operator clears the underlying
+    auth issue. ``block_reason_class`` (Bug 6) is intentionally NOT
+    stamped — that field is reserved for true ``blocked`` tasks; a
+    quarantined task is awaiting recovery, not classification.
     """
     try:
         await orch.plan_manager.update_task_status(
             task_id,
-            "blocked",
-            meta={
-                "blocked_reason": f"auth_failed: {exc}",
-                # v0.29.0 Bug 6: auth halt is canonical infrastructure.
-                "block_reason_class": "infrastructure",
-            },
+            "quarantined",
+            meta={"blocked_reason": f"auth_failed: {exc}"},
         )
     except Exception as exc2:  # noqa: BLE001 — best-effort idempotent stamp
         logger.warning(
-            "execute_phase.auth_failed_block_failed",
+            "execute_phase.auth_failed_quarantine_failed",
             task_id=task_id,
             err=str(exc2),
+        )
+    # v0.29.0 Bug 7: park the owning phase at ``review_status="paused"``
+    # so the phase aggregator's run-loop and the resume path both see a
+    # clear "halt-recovery pending" signal. Looking up the phase id is
+    # best-effort; failure here just means the next ``_maybe_run_phase
+    # _review`` poll will set the pause stamp itself once it sees the
+    # quarantined task.
+    try:
+        plan = await orch.plan_manager.load()
+        if plan is not None:
+            phase_id_for_pause: str | None = None
+            current_review_status: str | None = None
+            for phase in plan.phases:
+                for t in phase.tasks:
+                    if t.id == task_id:
+                        phase_id_for_pause = phase.id
+                        current_review_status = phase.review_status
+                        break
+                if phase_id_for_pause is not None:
+                    break
+            if phase_id_for_pause is not None:
+                await _pause_phase_for_quarantine(
+                    orch, phase_id_for_pause, current_review_status
+                )
+    except Exception as exc3:  # noqa: BLE001 — never mask the original
+        logger.warning(
+            "execute_phase.auth_failed_pause_lookup_failed",
+            task_id=task_id,
+            err=str(exc3),
         )
     logger.error(
         "execute_phase.auth_failed_halt",
@@ -1388,7 +1433,8 @@ async def _halt_task_for_auth_failed(
     # ``autodev execute`` users see one clear line on the console.
     print(
         f"\nautodev execute: aborting on authentication failure ({exc}).\n"
-        "  Refresh your credentials and retry.\n",
+        "  Task is quarantined; refresh your credentials and "
+        "run `autodev resume` to continue.\n",
     )
 
 
@@ -1398,20 +1444,26 @@ async def _halt_for_auth_failed(
     """Whole-plan variant of :func:`_halt_task_for_auth_failed`.
 
     The worker that originally raised has already stamped its own task
-    as ``blocked``; here we just emit the structured halt event and the
-    operator-facing message. Walks the plan to find the in-flight task
-    (status ``in_progress``) for the structured-log payload — best-
-    effort and falls back to ``task_id="<unknown>"`` if the plan can't
-    be loaded (e.g. ledger corruption mid-halt).
+    as ``quarantined`` (v0.29.0 Bug 7); here we just emit the
+    structured halt event and the operator-facing message. Walks the
+    plan to find the halted task — preferring ``quarantined`` (the
+    canonical post-halt status) and falling back to ``in_progress`` for
+    the brief window before the worker's stamp lands. Best-effort and
+    falls back to ``task_id="<unknown>"`` if the plan can't be loaded
+    (e.g. ledger corruption mid-halt).
     """
     in_flight_task_id = "<unknown>"
+    halted_phase_id: str | None = None
+    halted_phase_review_status: str | None = None
     try:
         plan = await orch.plan_manager.load()
         if plan is not None:
             for phase in plan.phases:
                 for t in phase.tasks:
-                    if t.status == "in_progress":
+                    if t.status in ("quarantined", "in_progress"):
                         in_flight_task_id = t.id
+                        halted_phase_id = phase.id
+                        halted_phase_review_status = phase.review_status
                         break
                 if in_flight_task_id != "<unknown>":
                     break
@@ -1420,6 +1472,19 @@ async def _halt_for_auth_failed(
             "execute_phase.auth_failed_plan_load_failed",
             err=str(exc2),
         )
+    # v0.29.0 Bug 7: park the owning phase at ``review_status="paused"``
+    # so the resume path sees a clear "halt-recovery pending" signal.
+    if halted_phase_id is not None:
+        try:
+            await _pause_phase_for_quarantine(
+                orch, halted_phase_id, halted_phase_review_status
+            )
+        except Exception as exc3:  # noqa: BLE001 — never mask the original
+            logger.warning(
+                "execute_phase.auth_failed_pause_lookup_failed",
+                phase_id=halted_phase_id,
+                err=str(exc3),
+            )
     logger.error(
         "execute_phase.auth_failed_halt",
         task_id=in_flight_task_id,
@@ -1427,7 +1492,8 @@ async def _halt_for_auth_failed(
     )
     print(
         f"\nautodev execute: aborting on authentication failure ({exc}).\n"
-        "  Refresh your credentials and retry.\n",
+        "  Task is quarantined; refresh your credentials and "
+        "run `autodev resume` to continue.\n",
     )
 
 
@@ -1586,12 +1652,13 @@ async def _execute_phase_dag(
                 completed_task = d.result()
                 processed.append(completed_task)
             except AuthenticationFailedError:
-                # v0.28.0 Bug 2: drain remaining in-flight workers so we
+                # v0.29.0 Bug 7: drain remaining in-flight workers so we
                 # don't leave orphan asyncio tasks dangling, then re-raise
                 # so ``run_execute_phase`` can log the structured halt
                 # event and abort the phase loop. The worker itself has
-                # already stamped ``blocked_reason="auth_failed: ..."``
-                # on the offending task before re-raising.
+                # already stamped the offending task as ``quarantined``
+                # with ``blocked_reason="auth_failed: ..."`` retained
+                # for forensics before re-raising.
                 for other_id, other in list(in_flight.items()):
                     if other.done():
                         continue
@@ -1850,12 +1917,14 @@ async def _execute_cross_phase_dag(
                 if completed_task.status == "blocked":
                     failed_parents.add(finished_id)
             except AuthenticationFailedError:
-                # v0.28.0 Bug 2: cross-phase variant of the typed halt.
+                # v0.29.0 Bug 7: cross-phase variant of the typed halt.
                 # Cancel and drain remaining workers so we don't strand
                 # asyncio tasks across the cross-phase pool, then
                 # re-raise into ``run_execute_phase`` for the structured
                 # log + abort. The worker has already stamped the
-                # offending task with ``blocked_reason="auth_failed: ..."``.
+                # offending task as ``quarantined`` with
+                # ``blocked_reason="auth_failed: ..."`` retained for
+                # forensics.
                 for other_id, other in list(in_flight.items()):
                     if other.done():
                         continue
@@ -1989,27 +2058,25 @@ async def _execute_one_worker(
     try:
         return await _execute_one(orch, task, worktree_mgr)
     except AuthenticationFailedError as exc:
-        # v0.28.0 Bug 2: stamp the task as ``blocked`` with the typed
-        # ``auth_failed:`` prefix BEFORE re-raising so the top-level
-        # ``run_execute_phase`` catch site sees a fully-persisted plan
-        # state on the way out (the catch itself does not reach into
-        # the in-flight task — by the time it fires, the worker has
-        # already returned). Re-raising propagates through
-        # ``_execute_phase_dag`` (which has its own typed catch) up to
-        # ``run_execute_phase`` for the structured-log + abort.
+        # v0.29.0 Bug 7: stamp the task as ``quarantined`` (NOT
+        # ``blocked``) with the typed ``auth_failed:`` prefix retained
+        # in ``blocked_reason`` for forensics BEFORE re-raising so the
+        # top-level ``run_execute_phase`` catch site sees a fully-
+        # persisted plan state on the way out. Quarantined is non-
+        # terminal so ``Orchestrator.resume()`` picks the task up
+        # automatically once the operator clears the underlying auth
+        # issue. Re-raising propagates through ``_execute_phase_dag``
+        # (which has its own typed catch) up to ``run_execute_phase``
+        # for the structured-log + abort.
         try:
             await orch.plan_manager.update_task_status(
                 task.id,
-                "blocked",
-                meta={
-                    "blocked_reason": f"auth_failed: {exc}",
-                    # v0.29.0 Bug 6: auth_failed is canonical infra.
-                    "block_reason_class": "infrastructure",
-                },
+                "quarantined",
+                meta={"blocked_reason": f"auth_failed: {exc}"},
             )
         except Exception as exc2:  # noqa: BLE001 — never mask the original
             logger.warning(
-                "execute_phase.auth_failed_block_failed",
+                "execute_phase.auth_failed_quarantine_failed",
                 task_id=task.id,
                 err=str(exc2),
             )
@@ -2185,6 +2252,50 @@ def _all_phase_tasks_terminal(phase: Phase) -> bool:
     return all(t.status in _TERMINAL_TASK_STATUSES for t in phase.tasks)
 
 
+def _phase_has_quarantined_task(phase: Phase) -> bool:
+    """v0.29.0 Bug 7: ``True`` iff any task in the phase is ``quarantined``.
+
+    Used by :func:`_maybe_run_phase_review` as the early-bail guard that
+    refuses to auto-accept (or even re-evaluate) a phase whose execution
+    was halted by a typed infrastructure failure
+    (:class:`AuthenticationFailedError` etc.). When this returns
+    ``True``, the aggregator parks the phase at ``review_status="paused"``
+    instead of firing the phase-review tournament; the
+    :meth:`Orchestrator.resume` path clears the paused state once the
+    quarantined tasks resolve and re-execute.
+    """
+    return any(t.status == "quarantined" for t in phase.tasks)
+
+
+async def _pause_phase_for_quarantine(
+    orch: "Orchestrator", phase_id: str, current_status: str | None
+) -> None:
+    """v0.29.0 Bug 7: idempotently park the phase at ``review_status="paused"``.
+
+    No-op when the phase is already paused so the per-worker drain
+    callbacks don't write a redundant ledger entry on every poll.
+    Failures are swallowed (logged) so the auth-failed halt path
+    cannot be masked by a phase-meta update problem.
+    """
+    if current_status == "paused":
+        return
+    try:
+        await orch.plan_manager.update_phase_meta(
+            phase_id, review_status="paused"
+        )
+        logger.info(
+            "execute_phase.phase_review_paused_for_quarantine",
+            phase_id=phase_id,
+            prior_status=current_status,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.phase_review_pause_failed",
+            phase_id=phase_id,
+            err=str(exc),
+        )
+
+
 async def _maybe_run_phase_review(
     orch: "Orchestrator", phase_id: str
 ) -> None:
@@ -2196,6 +2307,13 @@ async def _maybe_run_phase_review(
     re-firing the tournament. Once corrective tasks reach terminal, this
     function transitions ``"corrective_required"`` directly to
     ``"accepted"`` without a second tournament.
+
+    v0.29.0 Bug 7: also short-circuits when the phase contains a
+    ``quarantined`` task. Quarantined tasks are non-terminal but signal
+    a halt-on-infra-failure that must NOT be silently force-accepted.
+    The phase is parked at ``review_status="paused"`` instead, and
+    :meth:`Orchestrator.resume` clears that state once the quarantined
+    work resolves so the tournament re-fires fresh.
     """
     if not orch.cfg.tournaments.phase_review.enabled:
         return
@@ -2214,10 +2332,25 @@ async def _maybe_run_phase_review(
     if phase is None:
         return
 
+    # v0.29.0 Bug 7: BEFORE every auto-accept site below, refuse to
+    # touch a phase that holds a quarantined task. Park at "paused" and
+    # exit; the resume path is responsible for clearing this once the
+    # quarantined work resolves.
+    if _phase_has_quarantined_task(phase):
+        await _pause_phase_for_quarantine(orch, phase_id, phase.review_status)
+        return
+
     # Critical loop guard: reviewed phases are not re-reviewed.
     if phase.review_status == "accepted":
         return
     if phase.review_status == "skipped":
+        return
+    if phase.review_status == "paused":
+        # v0.29.0 Bug 7: a phase parked by an earlier quarantine. With
+        # no quarantined tasks remaining (checked above), the resume
+        # path is responsible for explicitly clearing ``paused``;
+        # observing ``paused`` here without the resume-clear means
+        # we're being polled mid-recovery and should defer.
         return
     if phase.review_status == "corrective_required":
         # Corrective tasks have landed terminal — accept and move on.

@@ -13,6 +13,12 @@ States a task moves through inside the execute loop:
 
 Any in-flight state may fall back to ``in_progress`` on retry, or to
 ``blocked`` on hard failure. ``skipped`` is a user-driven escape hatch.
+
+v0.29.0 Bug 7: ``in_progress`` may also fall to ``quarantined`` on a
+typed infrastructure halt (e.g. :class:`AuthenticationFailedError`).
+``quarantined`` is non-terminal — :meth:`Orchestrator.resume` picks
+quarantined tasks up automatically and walks them back through
+``in_progress`` so the rest of the pipeline edges re-apply unchanged.
 """
 
 from __future__ import annotations
@@ -25,8 +31,22 @@ TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     # the ARCHITECT_CONSULT "refine-tasks" resolution can supersede a
     # failing task with corrective sub-tasks. Metadata ``architect_consult_action="refine"``
     # distinguishes the architect-driven skip from a user-driven one.
+    #
+    # v0.29.0 Bug 7: ``in_progress`` -> ``quarantined`` covers the typed
+    # halt path (``AuthenticationFailedError`` and other infra failures).
+    # ``quarantined`` -> ``in_progress`` is the resume edge: the operator
+    # clears the underlying infra issue and ``Orchestrator.resume()``
+    # picks the task up again. ``blocked`` -> ``quarantined`` is the
+    # operator/auth-recovery upgrade path so an already-blocked task can
+    # be re-categorised as resumable instead of terminal.
     "pending": {"in_progress", "skipped", "blocked"},
-    "in_progress": {"coded", "blocked", "in_progress", "skipped"},
+    "in_progress": {
+        "coded",
+        "blocked",
+        "in_progress",
+        "skipped",
+        "quarantined",
+    },
     # auto-gates retry back to in_progress on failure
     "coded": {"auto_gated", "in_progress", "blocked"},
     "auto_gated": {"reviewed", "in_progress", "blocked"},
@@ -35,9 +55,15 @@ TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     "tournamented": {"complete", "blocked"},
     "complete": set(),
     # Blocked tasks can only be moved back to in_progress by an explicit
-    # resume decision.
-    "blocked": {"in_progress"},
+    # resume decision. v0.29.0 Bug 7: also allow promotion to
+    # ``quarantined`` so an operator can upgrade an infra-flavoured
+    # block to the resumable surface.
+    "blocked": {"in_progress", "quarantined"},
     "skipped": set(),
+    # v0.29.0 Bug 7: non-terminal infrastructure-halt state. Resume goes
+    # back through ``in_progress`` so the rest of the pipeline edges
+    # (coded/auto_gated/...) re-apply unchanged.
+    "quarantined": {"in_progress"},
 }
 
 
