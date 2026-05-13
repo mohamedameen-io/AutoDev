@@ -531,11 +531,16 @@ def test_build_command_omits_effort_when_empty_string(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_healthcheck_success() -> None:
+    """v0.28.0 (Bug 10): healthcheck is now a two-stage probe — ``--version``
+    THEN a live PONG round-trip. Both must succeed for ``(True, _)``.
+    """
     adapter = ClaudeCodeAdapter()
-    fake = _fake_proc(stdout="2.1.92 (Claude Code)\n", returncode=0)
+    version_proc = _fake_proc(stdout="2.1.92 (Claude Code)\n", returncode=0)
+    pong_blob = _good_claude_blob("PONG")
+    pong_proc = _fake_proc(stdout=pong_blob, returncode=0)
     with patch(
         "adapters.claude_code.asyncio.create_subprocess_exec",
-        AsyncMock(return_value=fake),
+        AsyncMock(side_effect=[version_proc, pong_proc]),
     ):
         ok, details = await adapter.healthcheck()
     assert ok is True

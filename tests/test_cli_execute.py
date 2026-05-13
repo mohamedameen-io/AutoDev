@@ -121,6 +121,8 @@ def test_execute_success_renders_table(tmp_path: Path) -> None:
             patch("cli.commands.execute.Orchestrator") as mock_orch_cls,
         ):
             mock_adapter = MagicMock()
+            # v0.28.0 (Bug 10): preflight re-probe must succeed.
+            mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
             mock_get_adapter.return_value = mock_adapter
 
             mock_orch = MagicMock()
@@ -148,6 +150,8 @@ def test_execute_autodev_error_exits_2(tmp_path: Path) -> None:
             patch("cli.commands.execute.Orchestrator") as mock_orch_cls,
         ):
             mock_adapter = MagicMock()
+            # v0.28.0 (Bug 10): preflight re-probe must succeed.
+            mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
             mock_get_adapter.return_value = mock_adapter
 
             mock_orch = MagicMock()
@@ -184,6 +188,8 @@ def test_execute_with_task_id(tmp_path: Path) -> None:
             patch("cli.commands.execute.Orchestrator") as mock_orch_cls,
         ):
             mock_adapter = MagicMock()
+            # v0.28.0 (Bug 10): preflight re-probe must succeed.
+            mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
             mock_get_adapter.return_value = mock_adapter
 
             mock_orch = MagicMock()

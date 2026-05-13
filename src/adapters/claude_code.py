@@ -438,6 +438,24 @@ class ClaudeCodeAdapter(PlatformAdapter):
             )
 
     async def healthcheck(self) -> tuple[bool, str]:
+        """Two-stage probe: cheap ``--version``, then live PONG round-trip.
+
+        Stage 1 (``claude --version``) catches "CLI missing / broken install".
+        Stage 2 (``echo PONG | claude -p --max-turns 1``, 10s timeout) catches
+        bad auth and network failures that stage 1 cannot see — a perfectly
+        installed CLI with an expired token still returns 0 from
+        ``--version`` but fails the live call with HTTP 401/403.
+
+        Reason prefixes (return value's second element):
+          * ``"binary not found: ..."``       — Stage 1 ``FileNotFoundError``.
+          * ``"claude --version exit ..."``   — Stage 1 nonzero.
+          * ``"claude --version timed out"``  — Stage 1 hang (5s).
+          * ``"auth_failed: ..."``            — Stage 2 ``is_error=true`` with
+                                                401/403 in the message.
+          * ``"network: ..."``                — Stage 2 timeout (10s) or other
+                                                non-auth ``is_error=true``.
+        """
+        # Stage 1: cheap CLI presence + version probe.
         try:
             proc = await asyncio.create_subprocess_exec(
                 self.binary,
@@ -468,4 +486,83 @@ class ClaudeCodeAdapter(PlatformAdapter):
                 f"claude --version exit {proc.returncode}: "
                 f"{stderr_b.decode('utf-8', errors='replace').strip()[:200]}"
             )
-        return True, stdout_b.decode("utf-8", errors="replace").strip()
+        version_str = stdout_b.decode("utf-8", errors="replace").strip()
+
+        # Stage 2: live PONG probe. Mirrors ``execute()``'s subprocess
+        # patterns (lines 112-117) — same create_subprocess_exec/wait_for
+        # idioms; same kill-on-cancel/timeout discipline.
+        return await self._pong_probe(version_str)
+
+    async def _pong_probe(self, version_str: str) -> tuple[bool, str]:
+        """Run ``echo PONG | claude -p --max-turns 1`` and classify the result.
+
+        10s timeout is intentional: this runs at every ``autodev resume`` /
+        ``execute`` startup; a longer wait would defeat fail-fast semantics.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.binary,
+                "-p",
+                "PONG",
+                "--max-turns",
+                "1",
+                "--output-format",
+                "json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            # Should be unreachable — Stage 1 already proved the binary
+            # exists — but stay defensive for racy filesystems.
+            return False, f"binary not found: {self.binary}"
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=10,
+            )
+        except asyncio.CancelledError:
+            with suppress(ProcessLookupError):
+                proc.kill()
+            with suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            raise
+        except asyncio.TimeoutError:
+            with suppress(ProcessLookupError):
+                proc.kill()
+            with suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            return False, "network: PONG probe timed out after 10s"
+
+        stdout = stdout_b.decode("utf-8", errors="replace")
+        stderr = stderr_b.decode("utf-8", errors="replace")
+        rc = proc.returncode if proc.returncode is not None else -1
+
+        # Try to parse the structured JSON. The CLI emits its result envelope
+        # to stdout even on rc!=0 in many failure modes (see Fix 4 comment in
+        # ``execute`` above), so don't gate on rc first.
+        parsed: dict[str, Any] | None = None
+        try:
+            candidate = json.loads(stdout)
+            if isinstance(candidate, dict):
+                parsed = candidate
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+
+        if parsed is not None:
+            is_error = bool(parsed.get("is_error", False))
+            if not is_error:
+                return True, version_str or "ok"
+            message = str(parsed.get("result", "") or parsed.get("error", "")).strip()
+            # Auth-failure detection: HTTP 401/403 in the CLI's message body.
+            # The Anthropic CLI surfaces these as ``API Error: 401`` /
+            # ``API Error: 403`` strings inside the ``result`` field.
+            if "401" in message or "403" in message:
+                snippet = message[:200] if message else "401/403"
+                return False, f"auth_failed: {snippet}"
+            snippet = message[:200] if message else f"is_error=true rc={rc}"
+            return False, f"network: {snippet}"
+
+        # Unparseable stdout — treat as a network/transport failure rather
+        # than success. Surface a short tail so operators can diagnose.
+        tail = stderr.strip()[:200] or stdout.strip()[:200] or f"rc={rc}"
+        return False, f"network: PONG probe produced no parseable result ({tail})"

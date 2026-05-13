@@ -55,4 +55,23 @@ class PlatformAdapter(ABC):
 
     @abstractmethod
     async def healthcheck(self) -> tuple[bool, str]:
-        """Return (ok, details) describing CLI presence / login status."""
+        """Return ``(ok, details)`` describing CLI presence + login status.
+
+        Contract:
+          * On success → ``(True, <human-readable status>)`` (e.g. version
+            string).
+          * On any failure → ``(False, <reason>)``. Concrete adapters MUST
+            distinguish failure modes via a stable reason prefix so callers
+            (e.g. ``autodev resume`` / ``execute`` preflight) can render
+            actionable guidance:
+              - ``"binary not found: ..."`` → CLI missing.
+              - ``"auth_failed: ..."``       → reachable CLI, bad/expired
+                credentials (HTTP 401/403 from the upstream LLM API).
+              - ``"network: ..."``           → reachable CLI, transient
+                upstream failure (timeout, 5xx, connection error).
+
+        Implementations should fail fast (a few seconds, not minutes) so the
+        check is safe to gate startup on. The Claude Code adapter implements
+        a two-stage probe: ``--version`` (cheap) then a live PONG round-trip
+        (catches auth/network).
+        """

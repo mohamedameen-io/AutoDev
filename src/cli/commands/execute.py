@@ -15,6 +15,7 @@ from typing import Literal, cast
 from adapters.detect import get_adapter
 from agents import build_registry
 from autologging import get_logger
+from cli.commands.resume import _print_preflight_failure
 from config.loader import load_config
 from errors import AutodevError
 from orchestrator import Orchestrator
@@ -105,15 +106,31 @@ def execute(
     # files when it queries ``IndexQuery.get_candidates_for_spec``.
     _maybe_refresh_index(cwd, cfg)
 
+    # v0.28.0 (Bug 10): mandatory preflight probe. Re-runs ``healthcheck``
+    # right before entering the orchestrator loop so a stale negative cached
+    # inside ``get_adapter`` cannot lock the user out, and a freshly-broken
+    # auth/network state is surfaced before any LLM spend.
+    preflight_failure: tuple[str, str] | None = None
+
     async def _run() -> None:
         # v0.26.0: ``platform: inline`` is auto-migrated to ``claude_code``
         # by the schema validator. ``cfg.platform`` is always one of
         # {claude_code, cursor, auto} here; no ``DelegationPendingSignal``
         # path remains.
+        nonlocal preflight_failure
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
         adapter = await get_adapter(
             cast("Literal['claude_code', 'cursor', 'auto']", platform_pref)
         )
+
+        # Mandatory re-probe — NOT cached. Mirrors the ``autodev resume``
+        # path (Bug 10) so both entry points fail-fast on infrastructure
+        # problems.
+        ok, details = await adapter.healthcheck()
+        if not ok:
+            preflight_failure = ("execute", details)
+            return
+
         registry = build_registry(cfg)
         orch = Orchestrator(
             cwd=cwd,
@@ -129,6 +146,11 @@ def execute(
         asyncio.run(_run())
     except AutodevError as exc:
         console.print(f"[red]autodev execute failed[/red]: {exc}")
+        sys.exit(2)
+
+    if preflight_failure is not None:
+        _, reason = preflight_failure
+        _print_preflight_failure(console, "execute", reason)
         sys.exit(2)
 
 

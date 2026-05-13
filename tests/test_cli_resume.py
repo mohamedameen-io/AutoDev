@@ -71,6 +71,9 @@ def test_resume_autodev_error_exits_2(tmp_path: Path) -> None:
             patch("cli.commands.resume.Orchestrator") as mock_orch_cls,
         ):
             mock_adapter = MagicMock()
+            # v0.28.0 (Bug 10): preflight re-probe must succeed so we reach
+            # the orchestrator branch this test exercises.
+            mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
             mock_get_adapter.return_value = mock_adapter
 
             mock_orch = MagicMock()
@@ -108,6 +111,9 @@ def test_resume_success_no_suspend_state(tmp_path: Path) -> None:
             patch("cli.commands.resume.Orchestrator") as mock_orch_cls,
         ):
             mock_adapter = MagicMock()
+            # v0.28.0 (Bug 10): preflight probe must succeed for resume to
+            # enter the orchestrator loop.
+            mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
             mock_get_adapter.return_value = mock_adapter
 
             mock_orch = MagicMock()

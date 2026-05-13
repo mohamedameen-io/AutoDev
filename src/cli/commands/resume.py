@@ -75,6 +75,13 @@ def resume(platform: str | None) -> None:
     # tracked files via ``IndexQuery``.
     _maybe_refresh_index(cwd, cfg)
 
+    # v0.28.0 (Bug 10): mandatory preflight probe. ``get_adapter`` already
+    # runs ``healthcheck`` inside ``detect_platform``, but we re-probe here
+    # because the user typically invokes ``autodev resume`` after just
+    # fixing auth — a cached/stale negative would lock them out. The
+    # probe must succeed before we enter the execute loop.
+    preflight_failure: tuple[str, str] | None = None
+
     async def _run() -> None:
         # v0.26.0: the inline suspend-state branch (read
         # ``.autodev/inline-state.json``, instantiate InlineAdapter, gate on
@@ -82,10 +89,19 @@ def resume(platform: str | None) -> None:
         # The migrator in ``config.schema`` rewrites legacy
         # ``platform: inline`` to ``platform: claude_code`` on load so
         # ``cfg.platform`` is always one of {claude_code, cursor, auto}.
+        nonlocal preflight_failure
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
         adapter: PlatformAdapter = await get_adapter(
             cast("Literal['claude_code', 'cursor', 'auto']", platform_pref)
         )
+
+        # Mandatory re-probe — NOT cached. If ``get_adapter`` succeeded but
+        # the underlying CLI / auth has flipped between then and now, we
+        # surface that here rather than thrashing the orchestrator.
+        ok, details = await adapter.healthcheck()
+        if not ok:
+            preflight_failure = ("resume", details)
+            return
 
         registry = build_registry(cfg)
         orch = Orchestrator(cwd=cwd, cfg=cfg, adapter=adapter, registry=registry)
@@ -97,6 +113,33 @@ def resume(platform: str | None) -> None:
     except AutodevError as exc:
         console.print(f"[red]autodev resume failed[/red]: {exc}")
         sys.exit(2)
+
+    if preflight_failure is not None:
+        _, reason = preflight_failure
+        _print_preflight_failure(console, "resume", reason)
+        sys.exit(2)
+
+
+def _print_preflight_failure(console: Console, command: str, reason: str) -> None:
+    """Render the actionable infrastructure-not-ready block (Bug 10).
+
+    Format mirrors the multi-line layout used by ``reset.py`` / ``status.py``
+    for operator-facing diagnostics.
+    """
+    console.print(f"[red]autodev {command}: infrastructure not ready[/red]")
+    console.print(f"  reason: {reason}")
+    console.print("")
+    console.print("  Refresh your auth and retry:")
+    console.print(
+        "    • If using API key: verify [bold]ANTHROPIC_API_KEY[/bold]"
+    )
+    console.print(
+        "    • If using corp proxy: refresh "
+        "[bold]ANTHROPIC_AUTH_TOKEN[/bold]"
+    )
+    console.print(
+        "    • If using subscription: run [bold]claude /login[/bold]"
+    )
 
 
 def _render_resume_summary(console: Console, tasks: list) -> None:
