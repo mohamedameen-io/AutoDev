@@ -2,6 +2,52 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.1] - 2026-05-13
+
+Patch release: `autodev init --platform cursor` now installs the
+`/autodev` slash command. Cursor 1.6+ supports custom slash commands
+at `.cursor/commands/<name>.md` (same shape as Claude Code's
+`.claude/commands/<name>.md`), but the v0.30.0 init flow at
+`src/cli/commands/init.py:144` explicitly skipped the install for
+the `cursor` platform — Cursor users got the background context rules
+under `.cursor/rules/<role>.mdc` but no slash entry in the Composer
+agent picker. This patch closes that gap.
+
+### Added
+- `render_cursor_slash_command()` in `src/adapters/inline_config.py`,
+  alongside the existing `render_claude_slash_command()`. Returns a
+  Cursor-flavoured passthrough template — plain markdown without
+  Claude's `allowed-tools:` / `argument-hint:` frontmatter (Cursor
+  command files are reusable prompt templates loaded into the
+  Composer agent's input box, not tool-permission scoped). Routes
+  to `--platform cursor` everywhere the Claude variant routes to
+  `--platform claude_code`. Includes the full v0.29-v0.30 subcommand
+  list (notably `requeue` and `rewind`, which the existing Claude
+  variant currently omits — to be backfilled in a future release).
+
+### Changed
+- `autodev init`'s slash-command install path widened from a single
+  conditional `slash_path: Path | None` to a `slash_paths: list[Path]`
+  that now writes BOTH files when `--platform auto` (the default):
+  - `.claude/commands/autodev.md` for `claude` / `auto`
+  - `.cursor/commands/autodev.md` for `cursor` / `auto`
+  The pretty-print summary table iterates the list so users see
+  every file written.
+
+### Out of scope
+- Cursor SDK adoption (`@cursor/sdk` TypeScript package, public beta
+  since 2026-04-29) and Cursor Cloud Agents REST API — both would
+  unlock typed `CursorAgentError` / `IntegrationNotConnectedError`
+  classification (the same kind of "swallow the error class" hole
+  the v0.28-v0.30 chain closed for Claude Code) plus first-class
+  hooks / subagents / cloud-VM execution that fits AutoDev's
+  tournament topology cleanly. Architectural decision deferred to
+  a future v0.31+ — re-introduces in-process complexity that
+  v0.26.0's subprocess-only refactor deliberately removed; needs a
+  spec doc covering Node.js bridge vs REST-API trade-offs, the
+  token-billing cost model, and the migration story for existing
+  ``platform: cursor`` workspaces.
+
 ## [0.30.0] - 2026-05-13
 
 Polish and observability — final release in the v0.28-0.30 triplet
