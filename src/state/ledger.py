@@ -722,6 +722,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
             task.escalated = bool(payload["escalated"])
         if "evidence_bundle" in payload:
             task.evidence_bundle = payload["evidence_bundle"]
+        # v0.29.0 Bug 6: typed block class. Pre-v0.29.0 ledger entries
+        # omit the field; the migration shim in
+        # :func:`PlanManager._load_sync` backfills from blocked_reason.
+        if "block_reason_class" in payload:
+            cls = payload["block_reason_class"]
+            if cls in (None, "verdict", "infrastructure", "cap"):
+                task.block_reason_class = cls
         return plan
 
     if op == "mark_blocked":
@@ -827,10 +834,19 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # full list of descendant task ids that were transitioned from
         # ``pending`` to ``blocked``. Replay walks each id and applies
         # status="blocked" with a structured ``blocked_reason``.
+        # v0.29.0 Bug 6: payload may also carry the inherited
+        # ``block_reason_class`` so replay rebuilds the typed enum on
+        # cascaded descendants exactly as the original mutation did.
+        # Pre-v0.29.0 ledger entries omit the field — the migration
+        # shim in :func:`PlanManager._load_sync` backfills it from the
+        # blocked_reason string after replay.
         phase_id = payload.get("phase_id")
         failed_task_id = payload.get("failed_task_id")
         reason = payload.get("reason", "")
         blocked_ids = payload.get("blocked_task_ids") or []
+        block_reason_class = payload.get("block_reason_class")
+        if block_reason_class not in (None, "verdict", "infrastructure", "cap"):
+            block_reason_class = None
         if not isinstance(phase_id, str) or not isinstance(failed_task_id, str):
             raise LedgerCorruptError(
                 f"entry seq={entry.seq} mark_blocked_descendants malformed"
@@ -851,6 +867,8 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
                     t.blocked_reason = (
                         f"upstream-failure:{failed_task_id}:{reason}"
                     )
+                    if block_reason_class is not None:
+                        t.block_reason_class = block_reason_class
                     break
         return plan
 

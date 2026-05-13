@@ -89,6 +89,16 @@ class Orchestrator:
         # runs once per orchestrator instance even if it is called from
         # multiple entry points (plan / execute / resume).
         self._seed_packs_loaded: bool = False
+        # v0.29.0 Bug 6: transient cache of the most recent adapter
+        # result's ``subtype`` (and ``api_error_status``). Updated by
+        # :func:`execute_phase.delegate` after every adapter call;
+        # consumed by the ``GuardrailExceededError`` block sites in
+        # :func:`execute_phase._execute_one` to classify the typed
+        # ``Task.block_reason_class`` (auth/transport-class subtypes
+        # → ``"infrastructure"``; everything else → ``"cap"``). NOT
+        # persisted — a fresh orchestrator starts both at ``None``.
+        self._last_adapter_subtype: str | None = None
+        self._last_adapter_api_error_status: int | None = None
 
         # Wire AgentExtensionPlugins: merge their specs into the agent registry.
         if plugin_registry is not None:

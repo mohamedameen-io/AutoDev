@@ -45,6 +45,35 @@ def _iso_now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
+def _backfill_block_reason_class(plan: Plan) -> Plan:
+    """v0.29.0 Bug 6: backfill ``Task.block_reason_class`` on legacy plans.
+
+    Pre-v0.29.0 ``plan.json`` snapshots have no ``block_reason_class``
+    on blocked tasks (the field didn't exist). Pydantic's ``None``
+    default keeps load itself non-fatal, but downstream consumers that
+    branch on the typed enum (refuse-force-accept in Bug 3, etc.)
+    would treat the field as ``None`` ambiguously. This shim runs the
+    keyword classifier from :mod:`state.infra_patterns` on the legacy
+    ``blocked_reason`` string to backfill a typed value.
+
+    Pure / idempotent: only mutates tasks whose ``status == "blocked"``
+    AND whose ``block_reason_class is None``. New v0.29.0+ blocks that
+    stamp the field explicitly are left alone, so a second call is a
+    no-op. Conservative default — when the heuristic doesn't match,
+    classifies as ``"verdict"`` so a misclassification can't auto-
+    resume a task the agent legitimately rejected.
+    """
+    from state.infra_patterns import classify_blocked_reason
+
+    for phase in plan.phases:
+        for task in phase.tasks:
+            if task.status == "blocked" and task.block_reason_class is None:
+                task.block_reason_class = classify_blocked_reason(
+                    task.blocked_reason
+                )
+    return plan
+
+
 @dataclass(frozen=True)
 class RequeueResult:
     """Outcome of :meth:`PlanManager.requeue_tasks` (v0.28.0 Bug 8).
@@ -132,14 +161,16 @@ class PlanManager:
             # Apply any subsequent entries on top.
             for later in entries[last_snapshot_idx + 1 :]:
                 base_plan = _apply_for_load(base_plan, later)
-            return base_plan
+            return _backfill_block_reason_class(base_plan)
 
         # Full replay (no snapshot yet) — reuse the already-read entries to
         # avoid a second disk read inside replay_ledger().
         plan: Plan | None = None
         for entry in entries:
             plan = _apply_op(plan, entry)
-        return plan
+        if plan is None:
+            return None
+        return _backfill_block_reason_class(plan)
 
     async def init_plan(self, plan: Plan) -> Plan:
         """Initialize a fresh plan. Fails if a plan already exists."""
@@ -333,6 +364,16 @@ class PlanManager:
                     task.escalated = bool(meta["escalated"])
                 if "evidence_bundle" in meta:
                     task.evidence_bundle = meta["evidence_bundle"]
+                # v0.29.0 Bug 6: typed block category. Validated by the
+                # Pydantic Literal on :attr:`Task.block_reason_class`.
+                if "block_reason_class" in meta:
+                    cls = meta["block_reason_class"]
+                    if cls not in (None, "verdict", "infrastructure", "cap"):
+                        raise ValueError(
+                            f"block_reason_class must be one of "
+                            f"verdict|infrastructure|cap|None, got {cls!r}"
+                        )
+                    task.block_reason_class = cls
             plan = plan.model_copy(update={"updated_at": _iso_now()})
             await snapshot_plan(self._cwd, plan, session_id=self._session_id)
             self._log.info(
@@ -890,6 +931,12 @@ class PlanManager:
         carries the full id list so replay reproduces the cascade
         atomically — no half-applied state.
 
+        v0.29.0 Bug 6: every cascaded descendant inherits the parent's
+        :attr:`Task.block_reason_class`. When the parent has no class
+        (legacy plan path), the cascade defaults to ``"verdict"`` —
+        the conservative pick (won't auto-resume on a future
+        ``--infrastructure`` requeue).
+
         Returns the list of task ids that were actually transitioned
         (i.e. were ``pending`` before the call). Already-terminal
         descendants are left alone so this method is safe to call
@@ -912,12 +959,24 @@ class PlanManager:
             if not blocked_ids:
                 return []
 
+            # Look up the parent's class so cascaded descendants
+            # inherit it. Default to ``"verdict"`` when the parent is
+            # absent or unstamped (conservative).
+            parent_task = _find_task(plan, failed_task_id)
+            inherited_class = (
+                parent_task.block_reason_class
+                if parent_task is not None
+                and parent_task.block_reason_class is not None
+                else "verdict"
+            )
+
             # Apply in-memory.
             structured_reason = f"upstream-failure:{failed_task_id}:{reason}"
             for t in phase.tasks:
                 if t.id in blocked_ids:
                     t.status = "blocked"  # type: ignore[assignment]
                     t.blocked_reason = structured_reason
+                    t.block_reason_class = inherited_class
 
             # Single ledger op + snapshot.
             await append_entry(
@@ -928,6 +987,7 @@ class PlanManager:
                     "failed_task_id": failed_task_id,
                     "reason": reason,
                     "blocked_task_ids": blocked_ids,
+                    "block_reason_class": inherited_class,
                 },
                 session_id=self._session_id,
             )

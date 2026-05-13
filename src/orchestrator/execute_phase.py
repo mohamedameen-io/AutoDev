@@ -129,6 +129,41 @@ _CONFLICT_DIRECTIVE_RE = re.compile(
 )
 
 
+# v0.29.0 Bug 6: subtypes that classify a guardrail-trip as
+# infrastructure (the LLM was unavailable) rather than ``"cap"`` (the
+# agent legitimately ran out of turns/budget). Mirrors the constants
+# tournament.llm uses to classify retry behaviour for adapter results.
+_INFRA_ADAPTER_SUBTYPES: frozenset[str] = frozenset(
+    {"auth_failed", "rate_limited", "server_error"}
+)
+
+
+def _classify_guardrail_block(
+    last_subtype: str | None,
+) -> Literal["verdict", "infrastructure", "cap"]:
+    """v0.29.0 Bug 6: classify a guardrail-tripped block.
+
+    The guardrail can fire for two materially different reasons:
+
+      * The agent legitimately consumed its budget on the work
+        (subtype is ``None`` or something like ``error_max_turns``).
+        Classify as ``"cap"``: requeueing without widening the cap
+        would just re-burn the budget.
+      * The most recent adapter result was an auth / rate-limit /
+        5xx failure that the retry layer kept colliding with until
+        the guardrail tripped. Classify as ``"infrastructure"``:
+        the operator can fix the environment and ``autodev requeue
+        --infrastructure`` will pick the task back up.
+
+    The ``last_subtype`` parameter is the ``subtype`` of the most
+    recent :class:`AgentResult` the orchestrator saw, stashed on
+    ``orch._last_adapter_subtype`` by :func:`delegate`.
+    """
+    if last_subtype in _INFRA_ADAPTER_SUBTYPES:
+        return "infrastructure"
+    return "cap"
+
+
 def _parse_conflict_resolution(critic_response: str) -> ConflictResolution:
     """Extract a :class:`ConflictResolution` from the critic's text.
 
@@ -653,7 +688,10 @@ async def _dispatch_architect_consult(
         # the SOFT_BLOCKER outcome path so downstream operators see a
         # consistent shape, with the ``escalated_infra`` marker in
         # metadata distinguishing the architect-diagnosed case from the
-        # plain soft-blocker.
+        # plain soft-blocker. v0.29.0 Bug 6: stamp typed
+        # ``block_reason_class="infrastructure"`` — the architect
+        # explicitly diagnosed this as outside-the-loop, so operators
+        # can safely select it via ``autodev requeue --infrastructure``.
         await orch.plan_manager.mark_escalated(task.id)
         diagnosis = arch_resolution.guidance or "architect diagnosed infrastructure failure"
         return await orch.plan_manager.update_task_status(
@@ -663,6 +701,7 @@ async def _dispatch_architect_consult(
                 "blocked_reason": f"architect_consult: infrastructure: {diagnosis}",
                 "architect_consult_action": "infrastructure",
                 "escalated_infra": True,
+                "block_reason_class": "infrastructure",
             },
         )
 
@@ -1328,7 +1367,11 @@ async def _halt_task_for_auth_failed(
         await orch.plan_manager.update_task_status(
             task_id,
             "blocked",
-            meta={"blocked_reason": f"auth_failed: {exc}"},
+            meta={
+                "blocked_reason": f"auth_failed: {exc}",
+                # v0.29.0 Bug 6: auth halt is canonical infrastructure.
+                "block_reason_class": "infrastructure",
+            },
         )
     except Exception as exc2:  # noqa: BLE001 — best-effort idempotent stamp
         logger.warning(
@@ -1958,7 +2001,11 @@ async def _execute_one_worker(
             await orch.plan_manager.update_task_status(
                 task.id,
                 "blocked",
-                meta={"blocked_reason": f"auth_failed: {exc}"},
+                meta={
+                    "blocked_reason": f"auth_failed: {exc}",
+                    # v0.29.0 Bug 6: auth_failed is canonical infra.
+                    "block_reason_class": "infrastructure",
+                },
             )
         except Exception as exc2:  # noqa: BLE001 — never mask the original
             logger.warning(
@@ -1982,6 +2029,19 @@ async def _execute_one_worker(
         else:
             prefix = "worker_exception"
         blocked_reason = f"{prefix}: {exc}"
+        # v0.29.0 Bug 6: classify the typed block category. Network /
+        # auth-class exceptions (timeouts, OS-level network errors)
+        # surface as ``"infrastructure"`` so the operator can safely
+        # ``autodev requeue --infrastructure`` once the environment is
+        # healthy. Encoding errors and bare ``worker_exception``
+        # (developer-bug bucket) classify as ``"verdict"`` —
+        # requeueing without code changes won't help.
+        if prefix in ("qa_gate_timeout", "qa_gate_io_error"):
+            block_reason_class: Literal[
+                "verdict", "infrastructure", "cap"
+            ] = "infrastructure"
+        else:
+            block_reason_class = "verdict"
 
         # Persist traceback for operator diagnosis. Failure to write is
         # logged but never re-raised — the block path is already a
@@ -2011,7 +2071,10 @@ async def _execute_one_worker(
             blocked = await orch.plan_manager.update_task_status(
                 task.id,
                 "blocked",
-                meta={"blocked_reason": blocked_reason},
+                meta={
+                    "blocked_reason": blocked_reason,
+                    "block_reason_class": block_reason_class,
+                },
             )
         except Exception as exc2:  # noqa: BLE001
             logger.warning(
@@ -2508,7 +2571,12 @@ async def _execute_one(
                 task = await orch.plan_manager.update_task_status(
                     task.id,
                     "blocked",
-                    meta={"blocked_reason": f"guardrail_exceeded: {exc}"},
+                    meta={
+                        "blocked_reason": f"guardrail_exceeded: {exc}",
+                        "block_reason_class": _classify_guardrail_block(
+                            getattr(orch, "_last_adapter_subtype", None)
+                        ),
+                    },
                 )
                 return task
 
@@ -2613,7 +2681,12 @@ async def _execute_one(
                 task = await orch.plan_manager.update_task_status(
                     task.id,
                     "blocked",
-                    meta={"blocked_reason": f"guardrail_exceeded: {exc}"},
+                    meta={
+                        "blocked_reason": f"guardrail_exceeded: {exc}",
+                        "block_reason_class": _classify_guardrail_block(
+                            getattr(orch, "_last_adapter_subtype", None)
+                        ),
+                    },
                 )
                 return task
 
@@ -2661,7 +2734,12 @@ async def _execute_one(
                 task = await orch.plan_manager.update_task_status(
                     task.id,
                     "blocked",
-                    meta={"blocked_reason": f"guardrail_exceeded: {exc}"},
+                    meta={
+                        "blocked_reason": f"guardrail_exceeded: {exc}",
+                        "block_reason_class": _classify_guardrail_block(
+                            getattr(orch, "_last_adapter_subtype", None)
+                        ),
+                    },
                 )
                 return task
 
@@ -3540,6 +3618,17 @@ async def delegate(
     _t0 = _time.time()
     result = await orch.adapter.execute(inv)
     orch.guardrails.post_invocation(envelope.task_id, result)
+    # v0.29.0 Bug 6: stash the most recent adapter ``subtype`` (and
+    # ``api_error_status``) on the orchestrator so the
+    # GuardrailExceededError block site downstream can classify the
+    # block as ``"infrastructure"`` (subtype is auth/transport-class)
+    # vs ``"cap"`` (subtype is ``error_max_turns``/``None`` — agent
+    # legitimately exhausted budget). Stored as plain attributes;
+    # the orchestrator runs one task at a time per worker, and the
+    # cross-phase parallel path tracks per-task state via the typed
+    # ``in_flight`` map at the call site rather than the orchestrator.
+    orch._last_adapter_subtype = result.subtype
+    orch._last_adapter_api_error_status = result.api_error_status
     if result.success and result.text:
         orch.loop_detector.observe(envelope.task_id, role, result.text)
 

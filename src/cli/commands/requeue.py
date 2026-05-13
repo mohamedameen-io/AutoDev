@@ -41,41 +41,24 @@ from rich.table import Table
 
 from config.loader import load_config
 from errors import AutodevError
+from state.infra_patterns import (
+    INFRA_PATTERNS as _INFRA_PATTERNS,
+    looks_infrastructure as _looks_infrastructure,
+)
 from state.paths import config_path
 from state.plan_manager import PlanManager
 from state.schemas import Plan, Task
 
 
-# Keyword heuristic for ``--infrastructure``. Lives in the CLI module
-# (NOT in plan_manager) because v0.29.0 Bug 6 replaces it with the
-# typed :attr:`Task.block_reason_class` field — at which point this
-# module imports the typed predicate from a future
-# ``state.block_classifier`` and the keyword fallback retires. Keeping
-# the heuristic here means the plan_manager surface stays pure-FSM.
-_INFRA_PATTERNS: tuple[str, ...] = (
-    "403",
-    "401",
-    "Forbidden",
-    "authenticate",
-    "Failed to authenticate",
-    "api_error_status",
-    "Connection refused",
-    "DNS",
-)
-
-
-def _looks_infrastructure(blocked_reason: str | None) -> bool:
-    """Return ``True`` iff ``blocked_reason`` looks like an
-    infrastructure-class failure under the v0.28.0 keyword heuristic.
-
-    Case-insensitive substring match. ``None`` and empty strings
-    return ``False`` so callers can pass ``Task.blocked_reason``
-    directly without a guard.
-    """
-    if not blocked_reason:
-        return False
-    needle = blocked_reason.lower()
-    return any(p.lower() in needle for p in _INFRA_PATTERNS)
+# Re-exported from :mod:`state.infra_patterns` so the v0.28.0 import
+# surface stays stable. v0.29.0 Bug 6 promoted the keyword list to a
+# shared module so the schema-load migration shim can consume the same
+# heuristic without introducing a cli -> state import cycle.
+__all__ = [
+    "_INFRA_PATTERNS",
+    "_looks_infrastructure",
+    "requeue",
+]
 
 
 def _select_task_ids(

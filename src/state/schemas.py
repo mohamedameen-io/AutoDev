@@ -207,6 +207,24 @@ class Task(BaseModel):
     assigned_agent: str | None = None  # usually "developer"
     evidence_bundle: str | None = None  # path (relative to repo root) to evidence json
     blocked_reason: str | None = None
+    # v0.29.0 Bug 6: typed category for the block. ``None`` for backward
+    # compatibility with on-disk plans written before v0.29.0 — the
+    # ``PlanManager`` load shim backfills the field by classifying the
+    # ``blocked_reason`` string with the same keyword heuristic the
+    # ``autodev requeue --infrastructure`` selector uses (see
+    # :mod:`state.infra_patterns`). New blocks stamp the class explicitly
+    # at every block site in :mod:`orchestrator.execute_phase` and
+    # :meth:`PlanManager.mark_blocked_descendants`. Three buckets:
+    #
+    #   * ``"verdict"``        — agent reached a legitimate negative
+    #     verdict (reviewer rejected, tests failed past retry, etc.).
+    #   * ``"infrastructure"`` — outside-the-loop transient failure
+    #     (auth refresh, gateway 4xx, network, timeout). Safely
+    #     requeueable once the operator fixes the environment.
+    #   * ``"cap"``            — agent legitimately ran out of turns /
+    #     tokens / budget. Distinct from ``"infrastructure"`` because
+    #     requeueing without widening the cap would just re-burn it.
+    block_reason_class: Literal["verdict", "infrastructure", "cap"] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     # v0.27.0 (audit §6): does this task's developer attempt produce a
     # unified diff? Tasks that legitimately produce no diff (pure
