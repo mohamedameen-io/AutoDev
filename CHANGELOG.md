@@ -2,6 +2,130 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] - 2026-05-13
+
+Polish and observability — final release in the v0.28-0.30 triplet
+that closes the infrastructure-failure recovery surface end-to-end.
+v0.28.0 stopped the bleed (manual ``autodev requeue`` + classifier
++ probe); v0.29.0 added the typed data model
+(``block_reason_class``, ``quarantined``, ``autodev rewind``); this
+release adds the structural guarantees that turn the foundation into
+compile-time safety. Three bugs land: the phase aggregator now
+refuses to auto-accept ANY phase containing an infrastructure-class
+block (Bug 3, generalises the v0.29.0 quarantined-only check), the
+plan-ledger records ``api_error_status`` and a per-call
+``adapter_failure`` audit op so post-mortems no longer require
+grepping ``.autodev/debug/*.txt`` (Bug 4), and a cross-task circuit
+breaker halts a run after N infrastructure failures in a rolling
+window so a single dead token can't burn an entire run before
+guardrails fire (Bug 5).
+
+### Added
+- Phase aggregator infrastructure-block early bail
+  (``src/orchestrator/execute_phase.py:_phase_has_infrastructure_block``
+  + ``_pause_phase_for_infrastructure``). Wired in
+  ``_maybe_run_phase_review`` immediately after the v0.29.0
+  quarantined-check so all four downstream auto-accept sites
+  (corrective, A-winner, no-direction, no-corrective) inherit the
+  pause for free. Distinct log signal
+  (``execute_phase.phase_aggregate_paused_due_to_infrastructure``
+  vs the quarantined-path's
+  ``phase_review_paused_for_quarantine``) so post-mortems can tell
+  the two halt provenances apart even though both stamp the same
+  ``review_status="paused"``.
+- Ledger payload extension on ``update_task_status`` op: optional
+  ``api_error_status`` and ``last_adapter_subtype`` keys merged
+  through ``PlanManager.update_task_status``'s existing
+  ``payload.update(meta)`` shim. Stamped at the four block sites
+  Bug 6 already typed in v0.29.0
+  (``execute_phase.py:2138`` worker-exception fallback,
+  ``:2713`` developer guardrail,
+  ``:2823`` reviewer guardrail,
+  ``:2885`` test_engineer guardrail). Forensic-only — no Task
+  model field added.
+- New ``LedgerOp`` value ``"adapter_failure"``: per-adapter-failure
+  audit breadcrumb appended at the ``delegate()`` site
+  (``execute_phase.py:3765-3793``) for every ``success=False``
+  result regardless of whether the failure is fatal. Payload:
+  ``{"task_id", "api_error_status", "subtype", "error", "attempt_n"}``.
+  Best-effort — a ledger write failure here MUST NOT mask the
+  underlying adapter failure for the caller. Audit-only ``_apply_op``
+  handler returns plan unchanged.
+- ``InfraFailureCircuitBreaker``
+  (``src/orchestrator/circuit_breaker.py``): rolling-window counter
+  of infrastructure-class failures (subtypes
+  ``{"auth_failed","rate_limited","server_error"}`` — NOT
+  ``client_error`` or other deterministic subtypes which are per-task
+  verdicts, not infra signals). API: ``record_failure(task_id,
+  subtype, ts)``, ``should_halt() -> (bool, reason)``, ``reset()``.
+  Time backend: ``datetime.now(timezone.utc)`` matching the
+  orchestrator's other UTC-aware time handling. Successful adapter
+  results reset the counter (a healthy call clears any prior infra-
+  flake history).
+- ``InfrastructureCircuitOpenError`` typed exception
+  (``src/tournament/errors.py``, sibling of
+  ``AuthenticationFailedError``). Raised by the breaker
+  integration in ``delegate()`` immediately after the result hook;
+  caught at the same five top-level sites as
+  ``AuthenticationFailedError`` and treated identically (mark
+  in-flight task ``quarantined``, halt phase loop with actionable
+  message, exit non-zero). The v0.29.0 halt helpers
+  (``_halt_task_for_auth_failed``, ``_halt_for_auth_failed``) now
+  accept either exception type via union typing; co-located
+  ``_halt_reason_prefix`` helper keeps the ``blocked_reason`` ledger
+  prefix distinct (``auth_failed:`` vs ``infra_circuit_open:``) so
+  post-mortem grep stays per-typed-halt.
+- ``Config.circuit_breaker_threshold: int = 3`` and
+  ``Config.circuit_breaker_window_s: float = 60.0``
+  (``src/config/schema.py``) with Pydantic ``ge=1`` / ``gt=0.0``
+  validators. Tuneable for flaky environments — e.g. raise
+  threshold to 6 if you regularly hit small 503 bursts.
+
+### Fixed
+- The "phase 1 force-accepted in 0.5s with empty diff" failure mode
+  observed during the 2026-05-13 auth wave is now structurally
+  prevented at THREE layers: classifier (v0.28.0) routes the failure
+  to a typed exception, data model (v0.29.0) gives every block site a
+  typed ``block_reason_class``, and aggregator (this release)
+  refuses to auto-accept any phase whose composition includes an
+  infrastructure-class block. None of the three layers is sufficient
+  alone; together they make the pattern unreachable.
+- Post-mortem on a thrash now reads from the ledger, not from
+  ``.autodev/debug/*.txt`` glob walks. A single grep on the ledger
+  for ``op="adapter_failure"`` returns the failure timeline with
+  ``api_error_status``, ``subtype``, ``error``, and ``attempt_n``
+  per call.
+- A single dead corp-proxy token can no longer burn an entire run
+  before guardrails (the v0.27 invocation-cap and duration-cap)
+  notice. The breaker trips after 3 ``auth_failed``/``rate_limited``
+  /``server_error`` results in 60 s by default, raising
+  ``InfrastructureCircuitOpenError``, quarantining the in-flight
+  task, and halting the phase loop with an operator-facing message.
+  Resume picks up zero-touch the moment the underlying problem is
+  fixed.
+
+### Migration
+- No on-disk schema migrations. Pre-v0.30 plans, ledgers, and
+  configs load unchanged. ``circuit_breaker_threshold`` and
+  ``circuit_breaker_window_s`` use compile-time defaults when
+  absent from the config.
+- Forward-compatibility: v0.30 adds ``"adapter_failure"`` to the
+  ``LedgerOp`` Literal. A user who runs ``autodev`` under v0.30 and
+  then downgrades to v0.29.x cannot ``autodev resume`` —
+  pre-v0.30 ``_apply_op`` raises ``LedgerCorruptError`` on the new
+  op name. Same downgrade procedure as the v0.28/v0.29 migration
+  notes (``autodev reset --hard`` OR remove the offending ledger
+  lines manually).
+
+### Out of scope
+- Cross-platform adapter parity. The ``cursor.py`` adapter has a
+  parallel ``healthcheck`` method but its auth-error response
+  shape differs from the Claude CLI's; this triplet addresses the
+  ``claude_code`` adapter only. Cursor adapter still surfaces
+  failures via the legacy free-text ``error`` string.
+- Mutmut kill-rate gate (deferred from v0.27 again — separate work
+  stream).
+
 ## [0.29.0] - 2026-05-13
 
 Structured recovery surface — typed data model. v0.28.0 stopped the
