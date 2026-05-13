@@ -2296,6 +2296,60 @@ async def _pause_phase_for_quarantine(
         )
 
 
+def _phase_has_infrastructure_block(phase: Phase) -> bool:
+    """v0.30.0 Bug 3: ``True`` iff any task in the phase is ``blocked``
+    with ``block_reason_class="infrastructure"``.
+
+    Generalises the v0.29.0 Bug 7 quarantined-check from the non-
+    terminal halt path (``AuthenticationFailedError`` -> ``quarantined``)
+    to the terminal infrastructure-class block path (timeouts, OS-level
+    network errors -> ``blocked`` with the typed
+    ``"infrastructure"`` class stamped by ``_execute_one_worker``).
+    Both signals are operator-recoverable (``autodev requeue
+    --infrastructure``) and neither should be silently force-accepted
+    by the phase-review tournament. Distinct from the ``"verdict"``
+    and ``"cap"`` classes, which legitimately need review (the agent
+    reached a real negative verdict, or budget was exhausted).
+    """
+    return any(
+        t.status == "blocked" and t.block_reason_class == "infrastructure"
+        for t in phase.tasks
+    )
+
+
+async def _pause_phase_for_infrastructure(
+    orch: "Orchestrator", phase_id: str, current_status: str | None
+) -> None:
+    """v0.30.0 Bug 3: idempotently park a phase that holds an
+    ``"infrastructure"``-class blocked task at ``review_status="paused"``.
+
+    Sibling of :func:`_pause_phase_for_quarantine` with a distinct
+    structured-log signal (``phase_aggregate_paused_due_to_infrastructure``
+    vs ``phase_review_paused_for_quarantine``) so post-mortems can tell
+    the two recovery paths apart. No-op when the phase is already
+    paused so repeated aggregator polls don't churn the ledger.
+    Failures are swallowed (logged) so the pause path cannot mask the
+    underlying block.
+    """
+    if current_status == "paused":
+        return
+    try:
+        await orch.plan_manager.update_phase_meta(
+            phase_id, review_status="paused"
+        )
+        logger.info(
+            "execute_phase.phase_aggregate_paused_due_to_infrastructure",
+            phase_id=phase_id,
+            prior_status=current_status,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.phase_aggregate_pause_failed",
+            phase_id=phase_id,
+            err=str(exc),
+        )
+
+
 async def _maybe_run_phase_review(
     orch: "Orchestrator", phase_id: str
 ) -> None:
@@ -2314,6 +2368,13 @@ async def _maybe_run_phase_review(
     The phase is parked at ``review_status="paused"`` instead, and
     :meth:`Orchestrator.resume` clears that state once the quarantined
     work resolves so the tournament re-fires fresh.
+
+    v0.30.0 Bug 3: generalises the same guard to terminal blocked
+    tasks whose ``block_reason_class="infrastructure"``. The worker-
+    exception path can stamp a task ``blocked`` (terminal) with the
+    typed infrastructure class — without this guard the all-terminal
+    poll below would force-accept the phase even though the operator
+    can still recover via ``autodev requeue --infrastructure``.
     """
     if not orch.cfg.tournaments.phase_review.enabled:
         return
@@ -2338,6 +2399,16 @@ async def _maybe_run_phase_review(
     # quarantined work resolves.
     if _phase_has_quarantined_task(phase):
         await _pause_phase_for_quarantine(orch, phase_id, phase.review_status)
+        return
+    # v0.30.0 Bug 3: same guard for terminal blocked tasks that carry
+    # the typed ``"infrastructure"`` class. The aggregator must NOT
+    # auto-accept a phase whose only remaining failures are operator-
+    # recoverable transient infrastructure errors — the resume path
+    # will requeue + clear once the operator fixes the environment.
+    if _phase_has_infrastructure_block(phase):
+        await _pause_phase_for_infrastructure(
+            orch, phase_id, phase.review_status
+        )
         return
 
     # Critical loop guard: reviewed phases are not re-reviewed.
