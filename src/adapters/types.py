@@ -75,7 +75,19 @@ class AgentResult(BaseModel):
     # subtype (e.g. genuine subprocess failures with no parsable stdout).
     # Used by the tournament retry layer to short-circuit deterministic
     # failures (see :data:`tournament.llm._DETERMINISTIC_SUBTYPES`).
+    # v0.28.0 (Bug 1): adapters may also synthesize a subtype from
+    # ``api_error_status`` when the CLI omits its own ``subtype`` on
+    # transport-layer failures (401/403 → ``auth_failed``, 429 →
+    # ``rate_limited``, 5xx → ``server_error``, other 4xx → ``client_error``).
     subtype: str | None = None
+    # v0.28.0 (Bug 1): raw HTTP status code reported by the CLI on
+    # transport-layer failures (e.g. 403 from a corp proxy auth-token
+    # expiry). Surfaced as a typed integer so downstream ledger logging
+    # (Bug 4 in v0.30.0) and post-mortems don't have to grep free-text
+    # ``error`` strings or ``.autodev/debug/*.txt`` dumps. ``None`` when
+    # the CLI did not report ``api_error_status`` (success path or
+    # non-HTTP failure modes).
+    api_error_status: int | None = None
 
 
 class AgentSpec(BaseModel):

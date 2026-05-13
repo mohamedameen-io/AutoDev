@@ -24,6 +24,46 @@ from state.paths import debug_dir
 logger = get_logger(__name__)
 
 
+def _api_status_to_subtype(status: int | str) -> str | None:
+    """Map a CLI ``api_error_status`` HTTP code to a typed ``subtype``.
+
+    The Claude CLI emits ``api_error_status`` as an integer on
+    transport-layer failures but does NOT populate its own ``subtype``
+    field for these cases — pre-v0.28 the typed signal was lost into the
+    free-text ``result``/``error`` payload. This helper synthesizes a
+    subtype the tournament classifier and ledger can reason about:
+
+    ============  =====================
+    HTTP status   Synthesized subtype
+    ============  =====================
+    401, 403      ``auth_failed``
+    429           ``rate_limited``
+    500-599       ``server_error``
+    400-499 *     ``client_error``
+    other         ``None``
+    ============  =====================
+
+    \\* other than 401/403/429, which are special-cased above.
+
+    Returns ``None`` when ``status`` is missing/non-numeric or falls
+    outside the 4xx/5xx ranges so callers can preserve their existing
+    ``subtype is None`` semantics.
+    """
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return None
+    if code in (401, 403):
+        return "auth_failed"
+    if code == 429:
+        return "rate_limited"
+    if 500 <= code < 600:
+        return "server_error"
+    if 400 <= code < 500:
+        return "client_error"
+    return None
+
+
 # Observed `claude -p --output-format json` shape (claude 2.1.92):
 #   {"type":"result","subtype":"success","is_error":false,"duration_ms":...,
 #    "num_turns":...,"result":"...","stop_reason":"end_turn",
@@ -211,12 +251,36 @@ class ClaudeCodeAdapter(PlatformAdapter):
             # path (which DOES want to retry via the transient-substring
             # classifier).
             subtype_val: str | None = None
+            api_error_status_val: int | None = None
             try:
                 parsed_failure = json.loads(stdout)
                 if isinstance(parsed_failure, dict):
                     st = parsed_failure.get("subtype")
                     if st:
                         subtype_val = str(st)
+                    # v0.28.0 (Bug 1): surface ``api_error_status`` and
+                    # synthesize a typed subtype from it when the CLI
+                    # itself didn't classify the failure. A real error
+                    # subtype (e.g. ``error_max_turns``) wins; the CLI's
+                    # placeholder ``"success"`` paired with ``is_error=true``
+                    # does NOT win — synthesis fills it in.
+                    raw_status = parsed_failure.get("api_error_status")
+                    if raw_status is not None:
+                        try:
+                            api_error_status_val = int(raw_status)
+                        except (TypeError, ValueError):
+                            api_error_status_val = None
+                    is_err_failure = bool(parsed_failure.get("is_error", False))
+                    if (
+                        (
+                            subtype_val is None
+                            or (is_err_failure and subtype_val == "success")
+                        )
+                        and raw_status is not None
+                    ):
+                        synthesized = _api_status_to_subtype(raw_status)
+                        if synthesized is not None:
+                            subtype_val = synthesized
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -235,6 +299,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
                 raw_stdout=stdout,
                 raw_stderr=stderr,
                 subtype=subtype_val,
+                api_error_status=api_error_status_val,
             )
 
         try:
@@ -262,6 +327,31 @@ class ClaudeCodeAdapter(PlatformAdapter):
         subtype_val = parsed.get("subtype") or None
         if subtype_val is not None:
             subtype_val = str(subtype_val)
+
+        # v0.28.0 (Bug 1): surface ``api_error_status`` and, when the CLI
+        # didn't classify the failure itself, synthesize a typed subtype
+        # from the HTTP code. Mirrors the rc!=0 branch above so a 403
+        # surfaces the same ``auth_failed`` signal regardless of which
+        # exit path the CLI took. When ``is_error=true`` the CLI's own
+        # ``"success"`` subtype is treated as a placeholder (the CLI
+        # routinely emits ``subtype="success"`` alongside ``is_error=true``
+        # on transport-layer failures); a real error subtype like
+        # ``error_max_turns`` still wins over synthesis.
+        api_error_status_val = None
+        raw_status = parsed.get("api_error_status")
+        if raw_status is not None:
+            try:
+                api_error_status_val = int(raw_status)
+            except (TypeError, ValueError):
+                api_error_status_val = None
+        if (
+            (subtype_val is None or (is_error and subtype_val == "success"))
+            and is_error
+            and raw_status is not None
+        ):
+            synthesized = _api_status_to_subtype(raw_status)
+            if synthesized is not None:
+                subtype_val = synthesized
 
         cost_usd: float = 0.0
         if "total_cost_usd" in parsed:
@@ -294,6 +384,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
             raw_stdout=stdout,
             raw_stderr=stderr,
             subtype=subtype_val,
+            api_error_status=api_error_status_val,
         )
         return result
 
