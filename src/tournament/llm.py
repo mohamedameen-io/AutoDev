@@ -27,6 +27,7 @@ from tenacity import (
 
 from errors import AdapterError, TournamentError
 from autologging import get_logger
+from tournament.errors import AuthenticationFailedError
 
 
 # Substrings whose corresponding failures are normal-cost transients —
@@ -60,12 +61,23 @@ _EXPENSIVE_TRANSIENT_SUBSTRINGS = (
 # Subtypes that the CLI reports for deterministic failures — retrying with the
 # same prompt cannot help. When :class:`AgentResult.subtype` matches one of
 # these, ``_classify_error`` short-circuits transient classification and the
-# call is wrapped in a :class:`TournamentError` immediately.
+# call is wrapped in a :class:`TournamentError` (or, for ``auth_failed``, the
+# typed :class:`AuthenticationFailedError`) immediately.
+#
+# v0.28.0 Bug 2 added ``auth_failed`` (401/403 — bad credentials, every
+# subsequent call would also fail until the operator refreshes the token)
+# and ``client_error`` (4xx other than 401/403/429 — bad-request style; the
+# same prompt cannot succeed). ``rate_limited`` (429) and ``server_error``
+# (5xx) deliberately stay OUT — those classify as transient via the explicit
+# subtype branches in :func:`_classify_error` (the substring fallback for
+# "rate" / "503" still matches too, but the typed branch is authoritative).
 _DETERMINISTIC_SUBTYPES = frozenset(
     {
         "error_max_turns",
         "error_max_tokens",
         "error_during_execution",
+        "auth_failed",
+        "client_error",
     }
 )
 
@@ -184,13 +196,23 @@ def _classify_error(
         - ``None`` for non-transient or empty failures.
 
     Deterministic CLI failure subtypes (``subtype in _DETERMINISTIC_SUBTYPES``
-    — e.g. ``error_max_turns``) take precedence and force ``None`` regardless
-    of the error string. This prevents the retry loop from burning attempts on
-    a failure that is guaranteed to repeat (Fix 4 — must keep working across
-    BOTH transient classes after the v0.5.4 split).
+    — e.g. ``error_max_turns``, ``auth_failed``) take precedence and force
+    ``None`` regardless of the error string. This prevents the retry loop
+    from burning attempts on a failure that is guaranteed to repeat (Fix 4 —
+    must keep working across BOTH transient classes after the v0.5.4 split).
+
+    v0.28.0 Bug 2: typed transient subtypes (``rate_limited`` → 429,
+    ``server_error`` → 5xx) take precedence over the substring fallback so
+    a malformed / non-substring-matching error message still routes to the
+    right retry budget. ``ExpensiveTransientError`` is reserved for the
+    timeout substrings — neither typed subtype lands there today.
     """
     if subtype is not None and subtype in _DETERMINISTIC_SUBTYPES:
         return None
+    if subtype == "rate_limited":
+        return TransientError
+    if subtype == "server_error":
+        return TransientError
     text = (err or "") + " " + (str(exc) if exc else "")
     low = text.lower()
     # Expensive transients are a strict subset of "should retry" but with a
@@ -413,6 +435,21 @@ class AdapterLLMClient:
                         subtype=subtype,
                         err=error,
                     )
+                    # v0.28.0 Bug 2: ``auth_failed`` (401/403 from the
+                    # upstream API) propagates as the typed
+                    # :class:`AuthenticationFailedError` so the orchestrator's
+                    # top-level loop can catch it by type and abort the
+                    # phase loop without thrashing every subsequent task
+                    # against the same dead credential. All other
+                    # deterministic subtypes (max_turns, max_tokens,
+                    # error_during_execution, client_error) stay on the
+                    # generic :class:`TournamentError` path — those are
+                    # task-local and the loop should continue with the
+                    # next task.
+                    if subtype == "auth_failed":
+                        raise AuthenticationFailedError(
+                            f"auth_failed for role={role}: {error}"
+                        )
                     raise TournamentError(
                         f"non-retryable subtype={subtype} for role={role}: {error}"
                     )
@@ -489,6 +526,7 @@ class StubLLMClient:
 __all__ = [
     "AdapterLike",
     "AdapterLLMClient",
+    "AuthenticationFailedError",
     "ExpensiveTransientError",
     "StubLLMClient",
     "TransientError",

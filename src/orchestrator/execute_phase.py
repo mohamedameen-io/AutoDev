@@ -59,6 +59,7 @@ from state.schemas import (
     TestEvidence,
 )
 from tournament.effort import resolve_role_effort
+from tournament.errors import AuthenticationFailedError
 from tournament.task_overrides import (
     resolve_task_max_turns,
     resolve_task_timeout_s,
@@ -987,7 +988,18 @@ async def run_execute_phase(
         # baseline. This is idempotent (the meta-update only runs when
         # baseline_commit is unset).
         await _maybe_record_phase_entry(orch, task.phase_id)
-        processed.append(await _execute_one(orch, task))
+        try:
+            processed.append(await _execute_one(orch, task))
+        except AuthenticationFailedError as exc:
+            # v0.28.0 Bug 2: typed halt on auth failure. Stamp the
+            # offending task as ``blocked`` (idempotent — ``_execute_one``
+            # may have already done so when raised mid-pipeline), log
+            # the structured halt event, surface a clear console
+            # message, and re-raise so the CLI driver exits non-zero.
+            # Do NOT call ``_maybe_run_phase_review`` — the phase must
+            # not be force-accepted on the halt path.
+            await _halt_task_for_auth_failed(orch, task.id, exc)
+            raise
         # Single-task path also triggers review when the targeted task
         # was the last terminal one in its phase.
         await _maybe_run_phase_review(orch, task.phase_id)
@@ -1275,6 +1287,19 @@ async def run_execute_phase(
                     # Any new pending tasks? If not, stop looping.
                     if not any(t.status == "pending" for t in latest_phase.tasks):
                         break
+    except AuthenticationFailedError as exc:
+        # v0.28.0 Bug 2: typed halt on auth failure during the
+        # whole-plan loop. The worker has already stamped its own
+        # task as ``blocked`` with the ``auth_failed:`` prefix; we
+        # idempotently re-stamp here as a defensive net for the
+        # case where the exception came up a path that bypassed the
+        # worker's stamp (cross-phase cancellation, etc.). Then log
+        # the structured halt event and re-raise so the CLI driver
+        # exits non-zero. Phase review is NOT triggered for any
+        # in-flight phase — force-accepting on a halt path is the
+        # production stall this fix exists to prevent.
+        await _halt_for_auth_failed(orch, exc)
+        raise
     finally:
         if worktree_mgr is not None:
             try:
@@ -1284,6 +1309,83 @@ async def run_execute_phase(
                     "execute_phase.cleanup_all_failed", err=str(exc)
                 )
     return processed
+
+
+async def _halt_task_for_auth_failed(
+    orch: "Orchestrator", task_id: str, exc: AuthenticationFailedError
+) -> None:
+    """v0.28.0 Bug 2: shared halt routine for the typed auth-failure path.
+
+    Idempotently stamps the task as ``blocked`` with a structured
+    ``blocked_reason="auth_failed: <error>"`` and emits the
+    :data:`execute_phase.auth_failed_halt` structured-log event so the
+    operator sees one clear line in the run log linking the failure to
+    the halt. Failures inside this helper are swallowed (logged) so we
+    never mask the original :class:`AuthenticationFailedError` on the
+    way back up to the CLI driver.
+    """
+    try:
+        await orch.plan_manager.update_task_status(
+            task_id,
+            "blocked",
+            meta={"blocked_reason": f"auth_failed: {exc}"},
+        )
+    except Exception as exc2:  # noqa: BLE001 — best-effort idempotent stamp
+        logger.warning(
+            "execute_phase.auth_failed_block_failed",
+            task_id=task_id,
+            err=str(exc2),
+        )
+    logger.error(
+        "execute_phase.auth_failed_halt",
+        task_id=task_id,
+        err=str(exc),
+    )
+    # Operator-facing message — distinct from the structured log so
+    # ``autodev execute`` users see one clear line on the console.
+    print(
+        f"\nautodev execute: aborting on authentication failure ({exc}).\n"
+        "  Refresh your credentials and retry.\n",
+    )
+
+
+async def _halt_for_auth_failed(
+    orch: "Orchestrator", exc: AuthenticationFailedError
+) -> None:
+    """Whole-plan variant of :func:`_halt_task_for_auth_failed`.
+
+    The worker that originally raised has already stamped its own task
+    as ``blocked``; here we just emit the structured halt event and the
+    operator-facing message. Walks the plan to find the in-flight task
+    (status ``in_progress``) for the structured-log payload — best-
+    effort and falls back to ``task_id="<unknown>"`` if the plan can't
+    be loaded (e.g. ledger corruption mid-halt).
+    """
+    in_flight_task_id = "<unknown>"
+    try:
+        plan = await orch.plan_manager.load()
+        if plan is not None:
+            for phase in plan.phases:
+                for t in phase.tasks:
+                    if t.status == "in_progress":
+                        in_flight_task_id = t.id
+                        break
+                if in_flight_task_id != "<unknown>":
+                    break
+    except Exception as exc2:  # noqa: BLE001 — never mask the original
+        logger.warning(
+            "execute_phase.auth_failed_plan_load_failed",
+            err=str(exc2),
+        )
+    logger.error(
+        "execute_phase.auth_failed_halt",
+        task_id=in_flight_task_id,
+        err=str(exc),
+    )
+    print(
+        f"\nautodev execute: aborting on authentication failure ({exc}).\n"
+        "  Refresh your credentials and retry.\n",
+    )
 
 
 def _resolve_execute_parallelism(orch: "Orchestrator") -> int:
@@ -1440,6 +1542,33 @@ async def _execute_phase_dag(
             try:
                 completed_task = d.result()
                 processed.append(completed_task)
+            except AuthenticationFailedError:
+                # v0.28.0 Bug 2: drain remaining in-flight workers so we
+                # don't leave orphan asyncio tasks dangling, then re-raise
+                # so ``run_execute_phase`` can log the structured halt
+                # event and abort the phase loop. The worker itself has
+                # already stamped ``blocked_reason="auth_failed: ..."``
+                # on the offending task before re-raising.
+                for other_id, other in list(in_flight.items()):
+                    if other.done():
+                        continue
+                    other.cancel()
+                if in_flight:
+                    await asyncio.gather(
+                        *in_flight.values(), return_exceptions=True
+                    )
+                    for other_id in list(in_flight.keys()):
+                        try:
+                            await orch.plan_manager.clear_in_flight(
+                                other_id
+                            )
+                        except Exception as exc2:  # noqa: BLE001
+                            logger.warning(
+                                "execute_phase.clear_in_flight_failed",
+                                task_id=other_id,
+                                err=str(exc2),
+                            )
+                raise
             except Exception as exc:  # noqa: BLE001
                 # Worker raised — cascade-block descendants. The worker
                 # itself should have caught and routed to update_task_status,
@@ -1677,6 +1806,33 @@ async def _execute_cross_phase_dag(
                     pass  # caught by the speculative_parents check below
                 if completed_task.status == "blocked":
                     failed_parents.add(finished_id)
+            except AuthenticationFailedError:
+                # v0.28.0 Bug 2: cross-phase variant of the typed halt.
+                # Cancel and drain remaining workers so we don't strand
+                # asyncio tasks across the cross-phase pool, then
+                # re-raise into ``run_execute_phase`` for the structured
+                # log + abort. The worker has already stamped the
+                # offending task with ``blocked_reason="auth_failed: ..."``.
+                for other_id, other in list(in_flight.items()):
+                    if other.done():
+                        continue
+                    other.cancel()
+                if in_flight:
+                    await asyncio.gather(
+                        *in_flight.values(), return_exceptions=True
+                    )
+                    for other_id in list(in_flight.keys()):
+                        try:
+                            await orch.plan_manager.clear_in_flight(
+                                other_id
+                            )
+                        except Exception as exc2:  # noqa: BLE001
+                            logger.warning(
+                                "execute_phase.clear_in_flight_failed",
+                                task_id=other_id,
+                                err=str(exc2),
+                            )
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "execute_phase.cross_phase_worker_unhandled_exception",
@@ -1789,6 +1945,28 @@ async def _execute_one_worker(
     """
     try:
         return await _execute_one(orch, task, worktree_mgr)
+    except AuthenticationFailedError as exc:
+        # v0.28.0 Bug 2: stamp the task as ``blocked`` with the typed
+        # ``auth_failed:`` prefix BEFORE re-raising so the top-level
+        # ``run_execute_phase`` catch site sees a fully-persisted plan
+        # state on the way out (the catch itself does not reach into
+        # the in-flight task — by the time it fires, the worker has
+        # already returned). Re-raising propagates through
+        # ``_execute_phase_dag`` (which has its own typed catch) up to
+        # ``run_execute_phase`` for the structured-log + abort.
+        try:
+            await orch.plan_manager.update_task_status(
+                task.id,
+                "blocked",
+                meta={"blocked_reason": f"auth_failed: {exc}"},
+            )
+        except Exception as exc2:  # noqa: BLE001 — never mask the original
+            logger.warning(
+                "execute_phase.auth_failed_block_failed",
+                task_id=task.id,
+                err=str(exc2),
+            )
+        raise
     except Exception as exc:  # noqa: BLE001
         import asyncio
         import traceback
