@@ -246,6 +246,18 @@ LedgerOp = Literal[
     # triggered the requeue, useful for forensics on "which infra
     # incident motivated this resume".
     "requeue",
+    # v0.29.0 Bug 9: ``autodev rewind --to-phase N`` CLI fired a typed
+    # multi-phase reset to undo a force-accept. Audit-only — the per-task
+    # ``status → pending`` transitions and per-phase ``review_status →
+    # None`` mutations flow through the regular ``update_task_status``
+    # / ``update_phase_meta`` ops emitted alongside. Payload shape:
+    # ``{target_phase_id: str, reset_task_ids: list[str],
+    # reset_phase_ids: list[str], archive_dir: str | None,
+    # archived_paths: list[str]}`` where ``archive_dir`` is the
+    # repo-relative path under ``.autodev/rewound/`` that holds the
+    # quarantined evidence/tournament artifacts (``None`` when nothing
+    # needed archiving — idempotent re-run).
+    "rewind",
 ]
 
 
@@ -685,6 +697,12 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # alongside (one per requeued task); replay treats the
         # breadcrumb itself as a no-op.
         "requeue",
+        # v0.29.0 Bug 9: ``autodev rewind`` CLI breadcrumb. The actual
+        # multi-phase task / review-status transitions live in the
+        # ``update_task_status`` and ``update_phase_meta`` ops emitted
+        # alongside (one per affected task / phase); replay treats the
+        # breadcrumb itself as a no-op.
+        "rewind",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.
