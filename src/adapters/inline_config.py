@@ -89,6 +89,79 @@ diagnostics, and `/autodev resume` after fixing the underlying issue.
 """
 
 
+def render_cursor_slash_command() -> str:
+    """Return the full content for ``.cursor/commands/autodev.md``.
+
+    v0.30.1: Cursor 1.6+ supports custom slash commands as plain
+    markdown files at ``.cursor/commands/<name>.md``. Unlike Claude
+    Code's slash commands, Cursor commands have **no required
+    frontmatter** — no ``allowed-tools:``, no ``argument-hint:``. The
+    file body is loaded into the Composer agent's input box as a
+    reusable prompt template.
+
+    The routing rules mirror :func:`render_claude_slash_command` but
+    pass ``--platform cursor`` to every ``autodev`` invocation so
+    on-disk configs and per-trigger artifacts stay tagged correctly.
+
+    * ``/autodev`` (no args) prints the subcommand list.
+    * ``/autodev <subcommand> [...]`` (where ``<subcommand>`` is any
+      registered ``autodev`` CLI subcommand) runs ``autodev <subcommand>
+      [...]`` verbatim and surfaces the output.
+    * ``/autodev [--review] <feature description>`` (legacy intent flow)
+      drives a feature through ``plan`` → ``execute`` end-to-end.
+    """
+    return """\
+The user invoked `/autodev`. This command is a **complete passthrough** to
+the `autodev` CLI binary — every subcommand reachable from the shell is
+reachable from here. Do NOT write code yourself — delegate via `autodev`
+by running it through the shell.
+
+Args: $ARGUMENTS
+
+## Routing rule
+
+Inspect the FIRST whitespace-separated token of $ARGUMENTS:
+
+1. **No arguments / empty**: run `autodev --help` via the shell and surface
+   the subcommand list verbatim. Suggest the most useful entry points:
+   `/autodev <feature>` (one-shot), `/autodev --review <feature>` (checkpointed),
+   `/autodev resume`, `/autodev status`, `/autodev doctor`,
+   `/autodev metrics regex-timeouts`.
+
+2. **First token is one of these registered CLI subcommands**:
+   `doctor`, `execute`, `init`, `logs`, `metrics`, `plan`, `plugins`,
+   `prune`, `requeue`, `reset`, `resume`, `rewind`, `secretscan`,
+   `status`, `tournament`
+   — OR a help/version flag (`--help`, `-h`, `--version`).
+
+   → Direct CLI passthrough. Run `autodev $ARGUMENTS` via the shell and
+   surface stdout/stderr verbatim. Do NOT re-interpret, do NOT auto-chain
+   into other subcommands. The user is asking for that exact subcommand.
+
+3. **First token is `--review`**: checkpointed feature flow.
+   a. Strip the `--review` flag; treat the remainder as the feature intent.
+   b. If `.autodev/` does not exist, run `autodev init --force --platform cursor`.
+   c. Run `autodev plan --platform cursor "<intent>"` and surface the
+      plan summary (phases, tasks, projected calls).
+   d. STOP. Tell the user to reply with `go` (or equivalent) to proceed.
+   e. On `go`, run `autodev execute --platform cursor`.
+
+4. **Otherwise** (first token is a free-text feature description): one-shot
+   feature flow.
+   a. If `.autodev/` does not exist, run `autodev init --force --platform cursor`.
+   b. Run `autodev plan --platform cursor "$ARGUMENTS"` and surface the
+      plan summary.
+   c. Run `autodev execute --platform cursor`. Surface progress + final
+      status.
+
+## Error handling
+
+If any `autodev` invocation fails (non-zero exit), surface stderr verbatim.
+Do NOT retry blindly. Suggest `autodev doctor` and `autodev status` for
+diagnostics, and `/autodev resume` after fixing the underlying issue.
+"""
+
+
 def update_claude_md(content: str, section: str) -> str:
     """Replace or append the autodev-managed section in CLAUDE.md.
 
@@ -115,5 +188,6 @@ def update_claude_md(content: str, section: str) -> str:
 
 __all__ = [
     "render_claude_slash_command",
+    "render_cursor_slash_command",
     "update_claude_md",
 ]

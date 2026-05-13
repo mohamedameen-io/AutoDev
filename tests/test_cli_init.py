@@ -144,6 +144,63 @@ def test_init_inline_flag_is_deprecated_noop_alias(tmp_path: Path) -> None:
     assert "--inline" in result.output
 
 
+def test_init_cursor_platform_writes_cursor_slash_command(tmp_path: Path) -> None:
+    """v0.30.1: ``--platform cursor`` must install the Cursor 1.6+ slash
+    command at ``.cursor/commands/autodev.md``."""
+    runner = CliRunner()
+    result, cwd = _invoke_init(runner, tmp_path, "--platform", "cursor")
+    assert result.exit_code == 0, result.output
+
+    cursor_slash = cwd / ".cursor" / "commands" / "autodev.md"
+    assert cursor_slash.exists()
+    content = cursor_slash.read_text(encoding="utf-8")
+    assert "autodev" in content.lower()
+    assert "--platform cursor" in content
+    # No Claude Code frontmatter on cursor commands.
+    assert "allowed-tools:" not in content
+    assert "argument-hint:" not in content
+
+
+def test_init_cursor_platform_does_not_write_claude_slash_command(
+    tmp_path: Path,
+) -> None:
+    """v0.30.1: a pure cursor install must NOT pollute the workspace
+    with a ``.claude/commands/autodev.md`` file."""
+    runner = CliRunner()
+    result, cwd = _invoke_init(runner, tmp_path, "--platform", "cursor")
+    assert result.exit_code == 0, result.output
+
+    claude_slash = cwd / ".claude" / "commands" / "autodev.md"
+    assert not claude_slash.exists()
+
+
+def test_init_auto_platform_writes_both_slash_commands(tmp_path: Path) -> None:
+    """v0.30.1: ``--platform auto`` (the default) must install slash
+    commands for BOTH Claude Code and Cursor so the same workspace can
+    be driven from either host."""
+    runner = CliRunner()
+    result, cwd = _invoke_init(runner, tmp_path, "--platform", "auto")
+    assert result.exit_code == 0, result.output
+
+    claude_slash = cwd / ".claude" / "commands" / "autodev.md"
+    cursor_slash = cwd / ".cursor" / "commands" / "autodev.md"
+    assert claude_slash.exists()
+    assert cursor_slash.exists()
+
+
+def test_init_claude_platform_does_not_write_cursor_slash_command(
+    tmp_path: Path,
+) -> None:
+    """A pure claude install must NOT create ``.cursor/commands/`` files
+    (preserves the existing single-host install behavior)."""
+    runner = CliRunner()
+    result, cwd = _invoke_init(runner, tmp_path, "--platform", "claude")
+    assert result.exit_code == 0, result.output
+
+    cursor_slash = cwd / ".cursor" / "commands" / "autodev.md"
+    assert not cursor_slash.exists()
+
+
 def test_init_force_regenerates_slash_command(tmp_path: Path) -> None:
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:

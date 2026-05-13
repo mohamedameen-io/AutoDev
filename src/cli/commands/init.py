@@ -140,14 +140,33 @@ def init(platform: str, force: bool, inline: bool, rebuild_index: bool) -> None:
     claude_paths = render_claude_agents(specs, cwd)
     cursor_paths = render_cursor_rules(specs, cwd)
 
-    slash_path: Path | None = None
-    if platform_normalized != "cursor":
+    # v0.30.1: install slash commands for every host targeted by the
+    # selected platform. ``claude``/``auto`` get ``.claude/commands/
+    # autodev.md`` (Claude Code), and ``cursor``/``auto`` get
+    # ``.cursor/commands/autodev.md`` (Cursor 1.6+). The Claude variant
+    # carries Claude-specific frontmatter (``allowed-tools:`` etc.); the
+    # Cursor variant is plain markdown loaded into the Composer prompt.
+    slash_paths: list[Path] = []
+    if platform_normalized in ("claude", "auto"):
         from adapters.inline_config import render_claude_slash_command
 
-        commands_dir = cwd / ".claude" / "commands"
-        commands_dir.mkdir(parents=True, exist_ok=True)
-        slash_path = commands_dir / "autodev.md"
-        slash_path.write_text(render_claude_slash_command(), encoding="utf-8")
+        claude_commands_dir = cwd / ".claude" / "commands"
+        claude_commands_dir.mkdir(parents=True, exist_ok=True)
+        claude_slash_path = claude_commands_dir / "autodev.md"
+        claude_slash_path.write_text(
+            render_claude_slash_command(), encoding="utf-8"
+        )
+        slash_paths.append(claude_slash_path)
+    if platform_normalized in ("cursor", "auto"):
+        from adapters.inline_config import render_cursor_slash_command
+
+        cursor_commands_dir = cwd / ".cursor" / "commands"
+        cursor_commands_dir.mkdir(parents=True, exist_ok=True)
+        cursor_slash_path = cursor_commands_dir / "autodev.md"
+        cursor_slash_path.write_text(
+            render_cursor_slash_command(), encoding="utf-8"
+        )
+        slash_paths.append(cursor_slash_path)
 
     # v0.26.0: the inline workspace bootstrap (delegations/, responses/,
     # auto-resume CLAUDE.md section) was removed alongside InlineAdapter.
@@ -228,7 +247,7 @@ def init(platform: str, force: bool, inline: bool, rebuild_index: bool) -> None:
         table.add_row(str(p.relative_to(cwd)), "Claude Code agent")
     for p in cursor_paths:
         table.add_row(str(p.relative_to(cwd)), "Cursor rule")
-    if slash_path is not None:
+    for slash_path in slash_paths:
         table.add_row(str(slash_path.relative_to(cwd)), "slash command (/autodev)")
     if index_summary is not None:
         table.add_row(cfg.index_path, f"file/symbol index — {index_summary}")

@@ -16,6 +16,7 @@ from adapters.inline_config import (
     _CLAUDE_SECTION_END,
     _CLAUDE_SECTION_START,
     render_claude_slash_command,
+    render_cursor_slash_command,
     update_claude_md,
 )
 
@@ -146,3 +147,55 @@ def test_render_claude_slash_command_does_not_reference_inline_flag() -> None:
     # The ``in inline mode, follow the resume rule in CLAUDE.md`` clause
     # from v0.25.x is gone.
     assert "in inline mode" not in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# render_cursor_slash_command (Cursor 1.6+ slash command variant)
+# ---------------------------------------------------------------------------
+
+
+def test_render_cursor_slash_command_returns_non_empty_string() -> None:
+    result = render_cursor_slash_command()
+    assert isinstance(result, str)
+    assert result.strip() != ""
+    assert "autodev" in result.lower()
+
+
+def test_render_cursor_slash_command_uses_cursor_platform() -> None:
+    """The cursor variant must pass ``--platform cursor`` everywhere
+    instead of ``--platform claude_code``."""
+    result = render_cursor_slash_command()
+    assert "--platform cursor" in result
+    assert "--platform claude_code" not in result
+
+
+def test_render_cursor_slash_command_has_no_claude_frontmatter() -> None:
+    """Cursor slash commands are plain markdown — no ``allowed-tools:``
+    or ``argument-hint:`` frontmatter keys (those are Claude Code-only)."""
+    result = render_cursor_slash_command()
+    assert "allowed-tools:" not in result
+    assert "argument-hint:" not in result
+
+
+def test_render_cursor_slash_command_lists_every_cli_subcommand() -> None:
+    """Every registered CLI subcommand from src/cli/commands/__init__.py
+    must appear in the cursor template, mirroring the claude variant."""
+    result = render_cursor_slash_command()
+    for sub in (
+        "doctor",
+        "execute",
+        "init",
+        "logs",
+        "metrics",
+        "plan",
+        "plugins",
+        "prune",
+        "requeue",
+        "reset",
+        "resume",
+        "rewind",
+        "secretscan",
+        "status",
+        "tournament",
+    ):
+        assert f"`{sub}`" in result, f"missing subcommand {sub!r} in cursor template"
