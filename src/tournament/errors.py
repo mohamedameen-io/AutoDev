@@ -37,4 +37,34 @@ class AuthenticationFailedError(TournamentError):
     """
 
 
-__all__ = ["AuthenticationFailedError"]
+class InfrastructureCircuitOpenError(TournamentError):
+    """Raised when the cross-task infrastructure-failure circuit
+    breaker (:class:`orchestrator.circuit_breaker.InfraFailureCircuitBreaker`)
+    trips — i.e. ``threshold`` or more adapter failures with an
+    infrastructure-class subtype (``auth_failed`` / ``rate_limited`` /
+    ``server_error``) occurred within the rolling ``window_s`` window.
+
+    Caught at the same top-level sites as
+    :class:`AuthenticationFailedError` (added in v0.29.0 Bug 7) and
+    treated identically: the in-flight task is stamped
+    ``quarantined``, the owning phase is parked at
+    ``review_status="paused"``, and the run aborts non-zero with an
+    operator-facing message.
+
+    The relationship to :class:`AuthenticationFailedError` is one of
+    *generalization*. ``AuthenticationFailedError`` halts on the FIRST
+    ``auth_failed`` subtype — which catches a single bad token before
+    it cascades. ``InfrastructureCircuitOpenError`` covers the broader
+    failure class: a flaky 5xx burst from the upstream API or an
+    intermittent rate-limit storm produces ``server_error`` /
+    ``rate_limited`` subtypes spread across multiple tasks before any
+    single task accumulates enough retries to fail itself. The breaker
+    halts the whole run once that pattern crosses a threshold rather
+    than letting it thrash every queued task against the same flaky
+    backend. A single bad token still trips the breaker via repeated
+    ``auth_failed`` events, but the v0.28.0 single-shot path catches
+    that case sooner.
+    """
+
+
+__all__ = ["AuthenticationFailedError", "InfrastructureCircuitOpenError"]

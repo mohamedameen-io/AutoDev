@@ -100,6 +100,28 @@ class Orchestrator:
         self._last_adapter_subtype: str | None = None
         self._last_adapter_api_error_status: int | None = None
 
+        # v0.30.0 Bug 5: cross-task infrastructure-failure circuit breaker.
+        # Counts adapter failures with infra-class subtypes
+        # (``auth_failed`` / ``rate_limited`` / ``server_error``) in a
+        # rolling window; trips when the count crosses
+        # ``cfg.circuit_breaker_threshold`` within
+        # ``cfg.circuit_breaker_window_s`` seconds. The orchestrator's
+        # :func:`execute_phase.delegate` site feeds every adapter result
+        # in (success → ``reset()``; infra failure → ``record_failure``);
+        # on a trip it raises :class:`InfrastructureCircuitOpenError`
+        # which the v0.29.0 ``AuthenticationFailedError`` catch sites
+        # treat identically (quarantine + paused-phase + non-zero exit).
+        # Stored on the orchestrator (NOT lazy-init in execute()) so a
+        # caller can swap it out for a fake in tests via attribute
+        # assignment, mirroring how the rest of the orchestrator's
+        # collaborator wiring works.
+        from orchestrator.circuit_breaker import InfraFailureCircuitBreaker
+
+        self._circuit_breaker = InfraFailureCircuitBreaker(
+            threshold=cfg.circuit_breaker_threshold,
+            window_s=cfg.circuit_breaker_window_s,
+        )
+
         # Wire AgentExtensionPlugins: merge their specs into the agent registry.
         if plugin_registry is not None:
             for plugin in plugin_registry.agents.values():

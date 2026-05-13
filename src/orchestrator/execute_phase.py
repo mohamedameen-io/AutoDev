@@ -59,7 +59,10 @@ from state.schemas import (
     TestEvidence,
 )
 from tournament.effort import resolve_role_effort
-from tournament.errors import AuthenticationFailedError
+from tournament.errors import (
+    AuthenticationFailedError,
+    InfrastructureCircuitOpenError,
+)
 from tournament.task_overrides import (
     resolve_task_max_turns,
     resolve_task_timeout_s,
@@ -1029,18 +1032,18 @@ async def run_execute_phase(
         await _maybe_record_phase_entry(orch, task.phase_id)
         try:
             processed.append(await _execute_one(orch, task))
-        except AuthenticationFailedError as exc:
-            # v0.29.0 Bug 7: typed halt on auth failure. Stamp the
-            # offending task as ``quarantined`` (non-terminal so
-            # ``Orchestrator.resume`` picks it back up) with the
-            # typed ``auth_failed:`` reason retained for forensics,
-            # log the structured halt event, surface a clear console
-            # message, and re-raise so the CLI driver exits non-zero.
-            # Do NOT call ``_maybe_run_phase_review`` — the phase
-            # must not be force-accepted on the halt path; the
-            # aggregator's pause-on-quarantined check would short-
-            # circuit anyway, but skipping the call entirely is the
-            # belt-and-suspenders form.
+        except (AuthenticationFailedError, InfrastructureCircuitOpenError) as exc:
+            # v0.29.0 Bug 7 / v0.30.0 Bug 5: typed halt on auth failure
+            # OR a tripped cross-task infrastructure circuit breaker.
+            # Both stamp the offending task as ``quarantined`` (non-
+            # terminal so ``Orchestrator.resume`` picks it back up) with
+            # the typed reason retained for forensics, log the
+            # structured halt event, surface a clear console message,
+            # and re-raise so the CLI driver exits non-zero. Do NOT
+            # call ``_maybe_run_phase_review`` — the phase must not be
+            # force-accepted on the halt path; the aggregator's pause-
+            # on-quarantined check would short-circuit anyway, but
+            # skipping the call entirely is the belt-and-suspenders form.
             await _halt_task_for_auth_failed(orch, task.id, exc)
             raise
         # Single-task path also triggers review when the targeted task
@@ -1338,17 +1341,18 @@ async def run_execute_phase(
                     # Any new pending tasks? If not, stop looping.
                     if not any(t.status == "pending" for t in latest_phase.tasks):
                         break
-    except AuthenticationFailedError as exc:
-        # v0.29.0 Bug 7: typed halt on auth failure during the
-        # whole-plan loop. The worker has already stamped its own
-        # task as ``quarantined`` with the ``auth_failed:`` reason
-        # retained for forensics; we just emit the structured halt
-        # event and re-raise so the CLI driver exits non-zero. Phase
-        # review is NOT triggered for any in-flight phase — the
-        # phase aggregator's pause-on-quarantined check parks the
-        # phase at ``review_status="paused"`` instead of force-
-        # accepting on a halt path (the production stall this fix
-        # exists to prevent).
+    except (AuthenticationFailedError, InfrastructureCircuitOpenError) as exc:
+        # v0.29.0 Bug 7 / v0.30.0 Bug 5: typed halt during the whole-
+        # plan loop. The worker has already stamped its own task as
+        # ``quarantined`` with the typed reason retained for forensics
+        # (``auth_failed:`` for a single-shot auth failure,
+        # ``infra_circuit_open:`` for a tripped breaker); we just emit
+        # the structured halt event and re-raise so the CLI driver
+        # exits non-zero. Phase review is NOT triggered for any in-
+        # flight phase — the phase aggregator's pause-on-quarantined
+        # check parks the phase at ``review_status="paused"`` instead
+        # of force-accepting on a halt path (the production stall this
+        # fix exists to prevent).
         await _halt_for_auth_failed(orch, exc)
         raise
     finally:
@@ -1362,32 +1366,74 @@ async def run_execute_phase(
     return processed
 
 
+def _halt_reason_prefix(
+    exc: AuthenticationFailedError | InfrastructureCircuitOpenError,
+) -> str:
+    """Return the ``blocked_reason`` prefix for the typed halt path.
+
+    Differentiates the v0.28.0 single-shot auth halt from the v0.30.0
+    Bug 5 cross-task circuit-breaker halt so post-mortems can ``grep``
+    the ledger for either pattern. Both paths share the same
+    quarantine + paused-phase wiring; only the prefix differs.
+    """
+    if isinstance(exc, InfrastructureCircuitOpenError):
+        return "infra_circuit_open"
+    return "auth_failed"
+
+
+def _halt_console_message(
+    exc: AuthenticationFailedError | InfrastructureCircuitOpenError,
+) -> str:
+    """Compose the operator-facing console message for the halt path.
+
+    Both exception types produce the same shape ("aborting on … —
+    refresh credentials and ``autodev resume``") because the operator
+    response is identical: clear the underlying issue, re-run. The
+    leading clause names the failure mode so the operator knows which
+    knob to twist (a bad token vs. a flaky upstream).
+    """
+    if isinstance(exc, InfrastructureCircuitOpenError):
+        clause = f"aborting on {exc}"
+    else:
+        clause = f"aborting on authentication failure ({exc})"
+    return (
+        f"\nautodev execute: {clause}.\n"
+        "  Task is quarantined; refresh your credentials and "
+        "run `autodev resume` to continue.\n"
+    )
+
+
 async def _halt_task_for_auth_failed(
-    orch: "Orchestrator", task_id: str, exc: AuthenticationFailedError
+    orch: "Orchestrator",
+    task_id: str,
+    exc: AuthenticationFailedError | InfrastructureCircuitOpenError,
 ) -> None:
-    """v0.29.0 Bug 7: shared halt routine for the typed auth-failure path.
+    """v0.29.0 Bug 7 / v0.30.0 Bug 5: shared halt routine for typed
+    quarantine-class failures.
 
     Idempotently stamps the task as ``quarantined`` (NOT ``blocked``)
-    with a structured ``blocked_reason="auth_failed: <error>"`` retained
-    for forensics, and emits the :data:`execute_phase.auth_failed_halt`
-    structured-log event so the operator sees one clear line in the run
-    log linking the failure to the halt. Failures inside this helper
-    are swallowed (logged) so we never mask the original
-    :class:`AuthenticationFailedError` on the way back up to the CLI
-    driver.
+    with a structured ``blocked_reason`` retained for forensics
+    (prefix ``auth_failed:`` for the v0.28.0 single-shot path,
+    ``infra_circuit_open:`` for the v0.30.0 cross-task circuit-breaker
+    path), and emits the :data:`execute_phase.auth_failed_halt`
+    structured-log event so the operator sees one clear line in the
+    run log linking the failure to the halt. Failures inside this
+    helper are swallowed (logged) so we never mask the original
+    typed exception on the way back up to the CLI driver.
 
     v0.29.0 supersedes the v0.28.0 contract: the halt is now resumable.
     ``quarantined`` is non-terminal so :meth:`Orchestrator.resume` picks
     the task up automatically once the operator clears the underlying
-    auth issue. ``block_reason_class`` (Bug 6) is intentionally NOT
-    stamped — that field is reserved for true ``blocked`` tasks; a
-    quarantined task is awaiting recovery, not classification.
+    issue. ``block_reason_class`` (Bug 6) is intentionally NOT stamped
+    — that field is reserved for true ``blocked`` tasks; a quarantined
+    task is awaiting recovery, not classification.
     """
+    prefix = _halt_reason_prefix(exc)
     try:
         await orch.plan_manager.update_task_status(
             task_id,
             "quarantined",
-            meta={"blocked_reason": f"auth_failed: {exc}"},
+            meta={"blocked_reason": f"{prefix}: {exc}"},
         )
     except Exception as exc2:  # noqa: BLE001 — best-effort idempotent stamp
         logger.warning(
@@ -1428,18 +1474,16 @@ async def _halt_task_for_auth_failed(
         "execute_phase.auth_failed_halt",
         task_id=task_id,
         err=str(exc),
+        halt_kind=prefix,
     )
     # Operator-facing message — distinct from the structured log so
     # ``autodev execute`` users see one clear line on the console.
-    print(
-        f"\nautodev execute: aborting on authentication failure ({exc}).\n"
-        "  Task is quarantined; refresh your credentials and "
-        "run `autodev resume` to continue.\n",
-    )
+    print(_halt_console_message(exc))
 
 
 async def _halt_for_auth_failed(
-    orch: "Orchestrator", exc: AuthenticationFailedError
+    orch: "Orchestrator",
+    exc: AuthenticationFailedError | InfrastructureCircuitOpenError,
 ) -> None:
     """Whole-plan variant of :func:`_halt_task_for_auth_failed`.
 
@@ -1451,6 +1495,11 @@ async def _halt_for_auth_failed(
     the brief window before the worker's stamp lands. Best-effort and
     falls back to ``task_id="<unknown>"`` if the plan can't be loaded
     (e.g. ledger corruption mid-halt).
+
+    v0.30.0 Bug 5: also handles
+    :class:`InfrastructureCircuitOpenError` — the breaker raises this
+    from the same ``delegate()`` site and the catch-and-treat-identically
+    contract is preserved here via the union type.
     """
     in_flight_task_id = "<unknown>"
     halted_phase_id: str | None = None
@@ -1489,12 +1538,9 @@ async def _halt_for_auth_failed(
         "execute_phase.auth_failed_halt",
         task_id=in_flight_task_id,
         err=str(exc),
+        halt_kind=_halt_reason_prefix(exc),
     )
-    print(
-        f"\nautodev execute: aborting on authentication failure ({exc}).\n"
-        "  Task is quarantined; refresh your credentials and "
-        "run `autodev resume` to continue.\n",
-    )
+    print(_halt_console_message(exc))
 
 
 def _resolve_execute_parallelism(orch: "Orchestrator") -> int:
@@ -1651,14 +1697,16 @@ async def _execute_phase_dag(
             try:
                 completed_task = d.result()
                 processed.append(completed_task)
-            except AuthenticationFailedError:
-                # v0.29.0 Bug 7: drain remaining in-flight workers so we
-                # don't leave orphan asyncio tasks dangling, then re-raise
-                # so ``run_execute_phase`` can log the structured halt
-                # event and abort the phase loop. The worker itself has
-                # already stamped the offending task as ``quarantined``
-                # with ``blocked_reason="auth_failed: ..."`` retained
-                # for forensics before re-raising.
+            except (AuthenticationFailedError, InfrastructureCircuitOpenError):
+                # v0.29.0 Bug 7 / v0.30.0 Bug 5: drain remaining in-
+                # flight workers so we don't leave orphan asyncio tasks
+                # dangling, then re-raise so ``run_execute_phase`` can
+                # log the structured halt event and abort the phase
+                # loop. The worker itself has already stamped the
+                # offending task as ``quarantined`` with
+                # ``blocked_reason="auth_failed: ..."`` (or
+                # ``infra_circuit_open:`` for Bug 5) retained for
+                # forensics before re-raising.
                 for other_id, other in list(in_flight.items()):
                     if other.done():
                         continue
@@ -1916,15 +1964,15 @@ async def _execute_cross_phase_dag(
                     pass  # caught by the speculative_parents check below
                 if completed_task.status == "blocked":
                     failed_parents.add(finished_id)
-            except AuthenticationFailedError:
-                # v0.29.0 Bug 7: cross-phase variant of the typed halt.
-                # Cancel and drain remaining workers so we don't strand
-                # asyncio tasks across the cross-phase pool, then
-                # re-raise into ``run_execute_phase`` for the structured
-                # log + abort. The worker has already stamped the
-                # offending task as ``quarantined`` with
-                # ``blocked_reason="auth_failed: ..."`` retained for
-                # forensics.
+            except (AuthenticationFailedError, InfrastructureCircuitOpenError):
+                # v0.29.0 Bug 7 / v0.30.0 Bug 5: cross-phase variant of
+                # the typed halt. Cancel and drain remaining workers so
+                # we don't strand asyncio tasks across the cross-phase
+                # pool, then re-raise into ``run_execute_phase`` for
+                # the structured log + abort. The worker has already
+                # stamped the offending task as ``quarantined`` with
+                # the typed prefix (``auth_failed:`` or
+                # ``infra_circuit_open:``) retained for forensics.
                 for other_id, other in list(in_flight.items()):
                     if other.done():
                         continue
@@ -2057,22 +2105,22 @@ async def _execute_one_worker(
     """
     try:
         return await _execute_one(orch, task, worktree_mgr)
-    except AuthenticationFailedError as exc:
-        # v0.29.0 Bug 7: stamp the task as ``quarantined`` (NOT
-        # ``blocked``) with the typed ``auth_failed:`` prefix retained
-        # in ``blocked_reason`` for forensics BEFORE re-raising so the
-        # top-level ``run_execute_phase`` catch site sees a fully-
-        # persisted plan state on the way out. Quarantined is non-
-        # terminal so ``Orchestrator.resume()`` picks the task up
-        # automatically once the operator clears the underlying auth
-        # issue. Re-raising propagates through ``_execute_phase_dag``
-        # (which has its own typed catch) up to ``run_execute_phase``
-        # for the structured-log + abort.
+    except (AuthenticationFailedError, InfrastructureCircuitOpenError) as exc:
+        # v0.29.0 Bug 7 / v0.30.0 Bug 5: stamp the task as
+        # ``quarantined`` (NOT ``blocked``) with the typed prefix
+        # retained in ``blocked_reason`` for forensics BEFORE re-
+        # raising so the top-level ``run_execute_phase`` catch site
+        # sees a fully-persisted plan state on the way out.
+        # Quarantined is non-terminal so ``Orchestrator.resume()``
+        # picks the task up automatically once the operator clears the
+        # underlying issue. Re-raising propagates through
+        # ``_execute_phase_dag`` (which has its own typed catch) up to
+        # ``run_execute_phase`` for the structured-log + abort.
         try:
             await orch.plan_manager.update_task_status(
                 task.id,
                 "quarantined",
-                meta={"blocked_reason": f"auth_failed: {exc}"},
+                meta={"blocked_reason": f"{_halt_reason_prefix(exc)}: {exc}"},
             )
         except Exception as exc2:  # noqa: BLE001 — never mask the original
             logger.warning(
@@ -3869,6 +3917,7 @@ async def delegate(
     # ``in_flight`` map at the call site rather than the orchestrator.
     orch._last_adapter_subtype = result.subtype
     orch._last_adapter_api_error_status = result.api_error_status
+
     # v0.30.0 Bug 4: per-adapter-failure audit breadcrumb. Append one
     # ``adapter_failure`` ledger op for every ``success=False`` result
     # (transient OR fatal) so post-mortems can grep the ledger directly
@@ -3896,6 +3945,42 @@ async def delegate(
                 task_id=envelope.task_id,
                 err=str(exc),
             )
+
+    # v0.30.0 Bug 5: feed the result into the cross-task circuit breaker.
+    # Order matters — Bug 4's adapter_failure breadcrumb above lands FIRST
+    # so the post-mortem ledger still records the failure even when the
+    # breaker trip below raises. Success → reset the rolling counter (a
+    # healthy adapter call clears any prior infra-flake history). Infra-
+    # class failure → record and check; if the rolling-window count
+    # crossed the trip threshold, raise
+    # :class:`InfrastructureCircuitOpenError` so the existing v0.29.0
+    # ``AuthenticationFailedError`` catch sites quarantine the in-flight
+    # task and abort the phase loop. ``getattr`` is defensive: some unit-
+    # test orchestrator stubs predate Bug 5 and lack the attribute — for
+    # those the breaker logic is a silent no-op rather than a crash.
+    _breaker = getattr(orch, "_circuit_breaker", None)
+    if _breaker is not None:
+        if result.success:
+            _breaker.reset()
+        else:
+            from datetime import datetime as _datetime, timezone as _tz
+
+            # ``datetime.now(timezone.utc)`` matches the orchestrator's
+            # other UTC-aware time handling (see
+            # :func:`_compute_retry_delay_s` which uses the same call).
+            # The breaker normalizes naive stamps internally, but giving
+            # it an aware stamp here keeps the call site self-documenting.
+            _breaker.record_failure(
+                envelope.task_id or "<unknown>",
+                result.subtype,
+                _datetime.now(_tz.utc),
+            )
+            _halt, _reason = _breaker.should_halt()
+            if _halt:
+                raise InfrastructureCircuitOpenError(
+                    _reason or "infrastructure circuit open"
+                )
+
     if result.success and result.text:
         orch.loop_detector.observe(envelope.task_id, role, result.text)
 

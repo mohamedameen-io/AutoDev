@@ -850,6 +850,22 @@ class AutodevConfig(BaseModel):
     # Set False to force synchronous initial build even on huge repos.
     index_huge_repo_async_init: bool = True
 
+    # v0.30.0 Bug 5: cross-task infrastructure-failure circuit breaker.
+    # Counts adapter failures whose ``subtype`` is in
+    # ``{auth_failed, rate_limited, server_error}`` over a rolling
+    # window; trips when the count reaches ``circuit_breaker_threshold``
+    # within ``circuit_breaker_window_s`` seconds. On trip the
+    # orchestrator raises
+    # :class:`tournament.errors.InfrastructureCircuitOpenError`, which
+    # the existing :class:`AuthenticationFailedError` catch sites
+    # (v0.29.0 Bug 7) treat identically — quarantine the in-flight
+    # task, park the phase at ``review_status="paused"``, exit non-zero.
+    # Defaults (3 in 60s) match the user-locked value in the v0.30.0
+    # plan; raise the threshold or window for noisy networks where
+    # transient 5xx bursts shouldn't kill the run.
+    circuit_breaker_threshold: int = Field(default=3, ge=1)
+    circuit_breaker_window_s: float = Field(default=60.0, gt=0.0)
+
     @model_validator(mode="after")
     def _migrate_inline_platform(self) -> "AutodevConfig":
         """v0.26.0: rewrite legacy ``platform: "inline"`` to ``"claude_code"``.
