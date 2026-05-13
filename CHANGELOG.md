@@ -2,6 +2,110 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-05-13
+
+Infrastructure-failure recovery surface — foundation. A real-world run
+hit a corp-proxy `ANTHROPIC_AUTH_TOKEN` expiry mid-execute; the adapter
+silently swallowed the resulting 403s, the tournament classifier never
+recognised them as a typed failure class, and the orchestrator burned
+~150 retries thrashing on dead auth before guardrails fired and a phase
+was force-accepted with an empty diff. v0.28.0 ships the first of three
+planned releases that close this failure mode end-to-end: this release
+stops the bleed (a manual escape hatch + the silent-classifier fix +
+a startup probe). v0.29.0 will add the typed data model
+(`block_reason_class`, `quarantined`, `autodev rewind`); v0.30.0 will
+add the structural guarantees (refuse force-accept, ledger
+observability, circuit breaker).
+
+### Added
+- `autodev requeue` CLI command — flips blocked tasks back to
+  `pending` so the operator can resume after transient outside-the-loop
+  failures (auth refresh, gateway 4xx, DNS hiccup) without losing the
+  surrounding plan structure or the prior tournament work invested in
+  each task. Selection flags compose: `--task ID` (repeatable),
+  `--phase ID` (repeatable), `--infrastructure` (keyword heuristic
+  matching 401/403/Forbidden/authenticate/api_error_status/Connection
+  refused/DNS), `--all-blocked`. `--dry-run` previews without writing
+  the ledger; `--yes` skips the interactive confirmation.
+  `src/cli/commands/requeue.py` (new),
+  `PlanManager.requeue_tasks` + `RequeueResult` dataclass.
+- `AgentResult.api_error_status: int | None` field. The `claude_code`
+  adapter now synthesises a typed `subtype` from `api_error_status`
+  (401/403 → `auth_failed`, 429 → `rate_limited`, 5xx → `server_error`,
+  other 4xx → `client_error`) in BOTH parse branches (rc!=0 with
+  JSON-in-stdout, AND rc=0 success-path with `is_error=true`). The
+  CLI's own real subtype (e.g. `error_max_turns`) keeps precedence.
+  `src/adapters/claude_code.py:_api_status_to_subtype`.
+- `AuthenticationFailedError` typed exception
+  (`src/tournament/errors.py`, subclass of `TournamentError`). Raised
+  by the tournament retry wrapper on `auth_failed` subtype.
+  `run_execute_phase` and the underlying DAG dispatchers
+  (`_execute_phase_dag`, `_execute_cross_phase_dag`,
+  `_execute_one_worker`) catch it, mark the in-flight task `blocked`
+  with `blocked_reason="auth_failed: <error>"`, log
+  `execute_phase.auth_failed_halt`, surface an operator-facing console
+  message, and re-raise so the CLI exits non-zero. Phase review is
+  intentionally never triggered on the halt path — force-accepting a
+  half-empty phase on dead credentials is the production stall this
+  fix exists to prevent.
+- `claude_code` adapter `healthcheck()` second-stage PONG probe
+  (`echo PONG | claude -p --max-turns 1`, 10s timeout). Stage 1
+  (`claude --version`) still catches a missing CLI; stage 2 catches
+  the case a working binary masks expired auth or a broken upstream.
+  Returns `(False, "auth_failed: ...")` on 401/403,
+  `(False, "network: ...")` on timeout. The abstract
+  `PlatformAdapter.healthcheck` contract documents these reason
+  prefixes so callers can route on them.
+- Mandatory preflight re-probe in `autodev resume` and
+  `autodev execute` immediately before entering the orchestrator loop.
+  Re-runs `await adapter.healthcheck()` (NOT cached) — users typically
+  invoke `resume` right after fixing auth, so a stale negative would
+  lock them out. On probe failure both commands exit 2 and print an
+  actionable refresh-auth block (verify `ANTHROPIC_API_KEY`, refresh
+  `ANTHROPIC_AUTH_TOKEN`, or run `claude /login`). The Orchestrator
+  is never constructed if the probe fails, so no LLM spend is incurred
+  for a known-broken environment.
+- New `LedgerOp` value `"requeue"` — audit-only breadcrumb appended
+  alongside the per-task `update_task_status` ops emitted by
+  `requeue_tasks`. Replay reproduces the per-task transitions purely
+  through the `update_task_status` ops.
+
+### Fixed
+- 401/403/429/5xx responses from the Claude CLI are no longer silently
+  swallowed into a free-text `error` string and downstream
+  `"empty reviewer response"` placeholder. The tournament classifier
+  now sees a typed signal and short-circuits: `auth_failed` and
+  `client_error` are treated as deterministic (no retry); `rate_limited`
+  and `server_error` are classified as transient (retry via tenacity
+  backoff).
+- `autodev resume` now reports infrastructure problems (bad auth,
+  network) at startup with an actionable message instead of building
+  the Orchestrator and thrashing retries against a dead endpoint.
+
+### Migration
+- No on-disk schema migrations. Existing `.autodev/config.json`,
+  `plan.json`, and pre-v0.28 ledgers load unchanged.
+- Forward-compatibility: v0.28 adds `"requeue"` to the `LedgerOp`
+  Literal. A user who runs `autodev` under v0.28 and then downgrades
+  to v0.27.x cannot `autodev resume` — pre-v0.28 `_apply_op` raises
+  `LedgerCorruptError` on the new op name. Same downgrade procedure
+  as the v0.27 migration note (`autodev reset --hard` OR remove the
+  offending ledger lines manually).
+
+### Out of scope
+- v0.29.0 covers the typed data-model overhaul: `Task.block_reason_class`
+  (replaces the v0.28 `--infrastructure` keyword heuristic with a typed
+  field stamped at every block site), the `quarantined` `TaskStatus`
+  (so `AuthenticationFailedError` halts auto-resume cleanly without
+  needing an explicit `requeue`), `Phase.review_status="paused"`, and
+  `autodev rewind --to-phase` for undoing prior force-accepts.
+- v0.30.0 covers the structural guarantees that turn this release's
+  classifier+probe foundation into compile-time safety: phase aggregator
+  refuses to auto-accept a phase containing infrastructure-class blocks,
+  ledger observability records `api_error_status`, and a cross-task
+  circuit breaker halts a run after N infrastructure failures in a
+  rolling window.
+
 ## [0.27.0] - 2026-05-12
 
 Autonomy-stability audit. v0.26.2's persistent-failure drop closed one
