@@ -13,6 +13,7 @@ from cli.commands import (
     plan,
     plugins,
     prune,
+    requeue,
     reset,
     resume,
     secretscan_baseline,
@@ -32,6 +33,7 @@ def register_commands(group: click.Group) -> None:
     group.add_command(doctor.doctor)
     group.add_command(logs.logs)
     group.add_command(reset.reset)
+    group.add_command(requeue.requeue)
     group.add_command(prune.prune)
     group.add_command(plugins.plugins)
     group.add_command(secretscan_baseline.secretscan)

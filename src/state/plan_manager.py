@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -42,6 +43,26 @@ _TERMINAL_TASK_STATUSES: frozenset[str] = frozenset(
 
 def _iso_now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+@dataclass(frozen=True)
+class RequeueResult:
+    """Outcome of :meth:`PlanManager.requeue_tasks` (v0.28.0 Bug 8).
+
+    Carries the post-mutation summary the CLI surfaces to the operator
+    plus the raw lists tests inspect to assert idempotency.
+
+    ``requeued_task_ids`` excludes inputs that were already ``pending``
+    (the requeue is idempotent so a second call returns an empty list
+    here even when the same ids were passed in).
+
+    ``reset_phase_ids`` is the set of phases whose ``review_status`` was
+    flipped from any non-``None`` value back to ``None`` so the
+    phase-review tournament fires fresh on the next execute pass.
+    """
+
+    requeued_task_ids: list[str] = field(default_factory=list)
+    reset_phase_ids: list[str] = field(default_factory=list)
 
 
 class PlanManager:
@@ -432,6 +453,141 @@ class PlanManager:
                 reason=reason,
             )
             return task
+
+    async def requeue_tasks(
+        self,
+        task_ids: list[str],
+        *,
+        reset_phase_review: bool = True,
+        source: str = "interactive",
+    ) -> RequeueResult:
+        """v0.28.0 Bug 8: typed task-status reset for the ``requeue`` CLI.
+
+        For every id in ``task_ids`` whose current status is NOT
+        already ``pending``: flip status to ``pending``, zero
+        ``retry_count``, clear ``escalated`` + ``blocked_reason``.
+        Tasks already at ``pending`` are skipped (idempotent — a second
+        call writes zero ledger entries for those tasks).
+
+        When ``reset_phase_review`` is true (default), every phase
+        containing at least one requeued task has its ``review_status``
+        flipped back to ``None`` via the regular ``update_phase_meta``
+        op, so the phase-review tournament re-fires fresh on the next
+        execute pass instead of believing the phase is already
+        accepted.
+
+        ``source`` is a short label ("--task" | "--phase" |
+        "--infrastructure" | "--all-blocked" | "interactive") recorded
+        in the audit ``requeue`` ledger entry so forensics can later
+        reconstruct *why* the operator triggered the requeue.
+
+        Bypasses the FSM ``assert_transition`` check: ``blocked →
+        pending`` is not a legal automatic edge (would trigger
+        spontaneous retries), but it IS a legal operator-driven edge
+        and the ledger captures the explicit ``op="requeue"`` audit
+        breadcrumb so the transition is never silent.
+        """
+        async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
+            plan = self._load_sync()
+            if plan is None:
+                raise PlanConcurrentModificationError(
+                    "no plan initialized; call init_plan first"
+                )
+
+            # Pre-pass: validate every id resolves AND determine which
+            # tasks actually need a transition. Anything already
+            # pending is filtered out so the call is idempotent.
+            tasks_to_requeue: list[Task] = []
+            for tid in task_ids:
+                task = _find_task(plan, tid)
+                if task is None:
+                    raise PlanConcurrentModificationError(
+                        f"task_id={tid!r} not found in current plan"
+                    )
+                if task.status == "pending":
+                    continue
+                tasks_to_requeue.append(task)
+
+            if not tasks_to_requeue:
+                # Idempotent no-op — no audit breadcrumb either, so
+                # re-running ``autodev requeue --task X`` after success
+                # writes zero ledger entries.
+                return RequeueResult()
+
+            requeued_ids = [t.id for t in tasks_to_requeue]
+
+            # Audit-only breadcrumb capturing CLI intent. Emitted
+            # BEFORE the per-task ops so a partial-write crash leaves
+            # the breadcrumb but no half-applied state — replay then
+            # reconstructs whichever subset of update_task_status ops
+            # actually landed.
+            await append_entry(
+                self._cwd,
+                op="requeue",
+                payload={
+                    "task_ids": requeued_ids,
+                    "reset_phase_review": bool(reset_phase_review),
+                    "source": source,
+                },
+                session_id=self._session_id,
+            )
+
+            # Per-task transitions. Each emits its own
+            # ``update_task_status`` op so replay reproduces the full
+            # mutation set even if the audit breadcrumb were ever lost.
+            for task in tasks_to_requeue:
+                await append_entry(
+                    self._cwd,
+                    op="update_task_status",
+                    payload={
+                        "task_id": task.id,
+                        "status": "pending",
+                        "blocked_reason": None,
+                        "retry_count": 0,
+                        "escalated": False,
+                    },
+                    session_id=self._session_id,
+                )
+                task.status = "pending"
+                task.blocked_reason = None
+                task.retry_count = 0
+                task.escalated = False
+
+            # Phase-level review reset. Only phases that actually held
+            # a non-None review_status get touched — re-running on a
+            # fresh phase would otherwise emit a redundant noop entry.
+            reset_phase_ids: list[str] = []
+            if reset_phase_review:
+                affected_phase_ids = {t.phase_id for t in tasks_to_requeue}
+                for phase in plan.phases:
+                    if phase.id not in affected_phase_ids:
+                        continue
+                    if phase.review_status is None:
+                        continue
+                    await append_entry(
+                        self._cwd,
+                        op="update_phase_meta",
+                        payload={
+                            "phase_id": phase.id,
+                            "review_status": None,
+                        },
+                        session_id=self._session_id,
+                    )
+                    phase.review_status = None
+                    reset_phase_ids.append(phase.id)
+
+            plan = plan.model_copy(update={"updated_at": _iso_now()})
+            await snapshot_plan(self._cwd, plan, session_id=self._session_id)
+            self._log.info(
+                "requeue.applied",
+                task_ids=requeued_ids,
+                reset_phase_ids=reset_phase_ids,
+                source=source,
+            )
+            return RequeueResult(
+                requeued_task_ids=requeued_ids,
+                reset_phase_ids=reset_phase_ids,
+            )
 
     async def reconcile_evidence_vs_ledger(self) -> dict[str, list]:
         """v0.22.2 B3: detect + repair orphan evidence at resume time.

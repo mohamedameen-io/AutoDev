@@ -236,6 +236,16 @@ LedgerOp = Literal[
     # routing to the architect-consult rung lives in the orchestrator
     # caller. Payload: ``{role: str, reason: str, raw_response: str}``.
     "agent_escalated",
+    # v0.28.0 Bug 8: ``autodev requeue`` CLI fired a typed task-status
+    # reset. Audit-only — the per-task ``status: blocked → pending``
+    # transitions flow through the regular ``update_task_status`` ops
+    # emitted alongside (one per requeued task). Payload shape:
+    # ``{task_ids: list[str], reset_phase_review: bool, source: str}``
+    # where ``source`` is the CLI flag ("--task" | "--phase" |
+    # "--infrastructure" | "--all-blocked" | "interactive") that
+    # triggered the requeue, useful for forensics on "which infra
+    # incident motivated this resume".
+    "requeue",
 ]
 
 
@@ -670,6 +680,11 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         "task_blocked_scope_violation",
         # v0.27 Phase 7: role agent emitted ESCALATE: line. Audit-only.
         "agent_escalated",
+        # v0.28.0 Bug 8: ``autodev requeue`` CLI breadcrumb. The actual
+        # task transitions live in ``update_task_status`` ops emitted
+        # alongside (one per requeued task); replay treats the
+        # breadcrumb itself as a no-op.
+        "requeue",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.
