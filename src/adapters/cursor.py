@@ -476,7 +476,14 @@ class CursorAdapter(PlatformAdapter):
                 # the call as a typed failure so the orchestrator's
                 # retry / escalate FSM kicks in instead of the silent
                 # soft-block on ``["empty reviewer response"]``.
-                if not is_error and not text.strip():
+                #
+                # v0.31.1 (Phase 0): drop the ``not is_error`` guard.
+                # When the CLI emits ``is_error=true`` alongside an
+                # empty result (transport-layer failures, timeouts),
+                # the dump is exactly what we need to diagnose root
+                # cause. Empty text is the machinery-failure signal;
+                # ``is_error`` is orthogonal.
+                if not text.strip():
                     if _raw_response_dump_enabled():
                         self._dump_empty_result(
                             inv=inv,

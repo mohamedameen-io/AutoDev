@@ -270,9 +270,17 @@ async def test_execute_nonzero_exit_writes_debug_dump(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_execute_is_error_true(tmp_path: Path) -> None:
+    """``is_error=true`` with non-empty ``result`` propagates the CLI's
+    error string. The empty-result variant is now intercepted by the
+    Phase 1.1 dump path (regression coverage in
+    test_adapter_empty_result_dump.py); use a non-empty result here so
+    we still exercise the original ``is_error`` propagation contract.
+    """
     adapter = ClaudeCodeAdapter()
     inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path)
-    blob = json.dumps({"result": "", "is_error": True, "error": "rate_limited"})
+    blob = json.dumps(
+        {"result": "rate-limited; retry later", "is_error": True, "error": "rate_limited"}
+    )
     fake = _fake_proc(stdout=blob, returncode=0)
     with patch(
         "adapters.claude_code.asyncio.create_subprocess_exec",

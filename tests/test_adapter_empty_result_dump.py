@@ -272,3 +272,98 @@ async def test_cursor_non_empty_result_does_not_dump(
     if debug_dir.exists():
         dumps = list(debug_dir.glob("reviewer-*-empty.json"))
         assert dumps == [], f"expected no dump on success, got {dumps}"
+
+
+# ----------------------------------------------------------------------------
+# v0.31.1 (Phase 0): is_error=true AND result="" must still dump.
+#
+# v0.31.0 shipped the dump path with predicate ``not is_error and not text``,
+# which silently skipped the dump whenever the CLI emitted ``is_error=true``
+# alongside an empty ``result``. Per the v0.28.0 in-file comment, that is
+# the dominant transport-failure shape — exactly the case the dump was
+# built to capture. Drop the ``is_error`` gate; empty text is the
+# machinery-failure signal regardless of whether ``is_error`` is set.
+# ----------------------------------------------------------------------------
+
+
+def _empty_claude_blob_with_is_error_true() -> str:
+    """Mimic transport-layer failure: rc=0, parseable JSON, is_error=true,
+    result="". The CLI exits cleanly but the underlying call failed, and
+    the response body carries no recoverable text.
+    """
+    return json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "duration_ms": 5000,
+            "num_turns": 1,
+            "result": "",
+            "stop_reason": "max_tokens",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "total_cost_usd": 0.0,
+            "usage": {"input_tokens": 1000, "output_tokens": 0},
+            "modelUsage": {},
+            "permission_denials": [],
+            "terminal_reason": "completed",
+            "uuid": "11111111-1111-1111-1111-111111111111",
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_claude_empty_result_with_is_error_true_still_dumps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for v0.31.1 Phase 0: when ``is_error=true`` AND
+    ``result=""``, the dump must still fire. The v0.31.0 predicate
+    silently skipped this branch — the most diagnostic case in
+    production.
+    """
+    monkeypatch.setenv("AUTODEV_DEBUG_RAW_RESPONSES", "1")
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="reviewer", prompt="p", cwd=tmp_path, max_turns=3)
+    fake = _fake_proc(stdout=_empty_claude_blob_with_is_error_true(), returncode=0)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    dumps = list((tmp_path / ".autodev" / "debug").glob("reviewer-*-empty.json"))
+    assert len(dumps) == 1, (
+        "v0.31.1 regression: dump must fire even when CLI returns "
+        f"is_error=true alongside an empty result; got dumps={dumps}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cursor_empty_result_with_is_error_true_still_dumps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for v0.31.1 Phase 0: Cursor variant of the
+    is_error=true + empty-result case.
+    """
+    monkeypatch.setenv("AUTODEV_DEBUG_RAW_RESPONSES", "1")
+    adapter = CursorAdapter(binaries=("cursor",))
+    inv = AgentInvocation(role="reviewer", prompt="p", cwd=tmp_path)
+    blob = json.dumps(
+        {
+            "result": "",
+            "thread_id": "abc-123",
+            "is_error": True,
+            "error": "transport timeout",
+        }
+    )
+    fake = _fake_proc(stdout=blob, returncode=0)
+    with patch(
+        "adapters.cursor.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    dumps = list((tmp_path / ".autodev" / "debug").glob("reviewer-*-empty.json"))
+    assert len(dumps) == 1, (
+        "v0.31.1 regression: cursor adapter dump must fire even when "
+        f"CLI returns is_error=true alongside an empty result; got dumps={dumps}"
+    )

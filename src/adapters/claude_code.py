@@ -349,7 +349,16 @@ class ClaudeCodeAdapter(PlatformAdapter):
         # envelope). Dump full stdout/stderr + invocation context, then
         # return a failure-flagged result so downstream retry / escalate
         # logic kicks in. Gated by ``AUTODEV_DEBUG_RAW_RESPONSES``.
-        if not is_error and not text.strip():
+        #
+        # v0.31.1 (Phase 0): drop the ``not is_error`` guard. The CLI
+        # routinely emits ``is_error=true`` alongside ``result=""`` on
+        # transport-layer failures (per the v0.28.0 comment elsewhere
+        # in this file), and that is exactly the case the dump was
+        # built to capture. Empty text is the machinery-failure signal;
+        # ``is_error`` is orthogonal to whether the forensic dump
+        # should be written. The orchestrator still classifies
+        # ``is_error=true`` correctly for control flow downstream.
+        if not text.strip():
             if _raw_response_dump_enabled():
                 self._dump_empty_result(
                     inv=inv,
