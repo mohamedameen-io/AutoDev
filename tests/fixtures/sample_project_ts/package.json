@@ -1,0 +1,12 @@
+{
+  "name": "sample-ts-project",
+  "version": "0.0.1",
+  "description": "Sample TypeScript project for AutoDev E2E testing.",
+  "main": "index.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
