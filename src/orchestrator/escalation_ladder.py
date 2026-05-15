@@ -38,7 +38,12 @@ no longer plausible."
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
+
+from autologging import get_logger
+
+
+logger = get_logger(__name__)
 
 
 # Public step labels returned by :func:`next_step`. The executor branches
@@ -117,7 +122,10 @@ class StuckState:
     last_event: str = ""
 
 
-def next_step(state: StuckState) -> StuckStepLabel:
+def next_step(
+    state: StuckState,
+    knowledge_context: dict[str, Any] | None = None,
+) -> StuckStepLabel:
     """Return the ladder's next escalation step for ``state``.
 
     See module docstring for the threshold table. Pure function: does
@@ -137,6 +145,20 @@ def next_step(state: StuckState) -> StuckStepLabel:
       the architect hasn't been consulted yet (``architect_count < 1``).
     * ``"SOFT_BLOCKER"`` — terminate the task with a human-decision
       handoff (no further autonomous escalation).
+
+    v0.32.0 Phase 4.1: ``knowledge_context`` is an optional dict carrying
+    PRM-detected pattern names under the ``"detected_patterns"`` key.
+    When ``"repetition_loop"`` is detected AND the ladder would otherwise
+    return ``"REFINE"`` (or ``"continue"``), the result is escalated to
+    ``"PIVOT"`` — repeating the same edit on the same files is the exact
+    failure mode that REFINE cannot fix. When ``"ping_pong"`` is detected
+    AND the ladder would otherwise return ``"REFINE"`` or ``"PIVOT"``,
+    the result is escalated to ``"ARCHITECT_CONSULT"`` (assuming
+    architect_count < 1) or ``"SOFT_BLOCKER"`` otherwise — alternating
+    between two targets is structural confusion the architect is best
+    positioned to resolve. When ``knowledge_context`` is None or carries
+    no recognised patterns, behaviour is byte-identical to the
+    pre-Phase-4 ladder.
     """
     # SOFT_BLOCKER beats every other step. v0.26.1 patch G: also fires
     # once the architect has been consulted (architect_count >= 1) —
@@ -165,10 +187,73 @@ def next_step(state: StuckState) -> StuckStepLabel:
     ):
         return "WEB_SEARCH"
     if state.discard_count >= _DISCARD_PIVOT_THRESHOLD:
+        baseline: StuckStepLabel = "PIVOT"
+    elif state.discard_count >= _DISCARD_REFINE_THRESHOLD:
+        baseline = "REFINE"
+    else:
+        baseline = "continue"
+
+    # v0.32.0 Phase 4.1: PRM-pattern-aware overrides. The detector in
+    # :mod:`orchestrator.prm` already fires `repetition_loop` when the
+    # same (role, action, target_files) triple appears 3× in a row and
+    # `ping_pong` when two targets alternate 4×. Either pattern means
+    # the cheap REFINE path will not produce a different outcome — we
+    # have empirical evidence that the agent is stuck in a fixed point.
+    detected = _detected_patterns(knowledge_context)
+    if not detected:
+        return baseline
+
+    if "repetition_loop" in detected and baseline in ("continue", "REFINE"):
+        logger.info(
+            "escalation_ladder.repetition_loop_overrides_refine_to_pivot",
+            discard_count=state.discard_count,
+            pivot_count=state.pivot_count,
+            baseline=baseline,
+        )
         return "PIVOT"
-    if state.discard_count >= _DISCARD_REFINE_THRESHOLD:
-        return "REFINE"
-    return "continue"
+
+    if "ping_pong" in detected and baseline in ("REFINE", "PIVOT"):
+        # ping_pong means the agent is alternating between two targets —
+        # the structural decision is the bug, not the local edit. Skip
+        # the developer-facing rungs and route to the architect (if not
+        # already consulted) or the human (if architect already weighed in).
+        if state.architect_count < _ARCHITECT_SOFT_BLOCKER_THRESHOLD:
+            logger.info(
+                "escalation_ladder.ping_pong_escalates_to_architect_consult",
+                discard_count=state.discard_count,
+                pivot_count=state.pivot_count,
+                baseline=baseline,
+            )
+            return "ARCHITECT_CONSULT"
+        logger.info(
+            "escalation_ladder.ping_pong_escalates_to_soft_blocker",
+            discard_count=state.discard_count,
+            pivot_count=state.pivot_count,
+            baseline=baseline,
+        )
+        return "SOFT_BLOCKER"
+
+    return baseline
+
+
+def _detected_patterns(
+    knowledge_context: dict[str, Any] | None,
+) -> set[str]:
+    """Extract the ``detected_patterns`` set from ``knowledge_context``.
+
+    Returns an empty set on None / missing / malformed input — the
+    override paths above degrade silently to the pre-Phase-4 ladder so
+    a misshapen caller never crashes the retry loop.
+    """
+    if not knowledge_context:
+        return set()
+    raw = knowledge_context.get("detected_patterns")
+    if raw is None:
+        return set()
+    try:
+        return {str(p) for p in raw}
+    except TypeError:
+        return set()
 
 
 __all__ = [
