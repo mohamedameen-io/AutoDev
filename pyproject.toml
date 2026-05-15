@@ -123,7 +123,7 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 filterwarnings = [
     "ignore:coroutine 'create_subprocess_exec' was never awaited:RuntimeWarning",
     "ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning",
