@@ -27,6 +27,7 @@ from typing import Iterable
 
 from errors import AutodevError
 from autologging import get_logger
+from orchestrator import worktree_state
 
 
 logger = get_logger(__name__)
@@ -51,6 +52,7 @@ class WorktreeManager:
         *,
         huge_mode: bool = False,
         huge_create_timeout_s: float = 600.0,
+        autodev_root: Path | None = None,
     ) -> None:
         """Initialize a worktree manager.
 
@@ -65,6 +67,14 @@ class WorktreeManager:
         self._dir = Path(tournament_dir)
         self._huge_mode = bool(huge_mode)
         self._huge_create_timeout_s = float(huge_create_timeout_s)
+        # v0.31.0 (Phase 5.2): root for the worktree-state manifest.
+        # When None we infer ``<main_repo>/.autodev/`` so legacy callers
+        # continue recording state without an explicit override. Tests
+        # (and out-of-tree callers) can pass an explicit path.
+        if autodev_root is None:
+            self._autodev_root = self._main / ".autodev"
+        else:
+            self._autodev_root = Path(autodev_root)
         self._log = get_logger(
             component="worktree",
             main_repo=str(self._main),
@@ -189,6 +199,9 @@ class WorktreeManager:
                 path=str(wt),
                 paths=sparse_paths,
             )
+            worktree_state.record_create(
+                self._autodev_root, path=wt, label=label, task_id=None
+            )
             return wt
 
         rc, out, err = await _run_git(
@@ -201,6 +214,9 @@ class WorktreeManager:
                 f"git worktree add failed (rc={rc}): {err.strip() or out.strip()}"
             )
         self._log.info("worktree.created", label=label, path=str(wt))
+        worktree_state.record_create(
+            self._autodev_root, path=wt, label=label, task_id=None
+        )
         return wt
 
     async def create_per_task(
@@ -271,6 +287,12 @@ class WorktreeManager:
                 path=str(wt),
                 paths=sparse_paths,
             )
+            worktree_state.record_create(
+                self._autodev_root,
+                path=wt,
+                label=task_id,
+                task_id=task_id,
+            )
             return wt
 
         rc, out, err = await _run_git(
@@ -282,6 +304,12 @@ class WorktreeManager:
                 f"git worktree add failed (rc={rc}): {err.strip() or out.strip()}"
             )
         self._log.info("worktree.created_per_task", task_id=task_id, path=str(wt))
+        worktree_state.record_create(
+            self._autodev_root,
+            path=wt,
+            label=task_id,
+            task_id=task_id,
+        )
         return wt
 
     async def remove_per_task(self, task_id: str, force: bool = True) -> None:
@@ -295,6 +323,7 @@ class WorktreeManager:
         wt = self._dir / "tasks" / task_id
         if not wt.exists():
             await _run_git(self._main, ["worktree", "prune"])
+            worktree_state.record_cleanup(self._autodev_root, path=wt)
             return
 
         args = ["worktree", "remove"]
@@ -304,8 +333,10 @@ class WorktreeManager:
         rc, _, _ = await _run_git(self._main, args)
         if rc != 0:
             await self._force_remove(wt)
+            worktree_state.record_cleanup(self._autodev_root, path=wt)
             return
         self._log.info("worktree.removed_per_task", task_id=task_id)
+        worktree_state.record_cleanup(self._autodev_root, path=wt)
 
     async def remove(self, label: str, force: bool = False) -> None:
         """Remove a worktree and its on-disk directory.
@@ -333,6 +364,7 @@ class WorktreeManager:
             # Best-effort prune so the admin DB is consistent if a previous
             # remove failed mid-way.
             await _run_git(self._main, ["worktree", "prune"])
+            worktree_state.record_cleanup(self._autodev_root, path=wt)
             return
 
         args = ["worktree", "remove"]
@@ -345,11 +377,14 @@ class WorktreeManager:
                 # Retry forcefully — this is the common happy path for our
                 # tournament where worktrees may have uncommitted changes.
                 await self._force_remove(wt)
+                worktree_state.record_cleanup(self._autodev_root, path=wt)
                 return
             # Force flag was already set — escalate to rmtree + prune.
             await self._force_remove(wt)
+            worktree_state.record_cleanup(self._autodev_root, path=wt)
             return
         self._log.info("worktree.removed", label=label, path=str(wt))
+        worktree_state.record_cleanup(self._autodev_root, path=wt)
 
     async def _force_remove(self, wt: Path) -> None:
         """Fallback cleanup when ``git worktree remove`` can't finish.

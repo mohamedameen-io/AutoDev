@@ -575,3 +575,100 @@ async def test_run_git_handles_cancellederror(tmp_path: Path) -> None:
             await task
 
     assert kill_calls, "_run_git did not kill subprocess on CancelledError"
+
+
+# ---------------------------------------------------------------------------
+# v0.31.0 (Phase 5.2): worktree-state manifest
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_state_manifest_round_trip(tmp_path: Path) -> None:
+    """Manifest gains an entry on create and loses it on remove.
+
+    Round-trip:
+
+    1. Cold start -- manifest empty.
+    2. ``create_per_task`` -- one entry with the right path/task_id.
+    3. ``remove_per_task`` -- entry gone.
+    """
+    from orchestrator import worktree_state
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    autodev_root = tmp_path / ".autodev"
+    autodev_root.mkdir()
+    wt_dir = autodev_root / "execute_worktrees"
+    mgr = WorktreeManager(
+        main_repo=repo,
+        tournament_dir=wt_dir,
+        autodev_root=autodev_root,
+    )
+
+    assert worktree_state.load_manifest(autodev_root) == []
+
+    wt = await mgr.create_per_task("4.2")
+    entries = worktree_state.load_manifest(autodev_root)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.task_id == "4.2"
+    assert e.label == "4.2"
+    # Path should resolve to the on-disk worktree (resolve() handles symlinks).
+    assert Path(e.path) == wt.resolve()
+    assert e.pid_of_creator > 0
+    assert e.created_at  # non-empty ISO-ish timestamp
+
+    await mgr.remove_per_task("4.2")
+    assert worktree_state.load_manifest(autodev_root) == []
+
+
+def test_state_manifest_atomic_write_survives_partial_failure(
+    tmp_path: Path,
+) -> None:
+    """Atomic write strategy: a crash during ``write_text`` leaves the
+    prior manifest intact.
+
+    We simulate this by writing a valid manifest first, then patching
+    ``write_text`` on the temp file path to raise mid-write, and asserting
+    the original manifest is still readable afterwards.
+    """
+    from unittest.mock import patch
+
+    from orchestrator import worktree_state
+
+    autodev_root = tmp_path / ".autodev"
+    autodev_root.mkdir()
+    wt_path_a = tmp_path / "execute_worktrees" / "tasks" / "1.1"
+    worktree_state.record_create(
+        autodev_root, path=wt_path_a, label="1.1", task_id="1.1"
+    )
+    before = worktree_state.load_manifest(autodev_root)
+    assert len(before) == 1
+
+    # Patch Path.write_text used by _atomic_write to fail. Because writes
+    # go through the .tmp file first and only os.replace the destination
+    # on success, the destination must remain unchanged.
+    real_write_text = Path.write_text
+
+    def boom(self, *args, **kwargs):
+        if self.suffix == ".tmp":
+            raise OSError("simulated disk full")
+        return real_write_text(self, *args, **kwargs)
+
+    with patch.object(Path, "write_text", boom):
+        # Either record_create swallows the OSError silently, or it
+        # raises -- either way, the manifest must not be corrupt.
+        try:
+            worktree_state.record_create(
+                autodev_root,
+                path=tmp_path / "execute_worktrees" / "tasks" / "2.2",
+                label="2.2",
+                task_id="2.2",
+            )
+        except OSError:
+            pass
+
+    after = worktree_state.load_manifest(autodev_root)
+    assert after == before, "atomic write must preserve the prior manifest"
