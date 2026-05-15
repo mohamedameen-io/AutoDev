@@ -2,6 +2,171 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] - 2026-05-15
+
+Hardening release. Closes the dominant production failure mode (reviewer
+agent emitting empty responses both adapters silently soft-blocked on),
+brings the Cursor adapter to parity with the Claude Code adapter on
+cancellation / debug-dump / binary-cache discipline, adds a usage-limit-
+aware downshift policy for Cursor, introduces a budget-escalation tracker
+for repeated `error_max_turns`, and lands the CI infrastructure that
+would have caught every v0.30.1 regression at PR time.
+
+### Reviewer pipeline (Phase 1)
+- Both adapters now persist a forensic dump to
+  `.autodev/debug/<role>-<ts>-empty.json` whenever the underlying CLI
+  returns `result == ""` on a clean exit. Previously this case was
+  invisible — `returncode == 0` with empty `result` triggered no debug
+  artifact, so empty-reviewer failures could not be diagnosed
+  post-hoc. Gated behind `AUTODEV_DEBUG_RAW_RESPONSES` (default-on).
+- `ReviewEvidence` (and Developer/Test evidence by symmetry) carries a
+  new optional `raw_response: str | None` field. The orchestrator writes
+  the underlying adapter text even when `output_text` ends up empty, so
+  every blocked task is self-diagnosing.
+- `_parse_review_verdict()` no longer silently defaults to `APPROVED`
+  when no verdict keyword is found. A new `MALFORMED` verdict value
+  represents "the reviewer machinery returned something we cannot
+  classify" and is treated distinctly from `NEEDS_CHANGES` (legitimate
+  negative review).
+- Reviewer envelope replaces the hard 8 KB `diff[:8000]` truncation
+  with a chunked builder: full diff for files ≤ 2 KB, head+tail+stats
+  for larger files, generated/lock files dropped, total soft-capped at
+  32 KB. Reviewer `max_turns` bumped 3 → 5. New
+  `output_token_budget: int | None` plumbed end-to-end on
+  `AgentInvocation` (advisory until adapters expose explicit flags).
+
+### Cursor adapter (Phases 2 + 2.6)
+- `CancelledError` is now caught in `execute()` and `healthcheck()`;
+  the in-flight subprocess is killed with a 5 s grace before re-raise.
+  Mirrors the existing Claude Code adapter discipline. Same handler
+  added to `WorktreeManager._run_git()`.
+- `_dump_failure_transcript()` helper added; called from every Cursor
+  failure path (non-zero exit, parse failure, env-var-skipped
+  downshift, downshift-cap-hit, and "no binary available"). First
+  rate/usage-limit hit that gets downshifted does NOT dump (the retry
+  path is the recovery); only true terminal failures dump.
+- `FileNotFoundError` per-binary is now cached within a single
+  `execute()` call; we never re-probe the same missing binary across
+  model attempts.
+- New `max_mode: bool | None` tri-state on `AgentInvocation`. The
+  Cursor `_build_command` translates it to CLI flags (currently a
+  no-op pending Cursor exposing a public Max Mode flag — see
+  `docs/cursor-cli-flags.md`).
+- Limit detection expanded beyond rate-limit. New helper
+  `_classify_limit_signal()` returns `"rate_limited"` |
+  `"usage_limit_hit"` | `"none"` and matches against both stdout AND
+  stderr for: `rate limit`, `rate_limit`, `too many requests`,
+  `usage limit`, `usage_limit`, `monthly limit`, `plan limit`,
+  `quota exceeded`, `out of credits`, `upgrade to continue`,
+  `limit reached`. HTTP 429 is still recognised explicitly.
+- On any limit hit, every role now downshifts to `model="auto"` with
+  `max_mode=False` regardless of the starting model — previously only
+  `opus`/`sonnet` starters got a fallback. Capped at one downshift
+  per call.
+- `usage_limit_hit` added to the v0.30.0 cross-task circuit-breaker
+  tracked subtypes alongside `auth_failed`, `rate_limited`,
+  `server_error`. Sustained usage-cap hits now pause the phase
+  instead of burning escalation budget forever.
+- Operator override: `AUTODEV_CURSOR_DISABLE_MAX_FALLBACK=1` skips
+  the downshift entirely (for unlimited / enterprise plans).
+
+### Budget escalation (Phase 3)
+- New `BudgetEscalationTracker` per orchestrator instance. When the
+  same `(task_id, role)` returns `error_max_turns` on consecutive
+  attempts:
+  - 2nd attempt: `ceil(prior × 1.5)` turns, +25 % timeout.
+  - 3rd attempt: `ceil(prior × 2.0)` turns, +50 % timeout. Emits a
+    new `budget_escalation` ledger op.
+  - 4th attempt: hard fail with `subtype="error_max_turns_escalation_exhausted"`
+    and a diagnostic pointing to `.autodev/config.json` overrides.
+- Counter resets on success and on any non-`error_max_turns` failure.
+- Hard ceilings at `max_turns ≤ 100`, `timeout_s ≤ 3600`
+  (overridable via `cfg.budget_escalation`).
+
+### Slash command unification (Phase 4)
+- New `src/adapters/slash_command_spec.py` with frozen
+  `SlashCommandSpec` dataclass and `canonical_slash_command_spec()`
+  builder. Subcommand tuple is derived at module-import time from the
+  live `cli.commands` registry.
+- `render_claude_slash_command()` and `render_cursor_slash_command()`
+  in `src/adapters/inline_config.py` are now thin platform-wrapping
+  shims (Claude prepends YAML frontmatter; Cursor passes `--platform
+  cursor` everywhere). Body is shared. The two templates cannot drift
+  again — three new tests in `tests/test_inline_config.py` lock
+  subcommand parity, routing-rule parity, and registry alignment.
+
+### Worktree hygiene + doctor + language fitness (Phase 5)
+- `autodev prune` learns `--executor-only` (operates only on
+  `.autodev/execute_worktrees/` and `_pool/`) and `--all` (ignores
+  age threshold). Combination is the post-SIGKILL emergency cleanup
+  path.
+- `WorktreeManager` now writes `.autodev/worktrees-state.json` on
+  every create / removes the entry on every cleanup. Atomic write.
+  Used by `prune --executor-only` and `doctor --repair-worktrees`.
+- New `src/runtime/language_profile.py` computes
+  `{language: percentage}` over the repo via extension weights.
+  Result cached at `.autodev/language_profile.json` with mtime
+  invalidation. Recomputed on `init`.
+- New `src/adapters/fitness.py` scores adapter fitness against the
+  language profile. Cursor scores 95 if TS+JS ≥ 50 %, 80 if ≥ 30 %,
+  60 if ≥ 10 %, 30 otherwise. Claude is baseline 85 across languages
+  (+5 for Python-heavy projects). Warning printed in `execute` /
+  `plan` when score < 50.
+- New `AUTODEV_LANG_WEIGHT` env var (default `0.0`, opt-in). When
+  > 0, `--platform auto` factors fitness into the choice instead of
+  always picking the first-found binary.
+- `autodev doctor` gains four new sections: codebase language
+  profile (top 5), per-adapter fitness for the selected adapter,
+  orphan worktree count (manifest-based), stale editor agent files
+  (mtime comparison). New `--repair-worktrees` flag lists orphans
+  without deleting.
+
+### CI infrastructure (Phase 6)
+- `tests/fixtures/fake_binaries/{fake-claude,fake-cursor}` are pure
+  bash mocks that hash the prompt and look up canned responses in
+  `$AUTODEV_FAKE_RESPONSE_DIR`. Honour `AUTODEV_FAKE_FAILURE_MODE`
+  for `error_max_turns`, `empty_result`, `timeout`, `nonzero_exit`,
+  `usage_limit`. macOS + Linux compatible.
+- `tests/fixtures/sample_project/` (Python) and
+  `tests/fixtures/sample_project_ts/` (TypeScript) feed the E2E
+  fixture and the Cursor fitness path.
+- `tests/integration/test_e2e_with_fake_binaries.py` — twelve tests
+  covering the fake-binary protocol, both adapters end-to-end via
+  `PATH`-injected fakes, and explicit regression coverage for
+  v0.30.1 Bug F2 (`timeout_s=None`).
+- `.github/workflows/test.yml` extended: runs the new E2E suite and
+  the slash-template drift gate on every PR.
+- `scripts/release_version.py` validates version format,
+  `src/_version.py` consistency, and `CHANGELOG.md` entry presence
+  before allowing a bump. Refuses to proceed otherwise.
+- New `.github/workflows/release.yml` (`workflow_dispatch`):
+  preflight-checks → unit-tests → doctor-smoke → manual-smoke-issue
+  → tag-and-publish → post-publish-smoke. The existing
+  `publish.yml` still handles PyPI + npm; release.yml is the gate
+  in front of it.
+- New `CONTRIBUTING.md` documents the release ceremony.
+
+### Schema / migration
+- `ReviewEvidence`, `DeveloperEvidence`, `TestEvidence` all gain
+  optional `raw_response: str | None = None`. Field defaults to
+  `None`, so older evidence files continue to load without
+  migration. The global `schema_version` is intentionally NOT
+  bumped — the new field is additive and backward-compatible.
+
+### Tests
+- 2809 passed, 7 skipped (vs 2710 before this release; +99 tests
+  across phases).
+- New files: `tests/test_orchestrator_review_parser.py`,
+  `tests/test_evidence_persists_raw_response.py`,
+  `tests/test_adapter_empty_result_dump.py`,
+  `tests/test_orchestrator_review_envelope_chunking.py`,
+  `tests/test_orchestrator_budget_escalation.py`,
+  `tests/test_language_profile.py`,
+  `tests/test_adapter_fitness.py`,
+  `tests/test_doctor_extended.py`,
+  `tests/test_release_version_script.py`,
+  `tests/integration/test_e2e_with_fake_binaries.py`.
+
 ## [0.30.2] - 2026-05-15
 
 Emergency patch release fixing two regressions in v0.30.1 that broke
