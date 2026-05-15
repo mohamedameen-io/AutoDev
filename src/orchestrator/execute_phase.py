@@ -2935,44 +2935,140 @@ async def _execute_one(
             task = await orch.plan_manager.update_task_status(task.id, "auto_gated")
 
             # Step 4: reviewer.
-            try:
-                review_env = _review_envelope(task, coder_ev.diff or "")
-                review_result = await delegate(
-                    orch,
-                    "reviewer",
-                    review_env,
-                    retry_count=task.retry_count,
-                    last_issues=last_issues,
-                    cwd_override=worktree,
+            #
+            # v0.32.0 Phase 2: when ``cfg.tournaments.review_tournament_enabled``,
+            # swap the legacy single-shot ``delegate(..., "reviewer", ...)``
+            # call for an A/B/AB tournament routed through
+            # :func:`orchestrator.review_tournament_runner.run_review_tournament`.
+            # Default ``False`` for one cycle (real-world telemetry needed
+            # before flipping the default in v0.33.0). All v0.31.0
+            # instrumentation is preserved by construction:
+            #   * each candidate gets the same chunked envelope (Phase 1.4),
+            #   * each judge's verdict parses through ``_parse_review_verdict``
+            #     so MALFORMED still classifies (Phase 1.3),
+            #   * ``raw_response`` is captured per candidate (Phase 1.2),
+            #   * the empty-result dump path is still inside ``delegate``.
+            review_env = _review_envelope(task, coder_ev.diff or "")
+            review_result_text: str = ""
+            review_tournament_outcome: (
+                "ReviewTournamentResult | None"
+            ) = None
+            if getattr(
+                orch.cfg.tournaments, "review_tournament_enabled", False
+            ):
+                from orchestrator.review_tournament_runner import (
+                    ReviewTournamentResult,
+                    run_review_tournament,
                 )
-            except GuardrailExceededError as exc:
-                logger.warning(
-                    "execute_phase.guardrail_exceeded",
-                    task_id=task.id,
-                    reason=str(exc),
-                )
-                task = await orch.plan_manager.update_task_status(
-                    task.id,
-                    "blocked",
-                    meta={
-                        "blocked_reason": f"guardrail_exceeded: {exc}",
-                        "block_reason_class": _classify_guardrail_block(
-                            getattr(orch, "_last_adapter_subtype", None)
-                        ),
-                        # v0.30.0 Bug 4: forensic-only payload extension —
-                        # carry the most recent adapter status / subtype
-                        # so post-mortems can grep the ledger directly.
-                        "api_error_status": getattr(
-                            orch, "_last_adapter_api_error_status", None
-                        ),
-                        "last_adapter_subtype": getattr(
-                            orch, "_last_adapter_subtype", None
-                        ),
-                    },
-                )
-                return task
 
-            verdict, issues = _parse_review_verdict(review_result.text)
+                try:
+                    review_tournament_outcome = await run_review_tournament(
+                        orch,
+                        task,
+                        coder_ev,
+                        review_env,
+                        cwd_override=worktree,
+                    )
+                except GuardrailExceededError as exc:
+                    logger.warning(
+                        "execute_phase.guardrail_exceeded",
+                        task_id=task.id,
+                        reason=str(exc),
+                    )
+                    task = await orch.plan_manager.update_task_status(
+                        task.id,
+                        "blocked",
+                        meta={
+                            "blocked_reason": f"guardrail_exceeded: {exc}",
+                            "block_reason_class": _classify_guardrail_block(
+                                getattr(orch, "_last_adapter_subtype", None)
+                            ),
+                            "api_error_status": getattr(
+                                orch, "_last_adapter_api_error_status", None
+                            ),
+                            "last_adapter_subtype": getattr(
+                                orch, "_last_adapter_subtype", None
+                            ),
+                        },
+                    )
+                    return task
+
+                verdict = review_tournament_outcome.winning_verdict
+                issues = list(review_tournament_outcome.winning_issues)
+                review_result_text = (
+                    review_tournament_outcome.evidence.candidates.get(
+                        review_tournament_outcome.winning_label,
+                        next(
+                            iter(
+                                review_tournament_outcome.evidence.candidates.values()
+                            )
+                        ),
+                    ).raw_response
+                    or ""
+                )
+                # v0.32.0 Phase 2: when the tournament escalated (max
+                # rounds without convergence) route to the existing
+                # critic_sounding_board rung — preserves the legacy
+                # escalation path.
+                if review_tournament_outcome.escalated:
+                    logger.warning(
+                        "execute_phase.review_tournament_escalated",
+                        task_id=task.id,
+                        tournament_id=review_tournament_outcome.tournament_id,
+                        rounds=review_tournament_outcome.rounds,
+                    )
+                    task = await _try_retry_or_escalate(
+                        orch,
+                        task,
+                        retry_limit,
+                        reason="review_tournament max_rounds",
+                    )
+                    if task.escalated:
+                        return task
+                    last_issues = issues or [
+                        "review_tournament max_rounds without convergence"
+                    ]
+                    continue
+            else:
+                try:
+                    review_result = await delegate(
+                        orch,
+                        "reviewer",
+                        review_env,
+                        retry_count=task.retry_count,
+                        last_issues=last_issues,
+                        cwd_override=worktree,
+                    )
+                except GuardrailExceededError as exc:
+                    logger.warning(
+                        "execute_phase.guardrail_exceeded",
+                        task_id=task.id,
+                        reason=str(exc),
+                    )
+                    task = await orch.plan_manager.update_task_status(
+                        task.id,
+                        "blocked",
+                        meta={
+                            "blocked_reason": f"guardrail_exceeded: {exc}",
+                            "block_reason_class": _classify_guardrail_block(
+                                getattr(orch, "_last_adapter_subtype", None)
+                            ),
+                            # v0.30.0 Bug 4: forensic-only payload extension —
+                            # carry the most recent adapter status / subtype
+                            # so post-mortems can grep the ledger directly.
+                            "api_error_status": getattr(
+                                orch, "_last_adapter_api_error_status", None
+                            ),
+                            "last_adapter_subtype": getattr(
+                                orch, "_last_adapter_subtype", None
+                            ),
+                        },
+                    )
+                    return task
+
+                verdict, issues = _parse_review_verdict(review_result.text)
+                review_result_text = review_result.text
+
             review_ev = ReviewEvidence(
                 task_id=task.id,
                 verdict=cast(
@@ -2980,7 +3076,7 @@ async def _execute_one(
                     verdict,
                 ),
                 issues=issues,
-                output_text=review_result.text,
+                output_text=review_result_text,
                 # v0.31.0 (Phase 1.2): always carry the raw model
                 # response so post-mortems can answer "what did the
                 # reviewer actually say?" without needing the
@@ -2989,7 +3085,7 @@ async def _execute_one(
                 # named so future parser changes that re-derive
                 # ``output_text`` (e.g. stripping the verdict line)
                 # don't lose the original.
-                raw_response=review_result.text,
+                raw_response=review_result_text,
             )
             await write_evidence(orch.cwd, task.id, review_ev)
             # v0.31.0 (Phase 1.3): treat MALFORMED as a machinery failure
@@ -3171,7 +3267,10 @@ async def _execute_one(
 
             # Step 7: extract and record lessons from agent outputs.
             await _record_lessons(orch, task.id, developer_result.text, "developer")
-            await _record_lessons(orch, task.id, review_result.text, "reviewer")
+            # v0.32.0 Phase 2: ``review_result_text`` is the winning
+            # candidate's raw response when the review tournament fired,
+            # otherwise the legacy single-shot reviewer's output text.
+            await _record_lessons(orch, task.id, review_result_text, "reviewer")
             await _record_lessons(orch, task.id, test_result.text, "test_engineer")
 
             # v0.11.0: when running in a per-task worktree, apply the
