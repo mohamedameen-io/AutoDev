@@ -1,0 +1,354 @@
+"""v0.32.0 Phase 1.4: hard-fail recovery tiers for the architect retry loop.
+
+After ``_MAX_ARCHITECT_ATTEMPTS`` (3) attempts fail in
+:func:`orchestrator.plan_phase.run_plan_phase`, the legacy contract was
+to re-raise the most recent exception immediately. v0.32.0 inserts
+four recovery tiers between the third failure and the hard-fail:
+
+* **Tier 4 — scope degradation:** if multiple errors share a directory
+  prefix, drop the highest-failure-count scope entry from the plan
+  spec and re-prompt the architect with the narrower spec. Implemented
+  by :func:`attempt_scope_degradation`.
+
+* **Tier 5 — model escalation:** if still failing AND the configured
+  architect model is sonnet, escalate to opus. Implemented by
+  :func:`should_escalate_model`.
+
+* **Tier 6 — user escalation:** emit a structured ``RecoveryHint``
+  placeholder so the CLI can surface "architect cannot converge — see
+  ``autodev status --blocked``". The full ``RecoveryHint`` schema
+  lands in Phase 5; for now we attach it as a free-form ``meta``
+  dict on the raised exception.
+
+* **Tier 7 — hard-fail with forensic summary:** abort the plan phase;
+  reference the archived ``architect-failed-*.md`` dumps so the
+  operator has the exact rejected markdown for offline inspection.
+
+The tiers are intentionally **best-effort**: each helper returns
+``None`` (or ``False``) when it cannot produce an action, which lets
+the caller fall through to the next tier without exception plumbing.
+The forensic-summary helper always succeeds (it's the terminal tier).
+
+This module deliberately avoids importing :mod:`orchestrator.plan_phase`
+at module load to keep the dependency graph one-way: ``plan_phase``
+imports recovery, never vice versa.
+
+Tests: ``tests/test_plan_phase_recovery.py``.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+
+if TYPE_CHECKING:
+    from state.schemas import Plan
+
+
+# Models that we treat as "weaker" — i.e. eligible for an opus bump on
+# Tier 5 model escalation. The check is substring-based so model
+# identifiers like ``claude-sonnet-4-20250514`` register as sonnet
+# without having to track every per-version suffix.
+_SONNET_MODEL_TOKENS: tuple[str, ...] = ("sonnet",)
+# Target opus model identifier set by Tier 5. Concrete identifier left
+# unspecified here; the caller passes the resolved value (the
+# orchestrator config knows what the install's opus pin is).
+_OPUS_MODEL_TOKENS: tuple[str, ...] = ("opus",)
+
+
+@dataclass(frozen=True)
+class ScopeDegradationResult:
+    """Outcome of an attempted scope-degradation pass.
+
+    ``new_plan`` is the degraded plan to re-prompt the architect with;
+    ``dropped_scope_entry`` is the path that was removed (used in the
+    ledger op + the architect's retry envelope so the model knows what
+    the orchestrator narrowed). ``None`` for both fields when no
+    degradation was possible (caller falls through to Tier 5).
+    """
+
+    new_plan: "Plan | None" = None
+    dropped_scope_entry: str | None = None
+    reason: str = ""
+
+    @property
+    def did_degrade(self) -> bool:
+        return self.new_plan is not None
+
+
+@dataclass(frozen=True)
+class RecoveryHintStub:
+    """v0.32.0 Phase 1.4 placeholder for the Phase 5 ``RecoveryHint``
+    schema.
+
+    Carries the single-class string + recommended action that the CLI
+    surfacing in Phase 5 will render. Kept as a frozen dataclass with
+    only the two strings the caller needs today; Phase 5 will replace
+    this with the full pydantic ``RecoveryHint`` model and rewire
+    every call site.
+    """
+
+    class_: str
+    action: str
+    archived_dumps: tuple[str, ...] = field(default_factory=tuple)
+
+
+def attempt_scope_degradation(
+    plan: "Plan",
+    errors_seen: dict[tuple[str, str], int],
+) -> ScopeDegradationResult:
+    """Tier 4: drop the highest-failure-count scope entry from ``plan``.
+
+    Scans ``errors_seen`` for ``(raw, reason)`` keys whose ``raw`` is
+    a path-shaped value (vs. an exception class name token used by
+    :func:`orchestrator.plan_phase.run_plan_phase` to count parse-class
+    recurrences). Picks the entry with the highest count and removes
+    its directory prefix from every scope-bearing field on ``plan``
+    via :func:`orchestrator.plan_phase._drop_entry_from_plan`.
+
+    Returns a :class:`ScopeDegradationResult` with ``new_plan=None``
+    when no path-shaped error qualifies (no scope to degrade) — the
+    caller should fall through to Tier 5.
+
+    The threshold for "high count" is intentionally permissive (>=2):
+    by the time Tier 4 fires, the architect has burned three full
+    attempts, so any path that recurred at all is a recovery
+    candidate.
+    """
+    # Filter to path-shaped keys. The plan_phase outer loop uses
+    # ``(type(exc).__name__, "")`` for non-PathValidationError
+    # exception classes; the empty-string ``reason`` field is the
+    # cheap discriminator.
+    path_failures = [
+        (raw, reason, count)
+        for (raw, reason), count in errors_seen.items()
+        if reason  # non-empty reason → PathValidationError-shaped key
+    ]
+    if not path_failures:
+        return ScopeDegradationResult(reason="no_path_failures")
+    # Pick the highest-count entry; ties broken by raw string for
+    # deterministic behaviour across runs.
+    path_failures.sort(key=lambda t: (-t[2], t[0]))
+    top_raw, _, top_count = path_failures[0]
+    if top_count < 2:
+        return ScopeDegradationResult(reason="below_recurrence_threshold")
+
+    # Defer the import — see the module docstring's one-way contract.
+    from orchestrator.plan_phase import _drop_entry_from_plan  # noqa: PLC0415
+
+    new_plan, was_dropped, _ = _drop_entry_from_plan(
+        plan, top_raw, include_files_new=True
+    )
+    if not was_dropped:
+        return ScopeDegradationResult(
+            reason="entry_not_present_in_any_scope_site"
+        )
+    # Empty-scope guard: silently widening the plan-level edit_scope
+    # to the whole-repo sentinel (``[]``) would be a P0 risk; same
+    # logic as ``_validate_with_persistent_drop``'s guard. Refuse the
+    # degradation in that case so the caller hard-fails through
+    # tiers 5-7 rather than running with an unbounded scope.
+    if plan.edit_scope and not new_plan.edit_scope:
+        return ScopeDegradationResult(
+            reason="degradation_would_widen_to_whole_repo"
+        )
+    # v0.27 Phase 4 mirror: a phase-level edit_scope override that
+    # was non-empty pre-drop and is empty post-drop silently widens
+    # the phase back to plan scope — same P0 risk class. Refuse.
+    for old_phase, new_phase in zip(plan.phases, new_plan.phases):
+        if (
+            old_phase.edit_scope is not None
+            and old_phase.edit_scope
+            and new_phase.edit_scope is not None
+            and not new_phase.edit_scope
+        ):
+            return ScopeDegradationResult(
+                reason="degradation_would_widen_phase_scope"
+            )
+    return ScopeDegradationResult(
+        new_plan=new_plan,
+        dropped_scope_entry=top_raw,
+        reason="recurrent_path_failure",
+    )
+
+
+def should_escalate_model(current_model: str | None) -> bool:
+    """Tier 5: should the architect's model bump from sonnet to opus?
+
+    Returns ``True`` when ``current_model`` looks like a sonnet
+    identifier (substring match); ``False`` otherwise (already on
+    opus, or on an unknown model the orchestrator shouldn't override).
+
+    Substring matching keeps the helper resilient against version
+    suffixes (``claude-sonnet-4-20250514``) without needing to track
+    every per-release identifier.
+    """
+    if not current_model:
+        return False
+    lowered = current_model.lower()
+    if any(tok in lowered for tok in _OPUS_MODEL_TOKENS):
+        return False
+    return any(tok in lowered for tok in _SONNET_MODEL_TOKENS)
+
+
+def surface_user_intervention_hint(
+    archived_dumps: list[str],
+) -> RecoveryHintStub:
+    """Tier 6: build the ``RecoveryHint`` placeholder for the CLI.
+
+    The full :class:`RecoveryHint` model lands in Phase 5. For now we
+    return a plain dataclass carrying the two strings the CLI
+    surfacing will need: a typed class and a recommended action.
+
+    ``archived_dumps`` is the list of ``architect-failed-*.md`` paths
+    accumulated across the failed attempts — surfaced verbatim so
+    the operator can ``cat`` them.
+    """
+    return RecoveryHintStub(
+        class_="architect_unconvergent",
+        action=(
+            "Run `autodev status` to see architect-failed dumps in "
+            ".autodev/debug/"
+        ),
+        archived_dumps=tuple(archived_dumps),
+    )
+
+
+def build_forensic_summary(
+    *,
+    last_exception: BaseException | None,
+    archived_dumps: list[str],
+    attempts: int,
+) -> str:
+    """Tier 7: render the human-readable forensic summary.
+
+    The summary is the message body of the final hard-fail exception
+    raised by :func:`orchestrator.plan_phase.run_plan_phase`. Mentions
+    each archived dump path (best-effort relative-to-cwd for
+    readability), the attempt count, and the last exception's class
+    name. No tracebacks — those live in the structured-log stream.
+    """
+    cwd = os.getcwd()
+    rendered_dumps = []
+    for path in archived_dumps:
+        try:
+            rendered_dumps.append(os.path.relpath(path, cwd))
+        except ValueError:
+            rendered_dumps.append(path)
+    parts: list[str] = [
+        f"Architect plan phase failed after {attempts} attempts.",
+    ]
+    if rendered_dumps:
+        parts.append("Archived rejected markdown dumps:")
+        for dump in rendered_dumps:
+            parts.append(f"  - {dump}")
+    if last_exception is not None:
+        parts.append(
+            f"Last error: {type(last_exception).__name__}: {last_exception}"
+        )
+    parts.append(
+        "Run `autodev status` for diagnostic + recovery options."
+    )
+    return "\n".join(parts)
+
+
+@dataclass
+class RecoveryOutcome:
+    """Aggregated outcome of running tiers 4-7.
+
+    ``degraded_plan`` is set when Tier 4 produced a narrower plan
+    spec; the caller re-prompts the architect with it. ``escalated_model``
+    carries the resolved opus identifier when Tier 5 fires — the
+    caller propagates it through the next ``_delegate`` call. The
+    ``recovery_hint`` is always populated (Tier 6 is unconditional);
+    the ``forensic_summary`` is always populated (Tier 7 is
+    unconditional).
+
+    Returned by :func:`run_recovery_tiers` so the caller can route on
+    typed fields rather than a dict.
+    """
+
+    degraded_plan: "Plan | None" = None
+    dropped_scope_entry: str | None = None
+    escalated_model: str | None = None
+    recovery_hint: RecoveryHintStub | None = None
+    forensic_summary: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+def run_recovery_tiers(
+    *,
+    plan: "Plan | None",
+    errors_seen: dict[tuple[str, str], int],
+    archived_dumps: list[str],
+    last_exception: BaseException | None,
+    attempts: int,
+    current_architect_model: str | None,
+    opus_model_id: str = "claude-opus-4-7",
+) -> RecoveryOutcome:
+    """Run all four recovery tiers, returning a typed outcome.
+
+    The caller (the architect-retry loop in
+    :func:`orchestrator.plan_phase.run_plan_phase`) consumes the
+    returned outcome by:
+
+    1. If ``degraded_plan`` is set: re-validate it and re-prompt the
+       architect; on success, exit the recovery path. On failure,
+       continue with Tier 5.
+    2. If ``escalated_model`` is set: re-prompt the architect once
+       more under the bumped model.
+    3. Always: emit the recovery_hint via the ledger / status CLI.
+    4. Always: hard-fail with the forensic summary as the exception
+       message.
+
+    ``opus_model_id`` is the resolved identifier the orchestrator
+    config pins — passed in rather than hard-coded here so the
+    plan-phase caller can read it from ``orch.cfg`` without this
+    module taking a config dependency.
+    """
+    outcome = RecoveryOutcome()
+
+    # Tier 4 — scope degradation.
+    if plan is not None:
+        deg = attempt_scope_degradation(plan, errors_seen)
+        if deg.did_degrade:
+            outcome.degraded_plan = deg.new_plan
+            outcome.dropped_scope_entry = deg.dropped_scope_entry
+            outcome.meta["tier4_reason"] = deg.reason
+        else:
+            outcome.meta["tier4_skipped_reason"] = deg.reason
+
+    # Tier 5 — model escalation.
+    if should_escalate_model(current_architect_model):
+        outcome.escalated_model = opus_model_id
+        outcome.meta["tier5_reason"] = "sonnet_to_opus"
+
+    # Tier 6 — user-intervention hint.
+    outcome.recovery_hint = surface_user_intervention_hint(archived_dumps)
+    # Mirror Phase 5's RecoveryHint payload shape on ``meta`` so the
+    # plan-phase caller can stash it on the eventual exception without
+    # waiting for Phase 5's full schema.
+    outcome.meta["recovery_hint_class"] = outcome.recovery_hint.class_
+    outcome.meta["recovery_hint_action"] = outcome.recovery_hint.action
+
+    # Tier 7 — forensic summary.
+    outcome.forensic_summary = build_forensic_summary(
+        last_exception=last_exception,
+        archived_dumps=archived_dumps,
+        attempts=attempts,
+    )
+    return outcome
+
+
+__all__ = [
+    "RecoveryHintStub",
+    "RecoveryOutcome",
+    "ScopeDegradationResult",
+    "attempt_scope_degradation",
+    "build_forensic_summary",
+    "run_recovery_tiers",
+    "should_escalate_model",
+    "surface_user_intervention_hint",
+]
