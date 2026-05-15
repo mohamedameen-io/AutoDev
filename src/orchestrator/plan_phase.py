@@ -1240,6 +1240,13 @@ async def _run_phase1_4_recovery(
             )
         except Exception:  # noqa: BLE001
             pass
+        # v0.32.0 (Phase 5, Gap G): stash the structured recovery hint
+        # on the exception so a future upstream catcher can render the
+        # actionable surface (e.g. an autodev plan top-level handler).
+        try:
+            setattr(last_exc, "recovery_hint", outcome.recovery_hint)
+        except Exception:  # noqa: BLE001 - never let attribute pinning mask the raise
+            pass
     return None
 
 

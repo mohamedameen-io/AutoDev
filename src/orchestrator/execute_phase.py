@@ -145,6 +145,200 @@ _INFRA_ADAPTER_SUBTYPES: frozenset[str] = frozenset(
 )
 
 
+# v0.32.0 (Phase 5, Gap G): RecoveryHint builders. Each soft-block
+# site in this module populates a structured hint via these helpers
+# before calling ``update_task_status(..., "blocked", meta={..., "recovery_hint": ...})``
+# so ``autodev status --blocked`` can render an actionable panel
+# without forcing the user to hand-read evidence files.
+
+_GuardrailClassToHintClass: dict[
+    Literal["verdict", "infrastructure", "cap"],
+    Literal[
+        "missing_test_output",
+        "thin_review_evidence",
+        "architect_unconvergent",
+        "model_capacity_exhausted",
+        "user_decision_required",
+        "network_transient",
+    ],
+] = {
+    "verdict": "user_decision_required",
+    "infrastructure": "network_transient",
+    "cap": "model_capacity_exhausted",
+}
+
+
+def _build_recovery_hint(
+    *,
+    task_id: str,
+    hint_class: Literal[
+        "missing_test_output",
+        "thin_review_evidence",
+        "architect_unconvergent",
+        "model_capacity_exhausted",
+        "user_decision_required",
+        "network_transient",
+    ],
+    action: str,
+    evidence_files: list[str] | None = None,
+    debug_files: list[str] | None = None,
+    commands: list[str] | None = None,
+):
+    """Construct a :class:`state.schemas.RecoveryHint` for a soft block.
+
+    Defaults the evidence path to ``.autodev/evidence/<task>-*.json``
+    and adds ``autodev requeue --task <id>`` to the commands list when
+    the caller does not override it. Populated paths are repo-relative
+    so the CLI surfacing layer can render them as copy-paste-ready
+    inputs to ``cat`` / editor commands.
+    """
+    from state.schemas import RecoveryHint  # noqa: PLC0415 — break cycle
+
+    evid = (
+        list(evidence_files)
+        if evidence_files is not None
+        else [
+            f".autodev/evidence/{task_id}-coder.json",
+            f".autodev/evidence/{task_id}-review.json",
+            f".autodev/evidence/{task_id}-test.json",
+        ]
+    )
+    dbg = list(debug_files) if debug_files is not None else []
+    cmds = (
+        list(commands)
+        if commands is not None
+        else [
+            f"autodev requeue --task {task_id}",
+            "autodev status --blocked",
+        ]
+    )
+    return RecoveryHint(
+        class_=hint_class,
+        recommended_user_action=action,
+        relevant_evidence_files=evid,
+        relevant_debug_files=dbg,
+        commands_to_try=cmds,
+    )
+
+
+def _build_recovery_hint_from_reason(
+    *, task_id: str, reason: str
+) -> "state.schemas.RecoveryHint":  # noqa: F821 — string annotation, lazy import
+    """Map a free-form ``reason`` string to a typed :class:`RecoveryHint`.
+
+    Used by sites that already classify via the ``reason`` text passed
+    through :func:`_try_retry_or_escalate` (developer adapter failure,
+    reviewer NEEDS_CHANGES / REJECTED / MALFORMED, tests failed,
+    review-tournament max-rounds, …). Conservative fallback: when the
+    text matches none of the known patterns, classify as
+    ``"user_decision_required"`` so the operator still gets actionable
+    text instead of a bare "blocked" message.
+    """
+    lowered = (reason or "").lower()
+    if "review_tournament" in lowered or "reviewer" in lowered:
+        return _build_recovery_hint(
+            task_id=task_id,
+            hint_class="thin_review_evidence",
+            action=(
+                f"Reviewer rejected the implementation. Inspect the "
+                f"rejection in .autodev/evidence/{task_id}-review.json, "
+                f"update the implementation to address the issues, then "
+                f"`autodev requeue --task {task_id}`."
+            ),
+        )
+    if "tests" in lowered:
+        return _build_recovery_hint(
+            task_id=task_id,
+            hint_class="missing_test_output",
+            action=(
+                f"Tests failed across retries. Inspect "
+                f".autodev/evidence/{task_id}-test.json for the failure "
+                f"signature, fix the underlying code or test, then "
+                f"`autodev requeue --task {task_id}`."
+            ),
+        )
+    if "adapter" in lowered or "qa_gate" in lowered:
+        return _build_recovery_hint(
+            task_id=task_id,
+            hint_class="network_transient",
+            action=(
+                "An adapter / QA gate failure persisted across retries. "
+                "Refresh credentials / connection (run `autodev doctor` "
+                f"to diagnose) and `autodev requeue --task {task_id}`."
+            ),
+            commands=[
+                "autodev doctor",
+                f"autodev requeue --task {task_id}",
+            ],
+        )
+    return _build_recovery_hint(
+        task_id=task_id,
+        hint_class="user_decision_required",
+        action=(
+            "Multiple refinement cycles produced no improvement. Manual "
+            "review needed — inspect evidence and decide whether to "
+            "retry, narrow the task, or skip."
+        ),
+    )
+
+
+def _build_guardrail_block_meta(
+    *, orch: "Orchestrator", task_id: str, exc: Exception
+) -> dict:
+    """v0.32.0 (Phase 5, Gap G): build the ``meta`` dict for the four
+    ``guardrail_exceeded`` soft-block sites in this module.
+
+    Centralises the previously-duplicated block payload (typed reason
+    class, forensic adapter status / subtype) AND populates a
+    structured :class:`state.schemas.RecoveryHint` so
+    ``autodev status --blocked`` renders an actionable user message
+    without forcing the user to hand-read evidence files.
+    """
+    last_subtype = getattr(orch, "_last_adapter_subtype", None)
+    block_class = _classify_guardrail_block(last_subtype)
+    hint_class = _GuardrailClassToHintClass[block_class]
+    if block_class == "infrastructure":
+        action = (
+            "Infrastructure failure (auth / rate-limit / 5xx) tripped the "
+            "guardrail. Refresh credentials and `autodev resume`."
+        )
+        commands = [
+            "autodev doctor",
+            f"autodev requeue --task {task_id}",
+            "autodev resume",
+        ]
+    elif block_class == "cap":
+        action = (
+            "The agent exhausted its budget (turns / tokens / time). "
+            "Either widen the per-task cap in .autodev/config.json under "
+            f"`guardrails`, narrow the task scope, or `autodev requeue --task {task_id}`."
+        )
+        commands = [
+            "autodev doctor",
+            f"autodev requeue --task {task_id}",
+        ]
+    else:  # "verdict"
+        action = (
+            "The agent reached a guardrail trip with no clean recovery "
+            f"path. Inspect .autodev/evidence/{task_id}-*.json and "
+            "decide whether to retry, narrow the task, or skip."
+        )
+        commands = [f"autodev requeue --task {task_id}"]
+    hint = _build_recovery_hint(
+        task_id=task_id,
+        hint_class=hint_class,
+        action=action,
+        commands=commands,
+    )
+    return {
+        "blocked_reason": f"guardrail_exceeded: {exc}",
+        "block_reason_class": block_class,
+        "api_error_status": getattr(orch, "_last_adapter_api_error_status", None),
+        "last_adapter_subtype": last_subtype,
+        "recovery_hint": hint,
+    }
+
+
 def _classify_guardrail_block(
     last_subtype: str | None,
 ) -> Literal["verdict", "infrastructure", "cap"]:
@@ -701,6 +895,22 @@ async def _dispatch_architect_consult(
         # can safely select it via ``autodev requeue --infrastructure``.
         await orch.plan_manager.mark_escalated(task.id)
         diagnosis = arch_resolution.guidance or "architect diagnosed infrastructure failure"
+        # v0.32.0 (Phase 5, Gap G): structured recovery hint mirroring
+        # the architect's diagnosis text.
+        infra_hint = _build_recovery_hint(
+            task_id=task.id,
+            hint_class="network_transient",
+            action=(
+                f"Architect diagnosed an infrastructure failure: "
+                f"{diagnosis[:200]}. Refresh credentials/connection and "
+                "`autodev resume`."
+            ),
+            commands=[
+                "autodev doctor",
+                f"autodev requeue --task {task.id} --infrastructure",
+                "autodev resume",
+            ],
+        )
         return await orch.plan_manager.update_task_status(
             task.id,
             "blocked",
@@ -709,6 +919,7 @@ async def _dispatch_architect_consult(
                 "architect_consult_action": "infrastructure",
                 "escalated_infra": True,
                 "block_reason_class": "infrastructure",
+                "recovery_hint": infra_hint,
             },
         )
 
@@ -731,6 +942,17 @@ async def _dispatch_architect_consult(
     # Defensive default — should be unreachable given the parser's
     # exhaustive fallback. Treat as infrastructure so the operator sees
     # the architect's raw output and can act.
+    # v0.32.0 (Phase 5, Gap G): user_decision_required hint — the
+    # architect produced text the parser couldn't structure.
+    unparseable_hint = _build_recovery_hint(
+        task_id=task.id,
+        hint_class="user_decision_required",
+        action=(
+            "Architect consult returned unparseable text. Inspect "
+            ".autodev/debug/architect-consult-*.txt and decide whether "
+            "to retry the consult, narrow the task, or skip."
+        ),
+    )
     return await orch.plan_manager.update_task_status(
         task.id,
         "blocked",
@@ -739,6 +961,7 @@ async def _dispatch_architect_consult(
                 f"architect_consult: unparseable response — {(arch_resolution.guidance or '')[:200]}"
             ),
             "architect_consult_action": "unparseable",
+            "recovery_hint": unparseable_hint,
         },
     )
 
@@ -2186,6 +2409,43 @@ async def _execute_one_worker(
             prefix=prefix,
             err=str(exc),
         )
+        # v0.32.0 (Phase 5, Gap G): structured recovery hint. Network /
+        # io / timeout exceptions get the network_transient class;
+        # encoding / unclassified ones land in user_decision_required.
+        if block_reason_class == "infrastructure":
+            worker_hint = _build_recovery_hint(
+                task_id=task.id,
+                hint_class="network_transient",
+                action=(
+                    f"Worker hit a transient {prefix} ({type(exc).__name__}). "
+                    "Refresh credentials/connection and `autodev resume`."
+                ),
+                debug_files=[
+                    f".autodev/debug/worker-exception-"
+                    f"{task.id.replace('/', '_').replace(' ', '_')}-*.txt"
+                ],
+                commands=[
+                    "autodev doctor",
+                    f"autodev requeue --task {task.id} --infrastructure",
+                    "autodev resume",
+                ],
+            )
+        else:
+            worker_hint = _build_recovery_hint(
+                task_id=task.id,
+                hint_class="user_decision_required",
+                action=(
+                    f"Worker raised an unclassified exception "
+                    f"({type(exc).__name__}). Inspect the captured "
+                    f"traceback in .autodev/debug/worker-exception-*.txt "
+                    f"and decide whether the underlying code or "
+                    f"configuration needs a fix."
+                ),
+                debug_files=[
+                    f".autodev/debug/worker-exception-"
+                    f"{task.id.replace('/', '_').replace(' ', '_')}-*.txt"
+                ],
+            )
         try:
             blocked = await orch.plan_manager.update_task_status(
                 task.id,
@@ -2202,6 +2462,7 @@ async def _execute_one_worker(
                     "last_adapter_subtype": getattr(
                         orch, "_last_adapter_subtype", None
                     ),
+                    "recovery_hint": worker_hint,
                 },
             )
         except Exception as exc2:  # noqa: BLE001
@@ -2841,24 +3102,14 @@ async def _execute_one(
                     task_id=task.id,
                     reason=str(exc),
                 )
+                # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
+                # also stamps a structured RecoveryHint.
                 task = await orch.plan_manager.update_task_status(
                     task.id,
                     "blocked",
-                    meta={
-                        "blocked_reason": f"guardrail_exceeded: {exc}",
-                        "block_reason_class": _classify_guardrail_block(
-                            getattr(orch, "_last_adapter_subtype", None)
-                        ),
-                        # v0.30.0 Bug 4: forensic-only payload extension —
-                        # carry the most recent adapter status / subtype
-                        # so post-mortems can grep the ledger directly.
-                        "api_error_status": getattr(
-                            orch, "_last_adapter_api_error_status", None
-                        ),
-                        "last_adapter_subtype": getattr(
-                            orch, "_last_adapter_subtype", None
-                        ),
-                    },
+                    meta=_build_guardrail_block_meta(
+                        orch=orch, task_id=task.id, exc=exc
+                    ),
                 )
                 return task
 
@@ -2987,21 +3238,14 @@ async def _execute_one(
                         task_id=task.id,
                         reason=str(exc),
                     )
+                    # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
+                    # also stamps a structured RecoveryHint.
                     task = await orch.plan_manager.update_task_status(
                         task.id,
                         "blocked",
-                        meta={
-                            "blocked_reason": f"guardrail_exceeded: {exc}",
-                            "block_reason_class": _classify_guardrail_block(
-                                getattr(orch, "_last_adapter_subtype", None)
-                            ),
-                            "api_error_status": getattr(
-                                orch, "_last_adapter_api_error_status", None
-                            ),
-                            "last_adapter_subtype": getattr(
-                                orch, "_last_adapter_subtype", None
-                            ),
-                        },
+                        meta=_build_guardrail_block_meta(
+                            orch=orch, task_id=task.id, exc=exc
+                        ),
                     )
                     return task
 
@@ -3057,24 +3301,14 @@ async def _execute_one(
                         task_id=task.id,
                         reason=str(exc),
                     )
+                    # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
+                    # also stamps a structured RecoveryHint.
                     task = await orch.plan_manager.update_task_status(
                         task.id,
                         "blocked",
-                        meta={
-                            "blocked_reason": f"guardrail_exceeded: {exc}",
-                            "block_reason_class": _classify_guardrail_block(
-                                getattr(orch, "_last_adapter_subtype", None)
-                            ),
-                            # v0.30.0 Bug 4: forensic-only payload extension —
-                            # carry the most recent adapter status / subtype
-                            # so post-mortems can grep the ledger directly.
-                            "api_error_status": getattr(
-                                orch, "_last_adapter_api_error_status", None
-                            ),
-                            "last_adapter_subtype": getattr(
-                                orch, "_last_adapter_subtype", None
-                            ),
-                        },
+                        meta=_build_guardrail_block_meta(
+                            orch=orch, task_id=task.id, exc=exc
+                        ),
                     )
                     return task
 
@@ -3162,24 +3396,14 @@ async def _execute_one(
                     task_id=task.id,
                     reason=str(exc),
                 )
+                # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
+                # also stamps a structured RecoveryHint.
                 task = await orch.plan_manager.update_task_status(
                     task.id,
                     "blocked",
-                    meta={
-                        "blocked_reason": f"guardrail_exceeded: {exc}",
-                        "block_reason_class": _classify_guardrail_block(
-                            getattr(orch, "_last_adapter_subtype", None)
-                        ),
-                        # v0.30.0 Bug 4: forensic-only payload extension —
-                        # carry the most recent adapter status / subtype
-                        # so post-mortems can grep the ledger directly.
-                        "api_error_status": getattr(
-                            orch, "_last_adapter_api_error_status", None
-                        ),
-                        "last_adapter_subtype": getattr(
-                            orch, "_last_adapter_subtype", None
-                        ),
-                    },
+                    meta=_build_guardrail_block_meta(
+                        orch=orch, task_id=task.id, exc=exc
+                    ),
                 )
                 return task
 
@@ -3292,6 +3516,26 @@ async def _execute_one(
                     diagnosis=diagnosis,
                     attempts=attempts,
                 )
+                # v0.32.0 (Phase 5, Gap G): structured recovery hint so
+                # the operator sees the exact diagnosis + the evidence
+                # path containing the captured stderr tail.
+                hint_hardfail = _build_recovery_hint(
+                    task_id=task.id,
+                    hint_class="missing_test_output",
+                    action=(
+                        f"Test runner produced an infrastructure-class "
+                        f"failure ({diagnosis}) that persisted across "
+                        f"{attempts} attempts. Inspect "
+                        f".autodev/evidence/{task.id}-test.json (stderr "
+                        f"tail captured) to fix the runner, then "
+                        f"`autodev requeue --task {task.id}`."
+                    ),
+                    evidence_files=[f".autodev/evidence/{task.id}-test.json"],
+                    commands=[
+                        f"autodev requeue --task {task.id}",
+                        "autodev doctor",
+                    ],
+                )
                 task = await orch.plan_manager.update_task_status(
                     task.id,
                     "blocked",
@@ -3300,6 +3544,7 @@ async def _execute_one(
                             f"test_diagnosis: {diagnosis} "
                             f"(persisted across {attempts} attempts)"
                         ),
+                        "recovery_hint": hint_hardfail,
                     },
                 )
                 return task
@@ -3310,6 +3555,21 @@ async def _execute_one(
                     "execute_phase.test_diagnosis_no_signal",
                     task_id=task.id,
                 )
+                # v0.32.0 (Phase 5, Gap G): structured hint pointing to
+                # the test evidence + suggesting the user verify tests
+                # are discoverable.
+                hint_no_signal = _build_recovery_hint(
+                    task_id=task.id,
+                    hint_class="missing_test_output",
+                    action=(
+                        f"The test gate produced no diagnostic signal. "
+                        f"Inspect .autodev/evidence/{task.id}-test.json and "
+                        f"ensure tests are discoverable; then "
+                        f"`autodev requeue --task {task.id}`."
+                    ),
+                    evidence_files=[f".autodev/evidence/{task.id}-test.json"],
+                    commands=[f"autodev requeue --task {task.id}"],
+                )
                 task = await orch.plan_manager.update_task_status(
                     task.id,
                     "blocked",
@@ -3318,6 +3578,7 @@ async def _execute_one(
                             "test result inconclusive — "
                             "no diagnostic signal"
                         ),
+                        "recovery_hint": hint_no_signal,
                     },
                 )
                 return task
@@ -3731,13 +3992,31 @@ async def _try_retry_or_escalate(
             if resolution.action == "soft-blocker":
                 await orch.plan_manager.mark_escalated(task.id)
                 guidance_text = resolution.guidance or "human decision required"
+                # v0.32.0 (Phase 5, Gap G): structured recovery hint so
+                # ``autodev status --blocked`` renders the critic's
+                # guidance + relevant evidence paths inline.
+                soft_block_hint = _build_recovery_hint(
+                    task_id=task.id,
+                    hint_class="user_decision_required",
+                    action=(
+                        f"Multiple refinement cycles produced no "
+                        f"improvement (discard_count="
+                        f"{stuck_state.discard_count}, pivot_count="
+                        f"{stuck_state.pivot_count}). Manual review "
+                        f"needed: {guidance_text[:200]}"
+                    ),
+                    commands=[
+                        f"autodev requeue --task {task.id}",
+                    ],
+                )
                 updated = await orch.plan_manager.update_task_status(
                     task.id,
                     "blocked",
                     meta={
                         "blocked_reason": (
                             f"soft-blocker: {guidance_text}"
-                        )
+                        ),
+                        "recovery_hint": soft_block_hint,
                     },
                 )
                 # Audit-only ledger op + cross-run lesson.
@@ -3911,10 +4190,21 @@ async def _try_retry_or_escalate(
                 err=str(exc),
             )
         await orch.plan_manager.mark_escalated(task.id)
+        # v0.32.0 (Phase 5, Gap G): structured recovery hint inferred
+        # from the ``reason`` text. The classifier picks among
+        # thin_review_evidence / missing_test_output / network_transient
+        # / user_decision_required so the CLI surface can render a
+        # purposeful action message.
+        retry_exhausted_hint = _build_recovery_hint_from_reason(
+            task_id=task.id, reason=reason
+        )
         updated = await orch.plan_manager.update_task_status(
             task.id,
             "blocked",
-            meta={"blocked_reason": f"escalated: {reason}"},
+            meta={
+                "blocked_reason": f"escalated: {reason}",
+                "recovery_hint": retry_exhausted_hint,
+            },
         )
         return updated
 
