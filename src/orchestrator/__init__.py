@@ -122,6 +122,18 @@ class Orchestrator:
             window_s=cfg.circuit_breaker_window_s,
         )
 
+        # v0.31.0 (Phase 3): per-(task_id, role) consecutive
+        # ``error_max_turns`` tracker. The ``delegate()`` site reads
+        # this BEFORE every dispatch to decide whether to escalate the
+        # invocation's ``max_turns`` / ``timeout_s`` budget, and
+        # updates it AFTER every dispatch with the adapter's
+        # ``result.subtype``. Owned by the orchestrator (one tracker
+        # per instance) so a fresh session resets the ladder by design.
+        # See :mod:`orchestrator.budget_escalation`.
+        from orchestrator.budget_escalation import BudgetEscalationTracker
+
+        self._budget_escalation_tracker = BudgetEscalationTracker()
+
         # Wire AgentExtensionPlugins: merge their specs into the agent registry.
         if plugin_registry is not None:
             for plugin in plugin_registry.agents.values():

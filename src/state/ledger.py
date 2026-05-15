@@ -287,6 +287,20 @@ LedgerOp = Literal[
     # Best-effort write — ledger append failures here MUST NOT mask
     # the underlying adapter failure for the caller.
     "adapter_failure",
+    # v0.31.0 (Phase 3): per-(task_id, role) budget escalation
+    # breadcrumb. Appended by :func:`execute_phase.delegate` whenever
+    # the per-(task_id, role) tracker observes a consecutive
+    # ``error_max_turns`` and decides to bump the dispatch's
+    # ``max_turns`` / ``timeout_s`` for the next attempt. Audit-only;
+    # does NOT mutate plan state. Payload shape:
+    # ``{task_id: str, role: str, prior_max_turns: int,
+    # new_max_turns: int, prior_timeout_s: int | None,
+    # new_timeout_s: int | None, attempt: int}`` where ``attempt`` is
+    # the 0-based escalation index (1 = second attempt / 1.5×;
+    # 2 = third attempt / 2.0×). Replay treats it as a no-op — the
+    # actual ``AgentInvocation`` budget mutation lives only in the
+    # caller's local state at the moment of dispatch.
+    "budget_escalation",
 ]
 
 
@@ -739,6 +753,14 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # forensic counter for "how many transient adapter failures
         # preceded the eventual outcome".
         "adapter_failure",
+        # v0.31.0 (Phase 3): per-(task_id, role) budget escalation
+        # breadcrumb. The actual budget bump lives only in the caller's
+        # local ``AgentInvocation`` state at dispatch time — the
+        # invocation is not persisted and the escalation tracker is
+        # in-memory only. Replay treats this op as a no-op forensic
+        # counter for "how many times we bumped the per-(task, role)
+        # budget before the underlying agent succeeded or hard-failed".
+        "budget_escalation",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

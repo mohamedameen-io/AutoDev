@@ -3883,6 +3883,107 @@ async def delegate(
         max_turns = spec_max_turns
         timeout_s = None  # adapter applies its own default (600s in claude_code)
 
+    # v0.31.0 (Phase 3): per-(task_id, role) budget escalation on
+    # consecutive ``error_max_turns``. The tracker is stateful (owned
+    # by the orchestrator); we read its current count to decide what
+    # multiplier to apply, then update it after the adapter returns.
+    # Hard-fail when the ladder is exhausted (4th consecutive max-turns
+    # would otherwise burn another retry slot with no extra budget).
+    # The ``getattr`` guard keeps backward compat with orchestrator
+    # stubs in older tests that predate the tracker.
+    _budget_tracker = getattr(orch, "_budget_escalation_tracker", None)
+    _escalation_attempt = 0
+    _prior_max_turns = max_turns
+    _prior_timeout_s = timeout_s
+    if _budget_tracker is not None and envelope.task_id:
+        from orchestrator.budget_escalation import (
+            BudgetEscalationTracker,
+            escalate_budget,
+        )
+
+        # Read tunable ceilings off the cfg if present (operator
+        # override surface), else fall back to the module defaults.
+        _ceiling_cfg = getattr(orch.cfg, "budget_escalation", None)
+        _max_turns_ceiling = (
+            getattr(_ceiling_cfg, "max_turns_ceiling", None)
+            if _ceiling_cfg is not None
+            else None
+        )
+        _timeout_s_ceiling = (
+            getattr(_ceiling_cfg, "timeout_s_ceiling", None)
+            if _ceiling_cfg is not None
+            else None
+        )
+        _kwargs: dict[str, int] = {}
+        if _max_turns_ceiling is not None:
+            _kwargs["max_turns_ceiling"] = int(_max_turns_ceiling)
+        if _timeout_s_ceiling is not None:
+            _kwargs["timeout_s_ceiling"] = int(_timeout_s_ceiling)
+
+        if _budget_tracker.is_exhausted(envelope.task_id, role):
+            # 4th consecutive ``error_max_turns`` would just burn
+            # another retry slot with no extra budget. Hard-fail
+            # before dispatching so the caller surfaces a typed
+            # diagnostic instead of consuming a retry quota.
+            return AgentResult(
+                success=False,
+                text="",
+                duration_s=0.0,
+                error=_budget_tracker.exhaustion_diagnostic,
+                subtype="error_max_turns_escalation_exhausted",
+            )
+
+        _escalation_attempt = _budget_tracker.current_attempt(
+            envelope.task_id, role
+        )
+        if _escalation_attempt > 0:
+            _new_max_turns, _new_timeout_s = escalate_budget(
+                _prior_max_turns,
+                _prior_timeout_s,
+                _escalation_attempt,
+                **_kwargs,
+            )
+            # Emit the budget-escalation breadcrumb BEFORE the bumped
+            # dispatch so post-mortems can correlate the escalation
+            # with the subsequent adapter call. Best-effort — a ledger
+            # failure here MUST NOT mask the dispatch. Mirrors the
+            # ``adapter_failure`` ledger pattern below.
+            _payload = {
+                "task_id": envelope.task_id,
+                "role": role,
+                "prior_max_turns": _prior_max_turns,
+                "new_max_turns": _new_max_turns,
+                "prior_timeout_s": _prior_timeout_s,
+                "new_timeout_s": _new_timeout_s,
+                "attempt": _escalation_attempt,
+            }
+            if getattr(orch, "plan_manager", None) is not None:
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="budget_escalation",
+                        payload=_payload,
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    # Ledger op may not be wired in older schemas; log a
+                    # structured-log fallback with the same payload so
+                    # the breadcrumb is recoverable from log streams.
+                    logger.warning(
+                        "orchestrator.budget_escalation",
+                        err=str(exc),
+                        **_payload,
+                    )
+            else:
+                # No plan_manager (some unit-test orchestrator stubs):
+                # log directly.
+                logger.warning(
+                    "orchestrator.budget_escalation",
+                    **_payload,
+                )
+            max_turns = _new_max_turns
+            timeout_s = _new_timeout_s
+        # Silence a noqa for the unused alias import on the no-op path.
+        _ = BudgetEscalationTracker
+
     # v0.11.0: per-task worktree isolation — when a worker passes a
     # cwd_override (its worktree path), agent execution happens there
     # rather than in orch.cwd (the main repo). All other accounting
@@ -3917,6 +4018,15 @@ async def delegate(
     # ``in_flight`` map at the call site rather than the orchestrator.
     orch._last_adapter_subtype = result.subtype
     orch._last_adapter_api_error_status = result.api_error_status
+
+    # v0.31.0 (Phase 3): record this dispatch's subtype against the
+    # per-(task_id, role) tracker so the NEXT delegate call for the
+    # same pair can decide whether to escalate. ``error_max_turns``
+    # increments; any other subtype (success or different failure)
+    # clears the counter. ``getattr`` keeps backward compat with the
+    # older orchestrator stubs used by some unit tests.
+    if _budget_tracker is not None and envelope.task_id:
+        _budget_tracker.record_result(envelope.task_id, role, result.subtype)
 
     # v0.30.0 Bug 4: per-adapter-failure audit breadcrumb. Append one
     # ``adapter_failure`` ledger op for every ``success=False`` result
