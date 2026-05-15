@@ -27,7 +27,7 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from adapters.git_utils import _git_rev_parse_head, extract_files_from_diff
 from adapters.types import AgentInvocation, AgentResult
@@ -3871,6 +3871,8 @@ async def _try_retry_or_escalate(
     ladder accounting reflects the freshest signal.
     """
     from orchestrator.escalation_ladder import next_step
+    from orchestrator.knowledge_lookup import lookup_recent_failures
+    from orchestrator.repetition_recovery import choose_recovery_action
     from state.knowledge import TournamentEvent
 
     # v0.25.1 Bug #4: enforce the configured minimum retry interval
@@ -3891,12 +3893,149 @@ async def _try_retry_or_escalate(
 
     # v0.15.0: bump the stuck-state discard counter under lock.
     stuck_state = await orch.plan_manager.increment_discard(task.id)
-    step = next_step(stuck_state)
+
+    # v0.32.0 Phase 4.1: query PRM for detected patterns and pass them
+    # into the ladder so ``repetition_loop`` / ``ping_pong`` can gate
+    # the REFINE→PIVOT (and REFINE/PIVOT→ARCHITECT_CONSULT) overrides.
+    # Defensive: any failure reading the trajectory store falls through
+    # to the legacy ladder behaviour (knowledge_context=None).
+    detected_patterns: list[str] = []
+    target_files_observed: list[str] = []
+    trajectory_store = getattr(orch, "trajectory_store", None)
+    if trajectory_store is not None:
+        try:
+            patterns = trajectory_store.analyze(task.id)
+            detected_patterns = [p.name for p in patterns]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.prm_analyze_failed_in_retry",
+                task_id=task.id,
+                err=str(exc),
+            )
+        try:
+            recent_events = trajectory_store.events_for(task.id)[-3:]
+            seen: set[str] = set()
+            for ev in recent_events:
+                for f in getattr(ev, "target_files", ()):
+                    if f not in seen:
+                        seen.add(f)
+                        target_files_observed.append(f)
+        except Exception:  # noqa: BLE001
+            target_files_observed = []
+
+    knowledge_context: dict[str, Any] | None = None
+    if detected_patterns:
+        knowledge_context = {"detected_patterns": detected_patterns}
+
+    step = next_step(stuck_state, knowledge_context=knowledge_context)
+
+    # v0.32.0 Phase 4.5: emit a forensic breadcrumb when the PRM
+    # observed a repetition_loop (regardless of whether the ladder ended
+    # up overriding — the breadcrumb captures the *signal* so post-
+    # mortems can correlate "we knew we were looping" with "what we
+    # did about it").
+    repetition_loop_detected = "repetition_loop" in detected_patterns
+    if repetition_loop_detected:
+        try:
+            await orch.plan_manager.ledger_append(
+                op="repetition_loop_detected",
+                payload={
+                    "task_id": task.id,
+                    "discard_count": stuck_state.discard_count,
+                    "pivot_count": stuck_state.pivot_count,
+                    "target_files": target_files_observed,
+                    "detected_at_attempt": int(getattr(task, "retry_count", 0)),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.ledger_append_failed",
+                op="repetition_loop_detected",
+                err=str(exc),
+            )
+
+    # v0.32.0 Phase 4.4: pick a recovery action so the ledger captures
+    # *why* the retry path is going to dispatch what it dispatches.
+    # The action does not currently override the ladder's choice (the
+    # ladder is the source of truth for the next dispatch rung); it is
+    # an audit-only annotation that lets forensics reconstruct the
+    # policy decision. Future work can route ``increase_scope`` /
+    # ``re_architect`` / ``do_nothing`` to dedicated paths once the
+    # corresponding dispatch sites mature.
+    qa_gates_passed = bool(getattr(task, "qa_gates_passed", False))
+    chosen_action = choose_recovery_action(
+        discard_count=stuck_state.discard_count,
+        pivot_count=stuck_state.pivot_count,
+        architect_count=stuck_state.architect_count,
+        qa_gates_passed=qa_gates_passed,
+        repetition_loop_detected=repetition_loop_detected,
+    )
+    try:
+        await orch.plan_manager.ledger_append(
+            op="recovery_action_chosen",
+            payload={
+                "task_id": task.id,
+                "action": chosen_action,
+                "reason": reason[:200],
+                "next_step": step,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.ledger_append_failed",
+            op="recovery_action_chosen",
+            err=str(exc),
+        )
 
     if step != "continue":
         # Ladder dispatch path. Build a minimal prior_attempts list from
         # the legacy retry_count for forensics.
         prior_attempts = [f"retry_count={task.retry_count}, reason={reason}"]
+
+        # v0.32.0 Phase 4.2: KB lookup before refine — query the
+        # knowledge store for the most recent discard / soft_blocker
+        # entries on this task signature and append them to the reason
+        # string so the critic prompt sees "we already tried X and Y".
+        # The lookup is bounded by a 100ms timeout so a slow store
+        # cannot stall the retry loop.
+        try:
+            past_failures = await lookup_recent_failures(orch, task.id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.knowledge_lookup_failed",
+                task_id=task.id,
+                err=str(exc),
+            )
+            past_failures = []
+        if past_failures:
+            kb_block_lines = [
+                "PAST_FAILURE_CONTEXT (recent discards/soft-blocks on this task):",
+            ]
+            for summary in past_failures:
+                kb_block_lines.append(f"  - {summary}")
+            kb_block = "\n".join(kb_block_lines)
+            prior_attempts.append(kb_block)
+            # Splice into the failure reason so the existing
+            # ``recent_evidence`` flow path picks it up unchanged.
+            reason = f"{reason}\n\n{kb_block}"
+            # Forensic breadcrumb: we switched the tactic by enriching
+            # the critic context with KB lookups.
+            try:
+                await orch.plan_manager.ledger_append(
+                    op="tactic_switch",
+                    payload={
+                        "task_id": task.id,
+                        "prior_tactic": "refine_minimal",
+                        "new_tactic": "refine_with_kb",
+                        "guidance_source": "kb_lookup",
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.ledger_append_failed",
+                    op="tactic_switch",
+                    err=str(exc),
+                )
 
         # v0.18.0: WEB_SEARCH ladder step — when enabled by config, fetch
         # top-3 search results and splice them as a ``WEB_CONTEXT:`` block
