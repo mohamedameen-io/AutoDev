@@ -50,6 +50,16 @@ class AgentInvocation(BaseModel):
     # returns ``None`` when no override applies and the caller falls back
     # to its own default (e.g. ``_DEFAULT_DEVELOPER_TIMEOUT_S``).
     timeout_s: int | None = None
+    # v0.31.0 (Phase 2.6): tri-state Cursor Max Mode hint. ``True`` =
+    # explicitly enable Max Mode (passed via the flag identified in
+    # ``docs/cursor-cli-flags.md`` if/when the Cursor CLI exposes one);
+    # ``False`` = explicitly disable Max Mode (used by the usage-limit
+    # downshift path so retries don't burn through the same usage cap at
+    # the same rate); ``None`` = leave behaviour to the CLI / account
+    # default. Adapters other than Cursor ignore this field — there is
+    # no Claude Code analogue. See ``CursorAdapter._max_mode_flag_for``
+    # for the current mapping.
+    max_mode: bool | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -115,6 +115,9 @@ class ClaudeCodeAdapter(PlatformAdapter):
         if inv.allowed_tools:
             cmd += ["--allowed-tools", ",".join(inv.allowed_tools)]
         # NOTE: We deliberately do NOT pass `--continue`; every call is fresh.
+        # ``inv.max_mode`` (v0.31.0 Phase 2.6) is a Cursor-specific tri-state.
+        # Claude Code has no Max Mode equivalent, so this adapter intentionally
+        # does not consume the field.
         return cmd
 
     async def init_workspace(self, cwd: Path, agents: list[AgentSpec]) -> None:
