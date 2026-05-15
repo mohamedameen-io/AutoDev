@@ -301,6 +301,13 @@ LedgerOp = Literal[
     # actual ``AgentInvocation`` budget mutation lives only in the
     # caller's local state at the moment of dispatch.
     "budget_escalation",
+    # v0.32.0 Phase 1.2: plan-phase architect budget escalation
+    # breadcrumb. Mirrors ``budget_escalation`` but emitted only by
+    # the plan-phase architect-retry loop (scope_id="plan_phase").
+    # Audit-only; replay no-op. Payload shape:
+    # ``{from_max_turns: int, to_max_turns: int, attempt: int,
+    # reason: str}``.
+    "plan_phase_budget_escalation",
 ]
 
 
@@ -761,6 +768,11 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # counter for "how many times we bumped the per-(task, role)
         # budget before the underlying agent succeeded or hard-failed".
         "budget_escalation",
+        # v0.32.0 Phase 1.2: plan-phase architect budget escalation.
+        # Audit-only; replay no-op. Same shape rationale as
+        # ``budget_escalation`` but scoped to the plan-phase
+        # architect retry loop.
+        "plan_phase_budget_escalation",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.
