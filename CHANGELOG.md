@@ -2,6 +2,36 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.2] - 2026-05-15
+
+Emergency patch release fixing two regressions in v0.30.1 that broke
+end-to-end flows on the Cursor adapter and on Claude Code's
+`/autodev` slash command for newer subcommands.
+
+### Fixed
+- `src/adapters/cursor.py:143-159`: `CursorAdapter.execute()` no longer
+  crashes / misformats the timeout error message when `inv.timeout_s`
+  is `None`. Mirrors the `effective_timeout_s` guard the Claude Code
+  adapter already had at `src/adapters/claude_code.py:139` (600s
+  default). Roles whose per-task complexity overrides leave
+  `timeout_s` unset (reviewer, judge, critic_*, etc.) were affected.
+- `src/adapters/inline_config.py`: the Claude `/autodev` template
+  now lists the `requeue` and `rewind` subcommands. Both were added
+  to the CLI registry in v0.28-v0.29 but never propagated to the
+  Claude template, so `/autodev requeue` and `/autodev rewind` typed
+  inside Claude Code fell into the free-text feature flow (case 4)
+  instead of the CLI passthrough (case 2). The Cursor template
+  already included them; the two are now in sync. A full
+  `SlashCommandSpec` refactor that prevents this class of drift is
+  scheduled for v0.31.0.
+
+### Tests added
+- `tests/test_adapter_cursor.py::test_execute_default_timeout_when_none`
+- `tests/test_adapter_cursor.py::test_execute_default_timeout_message_does_not_say_none`
+- `tests/test_inline_config.py::test_render_claude_slash_command_lists_every_cli_subcommand`
+  strengthened to assert the full canonical subcommand list (mirroring
+  the Cursor equivalent test).
+
 ## [0.30.1] - 2026-05-13
 
 Patch release: `autodev init --platform cursor` now installs the
