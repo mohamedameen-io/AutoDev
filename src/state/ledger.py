@@ -342,6 +342,38 @@ LedgerOp = Literal[
     "review_tournament_judged",
     "review_tournament_converged",
     "review_tournament_escalated",
+    # v0.32.0 Phase 4.5: knowledge-aware retry-loop telemetry. All three
+    # are audit-only — they do NOT mutate plan state on replay. The
+    # underlying task-status changes flow through the regular
+    # ``update_task_status`` ops emitted by the orchestrator's
+    # retry/escalation FSM. Mirrors the ``course_correction_emitted``
+    # op shape.
+    #
+    # - ``repetition_loop_detected``: payload
+    #   ``{task_id: str, discard_count: int, pivot_count: int,
+    #   target_files: list[str], detected_at_attempt: int}``. Emitted
+    #   when :func:`orchestrator.escalation_ladder.next_step` overrides
+    #   REFINE → PIVOT (or continue → PIVOT) because the PRM rule-based
+    #   detector observed three consecutive identical
+    #   ``(role, action, target_files)`` dispatches. Lets forensics see
+    #   "the ladder gated this task on a repetition loop, not on the
+    #   ordinary discard-count threshold".
+    # - ``recovery_action_chosen``: payload
+    #   ``{task_id: str, action: str, reason: str, next_step: str}``
+    #   where ``action`` is one of the
+    #   :data:`orchestrator.repetition_recovery.RecoveryAction` literals
+    #   and ``next_step`` is the resolved ladder rung. Emitted once per
+    #   stuck-recovery decision; pairs with the regular ``stuck_*`` ops
+    #   that follow.
+    # - ``tactic_switch``: payload
+    #   ``{task_id: str, prior_tactic: str | None, new_tactic: str,
+    #   guidance_source: str}``. Emitted when the recovery policy
+    #   switches from one tactic to another (e.g. refine → pivot, or
+    #   refine_minimal → refine_with_kb). ``guidance_source`` is one
+    #   of ``"critic" | "kb_lookup" | "architect" | "prm_pattern"``.
+    "repetition_loop_detected",
+    "recovery_action_chosen",
+    "tactic_switch",
 ]
 
 
@@ -817,6 +849,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         "review_tournament_judged",
         "review_tournament_converged",
         "review_tournament_escalated",
+        # v0.32.0 Phase 4.5: knowledge-aware retry-loop telemetry. All
+        # three are audit-only — the underlying ``update_task_status``
+        # ops emitted by the retry/escalation FSM carry the actual
+        # plan-state mutations. Replay treats these as no-ops.
+        "repetition_loop_detected",
+        "recovery_action_chosen",
+        "tactic_switch",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.
