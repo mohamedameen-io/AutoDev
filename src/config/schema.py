@@ -852,8 +852,12 @@ class AutodevConfig(BaseModel):
 
     # v0.30.0 Bug 5: cross-task infrastructure-failure circuit breaker.
     # Counts adapter failures whose ``subtype`` is in
-    # ``{auth_failed, rate_limited, server_error}`` over a rolling
-    # window; trips when the count reaches ``circuit_breaker_threshold``
+    # ``{auth_failed, rate_limited, server_error, usage_limit_hit}``
+    # (``usage_limit_hit`` added in v0.31.0 Phase 2.6 to capture the
+    # cursor-adapter signal that a Cursor account has hit its monthly
+    # / plan cap, distinguished from per-minute ``rate_limited``)
+    # over a rolling window; trips when the count reaches
+    # ``circuit_breaker_threshold``
     # within ``circuit_breaker_window_s`` seconds. On trip the
     # orchestrator raises
     # :class:`tournament.errors.InfrastructureCircuitOpenError`, which

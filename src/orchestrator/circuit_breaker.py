@@ -62,6 +62,15 @@ INFRASTRUCTURE_SUBTYPES: Final[frozenset[str]] = frozenset(
         "auth_failed",
         "rate_limited",
         "server_error",
+        # v0.31.0 (Phase 2.6): Cursor usage-cap hit. Distinguished from
+        # ``rate_limited`` (per-minute throttle) because the remediation
+        # is different — a usage cap means "the account ran out of
+        # monthly credits," and continued retries will keep tripping
+        # the same wall. The cursor adapter already downshifts to
+        # ``--model auto`` once per call; the breaker's job is to halt
+        # the run when even the downshifted retries keep failing with
+        # this subtype across multiple tasks.
+        "usage_limit_hit",
     }
 )
 
