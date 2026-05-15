@@ -8,6 +8,12 @@ Walks three directories and removes children whose mtime is older than
 * ``evidence/`` — individual files (``<task_id>-{kind}.json``,
   ``<task_id>.patch``) accumulate per task across runs
 
+By default ``prune`` does NOT touch executor worktree directories
+(``execute_worktrees/`` and ``execute_worktrees_pool/``). Use
+``--executor-only --all`` after a forced kill (SIGKILL, parent crash) to
+sweep orphan worktrees, or ``autodev reset --hard`` for full nuclear
+cleanup.
+
 Always preserved: ``plan.json``, ``plan-ledger.jsonl``,
 ``knowledge.jsonl``, ``rejected_lessons.jsonl``, ``config.json``,
 ``spec.md``, the file index, and ``secretscan-baseline.json``. Use
@@ -78,6 +84,14 @@ def _children_older_than(parent: Path, threshold_s: float) -> list[Path]:
     return stale
 
 
+def _all_children(parent: Path) -> list[Path]:
+    """Return immediate children of ``parent`` regardless of age. Missing
+    parent returns empty list. Used by ``--all`` mode."""
+    if not parent.exists():
+        return []
+    return list(parent.iterdir())
+
+
 def _remove(path: Path) -> None:
     """Remove a file or directory; swallow OSError so prune is best-effort."""
     try:
@@ -100,8 +114,36 @@ def _remove(path: Path) -> None:
     is_flag=True,
     help="List what would be removed without deleting anything.",
 )
-def prune(older_than: str, dry_run: bool) -> None:
-    """Garbage-collect stale tournament, session, and evidence artifacts."""
+@click.option(
+    "--executor-only",
+    is_flag=True,
+    help=(
+        "Only operate on .autodev/execute_worktrees/ and "
+        ".autodev/execute_worktrees_pool/. Skips tournaments, "
+        "sessions, and evidence. Default `prune` does NOT touch "
+        "executor worktrees -- use `--executor-only --all` after a "
+        "forced kill, or `autodev reset --hard` for nuclear cleanup."
+    ),
+)
+@click.option(
+    "--all",
+    "all_ages",
+    is_flag=True,
+    help=(
+        "Ignore the --older-than threshold and operate on every entry. "
+        "Combined with --executor-only this is the post-SIGKILL "
+        "emergency cleanup path."
+    ),
+)
+def prune(
+    older_than: str, dry_run: bool, executor_only: bool, all_ages: bool
+) -> None:
+    """Garbage-collect stale tournament, session, and evidence artifacts.
+
+    By default, `prune` does NOT touch executor worktrees. Use
+    `--executor-only --all` after a forced kill, or `reset --hard` for
+    nuclear cleanup.
+    """
     console = Console()
     try:
         threshold_s = _parse_duration(older_than)
@@ -117,20 +159,38 @@ def prune(older_than: str, dry_run: bool) -> None:
         )
         sys.exit(0)
 
+    root = autodev_root(cwd)
+    if executor_only:
+        targets = [
+            (root / "execute_worktrees", "executor-worktree"),
+            (root / "execute_worktrees_pool", "executor-pool"),
+        ]
+    else:
+        targets = [
+            (tournaments_dir(cwd), "tournament"),
+            (sessions_dir(cwd), "session"),
+            (evidence_dir(cwd), "evidence"),
+        ]
+
     stale: list[tuple[Path, str]] = []
-    for parent, label in (
-        (tournaments_dir(cwd), "tournament"),
-        (sessions_dir(cwd), "session"),
-        (evidence_dir(cwd), "evidence"),
-    ):
-        for child in _children_older_than(parent, threshold_s):
+    for parent, label in targets:
+        if all_ages:
+            children = _all_children(parent)
+        else:
+            children = _children_older_than(parent, threshold_s)
+        for child in children:
             stale.append((child, label))
 
     if not stale:
-        console.print(
-            f"[green]autodev prune:[/green] nothing older than "
-            f"{older_than} on disk."
-        )
+        if all_ages:
+            console.print(
+                "[green]autodev prune:[/green] nothing to remove."
+            )
+        else:
+            console.print(
+                f"[green]autodev prune:[/green] nothing older than "
+                f"{older_than} on disk."
+            )
         sys.exit(0)
 
     table = Table(
@@ -150,7 +210,7 @@ def prune(older_than: str, dry_run: bool) -> None:
             _remove(path)
     console.print(table)
     verb = "would remove" if dry_run else "removed"
+    suffix = "" if all_ages else f" older than {older_than}"
     console.print(
-        f"[green]autodev prune:[/green] {verb} {len(stale)} path(s) "
-        f"older than {older_than}."
+        f"[green]autodev prune:[/green] {verb} {len(stale)} path(s){suffix}."
     )

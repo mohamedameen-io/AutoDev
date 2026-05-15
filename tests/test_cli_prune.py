@@ -129,6 +129,89 @@ def test_prune_removes_old_sessions_keeps_recent(tmp_path: Path) -> None:
         assert new.exists()
 
 
+def test_executor_only_all_removes_fresh_worktrees(tmp_path: Path) -> None:
+    """``--executor-only --all`` sweeps fresh worktree dirs for emergency cleanup."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config(cwd)
+
+        ew = cwd / ".autodev" / "execute_worktrees"
+        ew.mkdir(parents=True)
+        fresh = ew / "tasks" / "1.1"
+        fresh.mkdir(parents=True)
+        (fresh / "scratch.txt").write_text("x", encoding="utf-8")
+
+        ewp = cwd / ".autodev" / "execute_worktrees_pool"
+        ewp.mkdir(parents=True)
+        pooled = ewp / "pool-0"
+        pooled.mkdir()
+        # No backdating — these are fresh.
+
+        result = runner.invoke(
+            cli, ["prune", "--executor-only", "--all"]
+        )
+        assert result.exit_code == 0, result.output
+        # Children removed:
+        assert not (ew / "tasks").exists()
+        assert not pooled.exists()
+
+
+def test_executor_only_skips_tournaments(tmp_path: Path) -> None:
+    """``--executor-only`` ignores tournaments/sessions/evidence."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config(cwd)
+
+        # Stale tournament (would be swept by default mode).
+        t_dir = cwd / ".autodev" / "tournaments"
+        t_dir.mkdir(parents=True)
+        old_t = t_dir / "plan-old"
+        old_t.mkdir()
+        _age_path(old_t, 60 * 86400)
+
+        # Stale executor worktree (immediate child must be aged).
+        ew = cwd / ".autodev" / "execute_worktrees"
+        ew.mkdir(parents=True)
+        wt_old = ew / "tournament-old"
+        wt_old.mkdir()
+        _age_path(wt_old, 60 * 86400)
+
+        result = runner.invoke(
+            cli, ["prune", "--executor-only", "--older-than", "30d"]
+        )
+        assert result.exit_code == 0, result.output
+        # Tournament untouched, executor children pruned.
+        assert old_t.exists()
+        assert not wt_old.exists()
+
+
+def test_default_prune_does_not_touch_executor_worktrees(tmp_path: Path) -> None:
+    """Default prune ignores executor worktrees even when stale."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config(cwd)
+
+        ew = cwd / ".autodev" / "execute_worktrees"
+        ew.mkdir(parents=True)
+        wt_old = ew / "tournament-old"
+        wt_old.mkdir()
+        _age_path(wt_old, 60 * 86400)
+
+        ewp = cwd / ".autodev" / "execute_worktrees_pool"
+        ewp.mkdir(parents=True)
+        pool_old = ewp / "pool-0"
+        pool_old.mkdir()
+        _age_path(pool_old, 60 * 86400)
+
+        result = runner.invoke(cli, ["prune", "--older-than", "30d"])
+        assert result.exit_code == 0, result.output
+        assert wt_old.exists(), "default prune must NOT touch executor worktrees"
+        assert pool_old.exists(), "default prune must NOT touch executor pool"
+
+
 def test_prune_dry_run_lists_without_deleting(tmp_path: Path) -> None:
     """``--dry-run`` reports what WOULD be pruned, removes nothing."""
     runner = CliRunner()
