@@ -28,3 +28,9 @@ jobs:
 
       - name: Run tests
         run: uv run pytest tests/ -v
+
+      - name: E2E with fake binaries
+        run: uv run pytest tests/integration/test_e2e_with_fake_binaries.py -v
+
+      - name: Slash command template drift check
+        run: uv run pytest tests/test_inline_config.py::test_canonical_spec_subcommands_match_cli_registry -v
