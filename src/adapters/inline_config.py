@@ -6,9 +6,23 @@ files and run ``autodev resume``. What remains is the subprocess-only
 slash-command template plus a small helper that preserves any legacy
 ``<!-- autodev-managed -->`` section in a user's existing ``CLAUDE.md``
 when migrating workspaces from <=v0.25.x.
+
+v0.31.0 (Phase 4): the Claude and Cursor templates are now rendered
+from a single :class:`adapters.slash_command_spec.SlashCommandSpec`.
+The two render functions below are thin platform-wrapping shims —
+Claude prepends YAML frontmatter and uses ``--platform claude_code``;
+Cursor uses no frontmatter, ``--platform cursor`` and a
+``--platform cursor`` extra arg on ``autodev init --force``. Every
+routing rule, subcommand list entry, and error-handling instruction
+lives in the spec, so the two templates cannot drift again.
 """
 
 from __future__ import annotations
+
+from adapters.slash_command_spec import (
+    canonical_slash_command_spec,
+    render_slash_command_body,
+)
 
 _CLAUDE_SECTION_START = "<!-- autodev-managed: do not edit this section -->"
 _CLAUDE_SECTION_END = "<!-- /autodev-managed -->"
@@ -21,6 +35,9 @@ def render_claude_slash_command() -> str:
     v0.26.0: every dispatch is subprocess (``--platform claude_code``);
     InlineAdapter is gone, so the slash command never embeds itself in
     the host agent's session — it always shells out to ``autodev``.
+    v0.31.0: body is built from
+    :func:`adapters.slash_command_spec.canonical_slash_command_spec` so
+    it cannot drift from the Cursor variant.
 
     * ``/autodev`` (no args) prints the subcommand list.
     * ``/autodev <subcommand> [...]`` (where ``<subcommand>`` is any
@@ -31,63 +48,22 @@ def render_claude_slash_command() -> str:
     * ``/autodev [--review] <feature description>`` (legacy intent flow)
       drives a feature through ``plan`` → ``execute`` end-to-end.
     """
-    return """\
----
-description: Full AutoDev CLI passthrough — any subcommand, or drive a feature end-to-end.
-allowed-tools: [Bash]
-argument-hint: <subcommand> [args] | [--review] <feature description>
----
-
-The user invoked `/autodev`. This command is a **complete passthrough** to
-the `autodev` CLI binary — every subcommand reachable from the shell is
-reachable from here. Do NOT write code yourself — delegate via `autodev`.
-
-Args: $ARGUMENTS
-
-## Routing rule
-
-Inspect the FIRST whitespace-separated token of $ARGUMENTS:
-
-1. **No arguments / empty**: run `autodev --help` via Bash and surface the
-   subcommand list verbatim. Suggest the most useful entry points:
-   `/autodev <feature>` (one-shot), `/autodev --review <feature>` (checkpointed),
-   `/autodev resume`, `/autodev status`, `/autodev doctor`,
-   `/autodev metrics regex-timeouts`.
-
-2. **First token is one of these registered CLI subcommands**:
-   `doctor`, `execute`, `init`, `logs`, `metrics`, `plan`, `plugins`,
-   `prune`, `requeue`, `reset`, `resume`, `rewind`, `secretscan`, `status`,
-   `tournament`
-   — OR a help/version flag (`--help`, `-h`, `--version`).
-
-   → Direct CLI passthrough. Run `autodev $ARGUMENTS` via Bash and surface
-   stdout/stderr verbatim. Do NOT re-interpret, do NOT auto-chain into other
-   subcommands. The user is asking for that exact subcommand.
-
-3. **First token is `--review`**: checkpointed feature flow.
-   a. Strip the `--review` flag; treat the remainder as the feature intent.
-   b. If `.autodev/` does not exist, run `autodev init --force`
-      (defaults to platform: claude_code in v0.26.0).
-   c. Run `autodev plan --platform claude_code "<intent>"` and surface the
-      plan summary (phases, tasks, projected calls).
-   d. STOP. Tell the user to reply with `go` (or equivalent) to proceed.
-   e. On `go`, run `autodev execute --platform claude_code`.
-
-4. **Otherwise** (first token is a free-text feature description): one-shot
-   feature flow.
-   a. If `.autodev/` does not exist, run `autodev init --force`
-      (defaults to platform: claude_code in v0.26.0).
-   b. Run `autodev plan --platform claude_code "$ARGUMENTS"` and surface the
-      plan summary.
-   c. Run `autodev execute --platform claude_code`. Surface progress + final
-      status.
-
-## Error handling
-
-If any `autodev` invocation fails (non-zero exit), surface stderr verbatim.
-Do NOT retry blindly. Suggest `autodev doctor` and `autodev status` for
-diagnostics, and `/autodev resume` after fixing the underlying issue.
-"""
+    spec = canonical_slash_command_spec()
+    frontmatter = (
+        "---\n"
+        f"description: {spec.description}\n"
+        "allowed-tools: [Bash]\n"
+        "argument-hint: <subcommand> [args] | [--review] <feature description>\n"
+        "---\n\n"
+    )
+    body = render_slash_command_body(
+        spec,
+        tool_phrase="Bash",
+        platform_flag="claude_code",
+        init_extra_args="",
+        delegation_suffix="",
+    )
+    return frontmatter + body
 
 
 def render_cursor_slash_command() -> str:
@@ -104,6 +80,11 @@ def render_cursor_slash_command() -> str:
     pass ``--platform cursor`` to every ``autodev`` invocation so
     on-disk configs and per-trigger artifacts stay tagged correctly.
 
+    v0.31.0: body comes from the same
+    :class:`adapters.slash_command_spec.SlashCommandSpec` the Claude
+    renderer uses; only platform flags and the "via the shell" tool
+    phrase differ.
+
     * ``/autodev`` (no args) prints the subcommand list.
     * ``/autodev <subcommand> [...]`` (where ``<subcommand>`` is any
       registered ``autodev`` CLI subcommand) runs ``autodev <subcommand>
@@ -111,56 +92,14 @@ def render_cursor_slash_command() -> str:
     * ``/autodev [--review] <feature description>`` (legacy intent flow)
       drives a feature through ``plan`` → ``execute`` end-to-end.
     """
-    return """\
-The user invoked `/autodev`. This command is a **complete passthrough** to
-the `autodev` CLI binary — every subcommand reachable from the shell is
-reachable from here. Do NOT write code yourself — delegate via `autodev`
-by running it through the shell.
-
-Args: $ARGUMENTS
-
-## Routing rule
-
-Inspect the FIRST whitespace-separated token of $ARGUMENTS:
-
-1. **No arguments / empty**: run `autodev --help` via the shell and surface
-   the subcommand list verbatim. Suggest the most useful entry points:
-   `/autodev <feature>` (one-shot), `/autodev --review <feature>` (checkpointed),
-   `/autodev resume`, `/autodev status`, `/autodev doctor`,
-   `/autodev metrics regex-timeouts`.
-
-2. **First token is one of these registered CLI subcommands**:
-   `doctor`, `execute`, `init`, `logs`, `metrics`, `plan`, `plugins`,
-   `prune`, `requeue`, `reset`, `resume`, `rewind`, `secretscan`,
-   `status`, `tournament`
-   — OR a help/version flag (`--help`, `-h`, `--version`).
-
-   → Direct CLI passthrough. Run `autodev $ARGUMENTS` via the shell and
-   surface stdout/stderr verbatim. Do NOT re-interpret, do NOT auto-chain
-   into other subcommands. The user is asking for that exact subcommand.
-
-3. **First token is `--review`**: checkpointed feature flow.
-   a. Strip the `--review` flag; treat the remainder as the feature intent.
-   b. If `.autodev/` does not exist, run `autodev init --force --platform cursor`.
-   c. Run `autodev plan --platform cursor "<intent>"` and surface the
-      plan summary (phases, tasks, projected calls).
-   d. STOP. Tell the user to reply with `go` (or equivalent) to proceed.
-   e. On `go`, run `autodev execute --platform cursor`.
-
-4. **Otherwise** (first token is a free-text feature description): one-shot
-   feature flow.
-   a. If `.autodev/` does not exist, run `autodev init --force --platform cursor`.
-   b. Run `autodev plan --platform cursor "$ARGUMENTS"` and surface the
-      plan summary.
-   c. Run `autodev execute --platform cursor`. Surface progress + final
-      status.
-
-## Error handling
-
-If any `autodev` invocation fails (non-zero exit), surface stderr verbatim.
-Do NOT retry blindly. Suggest `autodev doctor` and `autodev status` for
-diagnostics, and `/autodev resume` after fixing the underlying issue.
-"""
+    spec = canonical_slash_command_spec()
+    return render_slash_command_body(
+        spec,
+        tool_phrase="the shell",
+        platform_flag="cursor",
+        init_extra_args=" --platform cursor",
+        delegation_suffix="\nby running it through the shell",
+    )
 
 
 def update_claude_md(content: str, section: str) -> str:
