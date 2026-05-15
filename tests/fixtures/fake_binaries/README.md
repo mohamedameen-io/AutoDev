@@ -1,11 +1,11 @@
 # Fake LLM Binaries
 
-Drop-in stand-ins for `claude` and `cursor` (a.k.a. `cursor-agent`) that the
-AutoDev orchestrator can shell out to during E2E tests without making any
-network calls.
+Drop-in stand-ins for `claude`, `cursor` (a.k.a. `cursor-agent`), and
+`pytest` that the AutoDev orchestrator can shell out to during E2E tests
+without making any network calls or real test runs.
 
-Both scripts are pure POSIX bash — no Python, no Node, no `jq` — so they
-work identically on macOS and Ubuntu CI runners.
+All three scripts are pure POSIX bash — no Python, no Node, no `jq` — so
+they work identically on macOS and Ubuntu CI runners.
 
 ## Usage
 
@@ -34,18 +34,32 @@ If no file matches, it emits a generic success blob:
   `{"result":"[fake-claude] default","model":"claude-haiku","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50}}`
 - **fake-cursor**:
   `{"result":"[fake-cursor] default","thread_id":"fake-thread","is_error":false}`
+- **fake-pytest**:
+  `RESULTS: passed=3 failed=0 total=3` on stdout, exit 0.
+
+The fake-pytest "prompt" used for canned lookup is the joined non-flag
+positional argv (typically the test path or nodeid).
 
 ## Failure-mode switch
 
 Set `AUTODEV_FAKE_FAILURE_MODE` to short-circuit before the canned lookup:
 
-| Mode             | Behaviour                                                     | Applies to        |
-|------------------|---------------------------------------------------------------|-------------------|
-| `error_max_turns`| Print `error_max_turns` JSON, exit 1                          | fake-claude       |
-| `empty_result`   | Print `{"result":""}`, exit 0                                 | both              |
-| `timeout`        | `sleep 30` (rely on the harness's `wait_for` to kill us)      | both              |
-| `nonzero_exit`   | Write to stderr, exit 3                                       | both              |
-| `usage_limit`    | Emit usage-limit JSON to stderr, exit 1                       | fake-cursor       |
+| Mode                                     | Behaviour                                                                                                         | Applies to        |
+|------------------------------------------|-------------------------------------------------------------------------------------------------------------------|-------------------|
+| `error_max_turns`                        | Print `error_max_turns` JSON, exit 1                                                                              | fake-claude       |
+| `empty_result`                           | Print `{"result":""}`, exit 0                                                                                     | both LLMs         |
+| `reviewer_returns_empty_silently`        | Alias for `empty_result` (named after the scenario it asserts)                                                    | fake-claude       |
+| `timeout`                                | `sleep 30` (rely on the harness's `wait_for` to kill us)                                                          | both LLMs         |
+| `nonzero_exit`                           | Write to stderr, exit 3                                                                                           | both LLMs         |
+| `usage_limit`                            | Emit usage-limit JSON to stderr, exit 1                                                                           | fake-cursor       |
+| `is_error_true_with_empty_result`        | Print `{"is_error":true,"result":""}`, exit 0 (v0.31.1 dump-predicate regression guard)                           | fake-cursor       |
+| `architect_rejected_paths_{1,2,3}`       | Return a plan referencing paths the validator rejects; bumps `$AUTODEV_FAKE_RESPONSE_DIR/.attempt_count` per call | fake-claude       |
+| `repetition_loop`                        | Return IDENTICAL output every call regardless of prompt                                                           | fake-claude       |
+| `no_tests_collected`                     | `collected 0 items`, exit 5 (pytest's "no tests" code)                                                            | fake-pytest       |
+| `zero_pass_zero_fail`                    | `RESULTS: passed=0 failed=0 total=0`, exit 0 (silent zero — Gap C)                                                | fake-pytest       |
+| `collection_error`                       | `SyntaxError` to stderr, exit 1                                                                                   | fake-pytest       |
+| `runtime_crash`                          | `ImportError` + traceback to stderr, exit 1                                                                       | fake-pytest       |
+| `capture_failed`                         | Empty stdout AND stderr, exit 1                                                                                   | fake-pytest       |
 
 Unset / unrecognised → normal canned-response flow.
 
