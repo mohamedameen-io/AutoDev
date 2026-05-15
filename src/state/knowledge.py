@@ -85,7 +85,34 @@ Tier = Literal["swarm", "hive"]
 
 
 class KnowledgeEntry(BaseModel):
-    """A single lesson persisted in either the swarm or hive tier."""
+    """A single lesson persisted in either the swarm or hive tier.
+
+    The ``metadata`` dict is intentionally schema-less so emitters can
+    attach context without forcing a model migration. v0.32.0 Phase 4.3
+    standardises a small set of optional keys consumed by the
+    knowledge-aware retry path; all are optional with no defaults so
+    older lessons stay readable:
+
+    * ``event_type`` — :data:`TournamentEventType`. Set by
+      :meth:`KnowledgeStore.record_tournament_event`.
+    * ``family`` — short subsystem identifier (e.g. ``"execute-phase"``).
+    * ``task_id`` — the AutoDev task that produced the lesson, when
+      known. Used by :func:`orchestrator.knowledge_lookup.lookup_recent_failures`
+      for direct-id similarity.
+    * ``task_signature`` — sha256 hex digest from
+      :func:`compute_task_signature`. Used for cross-reset similarity
+      (the same logical task that was recreated will match).
+    * ``kb_entry_type`` — one of
+      ``"repetition_loop" | "thin_evidence" | "course_correction" |
+      "soft_block" | "autoreason_converged"``. Lets the lookup helper
+      filter for genuinely informative entries.
+    * ``tactic_tried`` — short label (``"refine_x"``, ``"pivot_y"``,
+      ``"web_search"``, etc.) so the next attempt can pick a *different*
+      tactic.
+    * ``resolution`` — one of ``"human_required" | "worked" |
+      "failed_again"`` so retroactive learning can reinforce the
+      tactic / suggestion that actually unblocked the task.
+    """
 
     id: str
     timestamp: str
@@ -921,6 +948,72 @@ def _fresh_id(text: str, role: str, salt: str = "") -> str:
     return f"{role[:8]}-{h.hexdigest()[:10]}-{uuid.uuid4().hex[:4]}"
 
 
+def compute_task_signature(task: Any) -> str:
+    """Stable signature for cross-reset task similarity (v0.32.0 Phase 4.3).
+
+    Returns the hex digest of a sha256 over a canonical string built from:
+
+    * the sorted set of files the task targets (``task.files`` or
+      ``task.target_files``);
+    * the error class name (when an evidence object with
+      ``error_class`` / ``failure_class`` is attached);
+    * the first 512 chars of the most recent diff (``task.last_diff``).
+
+    The function is defensive: missing / empty fields are tolerated
+    (rendered as the empty string) so a partially-populated task still
+    produces a stable hash. Two tasks with the same file set, the same
+    error class, and the same opening diff slice will collide — which
+    is exactly the similarity signal :func:`orchestrator.knowledge_lookup.lookup_recent_failures`
+    wants when filtering past failures.
+    """
+    files = _get_attr(task, ("files", "target_files"), default=())
+    if isinstance(files, (list, tuple, set, frozenset)):
+        sorted_files = sorted(str(p) for p in files)
+    elif files:
+        sorted_files = [str(files)]
+    else:
+        sorted_files = []
+
+    error_class = _get_attr(
+        task,
+        ("error_class", "failure_class", "last_error_class"),
+        default="",
+    )
+    if not isinstance(error_class, str):
+        error_class = error_class.__class__.__name__ if error_class else ""
+
+    last_diff = _get_attr(task, ("last_diff", "diff", "evidence_diff"), default="")
+    if not isinstance(last_diff, str):
+        last_diff = ""
+    diff_head = last_diff[:512]
+
+    canonical = "\n".join(
+        [
+            "files=" + ",".join(sorted_files),
+            "error_class=" + str(error_class),
+            "diff_head=" + diff_head,
+        ]
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _get_attr(obj: Any, keys: tuple[str, ...], default: Any) -> Any:
+    """Look up the first present attribute / key on ``obj``.
+
+    Supports both attribute-style access (dataclass / pydantic) and
+    dict-style access. Returns ``default`` when none of ``keys`` resolve.
+    """
+    for key in keys:
+        if isinstance(obj, dict):
+            if key in obj and obj[key] is not None:
+                return obj[key]
+        else:
+            value = getattr(obj, key, None)
+            if value is not None:
+                return value
+    return default
+
+
 def _normalize_record_args(
     *args: Any, **kwargs: Any
 ) -> tuple[str, str, float, dict[str, Any]]:
@@ -971,5 +1064,6 @@ __all__ = [
     "RejectedLesson",
     "TournamentEvent",
     "TournamentEventType",
+    "compute_task_signature",
     "jaccard_bigrams",
 ]
