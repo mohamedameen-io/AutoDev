@@ -237,6 +237,16 @@ def init(platform: str, force: bool, inline: bool, rebuild_index: bool) -> None:
                 "(execute/plan/resume will retry on next invocation)"
             )
 
+    # v0.31.0 (Phase 5.3): refresh the codebase language profile cache so
+    # the doctor / fitness / detect downstream consumers see fresh data.
+    # Best-effort: a profile failure must not block init.
+    try:
+        from runtime.language_profile import compute_language_profile
+
+        compute_language_profile(cwd, force_recompute=True)
+    except Exception:  # noqa: BLE001 - profile is informational
+        pass
+
     # Pretty console summary.
     table = Table(title="autodev init")
     table.add_column("File", style="cyan", no_wrap=False)
