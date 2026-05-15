@@ -187,6 +187,11 @@ def doctor(repair_worktrees: bool) -> None:
     _render_orphan_worktree_section(console, cwd, repair_worktrees)
     console.print()
     _render_stale_editor_agent_files_section(console, cwd)
+    # v0.32.0 (Phase 5, Gap G): blocked-task summary so the operator
+    # sees at a glance whether prior runs left work parked, and is
+    # nudged toward the structured recovery surface.
+    console.print()
+    _render_blocked_tasks_section(console, cwd)
 
     exit_code = 0 if (either_ok and results[2].ok) else 1
     sys.exit(exit_code)
@@ -427,3 +432,48 @@ def _render_stale_editor_agent_files_section(
             f"({', '.join(stale_paths)}). Re-run `autodev init --force` to "
             "regenerate them from the current config."
         )
+
+
+def _render_blocked_tasks_section(console: Console, cwd: Path) -> None:
+    """v0.32.0 (Phase 5, Gap G): one-line blocked-task count + nudge.
+
+    Reads the on-disk plan via :class:`PlanManager` and counts blocked
+    tasks. Failures (no plan / corrupt ledger / load error) degrade to
+    silence rather than aborting doctor — the rest of doctor is still
+    useful even when the plan is unhealthy.
+
+    Output:
+      * 0 blocked: green "Blocked tasks: none".
+      * N > 0 blocked: yellow line pointing at ``autodev status --blocked``
+        for the structured recovery surface.
+    """
+    import asyncio
+
+    try:
+        from state.plan_manager import PlanManager  # noqa: PLC0415
+
+        async def _count() -> int:
+            pm = PlanManager(cwd, session_id="doctor-readonly")
+            plan = await pm.load()
+            if plan is None:
+                return 0
+            return sum(
+                1
+                for phase in plan.phases
+                for task in phase.tasks
+                if task.status == "blocked"
+            )
+
+        count = asyncio.run(_count())
+    except Exception as exc:  # noqa: BLE001 - never let the section abort doctor
+        console.print(f"[yellow]Blocked tasks:[/yellow] [dim]error: {exc}[/dim]")
+        return
+
+    if count == 0:
+        console.print("[green]Blocked tasks: none[/green]")
+        return
+    plural = "s" if count != 1 else ""
+    console.print(
+        f"[yellow]Blocked tasks:[/yellow] {count} task{plural} waiting for "
+        "input. Run [bold]autodev status --blocked[/bold] for details."
+    )

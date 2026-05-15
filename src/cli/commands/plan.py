@@ -16,6 +16,7 @@ from adapters.detect import get_adapter
 from adapters.fitness import compute_fitness_score, get_fitness_warning
 from agents import build_registry
 from autologging import get_logger
+from cli._blocked_banner import _maybe_print_blocked_banner
 from config.loader import load_config
 from errors import AutodevError
 from orchestrator import Orchestrator
@@ -105,6 +106,10 @@ def plan(intent: str, platform: str | None, complexity: str | None) -> None:
         # v0.31.0 (Phase 5.4): emit a fitness telemetry line + warn on
         # poor adapter/codebase fit. Best-effort.
         _emit_fitness_signal(console, cwd, adapter)
+        # v0.32.0 (Phase 5, Gap G): inform the operator before the
+        # planner runs that a previous session left blocked tasks
+        # behind.
+        await _maybe_print_blocked_banner(console, cwd)
         registry = build_registry(cfg)
         orch = Orchestrator(cwd=cwd, cfg=cfg, adapter=adapter, registry=registry)
         approved = await orch.plan(intent)

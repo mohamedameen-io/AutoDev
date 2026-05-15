@@ -16,6 +16,7 @@ from adapters.base import PlatformAdapter
 from adapters.detect import get_adapter
 from agents import build_registry
 from autologging import get_logger
+from cli._blocked_banner import _maybe_print_blocked_banner
 from config.loader import load_config
 from errors import AutodevError
 from orchestrator import Orchestrator
@@ -102,6 +103,11 @@ def resume(platform: str | None) -> None:
         if not ok:
             preflight_failure = ("resume", details)
             return
+
+        # v0.32.0 (Phase 5, Gap G): inform the operator before the
+        # orchestrator runs that a previous session left blocked
+        # tasks behind.
+        await _maybe_print_blocked_banner(console, cwd)
 
         registry = build_registry(cfg)
         orch = Orchestrator(cwd=cwd, cfg=cfg, adapter=adapter, registry=registry)

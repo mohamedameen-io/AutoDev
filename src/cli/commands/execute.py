@@ -16,6 +16,7 @@ from adapters.detect import get_adapter
 from adapters.fitness import compute_fitness_score, get_fitness_warning
 from agents import build_registry
 from autologging import get_logger
+from cli._blocked_banner import _maybe_print_blocked_banner
 from cli.commands.resume import _print_preflight_failure
 from config.loader import load_config
 from errors import AutodevError
@@ -135,6 +136,11 @@ def execute(
         if not ok:
             preflight_failure = ("execute", details)
             return
+
+        # v0.32.0 (Phase 5, Gap G): inform the operator before the
+        # orchestrator runs that a previous session left blocked
+        # tasks behind.
+        await _maybe_print_blocked_banner(console, cwd)
 
         registry = build_registry(cfg)
         orch = Orchestrator(
