@@ -12,6 +12,8 @@ where a pre-v0.26.0 workspace already has an
 from __future__ import annotations
 
 
+import click
+
 from adapters.inline_config import (
     _CLAUDE_SECTION_END,
     _CLAUDE_SECTION_START,
@@ -19,6 +21,8 @@ from adapters.inline_config import (
     render_cursor_slash_command,
     update_claude_md,
 )
+from adapters.slash_command_spec import canonical_slash_command_spec
+from cli.commands import register_commands
 
 
 # ---------------------------------------------------------------------------
@@ -209,3 +213,85 @@ def test_render_cursor_slash_command_lists_every_cli_subcommand() -> None:
         "tournament",
     ):
         assert f"`{sub}`" in result, f"missing subcommand {sub!r} in cursor template"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (v0.31.0) drift-prevention locks: SlashCommandSpec single source
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_spec_subcommands_match_cli_registry() -> None:
+    """The spec's subcommand tuple MUST equal the actual CLI registry.
+
+    This is the lock that keeps Phase 4 itself from drifting: if a new
+    ``autodev`` subcommand lands in ``src/cli/commands/__init__.py`` but
+    the spec's hardcoded fallback tuple is not refreshed (or the
+    registry-derivation regresses), this test fails before any template
+    renders incorrectly.
+    """
+    group = click.Group()
+    register_commands(group)
+    registry = tuple(sorted(group.commands.keys()))
+
+    spec = canonical_slash_command_spec()
+    assert spec.subcommands == registry, (
+        f"SlashCommandSpec.subcommands drifted from CLI registry.\n"
+        f"  spec: {spec.subcommands}\n"
+        f"  registry: {registry}"
+    )
+
+
+def test_slash_command_subcommands_in_sync() -> None:
+    """Both rendered templates must list every canonical subcommand.
+
+    Stronger than the prior per-template assertions: this iterates the
+    spec's subcommand tuple (the canonical source) and demands both
+    renders mention every entry, so adding a subcommand in one template
+    while forgetting the other is impossible.
+    """
+    spec = canonical_slash_command_spec()
+    claude = render_claude_slash_command()
+    cursor = render_cursor_slash_command()
+    for sub in spec.subcommands:
+        assert f"`{sub}`" in claude, (
+            f"Claude template missing subcommand {sub!r}"
+        )
+        assert f"`{sub}`" in cursor, (
+            f"Cursor template missing subcommand {sub!r}"
+        )
+
+
+def test_slash_command_routing_rules_identical() -> None:
+    """Routing case headings AND the error-handling block must appear in
+    BOTH rendered templates. This pins shared wording so a routing rule
+    change in one template is impossible without touching the spec — and
+    once you touch the spec, both templates inherit the change.
+    """
+    claude = render_claude_slash_command()
+    cursor = render_cursor_slash_command()
+
+    shared_markers = (
+        # Routing intro
+        "## Routing rule",
+        "Inspect the FIRST whitespace-separated token of $ARGUMENTS:",
+        # Case headings (the four routing cases)
+        "1. **No arguments / empty**",
+        "2. **First token is one of these registered CLI subcommands**:",
+        "3. **First token is `--review`**: checkpointed feature flow.",
+        "4. **Otherwise** (first token is a free-text feature description)",
+        # Help/version flag note inside case 2
+        "OR a help/version flag (`--help`, `-h`, `--version`).",
+        # Error-handling section (heading + every distinctive line)
+        "## Error handling",
+        "If any `autodev` invocation fails (non-zero exit), surface stderr verbatim.",
+        "Do NOT retry blindly. Suggest `autodev doctor` and `autodev status` for",
+        "diagnostics, and `/autodev resume` after fixing the underlying issue.",
+    )
+
+    for marker in shared_markers:
+        assert marker in claude, (
+            f"Claude template missing shared marker: {marker!r}"
+        )
+        assert marker in cursor, (
+            f"Cursor template missing shared marker: {marker!r}"
+        )
