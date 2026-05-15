@@ -89,7 +89,15 @@ def test_render_claude_slash_command_documents_review_flag() -> None:
 
 def test_render_claude_slash_command_lists_every_cli_subcommand() -> None:
     """Each registered CLI subcommand MUST appear in the routing rule list,
-    so the template stays in lock-step with src/cli/commands/."""
+    so the template stays in lock-step with src/cli/commands/.
+
+    v0.30.2 backfill: ``requeue`` and ``rewind`` were added to the registry
+    in v0.28-0.29 but never landed in the Claude template; the resulting
+    drift caused users typing ``/autodev requeue`` to fall through into the
+    free-text feature flow (case 4) instead of the CLI passthrough (case 2).
+    The Cursor template kept these subcommands current; this test now mirrors
+    the equivalent Cursor assertion at the end of this file.
+    """
     result = render_claude_slash_command()
     for sub in (
         "doctor",
@@ -100,8 +108,10 @@ def test_render_claude_slash_command_lists_every_cli_subcommand() -> None:
         "plan",
         "plugins",
         "prune",
+        "requeue",
         "reset",
         "resume",
+        "rewind",
         "secretscan",
         "status",
         "tournament",

@@ -56,7 +56,8 @@ Inspect the FIRST whitespace-separated token of $ARGUMENTS:
 
 2. **First token is one of these registered CLI subcommands**:
    `doctor`, `execute`, `init`, `logs`, `metrics`, `plan`, `plugins`,
-   `prune`, `reset`, `resume`, `secretscan`, `status`, `tournament`
+   `prune`, `requeue`, `reset`, `resume`, `rewind`, `secretscan`, `status`,
+   `tournament`
    — OR a help/version flag (`--help`, `-h`, `--version`).
 
    → Direct CLI passthrough. Run `autodev $ARGUMENTS` via Bash and surface
