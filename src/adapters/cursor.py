@@ -139,10 +139,19 @@ class CursorAdapter(PlatformAdapter):
                     last_err = f"binary not found: {binary}: {exc}"
                     continue
 
+                # ``inv.timeout_s`` is ``int | None`` (per-task overrides may leave
+                # it unset). Mirror the claude_code.py:139 guard so ``asyncio.wait_for``
+                # always receives a numeric timeout — passing ``None`` is harmless to
+                # ``wait_for`` itself but makes the error-message branch below format
+                # ``"timeout after Nones"``, and downstream code paths that arithmetic
+                # with the value (e.g. circuit breaker windowing) crash on ``None``.
+                effective_timeout_s: int = (
+                    inv.timeout_s if inv.timeout_s is not None else 600
+                )
                 try:
                     stdout_b, stderr_b = await asyncio.wait_for(
                         proc.communicate(),
-                        timeout=inv.timeout_s,
+                        timeout=effective_timeout_s,
                     )
                 except asyncio.TimeoutError:
                     with suppress(ProcessLookupError):
@@ -154,7 +163,7 @@ class CursorAdapter(PlatformAdapter):
                         success=False,
                         text="",
                         duration_s=duration,
-                        error=f"timeout after {inv.timeout_s}s",
+                        error=f"timeout after {effective_timeout_s}s",
                     )
 
                 duration = time.monotonic() - start

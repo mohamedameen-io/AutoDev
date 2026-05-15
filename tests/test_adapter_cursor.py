@@ -125,6 +125,52 @@ async def test_execute_cursor_timeout(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_default_timeout_when_none(tmp_path: Path) -> None:
+    """``inv.timeout_s=None`` must not crash ``asyncio.wait_for``.
+
+    Regression for v0.30.1 Bug F2: passing ``None`` as the second positional
+    arg to ``asyncio.wait_for`` is technically valid (it disables the
+    timeout), but we used to interpolate the same ``None`` into the timeout
+    error message and feed it to circuit-breaker arithmetic. Mirror the
+    claude_code adapter's 600s fallback.
+    """
+    adapter = CursorAdapter(binaries=("cursor",))
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, timeout_s=None)
+    fake = _fake_proc(stdout=_good_cursor_blob("PONG"), returncode=0)
+    with patch(
+        "adapters.cursor.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        # Must not raise TypeError on ``None`` arithmetic.
+        result = await adapter.execute(inv)
+    assert result.success is True
+    assert result.text == "PONG"
+
+
+@pytest.mark.asyncio
+async def test_execute_default_timeout_message_does_not_say_none(
+    tmp_path: Path,
+) -> None:
+    """When timeout_s is None and a timeout fires, the error message must
+    show the resolved default (600s), not the literal string 'None'."""
+    adapter = CursorAdapter(binaries=("cursor",))
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, timeout_s=None)
+    fake = _fake_proc(hang=True)
+    with patch(
+        "adapters.cursor.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ), patch(
+        "adapters.cursor.asyncio.wait_for",
+        AsyncMock(side_effect=asyncio.TimeoutError()),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.error is not None
+    assert "None" not in result.error
+    assert "600" in result.error
+
+
+@pytest.mark.asyncio
 async def test_execute_cursor_malformed_json(tmp_path: Path) -> None:
     adapter = CursorAdapter(binaries=("cursor",))
     inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path)
