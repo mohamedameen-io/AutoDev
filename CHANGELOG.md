@@ -2,6 +2,71 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - v0.32.0 Phase 2
+
+### Added
+- **Review tournament (autoreason A/B/AB pipeline)** —
+  `src/orchestrator/review_tournament_runner.py` introduces a
+  three-candidate refinement step for the reviewer:
+  - **A** is the unchanged developer patch + the original reviewer
+    verdict.
+  - **B** is an adversarial second-opinion review produced by the
+    new `adversarial_reviewer` role
+    (`src/agents/prompts/adversarial_reviewer.md`) — deliberately
+    framed to find the angle the original reviewer missed.
+  - **AB** is a synthesis produced by the new `merge_synthesizer`
+    role (`src/agents/prompts/merge_synthesizer.md`) that combines
+    A's strengths with B's improvements.
+  Three FRESH judges (default cohort:
+  `["judge", "minimality_judge", "judge_explorer"]`) blindly score
+  the candidates via Borda count. "Do nothing" (A wins
+  `convergence_k=2` rounds in a row) is a first-class verdict so
+  the loop converges on "the original was fine, stop" instead of
+  burning developer-refine cycles.
+- New evidence type
+  `state.schemas.ReviewTournamentEvidence` carrying tournament_id,
+  candidates dict (A / B / AB), judge rankings, Borda scores,
+  winner, valid_judges count, converged flag, and rounds; written
+  to `.autodev/evidence/{task_id}-review_tournament.json`.
+- New ledger ops `review_tournament_started`,
+  `review_tournament_judged`, `review_tournament_converged`,
+  `review_tournament_escalated` (audit-only — replay is a no-op).
+- New config knobs on `TournamentsConfig`:
+  `review_tournament_enabled` (default `False`),
+  `review_num_judges`, `review_convergence_k`, `review_max_rounds`,
+  `review_judge_roles`. Mirror knobs added to the runtime
+  `tournament.core.TournamentConfig` dataclass.
+
+### Feature flag rollout (opt-in for v0.32.0)
+- The review tournament ships **off by default** for one cycle. To
+  opt in, set `cfg.tournaments.review_tournament_enabled = true`
+  in `.autodev/config.json` (or programmatically before constructing
+  the orchestrator). The legacy single-shot reviewer path is
+  byte-identical when the flag is `false`.
+- v0.33.0 will flip the default to `true` after one cycle of
+  real-world telemetry confirms the do-nothing convergence rate
+  matches the autoreason published technique (NousResearch).
+- All v0.31.0 instrumentation is preserved by construction:
+  - each candidate is grounded against the same chunked review
+    envelope (Phase 1.4),
+  - each candidate's verdict parses through the existing
+    `_parse_review_verdict` so the Phase 1.3 MALFORMED-vs-content
+    distinction propagates,
+  - `raw_response` is captured on every candidate (Phase 1.2),
+  - the empty-result `*-empty.json` dump still fires from the
+    adapter layer.
+
+### Tests added
+- `tests/test_review_tournament_core.py` — Borda + tiebreak
+  invariants, `_no_progress` short-circuit, `_resolve_judge_cohort`
+  precedence (14 tests).
+- `tests/test_review_tournament_integration.py` — full-flow
+  StubAdapter coverage of: B/AB-wins exit semantics, no-progress
+  short-circuit (judges never called), max-rounds escalation,
+  chunked-envelope reuse across all three candidates, empty-A
+  MALFORMED propagation, evidence + ledger breadcrumb writes (6
+  tests).
+
 ## [0.31.1] - 2026-05-15
 
 Hot-patch fixing the dominant production failure mode that v0.31.0's

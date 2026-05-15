@@ -187,6 +187,64 @@ module-level constants in `src/orchestrator/budget_escalation.py`
 (The schema slot is read defensively — existing configs without the
 section continue to work unchanged.)
 
+### Review tournament (v0.32.0 — opt-in)
+
+The v0.32.0 review tournament replaces the single-shot reviewer step
+with an A/B/AB pipeline (developer patch + original review,
+adversarial second-opinion, merge synthesis), then runs three FRESH
+judges over the candidates via Borda count. "Do nothing" (A wins
+twice in a row) is a first-class verdict so the loop converges on
+"the original was fine, stop" instead of looping the developer.
+
+The feature is **opt-in for v0.32.0**: the default is `false` for
+one cycle so we can collect real-world telemetry before flipping the
+default in v0.33.0.
+
+To enable:
+
+```json
+{
+  "tournaments": {
+    "review_tournament_enabled": true,
+    "review_num_judges": 3,
+    "review_convergence_k": 2,
+    "review_max_rounds": 5,
+    "review_judge_roles": ["judge", "minimality_judge", "judge_explorer"]
+  }
+}
+```
+
+Fields:
+
+* `review_tournament_enabled` (bool, default `false`) — master
+  switch. When `true`, `execute_phase` swaps the legacy single-shot
+  `delegate(..., "reviewer", ...)` call for an A/B/AB tournament.
+  When `false`, behaviour is byte-identical to v0.31.x.
+* `review_num_judges` (int, default `3`) — cohort size. Operators
+  who pin `review_judge_roles` to a list get exactly that many
+  judges (the list length wins).
+* `review_convergence_k` (int, default `2`) — number of consecutive
+  A wins required to declare "do nothing". Matches the autoreason
+  published technique (NousResearch).
+* `review_max_rounds` (int, default `5`) — hard cap on rounds
+  before the runner escalates to `critic_sounding_board`. Keeps the
+  per-task budget bounded.
+* `review_judge_roles` (list[str] | null, default `null`) — cohort
+  override. `null` uses the built-in 3-role cohort
+  `["judge", "minimality_judge", "judge_explorer"]`.
+
+Forensics:
+
+* Evidence is written to
+  `.autodev/evidence/{task_id}-review_tournament.json` carrying all
+  three candidates + judge rankings + Borda scores.
+* Ledger ops `review_tournament_started`, `review_tournament_judged`
+  (per round), and `review_tournament_converged` /
+  `review_tournament_escalated` mark the lifecycle.
+* All v0.31.0 instrumentation (chunked envelope, MALFORMED parsing,
+  `raw_response` capture, empty-result dump) is preserved by
+  construction — each candidate inherits the same plumbing.
+
 ---
 
 ## See also
