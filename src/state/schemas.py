@@ -421,6 +421,28 @@ class TestEvidence(_BaseEvidence):
     # v0.31.0 (Phase 1.2): see ``CoderEvidence.raw_response``.
     raw_response: str | None = None
 
+    # v0.32.0 (Phase 3, Gap C): self-diagnostic fields populated by
+    # :func:`orchestrator.test_result_classifier.classify_test_result` so
+    # downstream consumers can distinguish "no tests existed" from
+    # "runner crashed" from "stdout capture failed". All fields are
+    # optional with ``None`` defaults to remain backward-compatible with
+    # v0.31.x evidence files on disk (existing JSON deserialises cleanly).
+    runner_returncode: int | None = None
+    tests_collected: int | None = None
+    collection_error: str | None = None
+    runner_stderr_tail: str | None = None
+    diagnosis: (
+        Literal[
+            "ok",
+            "no_tests_found",
+            "collection_failed",
+            "runtime_crash",
+            "capture_failed",
+            "no_signal",
+        ]
+        | None
+    ) = None
+
 
 class ExploreEvidence(_BaseEvidence):
     """Artifact produced by the ``explorer`` role during the plan phase."""
