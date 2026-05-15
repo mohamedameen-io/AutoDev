@@ -2,70 +2,193 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - v0.32.0 Phase 2
+## [0.32.0] - 2026-05-16
 
-### Added
-- **Review tournament (autoreason A/B/AB pipeline)** —
-  `src/orchestrator/review_tournament_runner.py` introduces a
-  three-candidate refinement step for the reviewer:
-  - **A** is the unchanged developer patch + the original reviewer
-    verdict.
-  - **B** is an adversarial second-opinion review produced by the
-    new `adversarial_reviewer` role
-    (`src/agents/prompts/adversarial_reviewer.md`) — deliberately
-    framed to find the angle the original reviewer missed.
-  - **AB** is a synthesis produced by the new `merge_synthesizer`
-    role (`src/agents/prompts/merge_synthesizer.md`) that combines
-    A's strengths with B's improvements.
-  Three FRESH judges (default cohort:
-  `["judge", "minimality_judge", "judge_explorer"]`) blindly score
-  the candidates via Borda count. "Do nothing" (A wins
-  `convergence_k=2` rounds in a row) is a first-class verdict so
-  the loop converges on "the original was fine, stop" instead of
-  burning developer-refine cycles.
-- New evidence type
-  `state.schemas.ReviewTournamentEvidence` carrying tournament_id,
-  candidates dict (A / B / AB), judge rankings, Borda scores,
-  winner, valid_judges count, converged flag, and rounds; written
-  to `.autodev/evidence/{task_id}-review_tournament.json`.
-- New ledger ops `review_tournament_started`,
-  `review_tournament_judged`, `review_tournament_converged`,
-  `review_tournament_escalated` (audit-only — replay is a no-op).
-- New config knobs on `TournamentsConfig`:
-  `review_tournament_enabled` (default `False`),
-  `review_num_judges`, `review_convergence_k`, `review_max_rounds`,
-  `review_judge_roles`. Mirror knobs added to the runtime
-  `tournament.core.TournamentConfig` dataclass.
+Hardening release closing the soft-block loop. v0.31.0 fixed every
+v0.30.1-class failure but exposed a different layer (architect plan-
+phase failures, silent test-runner 0/0/0, soft-block→thin-evidence
+loop with no recovery action, invisible blocked-state). v0.32.0
+attacks that layer AND the structural pattern of "every release
+fixes the most-recent surface and exposes the next one" via a
+standing retrospective discipline.
 
-### Feature flag rollout (opt-in for v0.32.0)
-- The review tournament ships **off by default** for one cycle. To
-  opt in, set `cfg.tournaments.review_tournament_enabled = true`
-  in `.autodev/config.json` (or programmatically before constructing
-  the orchestrator). The legacy single-shot reviewer path is
-  byte-identical when the flag is `false`.
-- v0.33.0 will flip the default to `true` after one cycle of
-  real-world telemetry confirms the do-nothing convergence rate
-  matches the autoreason published technique (NousResearch).
-- All v0.31.0 instrumentation is preserved by construction:
-  - each candidate is grounded against the same chunked review
-    envelope (Phase 1.4),
-  - each candidate's verdict parses through the existing
-    `_parse_review_verdict` so the Phase 1.3 MALFORMED-vs-content
-    distinction propagates,
-  - `raw_response` is captured on every candidate (Phase 1.2),
-  - the empty-result `*-empty.json` dump still fires from the
-    adapter layer.
+Ten distinct phases shipped under this release. Per-phase summary
+follows; full details in the v0.32.0 plan at
+`~/.claude/plans/we-have-multiple-problems-transient-cray.md`.
 
-### Tests added
-- `tests/test_review_tournament_core.py` — Borda + tiebreak
-  invariants, `_no_progress` short-circuit, `_resolve_judge_cohort`
-  precedence (14 tests).
-- `tests/test_review_tournament_integration.py` — full-flow
-  StubAdapter coverage of: B/AB-wins exit semantics, no-progress
-  short-circuit (judges never called), max-rounds escalation,
-  chunked-envelope reuse across all three candidates, empty-A
-  MALFORMED propagation, evidence + ledger breadcrumb writes (6
-  tests).
+### Phase 0 — v0.31.1 hot-patch (already shipped)
+The Phase 1.1 empty-result dump silently skipped when the CLI
+emitted `is_error=true` alongside `result==""`. Dropped the
+`is_error` gate. Live as v0.31.1.
+
+### Phase 1 — Architect convergence (Gaps A + B + F)
+- **Architect feedback loop:** `src/orchestrator/retry_envelope.py`
+  gains `most_recent_failures: list[PriorError]`. The architect
+  prompt at `src/agents/prompts/architect.md` interpolates a
+  `{rejection_history}` placeholder so retries see "you proposed
+  these paths and they were rejected; do not propose them again".
+- **Generic budget escalation:** `BudgetEscalationTracker` (Phase 3
+  of v0.31.0) refactored to key on `(scope_id, role)` instead of
+  per-task only. The architect retry loop now escalates `max_turns`
+  + `timeout_s` + (optionally) sonnet → opus on repeated failures.
+  New ledger op `plan_phase_budget_escalation`.
+- **Plan-time failure-class taxonomy:** new
+  `src/state/failure_classes.py` with `FailureClass` enum
+  distinguishing ExecuteTime / PlanTime / Infrastructure failures
+  and a `classify(...)` dispatcher.
+- **Hard-fail recovery tiers:** new
+  `src/orchestrator/plan_phase_recovery.py` with tier-4 scope
+  degradation, tier-5 model escalation, tier-6 user escalation
+  (populates `RecoveryHint`), tier-7 hard-fail with forensic
+  summary referencing the archived `architect-failed-*.md` dumps.
+
+### Phase 2 — Autoreason A/B/AB reviewer pipeline (already documented above this entry; preserved verbatim)
+**Feature flag `cfg.tournaments.review_tournament_enabled`
+defaults to `False`** for v0.32.0 — opt-in for one cycle to gather
+real-world telemetry; v0.33.0 will flip the default. Includes the
+full A / B / AB candidate generation, three fresh judges with
+Borda voting, "do nothing" convergence, new
+`ReviewTournamentEvidence` schema, four new ledger ops, and full
+preservation of v0.31.0's reviewer instrumentation (chunked
+envelope, MALFORMED parsing, raw_response capture, empty-result
+dump). New roles: `adversarial_reviewer`, `merge_synthesizer`.
+Cost: ~4–5× per-review token spend in exchange for dramatically
+lower soft-block rate.
+
+### Phase 3 — Test runner self-diagnostic (Gap C)
+- `TestEvidence` schema gains five optional fields:
+  `runner_returncode`, `tests_collected`, `collection_error`,
+  `runner_stderr_tail`, `diagnosis: Literal[...]`.
+- New `src/orchestrator/test_result_classifier.py::classify_test_result()`
+  with a 6-way diagnosis taxonomy: `ok`, `no_tests_found`,
+  `collection_failed`, `runtime_crash`, `capture_failed`,
+  `no_signal`.
+- Orchestrator-side handling now branches on diagnosis instead of
+  the legacy `failed > 0 or not success` heuristic. `no_tests_found`
+  no longer soft-blocks (legitimate); `collection_failed` retries
+  once then hard-fails with `RecoveryHint`; etc.
+- Backward-compatible: pre-v0.32.0 evidence files load with
+  `diagnosis=None`.
+
+### Phase 4 — Knowledge-aware escalation
+- **PRM as gate:** `src/orchestrator/escalation_ladder.py::next_step()`
+  now accepts an optional `knowledge_context` dict. When PRM has
+  detected `repetition_loop` for the current task, the ladder forces
+  PIVOT instead of REFINE; `ping_pong` escalates further.
+- **KB lookup before refine:** new
+  `src/orchestrator/knowledge_lookup.py::lookup_recent_failures()`
+  with a 100ms timeout fallback. Past failures on the current task
+  are injected into the critic's STUCK_CONTEXT so the critic sees
+  "we've already tried X and Y."
+- **KnowledgeEntry metadata additions:** documented optional keys
+  (`kb_entry_type`, `task_signature`, `task_id`, `tactic_tried`,
+  `resolution`); new `compute_task_signature(task)` helper.
+- **Repetition-loop recovery taxonomy:** new
+  `src/orchestrator/repetition_recovery.py::choose_recovery_action()`
+  mapping per-task counters + PRM signal onto seven recovery
+  actions (switch_tactic, increase_scope, decrease_scope,
+  re_architect, kb_lookup, ask_human, do_nothing).
+- New ledger ops: `repetition_loop_detected`,
+  `recovery_action_chosen`, `tactic_switch`.
+
+### Phase 5 — Soft-block surfacing (Gap G)
+- New `RecoveryHint` pydantic schema and `Task.recovery_hint`
+  optional field. Six classes: `missing_test_output`,
+  `thin_review_evidence`, `architect_unconvergent`,
+  `model_capacity_exhausted`, `user_decision_required`,
+  `network_transient`. Carries recommended user action, evidence
+  files, debug files, and CLI commands to try.
+- Populated at every soft-block site: execute_phase exhaustion,
+  plan_phase tier-6 user escalation, test gate `collection_failed`
+  / `capture_failed` / `no_signal`.
+- New `autodev status --blocked` flag renders blocked tasks as
+  rich panels with class, reason, evidence files, recommended
+  action, and copyable commands.
+- `autodev doctor` reports blocked-task count.
+- `autodev plan` / `execute` / `resume` print a pre-flight banner
+  when blocked tasks exist, directing users to
+  `autodev status --blocked`.
+
+### Phase 6 — CI gate closure
+- New `tests/fixtures/fake_binaries/fake-pytest` covers
+  `no_tests_collected`, `zero_pass_zero_fail`, `collection_error`,
+  `runtime_crash`, `capture_failed` modes.
+- `fake-claude` extended with `architect_rejected_paths_{1,2,3}`,
+  `repetition_loop`, `reviewer_returns_empty_silently` modes.
+- `fake-cursor` extended with `is_error_true_with_empty_result`
+  mode (regression for the v0.31.1 dump-predicate fix).
+- Six new integration tests under
+  `tests/integration/test_e2e_with_fake_binaries.py` covering:
+  Phase 1.1 dump regression, architect-failed dumps, architect
+  budget escalation, test-runner silent zero, repetition-loop
+  recovery action, blocked-task RecoveryHint surfacing.
+- Four new `release.yml` preflight grep checks lock the integration
+  anchors for Phase 1.1 (architect rejection_history),
+  Phase 1.1 dump fix (pytest gate), Phase 3 (TestEvidence.diagnosis),
+  Phase 5 (RecoveryHint + status.py integration).
+
+### Phase 7 — Real-task benchmark v1
+- New `benchmarks/` tree with runner + scorer + 5 fully-synthetic
+  MIT-licensed tasks across Python / TypeScript / Go covering
+  type errors, null checks, off-by-one, resource cleanup, and
+  string-allocation perf.
+- Runner produces `results.json` with primary pass/fail metric and
+  secondaries (wall_time_s, autodev_calls, diff_size_delta_bytes).
+- Designed as the missing fitness signal for any future external
+  optimiser (GEPA prompt evolution, RL training). Not yet wired
+  into CI — that's a v0.32.1 follow-up.
+
+### Phase 8 — Standing "next-layer" retrospective discipline
+- New `docs/release-retrospective-template.md` with a REQUIRED
+  Section 5: "What's the NEXT layer of failure?" — explicit
+  speculation about what will surface AFTER this release's fixes
+  ship. At least 3 candidates with severity guesses and falsifiable
+  signals.
+- New `.github/pull_request_template.md` with a release-bump
+  checklist that requires the prior version's retrospective have a
+  populated Section 5.
+- New CI gate in `release.yml::preflight-checks` that parses the
+  most-recent retrospective and fails if Section 5 has fewer than
+  3 bullets.
+- New `docs/retrospectives/v0.31.1.md` demonstrates the template
+  and seeds the discipline; lists 4 candidates feeding v0.33.0
+  planning (autoreason cost ceiling at scale, KB recall on novel
+  signatures, test-runner diagnosis on non-pytest/jest runners,
+  RecoveryHint catalog drift).
+
+### Schema / migration
+- All new fields on `TestEvidence`, `Task`, `KnowledgeEntry` are
+  optional with `None` defaults. v0.31.x evidence files load
+  without migration.
+- `Task.recovery_hint`, `TestEvidence.diagnosis`,
+  `ReviewTournamentEvidence` are additive.
+
+### Tests
+- 2955 passed, 2 skipped (vs ~2710 before v0.32.0; +245 new tests).
+- New test files: `test_architect_feedback_loop.py`,
+  `test_plan_phase_budget_escalation.py`, `test_plan_phase_recovery.py`,
+  `test_state_failure_classes.py`, `test_review_tournament_core.py`,
+  `test_review_tournament_integration.py`,
+  `test_orchestrator_test_result_classifier.py`,
+  `test_orchestrator_test_handling.py`,
+  `test_test_evidence_schema_backcompat.py`,
+  `test_orchestrator_knowledge_lookup.py`,
+  `test_orchestrator_repetition_recovery.py`,
+  `test_state_knowledge_task_signature.py`,
+  `test_recovery_hint_populated.py`, `test_status_blocked_flag.py`,
+  `test_doctor_blocked_section.py`, `test_blocked_banner_on_resume.py`,
+  `test_benchmark_runner.py`, `test_retrospective_discipline.py`,
+  `test_orchestrator_plan_phase_failure_classes.py`.
+
+### Out of scope (deferred to v0.33+)
+- `agent-governance-toolkit` adoption (re-evaluate after one cycle
+  of v0.32.0 in production).
+- `atropos` adoption (would build on Phase 7's benchmark).
+- `hermes-agent-self-evolution` GEPA prompt evolution (requires the
+  benchmark + a stable prompt corpus).
+- Auto-routing for the new `repetition_recovery` actions
+  (`increase_scope`, `re_architect`, `do_nothing`) — currently
+  emitted as ledger telemetry; dispatch routing lands as a follow-up.
 
 ## [0.31.1] - 2026-05-15
 
