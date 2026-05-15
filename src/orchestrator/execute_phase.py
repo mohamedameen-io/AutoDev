@@ -58,6 +58,10 @@ from state.schemas import (
     Task,
     TestEvidence,
 )
+from orchestrator.test_result_classifier import (
+    classify_test_result,
+    redact_stderr_tail,
+)
 from tournament.effort import resolve_role_effort
 from tournament.errors import (
     AuthenticationFailedError,
@@ -2772,6 +2776,14 @@ async def _execute_one(
     try:
         # Retry loop — one iteration = one developer-then-gates cycle.
         last_issues: list[str] = []
+        # v0.32.0 Phase 3 (Gap C): per-task attempt counters for the
+        # infrastructure-class test diagnoses (collection_failed /
+        # runtime_crash / capture_failed). Lives in this function's
+        # scope (NOT task.metadata) because ``task`` is reassigned to
+        # a fresh model on every ``update_task_status`` call inside
+        # the loop, which would clobber attribute mutations. A simple
+        # local dict survives the entire ``while True`` body.
+        test_diag_attempts: dict[str, int] = {}
         while True:
             try:
                 # v0.22.2 B3: emit a pre-flight marker BEFORE the developer
@@ -3172,6 +3184,18 @@ async def _execute_one(
                 return task
 
             passed, failed, total = _parse_test_counts(test_result.text)
+            # v0.32.0 Phase 3 (Gap C): six-way self-diagnostic so the
+            # orchestrator can distinguish "no tests existed" from
+            # "runner crashed" from "stdout capture failed". The
+            # classifier is a pure data transformation and never raises;
+            # the result is persisted on TestEvidence for forensics
+            # AND drives the branching below.
+            diagnosis = classify_test_result(
+                test_result, (passed, failed, total)
+            )
+            stderr_tail = redact_stderr_tail(
+                getattr(test_result, "raw_stderr", "") or "", tail_chars=1000
+            )
             test_ev = TestEvidence(
                 task_id=task.id,
                 passed=passed,
@@ -3181,9 +3205,34 @@ async def _execute_one(
                 # v0.31.0 (Phase 1.2): preserve raw response symmetrically
                 # with ReviewEvidence — same rationale, same field shape.
                 raw_response=test_result.text,
+                diagnosis=diagnosis,
+                runner_stderr_tail=stderr_tail or None,
             )
             await write_evidence(orch.cwd, task.id, test_ev)
-            if failed > 0 or not test_result.success:
+
+            if diagnosis == "no_tests_found":
+                # Legitimate: no tests exist for the changed code.
+                # Proceed to the next step rather than soft-blocking
+                # on phantom failures. The persistent record is on
+                # ``TestEvidence.diagnosis`` (already written above)
+                # — downstream consumers (e.g. ``autodev status``)
+                # read the evidence JSON, not the in-memory task.
+                logger.info(
+                    "execute_phase.tests_no_tests_found",
+                    task_id=task.id,
+                )
+                task = await orch.plan_manager.update_task_status(
+                    task.id, "tested"
+                )
+            elif diagnosis == "ok" and failed == 0 and test_result.success:
+                # Existing happy path — all tests passed.
+                task = await orch.plan_manager.update_task_status(
+                    task.id, "tested"
+                )
+            elif diagnosis == "ok":
+                # Tests collected and ran, but at least one failed
+                # (or runner reported non-success). Existing retry
+                # behaviour applies.
                 logger.info(
                     "execute_phase.tests_failed",
                     task_id=task.id,
@@ -3200,7 +3249,78 @@ async def _execute_one(
                     test_result.text[:500],
                 ]
                 continue
-            task = await orch.plan_manager.update_task_status(task.id, "tested")
+            elif diagnosis in (
+                "collection_failed",
+                "runtime_crash",
+                "capture_failed",
+            ):
+                # Infrastructure-class failures: retry once, then
+                # hard-fail with the diagnosis preserved in evidence.
+                attempts = test_diag_attempts.get(diagnosis, 0) + 1
+                test_diag_attempts[diagnosis] = attempts
+                if attempts == 1:
+                    log_method = (
+                        logger.error
+                        if diagnosis == "capture_failed"
+                        else logger.warning
+                    )
+                    log_method(
+                        "execute_phase.test_diagnosis_retry",
+                        task_id=task.id,
+                        diagnosis=diagnosis,
+                        attempt=attempts,
+                    )
+                    last_issues = [
+                        f"test_engineer {diagnosis} — retrying",
+                        test_result.text[:500],
+                    ]
+                    # Transition back to ``in_progress`` so the next
+                    # loop iteration's developer dispatch is a valid
+                    # state transition (mirrors what
+                    # ``_try_retry_or_escalate`` does on the legacy
+                    # tests-failed path). The retry-attempt counter
+                    # lives in ``test_diag_attempts`` (function-scope
+                    # local) and survives ``task`` reassignments.
+                    task = await orch.plan_manager.update_task_status(
+                        task.id, "in_progress"
+                    )
+                    continue
+                # Second occurrence — hard-fail.
+                logger.error(
+                    "execute_phase.test_diagnosis_hard_fail",
+                    task_id=task.id,
+                    diagnosis=diagnosis,
+                    attempts=attempts,
+                )
+                task = await orch.plan_manager.update_task_status(
+                    task.id,
+                    "blocked",
+                    meta={
+                        "blocked_reason": (
+                            f"test_diagnosis: {diagnosis} "
+                            f"(persisted across {attempts} attempts)"
+                        ),
+                    },
+                )
+                return task
+            else:
+                # ``no_signal`` — soft-block with an explicit reason
+                # rather than masquerading as a generic test failure.
+                logger.warning(
+                    "execute_phase.test_diagnosis_no_signal",
+                    task_id=task.id,
+                )
+                task = await orch.plan_manager.update_task_status(
+                    task.id,
+                    "blocked",
+                    meta={
+                        "blocked_reason": (
+                            "test result inconclusive — "
+                            "no diagnostic signal"
+                        ),
+                    },
+                )
+                return task
 
             # Step 6: impl tournament.
             if orch.cfg.tournaments.impl.enabled and not orch.disable_impl_tournament:
