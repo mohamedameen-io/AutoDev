@@ -13,6 +13,7 @@ from rich.table import Table
 from typing import Literal, cast
 
 from adapters.detect import get_adapter
+from adapters.fitness import compute_fitness_score, get_fitness_warning
 from agents import build_registry
 from autologging import get_logger
 from cli.commands.resume import _print_preflight_failure
@@ -122,6 +123,10 @@ def execute(
         adapter = await get_adapter(
             cast("Literal['claude_code', 'cursor', 'auto']", platform_pref)
         )
+
+        # v0.31.0 (Phase 5.4): emit a fitness telemetry line + warn on
+        # poor adapter/codebase fit. Best-effort; never blocks execution.
+        _emit_fitness_signal(console, cwd, adapter)
 
         # Mandatory re-probe — NOT cached. Mirrors the ``autodev resume``
         # path (Bug 10) so both entry points fail-fast on infrastructure
@@ -265,3 +270,33 @@ def _render_execute_summary(console: Console, tasks: list) -> None:
             "yes" if t.escalated else "no",
         )
     console.print(table)
+
+
+def _emit_fitness_signal(console: Console, cwd: Path, adapter) -> None:
+    """v0.31.0 (Phase 5.4): score the adapter against the codebase.
+
+    Prints a yellow warning when the score is below the warning threshold;
+    always emits a structured log line for fleet telemetry. Best-effort:
+    a profile/score failure never blocks execution.
+    """
+    try:
+        from runtime.language_profile import compute_language_profile
+        from autologging import get_logger
+
+        profile = compute_language_profile(cwd)
+        adapter_name = type(adapter).__name__.replace("Adapter", "").lower()
+        # Normalise to the names used in fitness rules.
+        if adapter_name == "claudecode":
+            adapter_name = "claude_code"
+        score = compute_fitness_score(adapter_name, profile)
+        warn = get_fitness_warning(adapter_name, profile)
+        get_logger(component="adapter.fitness").info(
+            "adapter.fitness",
+            adapter=adapter_name,
+            score=score,
+            profile=profile,
+        )
+        if warn is not None:
+            console.print(f"[yellow]{warn}[/yellow]")
+    except Exception:  # noqa: BLE001 - signal is informational
+        pass

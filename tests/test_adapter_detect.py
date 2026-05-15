@@ -175,3 +175,84 @@ async def test_get_adapter_auto_cursor(
     ):
         adapter = await get_adapter("auto")
     assert isinstance(adapter, CursorAdapter)
+
+
+# ---------------------------------------------------------------------------
+# v0.31.0 (Phase 5.5): language-weighted platform selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lang_weight_zero_keeps_claude_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """``AUTODEV_LANG_WEIGHT=0`` (default) preserves the historical Claude bias."""
+    monkeypatch.delenv("AUTODEV_PLATFORM", raising=False)
+    monkeypatch.setenv("AUTODEV_LANG_WEIGHT", "0.0")
+    # Make the cwd look TS-heavy -- if the weight kicked in, Cursor would win.
+    (tmp_path / "src").mkdir()
+    for i in range(5):
+        (tmp_path / "src" / f"app{i}.ts").write_text("export {};\n", encoding="utf-8")
+
+    with (
+        patch.object(
+            ClaudeCodeAdapter,
+            "healthcheck",
+            AsyncMock(return_value=(True, "ok")),
+        ),
+        patch.object(
+            CursorAdapter,
+            "healthcheck",
+            AsyncMock(return_value=(True, "ok")),
+        ),
+    ):
+        name = await detect_platform("auto", cwd=tmp_path)
+    assert name == "claude_code"
+
+
+@pytest.mark.asyncio
+async def test_lang_weight_one_picks_by_fitness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """``AUTODEV_LANG_WEIGHT=1.0`` picks the higher-fitness adapter."""
+    monkeypatch.delenv("AUTODEV_PLATFORM", raising=False)
+    monkeypatch.setenv("AUTODEV_LANG_WEIGHT", "1.0")
+    # TS-heavy cwd -> Cursor wins (95) vs Claude (85).
+    (tmp_path / "src").mkdir()
+    for i in range(5):
+        (tmp_path / "src" / f"app{i}.ts").write_text("export {};\n", encoding="utf-8")
+
+    with (
+        patch.object(
+            ClaudeCodeAdapter,
+            "healthcheck",
+            AsyncMock(return_value=(True, "ok")),
+        ),
+        patch.object(
+            CursorAdapter,
+            "healthcheck",
+            AsyncMock(return_value=(True, "ok")),
+        ),
+    ):
+        name = await detect_platform("auto", cwd=tmp_path)
+    assert name == "cursor"
+
+
+@pytest.mark.asyncio
+async def test_explicit_platform_skips_fitness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """An explicit ``preferred`` platform bypasses the fitness machinery."""
+    monkeypatch.delenv("AUTODEV_PLATFORM", raising=False)
+    monkeypatch.setenv("AUTODEV_LANG_WEIGHT", "1.0")
+    # TS-heavy cwd would pick Cursor under fitness, but the operator
+    # asked for claude_code explicitly -- honour that.
+    (tmp_path / "src").mkdir()
+    for i in range(5):
+        (tmp_path / "src" / f"app{i}.ts").write_text("export {};\n", encoding="utf-8")
+
+    with patch.object(
+        ClaudeCodeAdapter, "healthcheck", AsyncMock(return_value=(True, "ok"))
+    ):
+        name = await detect_platform("claude_code", cwd=tmp_path)
+    assert name == "claude_code"

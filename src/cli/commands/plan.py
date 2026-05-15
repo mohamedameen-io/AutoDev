@@ -13,6 +13,7 @@ from rich.table import Table
 from typing import Literal, cast
 
 from adapters.detect import get_adapter
+from adapters.fitness import compute_fitness_score, get_fitness_warning
 from agents import build_registry
 from autologging import get_logger
 from config.loader import load_config
@@ -101,6 +102,9 @@ def plan(intent: str, platform: str | None, complexity: str | None) -> None:
         adapter = await get_adapter(
             cast("Literal['claude_code', 'cursor', 'auto']", platform_pref)
         )
+        # v0.31.0 (Phase 5.4): emit a fitness telemetry line + warn on
+        # poor adapter/codebase fit. Best-effort.
+        _emit_fitness_signal(console, cwd, adapter)
         registry = build_registry(cfg)
         orch = Orchestrator(cwd=cwd, cfg=cfg, adapter=adapter, registry=registry)
         approved = await orch.plan(intent)
@@ -129,3 +133,32 @@ def _render_plan_summary(console: Console, plan_obj) -> None:
             )
     console.print(table)
     console.print(f"[green]Plan persisted:[/green] {plan_obj.plan_id}")
+
+
+def _emit_fitness_signal(console: Console, cwd: Path, adapter) -> None:
+    """v0.31.0 (Phase 5.4): score the adapter against the codebase.
+
+    Mirrors the helper in ``cli.commands.execute``. Prints a yellow
+    warning when score < threshold; always logs structured telemetry.
+    Best-effort: a profile/score failure never blocks planning.
+    """
+    try:
+        from runtime.language_profile import compute_language_profile
+        from autologging import get_logger
+
+        profile = compute_language_profile(cwd)
+        adapter_name = type(adapter).__name__.replace("Adapter", "").lower()
+        if adapter_name == "claudecode":
+            adapter_name = "claude_code"
+        score = compute_fitness_score(adapter_name, profile)
+        warn = get_fitness_warning(adapter_name, profile)
+        get_logger(component="adapter.fitness").info(
+            "adapter.fitness",
+            adapter=adapter_name,
+            score=score,
+            profile=profile,
+        )
+        if warn is not None:
+            console.print(f"[yellow]{warn}[/yellow]")
+    except Exception:  # noqa: BLE001 - signal is informational
+        pass
