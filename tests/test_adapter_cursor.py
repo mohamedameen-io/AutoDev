@@ -511,3 +511,193 @@ def test_usage_limit_subtype_feeds_circuit_breaker() -> None:
     halt, reason = cb.should_halt()
     assert halt is True
     assert reason is not None
+
+
+# ---------------------------------------------------------------------------
+# v0.31.0 (Phase 2.1 / 2.2 / 2.3): adapter parity hardening — CancelledError
+# kill, failure-transcript dumps, binary unavailability cache.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancellederror_kills_subprocess(tmp_path: Path) -> None:
+    """When the parent task is cancelled mid-``communicate()``, the cursor
+    subprocess MUST be killed before the CancelledError propagates."""
+    adapter = CursorAdapter(binaries=("cursor",))
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path)
+
+    kill_calls: list[None] = []
+
+    async def _hang_communicate(*_a, **_kw):
+        await asyncio.sleep(3600)
+
+    proc = AsyncMock()
+    proc.returncode = None
+    proc.communicate = _hang_communicate
+    proc.wait = AsyncMock(return_value=0)
+    proc.kill = lambda: kill_calls.append(None)
+
+    with patch(
+        "adapters.cursor.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=proc),
+    ):
+        task = asyncio.create_task(adapter.execute(inv))
+        # Yield so the task starts and reaches the await.
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert kill_calls, "proc.kill() was not called on CancelledError"
+
+
+@pytest.mark.asyncio
+async def test_cancellederror_in_healthcheck_kills_subprocess() -> None:
+    """Same kill-on-cancel guarantee for the healthcheck --version probe."""
+    adapter = CursorAdapter(binaries=("cursor",))
+
+    kill_calls: list[None] = []
+
+    async def _hang_communicate(*_a, **_kw):
+        await asyncio.sleep(3600)
+
+    proc = AsyncMock()
+    proc.returncode = None
+    proc.communicate = _hang_communicate
+    proc.wait = AsyncMock(return_value=0)
+    proc.kill = lambda: kill_calls.append(None)
+
+    with patch(
+        "adapters.cursor.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=proc),
+    ):
+        task = asyncio.create_task(adapter.healthcheck())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert kill_calls, "proc.kill() was not called on healthcheck cancel"
+
+
+@pytest.mark.asyncio
+async def test_failure_transcript_dumped_on_nonzero_exit(tmp_path: Path) -> None:
+    """A non-zero exit must produce a forensic dump under ``.autodev/debug/``."""
+    adapter = CursorAdapter(binaries=("cursor",))
+    inv = AgentInvocation(role="developer", prompt="p", cwd=tmp_path)
+    fake = _fake_proc(stdout="", stderr="not logged in", returncode=3)
+    with patch(
+        "adapters.cursor.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+
+    assert result.success is False
+    debug_dir = tmp_path / ".autodev" / "debug"
+    assert debug_dir.exists(), "debug dir was not created"
+    files = list(debug_dir.iterdir())
+    assert len(files) == 1, f"expected exactly one dump, got {files}"
+    assert files[0].name.startswith("developer-")
+    body = files[0].read_text(encoding="utf-8")
+    assert "== meta ==" in body
+    assert "not logged in" in body
+    assert "returncode: 3" in body
+
+
+@pytest.mark.asyncio
+async def test_failure_transcript_not_dumped_during_downshift_retry(
+    tmp_path: Path,
+) -> None:
+    """A rate-limit signal that gets downshifted-and-recovered MUST NOT
+    produce a debug dump — the first attempt is not a terminal failure."""
+    adapter = CursorAdapter(binaries=("cursor",))
+    inv = AgentInvocation(
+        role="developer", prompt="hi", cwd=tmp_path, model="sonnet"
+    )
+
+    fake_limit = _fake_proc(
+        stdout="", stderr="usage limit reached", returncode=1
+    )
+    fake_ok = _fake_proc(stdout=_good_cursor_blob("OK"), returncode=0)
+    spawn = AsyncMock(side_effect=[fake_limit, fake_ok])
+    with patch(
+        "adapters.cursor.asyncio.create_subprocess_exec",
+        spawn,
+    ):
+        result = await adapter.execute(inv)
+
+    assert result.success is True
+    debug_dir = tmp_path / ".autodev" / "debug"
+    # Either the directory was never created, or it was created and is empty.
+    if debug_dir.exists():
+        assert list(debug_dir.iterdir()) == [], (
+            "downshift-recovered call must not write a debug dump"
+        )
+
+
+@pytest.mark.asyncio
+async def test_failure_transcript_dumped_when_downshift_also_fails(
+    tmp_path: Path,
+) -> None:
+    """Counterpart to the above: when the downshift retry ALSO hits a
+    limit, the call IS terminal and MUST dump."""
+    adapter = CursorAdapter(binaries=("cursor",))
+    inv = AgentInvocation(
+        role="developer", prompt="hi", cwd=tmp_path, model="sonnet"
+    )
+    fake_limit_1 = _fake_proc(
+        stdout="", stderr="usage limit reached", returncode=1
+    )
+    fake_limit_2 = _fake_proc(
+        stdout="", stderr="usage limit reached again", returncode=1
+    )
+    spawn = AsyncMock(side_effect=[fake_limit_1, fake_limit_2])
+    with patch(
+        "adapters.cursor.asyncio.create_subprocess_exec",
+        spawn,
+    ):
+        result = await adapter.execute(inv)
+
+    assert result.success is False
+    debug_dir = tmp_path / ".autodev" / "debug"
+    assert debug_dir.exists()
+    files = list(debug_dir.iterdir())
+    assert len(files) >= 1
+
+
+@pytest.mark.asyncio
+async def test_unavailable_binary_not_re_probed_during_downshift(
+    tmp_path: Path,
+) -> None:
+    """If a binary FileNotFoundError'd on the first attempt, the
+    downshift retry must not re-probe it (Phase 2.3)."""
+    adapter = CursorAdapter(binaries=("cursor", "cursor-agent"))
+    inv = AgentInvocation(
+        role="developer", prompt="hi", cwd=tmp_path, model="sonnet"
+    )
+
+    # Sequence:
+    #  1. ``cursor`` -> FileNotFoundError
+    #  2. ``cursor-agent`` -> usage limit (returncode=1)
+    #  3. downshift retry: must NOT re-probe ``cursor``; must go directly
+    #     to ``cursor-agent``, which now succeeds.
+    fake_limit = _fake_proc(
+        stdout="", stderr="usage limit reached", returncode=1
+    )
+    fake_ok = _fake_proc(stdout=_good_cursor_blob("OK"), returncode=0)
+    spawn = AsyncMock(
+        side_effect=[FileNotFoundError("no cursor"), fake_limit, fake_ok]
+    )
+    with patch(
+        "adapters.cursor.asyncio.create_subprocess_exec",
+        spawn,
+    ):
+        result = await adapter.execute(inv)
+
+    assert result.success is True
+    # 3 spawn calls total: missing cursor, cursor-agent (limit),
+    # cursor-agent (downshift). NOT 4 — the missing ``cursor`` must
+    # not be re-probed.
+    assert spawn.call_count == 3
+    third = spawn.call_args_list[2].args
+    assert third[0] == "cursor-agent"

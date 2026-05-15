@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import os
 import time
@@ -14,6 +15,7 @@ from adapters.base import PlatformAdapter
 from adapters.git_utils import _diff_files, _git_diff, _git_porcelain_set
 from adapters.types import AgentInvocation, AgentResult, AgentSpec
 from autologging import get_logger
+from state.paths import debug_dir
 
 logger = get_logger(__name__)
 
@@ -214,6 +216,16 @@ class CursorAdapter(PlatformAdapter):
 
         last_err: str | None = None
 
+        # v0.31.0 (Phase 2.3): track binaries that have already failed
+        # ``FileNotFoundError`` within THIS execute() call. There is no
+        # point retrying a missing binary across the inner downshift
+        # loop — the filesystem state isn't going to change between
+        # attempts. Per-process binary-availability caching (across
+        # calls) is structurally invasive (would need a class-level
+        # cache + invalidation hooks) and is deferred — see
+        # ``docs/critical_analysis/`` Phase 2.3 follow-up.
+        unavailable_binaries: set[str] = set()
+
         # v0.31.0 (Phase 2.6): unified attempt list. Each entry is a
         # ``(model, max_mode)`` pair. The first attempt mirrors the
         # caller's invocation (``inv.model``, ``inv.max_mode``); if a
@@ -237,6 +249,10 @@ class CursorAdapter(PlatformAdapter):
             )
             attempt_failure: AgentResult | None = None
             for binary in self.binaries:
+                # v0.31.0 (Phase 2.3): skip binaries that already
+                # FileNotFoundError'd in an earlier attempt of this call.
+                if binary in unavailable_binaries:
+                    continue
                 # Create new invocation with this attempt's model + max_mode.
                 # Preserve every other field on the original invocation —
                 # including ``effort`` — so the downshift retry path doesn't
@@ -271,6 +287,11 @@ class CursorAdapter(PlatformAdapter):
                         stderr=asyncio.subprocess.PIPE,
                     )
                 except FileNotFoundError as exc:
+                    # v0.31.0 (Phase 2.3): mark this binary as
+                    # unavailable for the remainder of the call so the
+                    # downshift retry doesn't re-probe a binary the
+                    # filesystem just told us is missing.
+                    unavailable_binaries.add(binary)
                     last_err = f"binary not found: {binary}: {exc}"
                     continue
 
@@ -288,17 +309,59 @@ class CursorAdapter(PlatformAdapter):
                         proc.communicate(),
                         timeout=effective_timeout_s,
                     )
+                except asyncio.CancelledError:
+                    # v0.31.0 (Phase 2.1): parent task cancelled (SIGTERM,
+                    # KeyboardInterrupt propagation, or asyncio.gather
+                    # cancel). Kill the in-flight cursor child so we don't
+                    # leak processes after the orchestrator exits — mirrors
+                    # claude_code.py:171-180. Re-raise WITHOUT iterating to
+                    # the next binary / next downshift attempt: cancellation
+                    # is terminal for this call.
+                    with suppress(ProcessLookupError):
+                        proc.kill()
+                    with suppress(Exception):
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    raise
                 except asyncio.TimeoutError:
                     with suppress(ProcessLookupError):
                         proc.kill()
                     with suppress(asyncio.TimeoutError):
                         await asyncio.wait_for(proc.wait(), timeout=5)
                     duration = time.monotonic() - start
+                    # v0.31.0 (Phase 2.2): capture forensics for every
+                    # failure mode, including timeouts. Drain whatever the
+                    # subprocess buffered before kill (best-effort, 2s cap)
+                    # so the dump captures any partial transcript.
+                    stdout_b = b""
+                    stderr_b = b""
+                    with suppress(Exception):
+                        stdout_b, stderr_b = await asyncio.wait_for(
+                            proc.communicate(), timeout=2.0
+                        )
+                    stdout = (
+                        stdout_b.decode("utf-8", errors="replace")
+                        if stdout_b
+                        else ""
+                    )
+                    stderr = (
+                        stderr_b.decode("utf-8", errors="replace")
+                        if stderr_b
+                        else ""
+                    )
+                    self._dump_failure_transcript(
+                        inv=inv,
+                        stdout=stdout,
+                        stderr=stderr,
+                        returncode=-1,  # sentinel: timeout
+                        duration=duration,
+                    )
                     return AgentResult(
                         success=False,
                         text="",
                         duration_s=duration,
                         error=f"timeout after {effective_timeout_s}s",
+                        raw_stdout=stdout,
+                        raw_stderr=stderr,
                     )
 
                 duration = time.monotonic() - start
@@ -340,6 +403,15 @@ class CursorAdapter(PlatformAdapter):
                     break
 
                 if returncode != 0:
+                    # v0.31.0 (Phase 2.2): forensics dump on every
+                    # non-zero exit (mirrors claude_code.py:290-296).
+                    self._dump_failure_transcript(
+                        inv=inv,
+                        stdout=stdout,
+                        stderr=stderr,
+                        returncode=returncode,
+                        duration=duration,
+                    )
                     return AgentResult(
                         success=False,
                         text="",
@@ -356,6 +428,16 @@ class CursorAdapter(PlatformAdapter):
                         "cursor.parse_failed",
                         err=str(exc),
                         raw_stdout=stdout[:500],
+                    )
+                    # v0.31.0 (Phase 2.2): forensics dump on parse
+                    # failure — the raw stdout is critical evidence for
+                    # diagnosing CLI shape drift.
+                    self._dump_failure_transcript(
+                        inv=inv,
+                        stdout=stdout,
+                        stderr=stderr,
+                        returncode=returncode,
+                        duration=duration,
                     )
                     return AgentResult(
                         success=False,
@@ -402,6 +484,15 @@ class CursorAdapter(PlatformAdapter):
                         env_var=_DISABLE_FALLBACK_ENV,
                         trigger_subtype=limit_subtype,
                     )
+                    # v0.31.0 (Phase 2.2): downshift is being skipped,
+                    # so this IS a terminal failure — dump forensics.
+                    self._dump_failure_transcript(
+                        inv=inv,
+                        stdout=attempt_failure.raw_stdout or "",
+                        stderr=attempt_failure.raw_stderr or "",
+                        returncode=-1,
+                        duration=attempt_failure.duration_s,
+                    )
                     return attempt_failure
 
                 already_on_floor = (model == "auto" and max_mode is False)
@@ -410,6 +501,17 @@ class CursorAdapter(PlatformAdapter):
                     # this call OR we're already at the cheapest
                     # configuration — surface the error rather than
                     # looping (Phase 2.6.4 cap).
+                    # v0.31.0 (Phase 2.2): terminal failure — dump
+                    # forensics. Note: the FIRST limit signal on the
+                    # initial attempt does NOT dump (the downshift
+                    # might still recover); only the cap-hit case does.
+                    self._dump_failure_transcript(
+                        inv=inv,
+                        stdout=attempt_failure.raw_stdout or "",
+                        stderr=attempt_failure.raw_stderr or "",
+                        returncode=-1,
+                        duration=attempt_failure.duration_s,
+                    )
                     return attempt_failure
 
                 # Append exactly one downshift attempt and continue
@@ -432,12 +534,75 @@ class CursorAdapter(PlatformAdapter):
                 continue
 
         duration = time.monotonic() - start
+        # v0.31.0 (Phase 2.2): terminal "no binary anywhere" failure —
+        # dump forensics. There is no subprocess output to capture, but
+        # the meta block (role / model / cwd / timestamp) is still
+        # diagnostic for "why did the call never reach a CLI?".
+        self._dump_failure_transcript(
+            inv=inv,
+            stdout="",
+            stderr=last_err or "no cursor binary available",
+            returncode=-1,
+            duration=duration,
+        )
         return AgentResult(
             success=False,
             text="",
             duration_s=duration,
             error=last_err or "no cursor binary available",
         )
+
+    def _dump_failure_transcript(
+        self,
+        *,
+        inv: AgentInvocation,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+        duration: float,
+    ) -> None:
+        """Best-effort: dump full subprocess context to ``.autodev/debug/``.
+
+        Mirrors :meth:`adapters.claude_code.ClaudeCodeAdapter._dump_failure_transcript`
+        line-for-line so operators see the same forensic format regardless
+        of which adapter produced the failure. Filename:
+        ``{role}-{unix_ts_ms}.txt`` — Windows-safe (no ``:``),
+        pass-num-orderable, role-grouped on ``ls``. On any OSError
+        (permission, readonly fs, etc.) we log a warning and swallow —
+        never let a debug-dump failure mask the original subprocess error.
+        """
+        try:
+            target_dir = debug_dir(inv.cwd)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            ts_ms = int(time.time() * 1000)
+            target = target_dir / f"{inv.role}-{ts_ms}.txt"
+            iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            allowed_tools_repr = (
+                ",".join(inv.allowed_tools) if inv.allowed_tools else ""
+            )
+            sections = (
+                "== meta ==\n"
+                f"role: {inv.role}\n"
+                f"model: {inv.model or ''}\n"
+                f"max_turns: {inv.max_turns}\n"
+                f"allowed_tools: {allowed_tools_repr}\n"
+                f"returncode: {returncode}\n"
+                f"duration_s: {duration:.3f}\n"
+                f"timestamp: {iso}\n"
+                "\n== prompt ==\n"
+                f"{inv.prompt}\n"
+                "\n== stdout ==\n"
+                f"{stdout}\n"
+                "\n== stderr ==\n"
+                f"{stderr}\n"
+            )
+            target.write_text(sections, encoding="utf-8")
+        except OSError as exc:
+            logger.warning(
+                "cursor.debug_dump_failed",
+                role=inv.role,
+                err=str(exc),
+            )
 
     async def healthcheck(self) -> tuple[bool, str]:
         errors: list[str] = []
@@ -457,6 +622,14 @@ class CursorAdapter(PlatformAdapter):
                     proc.communicate(),
                     timeout=5,
                 )
+            except asyncio.CancelledError:
+                # v0.31.0 (Phase 2.1): kill child on parent cancel —
+                # mirrors claude_code.py:476-482.
+                with suppress(ProcessLookupError):
+                    proc.kill()
+                with suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                raise
             except asyncio.TimeoutError:
                 with suppress(ProcessLookupError):
                     proc.kill()
