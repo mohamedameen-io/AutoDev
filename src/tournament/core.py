@@ -146,6 +146,32 @@ class TournamentConfig:
     # inflation at 800-1000 input characters; a 4000-token cap is ~4× that
     # inflection point.
     oversized_demotion_token_threshold: int = 0
+    # v0.32.0 Phase 2 (review tournament): opt-in autoreason-style
+    # reviewer pipeline. When ``review_tournament_enabled=True``, the
+    # execute-phase reviewer step swaps the legacy single-shot
+    # ``delegate(..., "reviewer", ...)`` call for an A/B/AB tournament
+    # routed through :mod:`orchestrator.review_tournament_runner`. The
+    # remaining ``review_*`` fields parameterize the loop:
+    #
+    # * ``review_num_judges``: cohort size. Default 3 mirrors the plan
+    #   tournament's standard cohort.
+    # * ``review_convergence_k``: number of consecutive A wins required
+    #   to declare "do nothing — original verdict stands". Default 2
+    #   matches the autoreason published technique (NousResearch).
+    # * ``review_max_rounds``: hard cap on rounds before escalating to
+    #   ``critic_sounding_board``. Default 5 keeps the per-task budget
+    #   bounded.
+    # * ``review_judge_roles``: optional cohort override. ``None`` (the
+    #   default) uses the standard 3-role cohort
+    #   ``["judge", "minimality_judge", "judge_explorer"]``.
+    #
+    # All five fields default to v0.31.0-equivalent behavior so legacy
+    # configs / tests behave identically until the operator opts in.
+    review_tournament_enabled: bool = False
+    review_num_judges: int = 3
+    review_convergence_k: int = 2
+    review_max_rounds: int = 5
+    review_judge_roles: list[str] | None = None
 
 
 class PassResult(BaseModel):

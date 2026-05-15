@@ -364,6 +364,22 @@ class TournamentsConfig(BaseModel):
     # into every per-tournament slot whose own value is ``None``.
     auto_disable_for_models: list[str] = Field(default_factory=list)
 
+    # v0.32.0 Phase 2: opt-in autoreason-style A/B/AB review pipeline.
+    # When ``review_tournament_enabled=True``, the execute-phase reviewer
+    # step swaps the legacy single-shot ``delegate(..., "reviewer", ...)``
+    # call for an A/B/AB tournament routed through
+    # :mod:`orchestrator.review_tournament_runner`. Default ``False``
+    # because v0.32.0 ships the feature opt-in for one cycle (real-world
+    # telemetry needed before flipping the default in v0.33.0). The
+    # remaining knobs are intentionally minimal — most operators won't
+    # touch them; the cohort + convergence defaults match the published
+    # autoreason technique.
+    review_tournament_enabled: bool = False
+    review_num_judges: int = 3
+    review_convergence_k: int = 2
+    review_max_rounds: int = 5
+    review_judge_roles: list[str] | None = None
+
     @model_validator(mode="after")
     def _resolve_auto_disable(self) -> "TournamentsConfig":
         """v0.25.3: resolve each per-tournament ``auto_disable_for_models``.
