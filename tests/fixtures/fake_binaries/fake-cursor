@@ -56,6 +56,13 @@ case "${AUTODEV_FAKE_FAILURE_MODE:-}" in
     echo '{"error":"usage limit reached"}' >&2
     exit 1
     ;;
+  is_error_true_with_empty_result)
+    # v0.31.1 Phase 0 regression: rc=0, JSON parses, ``is_error: true`` AND
+    # ``result: ""``. The empty-dump predicate must fire on this shape; if
+    # it skips because ``is_error`` is truthy, the v0.31.0 bug is back.
+    printf '{"is_error":true,"result":"","thread_id":"fake-thread"}\n'
+    exit 0
+    ;;
 esac
 
 # --- canned response lookup ---------------------------------------------------

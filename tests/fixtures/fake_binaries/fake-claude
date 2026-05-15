@@ -30,12 +30,29 @@ if [[ -z "$prompt" ]] && [[ ! -t 0 ]]; then
 fi
 
 # --- failure mode short-circuits ---------------------------------------------
+# Some modes use a per-process state file so the fake can return DIFFERENT
+# output across consecutive invocations (e.g. simulating an architect that
+# keeps proposing the same rejected path on attempts 1, 2, 3).
+_attempt_file="${AUTODEV_FAKE_RESPONSE_DIR:-/tmp}/.attempt_count"
+_bump_attempt() {
+  local n=0
+  if [[ -f "$_attempt_file" ]]; then
+    n="$(cat "$_attempt_file")"
+  fi
+  n=$((n + 1))
+  printf '%s' "$n" > "$_attempt_file"
+  printf '%s' "$n"
+}
+
 case "${AUTODEV_FAKE_FAILURE_MODE:-}" in
   error_max_turns)
     printf '{"is_error":true,"subtype":"error_max_turns","result":"max turns reached"}\n'
     exit 1
     ;;
-  empty_result)
+  empty_result|reviewer_returns_empty_silently)
+    # ``reviewer_returns_empty_silently`` is an alias for ``empty_result`` so
+    # the test name reads as the scenario it asserts (a reviewer that says
+    # nothing while claiming success).
     printf '{"result":""}\n'
     exit 0
     ;;
@@ -46,6 +63,25 @@ case "${AUTODEV_FAKE_FAILURE_MODE:-}" in
   nonzero_exit)
     echo "fake-claude: synthetic failure" >&2
     exit 3
+    ;;
+  architect_rejected_paths_1|architect_rejected_paths_2|architect_rejected_paths_3)
+    # Returns a plan referencing paths the path validator will reject. The
+    # numeric suffix is the maximum attempt count we expect the test to
+    # drive — useful when the harness wants to know how many architect
+    # retries occurred. We bump an attempt counter so each invocation is
+    # observably distinct (the architect "re-proposes the same rejected
+    # path" but the fake still differentiates retries via the counter).
+    _n=$(_bump_attempt)
+    printf '{"result":"# Plan\\n\\n## Phase 1\\n\\nEdit `/etc/hosts` (attempt %s) and `../../../outside-repo.py`.\\n","model":"claude-haiku","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":50}}\n' "$_n"
+    exit 0
+    ;;
+  repetition_loop)
+    # Returns IDENTICAL output regardless of prompt or attempt. The
+    # attempt counter is bumped only so external observers can confirm
+    # the fake fired multiple times.
+    _bump_attempt >/dev/null
+    printf '{"result":"REPEATED_OUTPUT","model":"claude-haiku","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}\n'
+    exit 0
     ;;
 esac
 
