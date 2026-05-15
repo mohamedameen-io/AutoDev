@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Fake `cursor` / `cursor-agent` binary for E2E tests.
+# Protocol: see ./README.md
+set -u
+
+# --- swallow leading `agent` subcommand --------------------------------------
+if [[ "${1:-}" == "agent" ]]; then
+  shift
+fi
+
+# --- collect prompt + flags ---------------------------------------------------
+prompt=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --print|--force)
+      shift
+      ;;
+    --output-format|--model)
+      shift 2
+      ;;
+    --version)
+      echo "fake-cursor 0.0.0"
+      exit 0
+      ;;
+    -*)
+      shift
+      ;;
+    *)
+      # First non-flag positional is the prompt.
+      if [[ -z "$prompt" ]]; then
+        prompt="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+if [[ -z "$prompt" ]] && [[ ! -t 0 ]]; then
+  prompt="$(cat)"
+fi
+
+# --- failure mode short-circuits ---------------------------------------------
+case "${AUTODEV_FAKE_FAILURE_MODE:-}" in
+  empty_result)
+    printf '{"result":"","thread_id":"fake-thread","is_error":false}\n'
+    exit 0
+    ;;
+  timeout)
+    sleep 30
+    exit 0
+    ;;
+  nonzero_exit)
+    echo "fake-cursor: synthetic failure" >&2
+    exit 3
+    ;;
+  usage_limit)
+    echo '{"error":"usage limit reached"}' >&2
+    exit 1
+    ;;
+esac
+
+# --- canned response lookup ---------------------------------------------------
+hash=""
+if command -v md5sum >/dev/null 2>&1; then
+  hash="$(printf '%s' "$prompt" | md5sum | awk '{print $1}')"
+elif command -v md5 >/dev/null 2>&1; then
+  hash="$(printf '%s' "$prompt" | md5 -q)"
+fi
+canned="${AUTODEV_FAKE_RESPONSE_DIR:-}/response_${hash}.json"
+if [[ -n "$hash" && -f "$canned" ]]; then
+  cat "$canned"
+  exit 0
+fi
+
+# --- default success ----------------------------------------------------------
+printf '{"result":"[fake-cursor] default","thread_id":"fake-thread","is_error":false}\n'
+exit 0
