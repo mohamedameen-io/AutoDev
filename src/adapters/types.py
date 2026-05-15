@@ -60,6 +60,18 @@ class AgentInvocation(BaseModel):
     # no Claude Code analogue. See ``CursorAdapter._max_mode_flag_for``
     # for the current mapping.
     max_mode: bool | None = None
+    # v0.31.0 (Phase 1.4): hint for the maximum number of OUTPUT tokens
+    # the adapter should request from the underlying model. ``None`` =
+    # adapter inherits the CLI / account default. Plumbed through both
+    # adapters as advisory metadata today — neither the
+    # ``claude -p`` nor the ``cursor agent`` CLI exposes a public
+    # ``--max-output-tokens`` flag at the time of writing, so adapters
+    # log the field but cannot enforce it. The orchestrator passes a
+    # non-``None`` value (default 4096) for the reviewer call so the
+    # plumbing is in place the moment a CLI flag becomes available.
+    # See plan: Phase 1.4, "Pass an explicit max_tokens of at least
+    # 4096 to the reviewer call."
+    output_token_budget: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

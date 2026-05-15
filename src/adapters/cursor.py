@@ -147,6 +147,17 @@ def _fallback_disabled() -> bool:
     return os.environ.get(_DISABLE_FALLBACK_ENV, "") == "1"
 
 
+# v0.31.0 (Phase 1.1): mirror of the claude_code adapter switch. Default
+# ``"1"`` (on) so empty-result happy paths leave a forensic artifact on
+# disk. Set ``AUTODEV_DEBUG_RAW_RESPONSES=0`` to disable. Both adapters
+# read the same env var so operators have one knob, not two.
+_RAW_RESPONSE_DUMP_ENV = "AUTODEV_DEBUG_RAW_RESPONSES"
+
+
+def _raw_response_dump_enabled() -> bool:
+    return os.environ.get(_RAW_RESPONSE_DUMP_ENV, "1") != "0"
+
+
 class CursorAdapter(PlatformAdapter):
     """Adapter backed by the `cursor agent --print` or `cursor-agent` binary."""
 
@@ -269,6 +280,12 @@ class CursorAdapter(PlatformAdapter):
                     max_turns=inv.max_turns,
                     effort=inv.effort,
                     max_mode=max_mode,
+                    # v0.31.0 (Phase 1.4): preserve the output-token
+                    # hint across the downshift retry so the reviewer
+                    # call doesn't silently revert to CLI default
+                    # mid-loop. Cursor adapter ignores the field today
+                    # (no public flag) — see ``AgentInvocation`` docstring.
+                    output_token_budget=inv.output_token_budget,
                 )
                 cmd = self._build_command(binary, inv_with_attempt)
                 logger.info(
@@ -451,6 +468,31 @@ class CursorAdapter(PlatformAdapter):
                 text = _extract_text(parsed)
                 is_error = bool(parsed.get("is_error", False))
 
+                # v0.31.0 (Phase 1.1): empty-result happy-path dump.
+                # Same logic as claude_code adapter — the CLI exited 0 +
+                # produced parseable JSON, but every text-bearing field
+                # is empty. Persist a forensic artifact under
+                # ``.autodev/debug/<role>-<ts>-empty.json`` and surface
+                # the call as a typed failure so the orchestrator's
+                # retry / escalate FSM kicks in instead of the silent
+                # soft-block on ``["empty reviewer response"]``.
+                if not is_error and not text.strip():
+                    if _raw_response_dump_enabled():
+                        self._dump_empty_result(
+                            inv=inv,
+                            stdout=stdout,
+                            stderr=stderr,
+                            duration=duration,
+                        )
+                    return AgentResult(
+                        success=False,
+                        text="",
+                        duration_s=duration,
+                        error="empty result from CLI",
+                        raw_stdout=stdout,
+                        raw_stderr=stderr,
+                    )
+
                 files_after = _git_porcelain_set(inv.cwd)
                 files_changed = _diff_files(files_before, files_after)
                 diff = _git_diff(inv.cwd) if files_changed else None
@@ -600,6 +642,53 @@ class CursorAdapter(PlatformAdapter):
         except OSError as exc:
             logger.warning(
                 "cursor.debug_dump_failed",
+                role=inv.role,
+                err=str(exc),
+            )
+
+    def _dump_empty_result(
+        self,
+        *,
+        inv: AgentInvocation,
+        stdout: str,
+        stderr: str,
+        duration: float,
+    ) -> None:
+        """v0.31.0 (Phase 1.1): empty-result dump for the Cursor adapter.
+
+        Mirrors :meth:`adapters.claude_code.ClaudeCodeAdapter._dump_empty_result`
+        line-for-line so operators see one consistent forensic format
+        regardless of which adapter produced the empty happy-path
+        result. See that docstring for the full rationale. Best-effort —
+        any OSError is logged and swallowed.
+        """
+        try:
+            target_dir = debug_dir(inv.cwd)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            ts_ms = int(time.time() * 1000)
+            target = target_dir / f"{inv.role}-{ts_ms}-empty.json"
+            iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            payload = {
+                "note": (
+                    "empty result on happy path; investigate prompt size, "
+                    "max_tokens, structured-output schema"
+                ),
+                "role": inv.role,
+                "model": inv.model or "",
+                "max_turns": inv.max_turns,
+                "prompt_size_bytes": len(inv.prompt.encode("utf-8")),
+                "duration_s": round(duration, 3),
+                "timestamp": iso,
+                "raw_stdout": stdout,
+                "raw_stderr": stderr,
+            }
+            target.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning(
+                "cursor.empty_result_dump_failed",
                 role=inv.role,
                 err=str(exc),
             )

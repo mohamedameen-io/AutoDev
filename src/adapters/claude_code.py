@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import json
+import os
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -22,6 +23,20 @@ from autologging import get_logger
 from state.paths import debug_dir
 
 logger = get_logger(__name__)
+
+
+# v0.31.0 (Phase 1.1): operator switch for the empty-result happy-path
+# debug dump. Default ``"1"`` (on) so the next occurrence of the
+# "empty reviewer response" failure mode is self-diagnosing — the file
+# under ``.autodev/debug/<role>-<ts>-empty.json`` carries the full
+# stdout/stderr + invocation context the orchestrator otherwise discards.
+# Set ``AUTODEV_DEBUG_RAW_RESPONSES=0`` to disable (e.g. if disk-write
+# overhead becomes an operational concern in long runs).
+_RAW_RESPONSE_DUMP_ENV = "AUTODEV_DEBUG_RAW_RESPONSES"
+
+
+def _raw_response_dump_enabled() -> bool:
+    return os.environ.get(_RAW_RESPONSE_DUMP_ENV, "1") != "0"
 
 
 def _api_status_to_subtype(status: int | str) -> str | None:
@@ -324,6 +339,33 @@ class ClaudeCodeAdapter(PlatformAdapter):
 
         text = str(parsed.get("result", ""))
         is_error = bool(parsed.get("is_error", False))
+
+        # v0.31.0 (Phase 1.1): empty-result happy-path dump. The CLI
+        # exited 0 and produced parseable JSON, but ``result`` is empty
+        # (or whitespace). Without this branch the orchestrator soft-
+        # blocks the task with ``["empty reviewer response"]`` and there
+        # is no on-disk artifact to diagnose root cause (Hypothesis A:
+        # max_tokens; B: parser swallowed prose; C: schema rejected
+        # envelope). Dump full stdout/stderr + invocation context, then
+        # return a failure-flagged result so downstream retry / escalate
+        # logic kicks in. Gated by ``AUTODEV_DEBUG_RAW_RESPONSES``.
+        if not is_error and not text.strip():
+            if _raw_response_dump_enabled():
+                self._dump_empty_result(
+                    inv=inv,
+                    stdout=stdout,
+                    stderr=stderr,
+                    duration=duration,
+                )
+            return AgentResult(
+                success=False,
+                text="",
+                duration_s=duration,
+                error="empty result from CLI",
+                raw_stdout=stdout,
+                raw_stderr=stderr,
+                subtype=str(parsed.get("subtype") or "") or None,
+            )
         # Surface the CLI's ``subtype`` field on the result so the tournament
         # retry layer can short-circuit deterministic failures (e.g.
         # ``error_max_turns``). Empty / missing → None.
@@ -436,6 +478,55 @@ class ClaudeCodeAdapter(PlatformAdapter):
         except OSError as exc:
             logger.warning(
                 "claude_code.debug_dump_failed",
+                role=inv.role,
+                err=str(exc),
+            )
+
+    def _dump_empty_result(
+        self,
+        *,
+        inv: AgentInvocation,
+        stdout: str,
+        stderr: str,
+        duration: float,
+    ) -> None:
+        """v0.31.0 (Phase 1.1): dump full context for an empty-result happy
+        path to ``.autodev/debug/{role}-{ts}-empty.json``.
+
+        Distinct from :meth:`_dump_failure_transcript` (txt format, fired on
+        rc!=0 / timeout) so operators can ``ls .autodev/debug/*-empty.json``
+        to count occurrences of this specific failure mode without grepping
+        through transcripts. Best-effort: any OSError is logged and
+        swallowed — never let a debug-dump failure mask the empty-result
+        signal the caller already converted into a soft block upstream.
+        """
+        try:
+            target_dir = debug_dir(inv.cwd)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            ts_ms = int(time.time() * 1000)
+            target = target_dir / f"{inv.role}-{ts_ms}-empty.json"
+            iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            payload = {
+                "note": (
+                    "empty result on happy path; investigate prompt size, "
+                    "max_tokens, structured-output schema"
+                ),
+                "role": inv.role,
+                "model": inv.model or "",
+                "max_turns": inv.max_turns,
+                "prompt_size_bytes": len(inv.prompt.encode("utf-8")),
+                "duration_s": round(duration, 3),
+                "timestamp": iso,
+                "raw_stdout": stdout,
+                "raw_stderr": stderr,
+            }
+            target.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning(
+                "claude_code.empty_result_dump_failed",
                 role=inv.role,
                 err=str(exc),
             )
