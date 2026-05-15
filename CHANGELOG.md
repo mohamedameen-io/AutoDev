@@ -2,6 +2,40 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.1] - 2026-05-15
+
+Hot-patch fixing the dominant production failure mode that v0.31.0's
+own Phase 1.1 instrumentation was supposed to catch but silently
+skipped.
+
+### Fixed
+- `src/adapters/claude_code.py:352` and `src/adapters/cursor.py:479`:
+  the empty-result `*-empty.json` debug dump no longer requires
+  `is_error == False`. The v0.31.0 predicate
+  `if not is_error and not text.strip(): _dump_empty_result(...)`
+  silently skipped the dump whenever the CLI emitted `is_error=true`
+  alongside an empty `result` — exactly the transport-layer failure
+  shape (timeouts, rate-limited responses with empty bodies, max-
+  tokens exhaustion) the dump was built to capture. Empty text is the
+  machinery-failure signal; `is_error` is orthogonal to whether we
+  should record the forensic dump. The orchestrator still classifies
+  `is_error=true` correctly for control flow downstream.
+
+### Tests added
+- `tests/test_adapter_empty_result_dump.py::test_claude_empty_result_with_is_error_true_still_dumps`
+- `tests/test_adapter_empty_result_dump.py::test_cursor_empty_result_with_is_error_true_still_dumps`
+- These would have failed pre-fix; they are the lock that keeps
+  Phase 1.1 actually working on the transport-failure path.
+
+### Why this matters
+A fresh production run on v0.31.0 surfaced a `MALFORMED` reviewer
+verdict (Phase 1.3 working as designed) but produced zero
+`*-empty.json` dumps in `.autodev/debug/` — the very forensic
+artefact that lets us diagnose the root cause. Without those dumps
+the next layer of investigation would have been impossible. This
+hot-patch restores the invariant that every empty-result event
+leaves a forensic trail.
+
 ## [0.31.0] - 2026-05-15
 
 Hardening release. Closes the dominant production failure mode (reviewer
