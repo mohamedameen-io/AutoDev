@@ -1,0 +1,8 @@
+{
+  "language": "go",
+  "difficulty": "medium",
+  "expected_minutes": 6,
+  "license": "MIT",
+  "origin": "synthetic",
+  "description": "Add defer file.Close() so readLines() does not leak file descriptors."
+}

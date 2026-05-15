@@ -1,0 +1,15 @@
+--- a/index.js	2026-05-16 00:59:12
++++ b/index.js	2026-05-16 00:59:12
+@@ -4,9 +4,11 @@
+   return null;
+ }
+ 
+-// Bug: dereferences `user` even when getUserFromDb returns null.
+ function getUserById(id) {
+   const user = getUserFromDb(id);
++  if (!user) {
++    return { ok: false, status: 404, message: `user ${id} not found` };
++  }
+   return { ok: true, user: { id: user.id, name: user.name } };
+ }
+ 

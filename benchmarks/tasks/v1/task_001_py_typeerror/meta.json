@@ -1,0 +1,8 @@
+{
+  "language": "python",
+  "difficulty": "easy",
+  "expected_minutes": 2,
+  "license": "MIT",
+  "origin": "synthetic",
+  "description": "Widen format_price() to accept both int and float."
+}

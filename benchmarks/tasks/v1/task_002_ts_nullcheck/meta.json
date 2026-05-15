@@ -1,0 +1,8 @@
+{
+  "language": "javascript",
+  "difficulty": "easy",
+  "expected_minutes": 3,
+  "license": "MIT",
+  "origin": "synthetic",
+  "description": "Add a null check in getUserById so missing rows return a 404 object instead of throwing."
+}

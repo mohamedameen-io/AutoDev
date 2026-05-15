@@ -1,0 +1,15 @@
+--- a/main.py	2026-05-16 00:58:47
++++ b/main.py	2026-05-16 00:58:47
+@@ -1,6 +1,7 @@
+-def format_price(amount: int) -> str:
+-    # Bug: this guard rejects floats with a TypeError, but the spec says
+-    # we should accept both int and float.
+-    if not isinstance(amount, int):
+-        raise TypeError(f"format_price expects int, got {type(amount).__name__}")
++from typing import Union
++
++
++def format_price(amount: Union[int, float]) -> str:
++    if not isinstance(amount, (int, float)):
++        raise TypeError(f"format_price expects int or float, got {type(amount).__name__}")
+     return f"${amount:.2f}"

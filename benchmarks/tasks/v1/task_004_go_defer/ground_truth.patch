@@ -1,0 +1,16 @@
+--- a/lines.go	2026-05-16 01:00:08
++++ b/lines.go	2026-05-16 01:00:08
+@@ -6,12 +6,12 @@
+ )
+ 
+ // readLines opens the file at `path` and returns its lines.
+-// Bug: never closes the file handle, so callers leak fds.
+ func readLines(path string) ([]string, error) {
+ 	file, err := os.Open(path)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	defer file.Close()
+ 
+ 	var lines []string
+ 	scanner := bufio.NewScanner(file)

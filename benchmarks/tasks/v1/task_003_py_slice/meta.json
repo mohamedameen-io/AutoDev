@@ -1,0 +1,8 @@
+{
+  "language": "python",
+  "difficulty": "easy",
+  "expected_minutes": 4,
+  "license": "MIT",
+  "origin": "synthetic",
+  "description": "Fix off-by-one: the header is consumed twice (next() + [1:] slice)."
+}
