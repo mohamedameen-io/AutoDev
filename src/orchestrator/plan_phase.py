@@ -169,13 +169,23 @@ def _build_retry_env(
     from orchestrator.path_validator import PathValidationError
     from orchestrator.retry_envelope import PriorError, TypedRetryEnvelope
 
+    prior_errors = [
+        PriorError(raw=r, reason=s, count=n)
+        for (r, s), n in errors_seen.items()
+    ]
+    # v0.32.0 Phase 1.1: highlight the top-5 most-recurrent failures
+    # so the architect-prompt's `{rejection_history}` block calls them
+    # out explicitly instead of burying them in the prior_errors list.
+    # Sort descending by count, ties broken by raw string for stable
+    # rendering across attempts.
+    most_recent_failures = sorted(
+        prior_errors, key=lambda e: (-e.count, e.raw)
+    )[:5]
     envelope = TypedRetryEnvelope(
         prior_attempt=prior_plan_md[:2000] if prior_plan_md else "",
         parse_error=str(exc) if exc is not None else "",
-        prior_errors=[
-            PriorError(raw=r, reason=s, count=n)
-            for (r, s), n in errors_seen.items()
-        ],
+        prior_errors=prior_errors,
+        most_recent_failures=most_recent_failures,
         dropped_entries=list(dropped_entries),
         hint=_retry_hint_text(),
         path_error_raw=exc.raw if isinstance(exc, PathValidationError) else "",
@@ -651,12 +661,31 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         errors_seen: dict[tuple[str, str], int] = {}
         dropped_entries: list[str] = []
         last_exc: Exception | None = None
+        # v0.32.0 Phase 1.4: track the parsed plan from the most
+        # recent attempt that PARSED but failed validation, plus the
+        # full list of archived dumps. Recovery tier 4 needs a
+        # parsed plan to degrade scope; tier 7 needs the dump list
+        # for the forensic summary.
+        last_parsed_plan: Plan | None = None
+        archived_dumps_paths: list[str] = []
+        # v0.32.0 Phase 1.4: model override applied by tier 5 model
+        # escalation. ``None`` means "use the registry default".
+        architect_model_override: str | None = None
         architect_spec = orch.registry.get("architect")
         retry_max = (
             (architect_spec.max_turns or 5) + 2 if architect_spec else 7
         )
 
+        # v0.32.0 Phase 1.2: per-(scope_id, role) budget escalation
+        # for the architect's plan-phase scope. Mirrors the Phase 3
+        # execute-phase escalation but keyed on the literal scope
+        # ``"plan_phase"`` so a session-wide architect ladder never
+        # collides with any execute-phase task ladder.
+        _PLAN_PHASE_SCOPE = "plan_phase"
+        _budget_tracker = getattr(orch, "_budget_escalation_tracker", None)
+
         for attempt in range(_MAX_ARCHITECT_ATTEMPTS):
+            substitutions: dict[str, str] = {}
             if attempt == 0:
                 env = architect_env
                 max_turns_override: int | None = None
@@ -669,9 +698,95 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                     dropped_entries=dropped_entries,
                 )
                 max_turns_override = retry_max
+                # v0.32.0 Phase 1.1: render the architect's
+                # ``{rejection_history}`` block from the typed
+                # envelope so the architect sees its prior failures
+                # called out in the system prompt itself, not just
+                # buried in the CONTEXT block.
+                from orchestrator.retry_envelope import (  # noqa: PLC0415
+                    PriorError,
+                    TypedRetryEnvelope,
+                )
+
+                _typed = TypedRetryEnvelope(
+                    most_recent_failures=sorted(
+                        [
+                            PriorError(raw=r, reason=s, count=n)
+                            for (r, s), n in errors_seen.items()
+                        ],
+                        key=lambda e: (-e.count, e.raw),
+                    )[:5],
+                )
+                substitutions["rejection_history"] = (
+                    _typed.render_rejection_history(attempt=attempt + 1)
+                )
+
+            # v0.32.0 Phase 1.2: query the budget tracker AFTER the
+            # base ``max_turns_override`` is set so the escalation
+            # bumps the post-retry-default budget rather than the
+            # configured base. ``escalation_attempt > 0`` means the
+            # prior call returned ``error_max_turns`` and we now apply
+            # the 1.5×/2.0× curve. The breadcrumb is emitted before
+            # the dispatch so post-mortems can correlate.
+            if _budget_tracker is not None:
+                _esc_attempt = _budget_tracker.current_attempt(
+                    _PLAN_PHASE_SCOPE, "architect"
+                )
+                if _esc_attempt > 0:
+                    _base_max = max_turns_override or (
+                        (architect_spec.max_turns or 5) if architect_spec else 5
+                    )
+                    _new_max, _ = _budget_tracker.escalate_for(
+                        _PLAN_PHASE_SCOPE,
+                        "architect",
+                        base_max_turns=_base_max,
+                    )
+                    if _new_max != _base_max:
+                        try:
+                            await orch.plan_manager.ledger_append(
+                                op="plan_phase_budget_escalation",
+                                payload={
+                                    "from_max_turns": _base_max,
+                                    "to_max_turns": _new_max,
+                                    "attempt": _esc_attempt,
+                                    "reason": "architect_max_turns_recurrence",
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001 — best-effort
+                            logger.warning(
+                                "plan_phase.budget_escalation_ledger_failed",
+                                err=str(exc),
+                            )
+                        max_turns_override = _new_max
+
             architect_result = await _delegate(
-                orch, "architect", env, max_turns_override=max_turns_override
+                orch,
+                "architect",
+                env,
+                max_turns_override=max_turns_override,
+                system_prompt_substitutions=substitutions,
             )
+            # v0.32.0 Phase 1.2: feed the adapter's subtype back into
+            # the tracker so the NEXT attempt's escalation decision
+            # sees this attempt's outcome. ``error_max_turns`` and
+            # ``parse_failed`` count as escalation-worthy failures;
+            # any other subtype (success, transport-class failure)
+            # resets the counter.
+            if _budget_tracker is not None:
+                _sub = getattr(architect_result, "subtype", None)
+                if _sub == "parse_failed":
+                    # The escalator's record_failure semantics treat
+                    # any non-error_max_turns subtype as a reset, but
+                    # for the plan-phase architect we want parse
+                    # failures to count too. Fold them into the same
+                    # bucket as ``error_max_turns`` for tracking.
+                    _budget_tracker.record_failure(
+                        _PLAN_PHASE_SCOPE, "architect", "error_max_turns"
+                    )
+                else:
+                    _budget_tracker.record_failure(
+                        _PLAN_PHASE_SCOPE, "architect", _sub
+                    )
             plan_md = architect_result.text
             # Fallback: if architect wrote to a file instead of returning
             # text, try reading the plan from known file locations.
@@ -679,6 +794,10 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
 
             try:
                 plan = parse_plan_markdown(plan_md, spec_hash=spec_hash)
+                # v0.32.0 Phase 1.4: stash the parsed plan BEFORE
+                # validation so the recovery tiers can degrade scope
+                # against it even when validation rejects the run.
+                last_parsed_plan = plan
                 # v0.26.2 Phase 3: validate via the persistent-drop
                 # helper — on recurrence threshold the bad entry is
                 # dropped + a ``scope_entry_dropped`` ledger op is
@@ -701,6 +820,7 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                 last_exc = exc
                 # Phase 1a: archive the rejected markdown for diagnostics.
                 archived = _persist_failed_architect_plan(cwd, plan_md)
+                archived_dumps_paths.append(str(archived))
                 if isinstance(exc, PathValidationError):
                     key = (exc.raw, exc.reason)
                     errors_seen[key] = errors_seen.get(key, 0) + 1
@@ -737,8 +857,28 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                     max_attempts=_MAX_ARCHITECT_ATTEMPTS,
                 )
                 if attempt == _MAX_ARCHITECT_ATTEMPTS - 1:
-                    # Exhausted retries — surface the original error
-                    # so the operator can inspect the archived markdown.
+                    # v0.32.0 Phase 1.4: enter the four-tier recovery
+                    # path BEFORE re-raising. Each tier is best-effort
+                    # — when none can produce a clean plan we hard-fail
+                    # with the forensic summary as the exception body.
+                    recovered_plan = await _run_phase1_4_recovery(
+                        orch,
+                        cwd=cwd,
+                        last_parsed_plan=last_parsed_plan,
+                        errors_seen=errors_seen,
+                        archived_dumps=archived_dumps_paths,
+                        last_exc=last_exc,
+                        spec_hash=spec_hash,
+                        architect_env=architect_env,
+                        plan_md=plan_md,
+                        dropped_entries=dropped_entries,
+                        attempts=_MAX_ARCHITECT_ATTEMPTS,
+                        retry_max=retry_max,
+                    )
+                    if recovered_plan is not None:
+                        plan = recovered_plan
+                        break
+                    # Tier 7: hard-fail with forensic summary attached.
                     raise
 
         if orch.cfg.tournaments.plan.enabled:
@@ -917,12 +1057,211 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         orch.guardrails.end_task("plan")
 
 
+async def _run_phase1_4_recovery(
+    orch: "Orchestrator",
+    *,
+    cwd: Path,
+    last_parsed_plan: Plan | None,
+    errors_seen: dict[tuple[str, str], int],
+    archived_dumps: list[str],
+    last_exc: Exception | None,
+    spec_hash: str,
+    architect_env: DelegationEnvelope,
+    plan_md: str,
+    dropped_entries: list[str],
+    attempts: int,
+    retry_max: int,
+) -> Plan | None:
+    """v0.32.0 Phase 1.4: run the four recovery tiers between the
+    architect's third failure and the hard-fail re-raise.
+
+    Returns a successfully-validated :class:`Plan` when one of the
+    tiers (4 or 5) produces a clean plan; ``None`` when the caller
+    should hard-fail. Always emits the recovery_hint + forensic
+    summary onto the orchestrator's structured-log stream so the CLI
+    surfacing in Phase 5 can pick them up.
+
+    The helper is split out of the main loop so the recovery branch
+    is testable in isolation without exercising the entire architect
+    retry pipeline.
+    """
+    from orchestrator.path_validator import PathValidationError  # noqa: PLC0415
+    from orchestrator.plan_phase_recovery import (  # noqa: PLC0415
+        run_recovery_tiers,
+    )
+
+    architect_spec = orch.registry.get("architect")
+    current_model = (
+        architect_spec.model if architect_spec is not None else None
+    )
+    # Tier 5 target: the orchestrator config doesn't yet have a
+    # canonical opus pin field; hard-coding the latest opus
+    # identifier keeps the helper self-contained. When the config
+    # grows a typed ``models.opus`` field, swap this for that value.
+    opus_target = "claude-opus-4-7"
+
+    outcome = run_recovery_tiers(
+        plan=last_parsed_plan,
+        errors_seen=errors_seen,
+        archived_dumps=archived_dumps,
+        last_exception=last_exc,
+        attempts=attempts,
+        current_architect_model=current_model,
+        opus_model_id=opus_target,
+    )
+
+    # Best-effort breadcrumb so the recovery-hint surfaces in the
+    # ledger / status CLI. Failures must NOT mask the eventual
+    # hard-fail.
+    try:
+        await orch.plan_manager.ledger_append(
+            op="plan_phase_budget_escalation",
+            payload={
+                "from_max_turns": 0,
+                "to_max_turns": 0,
+                "attempt": attempts,
+                "reason": "phase1_4_recovery_entered",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "plan_phase.recovery_breadcrumb_failed", err=str(exc)
+        )
+
+    logger.warning(
+        "plan_phase.recovery_tiers_engaged",
+        recovery_hint_class=outcome.meta.get("recovery_hint_class", ""),
+        recovery_hint_action=outcome.meta.get("recovery_hint_action", ""),
+        archived_dumps=list(archived_dumps),
+        forensic_summary=outcome.forensic_summary,
+        tier4_did_degrade=outcome.degraded_plan is not None,
+        tier5_escalated_model=outcome.escalated_model,
+    )
+
+    # Tier 4 — try the degraded plan first (no extra architect call
+    # required, just re-validate).
+    if outcome.degraded_plan is not None:
+        try:
+            validated = await _validate_with_persistent_drop(
+                orch,
+                outcome.degraded_plan,
+                cwd,
+                # Fresh counters: the degraded plan is its own pass.
+                errors_seen={},
+                dropped_entries=list(dropped_entries),
+                attempt=0,
+            )
+            logger.info(
+                "plan_phase.recovery_tier4_succeeded",
+                dropped_scope_entry=outcome.dropped_scope_entry,
+            )
+            return validated
+        except (
+            PlanParseError,
+            _PYD_VAL_ERROR,
+            PathValidationError,
+        ) as exc:  # noqa: BLE001
+            logger.warning(
+                "plan_phase.recovery_tier4_failed", err=str(exc)
+            )
+            # Fall through to Tier 5.
+
+    # Tier 5 — re-prompt the architect under the bumped model. This
+    # consumes one extra dispatch beyond the standard retry budget.
+    if outcome.escalated_model is not None:
+        try:
+            env = _build_retry_env(
+                architect_env,
+                prior_plan_md=plan_md,
+                exc=last_exc,
+                errors_seen=errors_seen,
+                dropped_entries=dropped_entries,
+            )
+            # Apply the model override via a temporary registry shim:
+            # the registry is a plain dict so we mutate-and-restore
+            # to keep the override scoped to this single call.
+            original_spec = architect_spec
+            if original_spec is not None:
+                bumped_spec = original_spec.model_copy(
+                    update={"model": outcome.escalated_model}
+                )
+                orch.registry["architect"] = bumped_spec
+            try:
+                bumped_result = await _delegate(
+                    orch,
+                    "architect",
+                    env,
+                    max_turns_override=retry_max,
+                    system_prompt_substitutions={
+                        "rejection_history": "",
+                    },
+                )
+            finally:
+                if original_spec is not None:
+                    orch.registry["architect"] = original_spec
+            bumped_md = _try_read_plan_from_file(cwd, bumped_result.text)
+            bumped_plan = parse_plan_markdown(bumped_md, spec_hash=spec_hash)
+            validated = await _validate_with_persistent_drop(
+                orch,
+                bumped_plan,
+                cwd,
+                errors_seen=dict(errors_seen),
+                dropped_entries=list(dropped_entries),
+                attempt=attempts,
+            )
+            logger.info(
+                "plan_phase.recovery_tier5_succeeded",
+                escalated_model=outcome.escalated_model,
+            )
+            return validated
+        except (
+            PlanParseError,
+            _PYD_VAL_ERROR,
+            PathValidationError,
+            Exception,
+        ) as exc:  # noqa: BLE001
+            logger.warning(
+                "plan_phase.recovery_tier5_failed", err=str(exc)
+            )
+            # Fall through to Tier 6/7 (caller hard-fails).
+
+    # Tier 6 already fired (the recovery_hint was logged above); the
+    # caller (the architect-retry loop) hard-fails the plan-phase by
+    # re-raising. We attach the forensic summary onto the last
+    # exception so the operator sees both the original failure and
+    # the recovery context.
+    if last_exc is not None:
+        # Augment the exception's args with the forensic summary so
+        # the eventual ``raise`` carries it forward.
+        try:
+            last_exc.args = (
+                f"{last_exc.args[0] if last_exc.args else ''}\n\n"
+                f"{outcome.forensic_summary}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+# Module-level alias for the pydantic ValidationError to avoid
+# re-importing it inside _run_phase1_4_recovery (the import lives
+# inside run_plan_phase). Resolved lazily on first access.
+def _resolve_pyd_validation_error() -> type[BaseException]:
+    from pydantic import ValidationError as _PV  # noqa: PLC0415
+
+    return _PV
+
+
+_PYD_VAL_ERROR: type[BaseException] = _resolve_pyd_validation_error()
+
+
 async def _delegate(
     orch: "Orchestrator",
     role: str,
     envelope: DelegationEnvelope,
     *,
     max_turns_override: int | None = None,
+    system_prompt_substitutions: dict[str, str] | None = None,
 ) -> AgentResult:
     """Build an :class:`AgentInvocation` from the envelope + registry and call adapter.
 
@@ -935,11 +1274,31 @@ async def _delegate(
     shortcut on the resume path, ``write_suspend_state`` on the
     ``DelegationPendingSignal`` exit path) were removed. Every adapter
     is now a subprocess adapter.
+
+    v0.32.0 Phase 1.1: ``system_prompt_substitutions`` lets the
+    architect-retry loop interpolate ``{rejection_history}`` (and any
+    future placeholders) into the role's system prompt at call time.
+    Each ``{key}`` in ``spec.prompt`` is replaced with its mapped
+    value; missing placeholders are replaced with the empty string so
+    a never-substituted ``{rejection_history}`` doesn't leak into the
+    model's context as a literal token.
     """
     spec = orch.registry.get(role)
     if spec is None:
         raise AutodevError(f"role {role!r} not in registry")
-    parts: list[str] = [spec.prompt.strip()]
+    system_prompt = spec.prompt.strip()
+    # v0.32.0 Phase 1.1: interpolate ``{key}`` placeholders. Done with
+    # str.replace rather than str.format so prompt bodies that
+    # legitimately contain unrelated curly braces (JSON examples, code
+    # snippets, format specs) don't trip ``KeyError``.
+    substitutions = dict(system_prompt_substitutions or {})
+    # Always strip the ``{rejection_history}`` placeholder when no
+    # substitution was provided — first-attempt architect calls leave
+    # the spot blank rather than emitting the literal placeholder.
+    substitutions.setdefault("rejection_history", "")
+    for key, value in substitutions.items():
+        system_prompt = system_prompt.replace("{" + key + "}", value)
+    parts: list[str] = [system_prompt]
     block = envelope.render_as_task_message()
     parts.append("\n\n---\n")
     parts.append(block)

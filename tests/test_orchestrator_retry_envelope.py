@@ -65,9 +65,23 @@ def test_prior_errors_serialise_as_dicts() -> None:
         ],
     )
     payload = env.as_context_dict()
+    # v0.32.0 Phase 1.1: PriorError gained an optional ``suggestion``
+    # field (default empty string) so the architect can see remediation
+    # hints alongside the raw + reason. Older entries that don't set
+    # it round-trip with ``suggestion=""``.
     assert payload["prior_errors"] == [
-        {"raw": "src/foo.py", "reason": "missing_on_disk", "count": 2},
-        {"raw": "notes", "reason": "missing_on_disk", "count": 3},
+        {
+            "raw": "src/foo.py",
+            "reason": "missing_on_disk",
+            "count": 2,
+            "suggestion": "",
+        },
+        {
+            "raw": "notes",
+            "reason": "missing_on_disk",
+            "count": 3,
+            "suggestion": "",
+        },
     ]
 
 
@@ -157,8 +171,14 @@ def test_build_retry_env_with_path_validation_error() -> None:
     assert ctx["path_error_raw"] == "notes"
     assert ctx["path_error_reason"] == "missing_on_disk"
     assert ctx["path_error_suggestion"] == ""
+    # v0.32.0 Phase 1.1: PriorError gained ``suggestion`` (default "").
     assert ctx["prior_errors"] == [
-        {"raw": "notes", "reason": "missing_on_disk", "count": 2}
+        {
+            "raw": "notes",
+            "reason": "missing_on_disk",
+            "count": 2,
+            "suggestion": "",
+        }
     ]
     assert ctx["dropped_entries"] == ["prior_drop"]
     assert "no spec found" not in ctx["parse_error"].lower()

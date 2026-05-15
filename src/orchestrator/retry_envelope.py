@@ -34,11 +34,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class PriorError(BaseModel):
-    """One entry in :attr:`TypedRetryEnvelope.prior_errors`.
+    """One entry in :attr:`TypedRetryEnvelope.prior_errors` /
+    :attr:`TypedRetryEnvelope.most_recent_failures`.
 
-    Records ``(raw, reason, count)`` so the architect can see "this
-    same path failed N times — please correct it" rather than just
-    "something failed".
+    Records ``(raw, reason, count, suggestion)`` so the architect can
+    see "this same path failed N times — please correct it" rather
+    than just "something failed". ``suggestion`` is optional (empty
+    string when none) so the wire JSON shape stays uniform across
+    entries with and without a remediation hint.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -46,6 +49,7 @@ class PriorError(BaseModel):
     raw: str
     reason: str
     count: int
+    suggestion: str = ""
 
 
 class TypedRetryEnvelope(BaseModel):
@@ -74,6 +78,16 @@ class TypedRetryEnvelope(BaseModel):
     # architect prioritise repeat offenders.
     prior_errors: list[PriorError] = Field(default_factory=list)
 
+    # v0.32.0 Phase 1.1: top-N highlights of the prior_errors list,
+    # sorted by recurrence count descending. The architect.md template
+    # interpolates this into a `## PATH VALIDATION HISTORY` block so
+    # the model sees the most-recurrent failures called out rather
+    # than buried in a long context dump. Keeping it as a separate
+    # field (rather than re-sorting prior_errors at render time) lets
+    # tests assert on the rendered subset directly without coupling
+    # to the architect's prompt templating.
+    most_recent_failures: list[PriorError] = Field(default_factory=list)
+
     # Entries the orchestrator dropped from prior plan attempts via the
     # v0.26.2 persistent-failure drop mechanism. Surfacing them keeps
     # the architect aware of what's been removed so it doesn't re-emit
@@ -92,6 +106,35 @@ class TypedRetryEnvelope(BaseModel):
     path_error_raw: str = ""
     path_error_reason: str = ""
     path_error_suggestion: str = ""
+
+    def render_rejection_history(self, *, attempt: int) -> str:
+        """v0.32.0 Phase 1.1: render the architect's PATH VALIDATION HISTORY
+        block from :attr:`most_recent_failures`.
+
+        Returns the empty string when no failures have been recorded so
+        the ``{rejection_history}`` placeholder in ``architect.md``
+        renders as nothing on the first attempt (no header, no
+        whitespace turbulence).
+
+        ``attempt`` is the human-facing 1-based architect attempt
+        number — included verbatim in the header so the model sees
+        which retry it's on.
+        """
+        if not self.most_recent_failures:
+            return ""
+        lines: list[str] = [
+            f"## PATH VALIDATION HISTORY (Retry Attempt {attempt})",
+            "These paths failed in your prior attempts; do NOT propose them again:",
+        ]
+        for entry in self.most_recent_failures:
+            suggestion_part = (
+                f"; suggestion: {entry.suggestion}" if entry.suggestion else ""
+            )
+            lines.append(
+                f"- RECURRED {entry.count} times: {entry.raw} "
+                f"(reason: {entry.reason}{suggestion_part})"
+            )
+        return "\n".join(lines)
 
     def as_context_dict(self) -> dict[str, Any]:
         """Return the model as a plain ``dict[str, Any]`` for embedding
@@ -115,6 +158,12 @@ class TypedRetryEnvelope(BaseModel):
             payload.pop("path_error_raw", None)
             payload.pop("path_error_reason", None)
             payload.pop("path_error_suggestion", None)
+        # v0.32.0 Phase 1.1: ``most_recent_failures`` is rendered into
+        # the architect's prompt via :meth:`render_rejection_history`
+        # (interpolated as ``{rejection_history}`` at delegate time).
+        # Stripping it from the wire dict avoids duplicating the same
+        # data twice in the model's context window.
+        payload.pop("most_recent_failures", None)
         return payload
 
 
