@@ -378,15 +378,31 @@ class CoderEvidence(_BaseEvidence):
     output_text: str = ""
     duration_s: float = 0.0
     success: bool = True
+    # v0.31.0 (Phase 1.2): preserve the agent's raw response text even
+    # when ``output_text`` is empty / parsed-down to nothing. Lets
+    # post-mortems answer "what did the model actually return?" without
+    # having to grep ``.autodev/debug/*-empty.json`` dumps. Optional for
+    # backward compat with evidence files written before this field
+    # existed.
+    raw_response: str | None = None
 
 
 class ReviewEvidence(_BaseEvidence):
     """Artifact produced by the ``reviewer`` role."""
 
     kind: Literal["review"] = "review"
-    verdict: Literal["APPROVED", "NEEDS_CHANGES", "REJECTED"]
+    # v0.31.0 (Phase 1.3): ``MALFORMED`` is a NEW value distinct from
+    # ``NEEDS_CHANGES`` — it signals "the parser could not extract a
+    # verdict from the response", a machinery failure rather than a
+    # legitimate negative review. The orchestrator treats the two
+    # differently (NEEDS_CHANGES is a content signal that retries with
+    # the same prompt; MALFORMED is a format signal that warrants a
+    # stricter reminder + a debug dump).
+    verdict: Literal["APPROVED", "NEEDS_CHANGES", "REJECTED", "MALFORMED"]
     issues: list[str] = Field(default_factory=list)
     output_text: str = ""
+    # v0.31.0 (Phase 1.2): see ``CoderEvidence.raw_response``.
+    raw_response: str | None = None
 
 
 class TestEvidence(_BaseEvidence):
@@ -402,6 +418,8 @@ class TestEvidence(_BaseEvidence):
     total: int = 0
     output_text: str = ""
     coverage_pct: float | None = None
+    # v0.31.0 (Phase 1.2): see ``CoderEvidence.raw_response``.
+    raw_response: str | None = None
 
 
 class ExploreEvidence(_BaseEvidence):

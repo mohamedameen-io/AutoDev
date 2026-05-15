@@ -469,10 +469,12 @@ async def test_escalation_resets_per_role(tmp_path: Path) -> None:
     )
     await ep.delegate(orch, "reviewer", review_env)
 
-    # Reviewer's base max_turns is 3 (per src/config/defaults.py).
+    # Reviewer's base max_turns is 5 (per src/config/defaults.py;
+    # bumped 3 → 5 in v0.31.0 Phase 1.4 to give reviewers more
+    # headroom on non-trivial diffs).
     reviewer_call = next(c for c in adapter.calls if c.role == "reviewer")
-    # Reviewer doesn't pass ``task=`` so spec_max_turns kicks in (=3).
-    assert reviewer_call.max_turns == 3
+    # Reviewer doesn't pass ``task=`` so spec_max_turns kicks in (=5).
+    assert reviewer_call.max_turns == 5
 
 
 @pytest.mark.asyncio

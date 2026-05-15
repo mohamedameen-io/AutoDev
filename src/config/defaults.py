@@ -37,7 +37,11 @@ _AGENT_MAX_TURNS: dict[str, int] = {
     "explorer": 3,
     "domain_expert": 3,
     "developer": 10,
-    "reviewer": 3,
+    # v0.31.0 (Phase 1.4): bumped 3 → 5. Reviewers genuinely need more
+    # turns on non-trivial diffs (the prior cap was a tail contributor
+    # to Hypothesis A — empty result when the turn budget ran out
+    # before the model emitted the verdict).
+    "reviewer": 5,
     "test_engineer": 5,
     "critic_sounding_board": 3,
     "critic_drift_verifier": 3,

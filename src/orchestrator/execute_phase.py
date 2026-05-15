@@ -2857,6 +2857,9 @@ async def _execute_one(
                 output_text=developer_result.text,
                 duration_s=developer_result.duration_s,
                 success=developer_result.success,
+                # v0.31.0 (Phase 1.2): preserve raw response symmetrically
+                # with ReviewEvidence / TestEvidence.
+                raw_response=developer_result.text,
             )
             await write_evidence(orch.cwd, task.id, coder_ev)
             if developer_result.diff:
@@ -2972,11 +2975,52 @@ async def _execute_one(
             verdict, issues = _parse_review_verdict(review_result.text)
             review_ev = ReviewEvidence(
                 task_id=task.id,
-                verdict=cast("Literal['APPROVED', 'NEEDS_CHANGES', 'REJECTED']", verdict),
+                verdict=cast(
+                    "Literal['APPROVED', 'NEEDS_CHANGES', 'REJECTED', 'MALFORMED']",
+                    verdict,
+                ),
                 issues=issues,
                 output_text=review_result.text,
+                # v0.31.0 (Phase 1.2): always carry the raw model
+                # response so post-mortems can answer "what did the
+                # reviewer actually say?" without needing the
+                # ``.autodev/debug/*-empty.json`` dumps. Same string we
+                # already write to ``output_text`` today, but explicitly
+                # named so future parser changes that re-derive
+                # ``output_text`` (e.g. stripping the verdict line)
+                # don't lose the original.
+                raw_response=review_result.text,
             )
             await write_evidence(orch.cwd, task.id, review_ev)
+            # v0.31.0 (Phase 1.3): treat MALFORMED as a machinery failure
+            # rather than a content signal. For now (intermediate
+            # behaviour deferred from full orchestrator-side handling)
+            # we route MALFORMED through the same retry path as
+            # NEEDS_CHANGES but tag the reason so the ledger / logs make
+            # the distinction visible. A follow-up phase will add a
+            # stricter system-prompt prefix on retry and a
+            # MALFORMED-specific escalation ladder. See plan: Phase 1.3
+            # "If wiring the orchestrator-side MALFORMED handling is too
+            # invasive for this PR, ship the parser change + treat-as-
+            # NEEDS_CHANGES-with-warning intermediate."
+            if verdict == "MALFORMED":
+                logger.warning(
+                    "execute_phase.review_malformed",
+                    task_id=task.id,
+                    issues=issues,
+                    note=(
+                        "parser could not extract a verdict; treating as "
+                        "NEEDS_CHANGES with warning. Inspect "
+                        ".autodev/debug/*-empty.json for forensics."
+                    ),
+                )
+                task = await _try_retry_or_escalate(
+                    orch, task, retry_limit, reason="reviewer MALFORMED"
+                )
+                if task.escalated:
+                    return task
+                last_issues = issues or ["reviewer MALFORMED"]
+                continue
             if verdict in ("NEEDS_CHANGES", "REJECTED"):
                 logger.info(
                     "execute_phase.review_needs_changes",
@@ -3038,6 +3082,9 @@ async def _execute_one(
                 failed=failed,
                 total=total,
                 output_text=test_result.text,
+                # v0.31.0 (Phase 1.2): preserve raw response symmetrically
+                # with ReviewEvidence — same rationale, same field shape.
+                raw_response=test_result.text,
             )
             await write_evidence(orch.cwd, task.id, test_ev)
             if failed > 0 or not test_result.success:
@@ -3990,6 +4037,16 @@ async def delegate(
     # (evidence, ledger, guardrails) still keys off orch.cwd.
     effective_cwd = cwd_override if cwd_override is not None else orch.cwd
 
+    # v0.31.0 (Phase 1.4): per-role output-token hint. Reviewers are the
+    # most-bitten role for the empty-result failure mode (Hypothesis A);
+    # ask for a generous floor so the model has headroom to emit a full
+    # verdict + issues list. Other roles inherit ``None`` (CLI default)
+    # for now — extending the per-role table is cheap when more roles
+    # need explicit budgets.
+    _output_token_budget: int | None = None
+    if role == "reviewer":
+        _output_token_budget = 4_096
+
     inv = AgentInvocation(
         role=role,
         prompt="\n".join(parts),
@@ -3999,6 +4056,7 @@ async def delegate(
         max_turns=max_turns,
         effort=effort,
         timeout_s=timeout_s,
+        output_token_budget=_output_token_budget,
     )
 
     orch.guardrails.pre_invocation(envelope.task_id, inv)
@@ -4151,6 +4209,179 @@ def _developer_envelope(task: Task, extra_issues: list[str]) -> DelegationEnvelo
     )
 
 
+# v0.31.0 (Phase 1.4): generated / lock files that carry no review signal
+# but routinely dominate diff bytes. Skipped wholesale by the chunked
+# envelope so the per-file budget is spent on files a human reviewer
+# would actually want to see.
+_REVIEW_GENERATED_FILE_GLOBS: tuple[str, ...] = (
+    "*.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.lock",
+    "uv.lock",
+    "poetry.lock",
+    "Gemfile.lock",
+    "composer.lock",
+    "*.min.js",
+    "*.min.css",
+)
+# Soft byte caps — not hard limits, the chunker rounds at file boundaries.
+_REVIEW_PER_FILE_FULL_BYTES = 2_048  # files ≤ this size pass through whole.
+_REVIEW_PER_FILE_HEAD_BYTES = 1_024  # head slice for oversize files.
+_REVIEW_PER_FILE_TAIL_BYTES = 512  # tail slice for oversize files.
+_REVIEW_TOTAL_ENVELOPE_BYTES = 32_768  # soft cap on the chunked envelope.
+_REVIEW_DIFF_PASSTHROUGH_BYTES = 8_192  # diffs ≤ this size skip chunking.
+
+
+def _matches_generated_glob(path: str) -> bool:
+    """Return True if ``path`` matches any generated/lock file glob."""
+    import fnmatch as _fn
+
+    base = path.rsplit("/", 1)[-1]
+    for pattern in _REVIEW_GENERATED_FILE_GLOBS:
+        if _fn.fnmatch(path, pattern) or _fn.fnmatch(base, pattern):
+            return True
+    # Also skip any path containing a ``__pycache__/`` segment.
+    return "__pycache__/" in path or path.startswith("__pycache__/")
+
+
+def _split_diff_by_file(diff: str) -> list[tuple[str, str]]:
+    """Split a unified diff into ``[(path, file_diff_text), ...]`` chunks.
+
+    The split key is the standard ``diff --git a/<p> b/<p>`` header that
+    git emits at the start of each file's section. Lines preceding the
+    first header (rare; usually empty in our captured diffs) are
+    discarded — they carry no per-file context worth preserving and
+    would otherwise be appended to the first file's section misleadingly.
+    """
+    sections: list[tuple[str, str]] = []
+    current_path: str | None = None
+    current_lines: list[str] = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current_path is not None:
+                sections.append((current_path, "".join(current_lines)))
+            # ``diff --git a/foo/bar b/foo/bar`` — pull the b-side path
+            # which is the post-change name (handles renames sensibly).
+            parts = line.strip().split()
+            current_path = parts[3][2:] if len(parts) >= 4 else "<unknown>"
+            current_lines = [line]
+        else:
+            if current_path is None:
+                # Pre-header preamble; drop.
+                continue
+            current_lines.append(line)
+    if current_path is not None:
+        sections.append((current_path, "".join(current_lines)))
+    return sections
+
+
+def _summarise_file_diff(file_diff: str) -> str:
+    """Return ``"+N / -M, K hunks"`` summary of a file's diff section."""
+    plus = 0
+    minus = 0
+    hunks = 0
+    for line in file_diff.splitlines():
+        if line.startswith("@@"):
+            hunks += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            plus += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            minus += 1
+    return f"+{plus} / -{minus}, {hunks} hunks"
+
+
+def _build_chunked_review_diff(diff: str) -> str:
+    """v0.31.0 (Phase 1.4): build a chunked review envelope from ``diff``.
+
+    Strategy:
+
+    * If ``diff`` ≤ :data:`_REVIEW_DIFF_PASSTHROUGH_BYTES`: return as-is.
+    * Otherwise split per-file and:
+        - Skip generated / lock files entirely
+          (:func:`_matches_generated_glob`).
+        - Files ≤ :data:`_REVIEW_PER_FILE_FULL_BYTES`: include whole diff.
+        - Files > full-bytes: include the path + a per-file summary
+          (``"+N / -M, K hunks"``) plus head + tail byte slices.
+    * Soft-cap the assembled envelope at
+      :data:`_REVIEW_TOTAL_ENVELOPE_BYTES` and append a
+      ``"# REMAINING: <n> files truncated"`` footer when the cap fires.
+
+    Replaces the prior ``diff[:8000]`` hard truncation, which silently
+    dropped any per-file context past the 8 KB mark — the reviewer
+    couldn't see the files most likely to need scrutiny when those
+    files happened to land late in the diff stream.
+    """
+    if len(diff.encode("utf-8")) <= _REVIEW_DIFF_PASSTHROUGH_BYTES:
+        return diff
+
+    sections = _split_diff_by_file(diff)
+    if not sections:
+        # No ``diff --git`` headers at all (e.g. raw text patch). Fall
+        # back to a head-only slice rather than dropping the input.
+        return diff[: _REVIEW_PER_FILE_FULL_BYTES * 4]
+
+    parts: list[str] = []
+    skipped_generated = 0
+    truncated_files = 0
+    total_bytes = 0
+    files_emitted = 0
+    files_remaining = 0
+
+    for idx, (path, file_diff) in enumerate(sections):
+        if _matches_generated_glob(path):
+            skipped_generated += 1
+            continue
+
+        file_bytes = len(file_diff.encode("utf-8"))
+        if total_bytes >= _REVIEW_TOTAL_ENVELOPE_BYTES:
+            files_remaining = len(sections) - idx
+            break
+
+        if file_bytes <= _REVIEW_PER_FILE_FULL_BYTES:
+            chunk = file_diff
+        else:
+            head = file_diff[:_REVIEW_PER_FILE_HEAD_BYTES]
+            tail = (
+                file_diff[-_REVIEW_PER_FILE_TAIL_BYTES:]
+                if file_bytes > _REVIEW_PER_FILE_TAIL_BYTES
+                else ""
+            )
+            summary = _summarise_file_diff(file_diff)
+            chunk = (
+                f"# {path} ({summary}; "
+                f"showing first {_REVIEW_PER_FILE_HEAD_BYTES}B + "
+                f"last {_REVIEW_PER_FILE_TAIL_BYTES}B of "
+                f"{file_bytes}B total)\n"
+                f"{head}\n# ... [truncated middle] ...\n{tail}"
+            )
+            truncated_files += 1
+
+        parts.append(chunk)
+        total_bytes += len(chunk.encode("utf-8"))
+        files_emitted += 1
+
+    envelope = "\n".join(parts)
+    footer_bits: list[str] = []
+    if skipped_generated:
+        footer_bits.append(
+            f"{skipped_generated} generated/lock file(s) skipped"
+        )
+    if truncated_files:
+        footer_bits.append(
+            f"{truncated_files} large file(s) chunked to head+tail"
+        )
+    if files_remaining:
+        footer_bits.append(
+            f"{files_remaining} file(s) omitted (envelope cap reached)"
+        )
+    if footer_bits:
+        envelope += "\n\n# DIFF SUMMARY: " + "; ".join(footer_bits)
+        envelope += f" — {files_emitted} file(s) included in full review."
+    return envelope
+
+
 def _review_envelope(task: Task, diff: str) -> DelegationEnvelope:
     return DelegationEnvelope(
         task_id=task.id,
@@ -4158,13 +4389,18 @@ def _review_envelope(task: Task, diff: str) -> DelegationEnvelope:
         action="review",
         files=list(task.files),
         acceptance=(
-            "Respond with one of APPROVED / NEEDS_CHANGES / REJECTED on the "
-            "first line. Follow with bullet-point issues if not APPROVED."
+            "Respond with VERDICT: APPROVED, VERDICT: NEEDS_CHANGES, or "
+            "VERDICT: REJECTED on a line by itself. Follow with "
+            "bullet-point issues if not APPROVED."
         ),
         context={
             "task_title": task.title,
             "task_description": task.description,
-            "diff": diff[:8000],
+            # v0.31.0 (Phase 1.4): chunked envelope replaces the prior
+            # ``diff[:8000]`` hard truncation. See
+            # :func:`_build_chunked_review_diff` for the per-file
+            # bytewise budget.
+            "diff": _build_chunked_review_diff(diff),
         },
     )
 
@@ -4192,23 +4428,77 @@ def _test_envelope(task: Task, diff: str) -> DelegationEnvelope:
 
 
 def _parse_review_verdict(text: str) -> tuple[str, list[str]]:
-    if not text:
-        return "NEEDS_CHANGES", ["empty reviewer response"]
-    verdict = "APPROVED"
-    for line in text.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        upper = s.upper()
-        if "REJECTED" in upper:
-            verdict = "REJECTED"
-        elif "NEEDS_CHANGES" in upper or "NEEDS CHANGES" in upper:
-            verdict = "NEEDS_CHANGES"
-        elif "APPROVED" in upper:
-            verdict = "APPROVED"
-        else:
-            continue
-        break
+    """Parse a reviewer's response into a (verdict, issues) tuple.
+
+    v0.31.0 (Phase 1.3): hardened against two pre-existing failure modes:
+
+    * **Empty / whitespace-only response** — used to return
+      ``("NEEDS_CHANGES", ["empty reviewer response"])``, which masked
+      the underlying machinery failure (Hypothesis A: max_tokens
+      exhausted; Hypothesis C: structured-output schema rejected the
+      envelope) as a content signal. Now returns
+      ``("MALFORMED", ["empty reviewer response"])`` so the orchestrator
+      can route it through the format-specific retry path. The issues
+      list keeps the legacy ``"empty reviewer response"`` string for
+      backward compatibility with existing log/monitoring greps.
+    * **Prose with no verdict keyword** — used to silently default to
+      ``APPROVED`` (Hypothesis B), which is the unsafest possible
+      default. Now returns ``("MALFORMED", ...)``.
+
+    The verdict is now searched anywhere in the response (not just the
+    first non-empty line) and matched against the strict prefix
+    ``"VERDICT: <KEYWORD>"`` first; if no such line exists we fall back
+    to the legacy "first line containing a verdict keyword" search for
+    backward compat with reviewers that pre-date the strict prompt.
+    """
+    if not text or not text.strip():
+        return "MALFORMED", ["empty reviewer response"]
+
+    # Strict ``VERDICT: <KEYWORD>`` line takes precedence — this is the
+    # format the new (post-v0.31.0) reviewer system prompt instructs the
+    # model to emit. Case-insensitive on the keyword; the prefix match
+    # tolerates leading whitespace / list markers (``"- VERDICT: ..."``)
+    # that some reviewers occasionally produce.
+    import re as _re
+
+    strict_pat = _re.compile(
+        r"^\s*[-*]?\s*VERDICT\s*:\s*(APPROVED|NEEDS[_\s]CHANGES|REJECTED)\s*$",
+        _re.IGNORECASE | _re.MULTILINE,
+    )
+    m = strict_pat.search(text)
+    verdict: str | None = None
+    if m is not None:
+        token = m.group(1).upper().replace(" ", "_")
+        verdict = token
+
+    # Legacy fallback: scan every line for an unambiguous verdict
+    # keyword. Unlike the pre-v0.31.0 parser this scans ALL lines (not
+    # just the first non-empty one) so a reviewer that puts prose first
+    # and the verdict on line 5 is parsed correctly. If multiple verdict
+    # tokens appear, the last one wins — reviewers occasionally restate
+    # their initial impression and converge on a final verdict at the
+    # end.
+    if verdict is None:
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            upper = s.upper()
+            if "REJECTED" in upper:
+                verdict = "REJECTED"
+            elif "NEEDS_CHANGES" in upper or "NEEDS CHANGES" in upper:
+                verdict = "NEEDS_CHANGES"
+            elif "APPROVED" in upper:
+                verdict = "APPROVED"
+
+    # Strict default flipped from APPROVED → MALFORMED. The pre-v0.31.0
+    # default was a latent footgun: any reviewer producing prose without
+    # a recognised verdict keyword silently approved the change. Better
+    # to surface the format failure as a typed signal the orchestrator
+    # can handle (Phase 1.3 of the recovery plan).
+    if verdict is None:
+        verdict = "MALFORMED"
+
     issues: list[str] = []
     for line in text.splitlines():
         s = line.strip()
