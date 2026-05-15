@@ -123,6 +123,47 @@ jobs:
           fi
           echo "reviewer prompt: $SIZE bytes, contains VERDICT"
 
+      # v0.32.0 Phase 6: cheap grep-style preflights that lock the
+      # integration of every v0.32.0 phase against accidental removal.
+      # Each one would have caught a bug we shipped if it had existed.
+      - name: Phase 1.1 dump fires on empty result (v0.31.1 regression)
+        run: uv run pytest tests/test_adapter_empty_result_dump.py::test_claude_empty_result_with_is_error_true_still_dumps tests/test_adapter_empty_result_dump.py::test_cursor_empty_result_with_is_error_true_still_dumps -v
+
+      - name: Architect feedback loop is wired
+        run: |
+          if ! grep -q "{rejection_history}" src/agents/prompts/architect.md; then
+            echo "::error::src/agents/prompts/architect.md missing {rejection_history} placeholder (Phase 1.1)"
+            exit 1
+          fi
+          echo "Architect feedback loop placeholder present."
+
+      - name: Test runner self-diagnostic schema is wired
+        run: |
+          # Phase 3 schema spans multiple lines (``diagnosis: (`` then
+          # ``Literal[ ... ]``). Use ``pcregrep`` multiline OR fall back
+          # to ``grep -Pz`` when pcregrep is unavailable. Also accept the
+          # one-line form so future schema reflows stay green.
+          if grep -q "diagnosis: Literal" src/state/schemas.py; then
+            echo "TestEvidence.diagnosis schema present (single-line form)."
+          elif grep -Pzq "(?s)diagnosis:\s*\(\s*\n\s*Literal" src/state/schemas.py; then
+            echo "TestEvidence.diagnosis schema present (multi-line form)."
+          else
+            echo "::error::src/state/schemas.py missing TestEvidence.diagnosis Literal (Phase 3)"
+            exit 1
+          fi
+
+      - name: RecoveryHint is wired
+        run: |
+          if ! grep -q "class RecoveryHint" src/state/schemas.py; then
+            echo "::error::src/state/schemas.py missing RecoveryHint class (Phase 5)"
+            exit 1
+          fi
+          if ! grep -q "recovery_hint" src/cli/commands/status.py; then
+            echo "::error::src/cli/commands/status.py missing recovery_hint integration (Phase 5)"
+            exit 1
+          fi
+          echo "RecoveryHint schema and CLI surfacing present."
+
   unit-tests:
     name: Unit tests + E2E
     runs-on: ubuntu-latest
