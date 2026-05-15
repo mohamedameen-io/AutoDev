@@ -17,6 +17,13 @@ on:
 permissions:
   contents: write
   issues: write
+  # actions: write is required for the tag-and-publish job to invoke the
+  # Publish workflow via `gh workflow run --ref v$VERSION`. Without it,
+  # the GITHUB_TOKEN gets HTTP 403 "Resource not accessible by integration"
+  # on the workflow_dispatch endpoint. Discovered during the v0.31.1
+  # release; the manual workaround was `gh workflow run Publish --ref
+  # v$VERSION` from a developer's machine.
+  actions: write
 
 jobs:
   preflight-checks:
