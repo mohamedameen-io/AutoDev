@@ -537,3 +537,41 @@ async def test_cleanup_all_routes_per_task_via_remove_per_task(
         f"cleanup_all did not route per-task teardown through "
         f"remove_per_task; saw task_ids={removed_task_ids}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.31.0 (Phase 2.1): _run_git CancelledError → kill child + re-raise.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_git_handles_cancellederror(tmp_path: Path) -> None:
+    """When the parent task is cancelled mid-``communicate()``, ``_run_git``
+    MUST kill the in-flight git child and re-raise CancelledError."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    from orchestrator.worktree import _run_git
+
+    kill_calls: list[None] = []
+
+    async def _hang_communicate(*_a, **_kw):
+        await asyncio.sleep(3600)
+
+    proc = AsyncMock()
+    proc.returncode = None
+    proc.communicate = _hang_communicate
+    proc.wait = AsyncMock(return_value=0)
+    proc.kill = lambda: kill_calls.append(None)
+
+    with patch(
+        "orchestrator.worktree.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=proc),
+    ):
+        task = asyncio.create_task(_run_git(tmp_path, ["status"]))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert kill_calls, "_run_git did not kill subprocess on CancelledError"

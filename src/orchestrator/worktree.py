@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shutil
+from contextlib import suppress
 from pathlib import Path
 from typing import Iterable
 
@@ -790,6 +791,16 @@ async def _run_git(
             proc.communicate(stdin.encode("utf-8") if stdin is not None else None),
             timeout=timeout_s,
         )
+    except asyncio.CancelledError:
+        # v0.31.0 (Phase 2.1): parent task cancelled (SIGTERM,
+        # KeyboardInterrupt propagation, or asyncio.gather cancel).
+        # Kill the in-flight git child so we don't leak processes after
+        # the orchestrator exits — mirrors claude_code.py:171-180.
+        with suppress(ProcessLookupError):
+            proc.kill()
+        with suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        raise
     except asyncio.TimeoutError as exc:
         proc.kill()
         await proc.wait()
