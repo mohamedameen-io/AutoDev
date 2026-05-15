@@ -56,6 +56,52 @@ jobs:
         run: |
           uv run python scripts/release_version.py "${{ inputs.version }}" --check-only --allow-npm-mismatch
 
+      - name: Retrospective discipline check (Phase 8)
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Compute the prior version from the input. For X.Y.Z, prior is the
+          # immediately-previous version on disk in docs/retrospectives/. We use
+          # the most-recent existing retrospective file as the "prior" anchor —
+          # if none exists, this is the first retrospective and the check is a
+          # no-op (warn but don't block).
+          RETRO_DIR="docs/retrospectives"
+          if [ ! -d "$RETRO_DIR" ]; then
+            echo "::warning::No docs/retrospectives/ directory yet; this is fine for the first retrospective. Future releases must populate this."
+            exit 0
+          fi
+          LATEST_RETRO=$(ls -1 "$RETRO_DIR"/*.md 2>/dev/null | sort -V | tail -1)
+          if [ -z "$LATEST_RETRO" ]; then
+            echo "::warning::docs/retrospectives/ exists but is empty; first retrospective is forthcoming."
+            exit 0
+          fi
+          echo "Checking $LATEST_RETRO for required 'Next layer of failure' section..."
+          # Required: presence of the section header AND at least one bullet under it.
+          # Case-insensitive: heading may be "NEXT", "Next", or "next".
+          if ! grep -qiE "^## .*next layer of failure" "$LATEST_RETRO"; then
+            echo "::error::$LATEST_RETRO is missing the required '## 5. What's the NEXT layer of failure?' section."
+            echo "::error::See docs/release-retrospective-template.md for the required structure."
+            exit 1
+          fi
+          # Extract content between the Section 5 header and the next `## ` heading,
+          # then count `- ` bullets. We use awk to find the start line, then stream
+          # subsequent lines until the next `## ` header (excluding the start line
+          # itself from the end-pattern match — the naive `/start/,/end/` form
+          # collapses to one line because the start line also matches `^## `).
+          CONTENT=$(awk '
+            BEGIN { in_section = 0 }
+            /^## / {
+              if (in_section) { exit }
+              if (tolower($0) ~ /next layer of failure/) { in_section = 1; next }
+            }
+            in_section { print }
+          ' "$LATEST_RETRO" | grep -cE '^- ')
+          if [ "$CONTENT" -lt 3 ]; then
+            echo "::error::$LATEST_RETRO 'Next layer of failure' section has $CONTENT bullets; minimum 3 required."
+            exit 1
+          fi
+          echo "Retrospective discipline check passed: $LATEST_RETRO has $CONTENT 'next layer' candidates."
+
       - name: Slash command template drift check
         run: uv run pytest tests/test_inline_config.py::test_canonical_spec_subcommands_match_cli_registry -v
 
