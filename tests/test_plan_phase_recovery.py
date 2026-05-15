@@ -203,16 +203,24 @@ def test_should_escalate_model_unknown_returns_false() -> None:
 
 
 def test_surface_user_intervention_hint_carries_archived_dumps() -> None:
+    # v0.32.0 Phase 5 (Gap G): surface_user_intervention_hint now
+    # returns the real :class:`state.schemas.RecoveryHint` model. The
+    # ``archived_dumps`` payload moves to ``relevant_debug_files`` and
+    # ``action`` becomes ``recommended_user_action``.
+    from state.schemas import RecoveryHint
+
     hint = surface_user_intervention_hint(
         ["/tmp/architect-failed-1.md", "/tmp/architect-failed-2.md"]
     )
-    assert isinstance(hint, RecoveryHintStub)
+    assert isinstance(hint, RecoveryHint)
     assert hint.class_ == "architect_unconvergent"
-    assert "autodev status" in hint.action
-    assert hint.archived_dumps == (
+    assert "architect" in hint.recommended_user_action.lower()
+    assert hint.relevant_debug_files == [
         "/tmp/architect-failed-1.md",
         "/tmp/architect-failed-2.md",
-    )
+    ]
+    # Backward-compatible alias re-exports the same class.
+    assert RecoveryHintStub is RecoveryHint
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +271,9 @@ def test_run_recovery_tiers_returns_typed_outcome() -> None:
     assert outcome.recovery_hint.class_ == "architect_unconvergent"
     # Tier 7: forensic summary always populated.
     assert "3 attempts" in outcome.forensic_summary
-    # Meta carries the v0.32.0 placeholder for Phase 5's RecoveryHint.
+    # Meta carries the structured class + action for the CLI surface.
     assert outcome.meta["recovery_hint_class"] == "architect_unconvergent"
-    assert "autodev status" in outcome.meta["recovery_hint_action"]
+    assert "architect" in outcome.meta["recovery_hint_action"].lower()
 
 
 def test_run_recovery_tiers_skips_tier4_when_no_plan() -> None:

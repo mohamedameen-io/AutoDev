@@ -861,6 +861,22 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
             cls = payload["block_reason_class"]
             if cls in (None, "verdict", "infrastructure", "cap"):
                 task.block_reason_class = cls
+        # v0.32.0 (Phase 5, Gap G): replay the structured recovery hint
+        # so a resumed PlanManager surfaces the same actionable text
+        # the original block site populated. Pre-v0.32.0 entries omit
+        # the field; the load path simply leaves ``task.recovery_hint``
+        # at its ``None`` default.
+        if "recovery_hint" in payload:
+            from state.schemas import RecoveryHint as _RecoveryHint
+
+            raw_hint = payload["recovery_hint"]
+            if raw_hint is None:
+                task.recovery_hint = None
+            else:
+                try:
+                    task.recovery_hint = _RecoveryHint.model_validate(raw_hint)
+                except Exception:  # noqa: BLE001 - tolerate legacy payloads
+                    task.recovery_hint = None
         return plan
 
     if op == "mark_blocked":

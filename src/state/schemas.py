@@ -109,6 +109,57 @@ class AcceptanceCriterion(BaseModel):
     vote_history: list[CriterionVote] = Field(default_factory=list)
 
 
+class RecoveryHint(BaseModel):
+    """v0.32.0 (Phase 5, Gap G): structured guidance for unblocking a task.
+
+    Populated at every soft-block site so the CLI can render an actionable
+    user message without forcing the user to hand-read evidence files.
+    Each field carries one slice of the "why is this stuck and what do I
+    do" answer:
+
+      * ``class_`` — typed bucket the block falls into (one of six). Drives
+        the colour / icon selection in the CLI panel and lets fleet-level
+        analytics aggregate by failure mode.
+      * ``recommended_user_action`` — single sentence addressed to the
+        operator. Imperative voice (`"Inspect ..."`, `"Refresh ..."`,
+        `"Manual review needed."`).
+      * ``relevant_evidence_files`` / ``relevant_debug_files`` — repo-
+        relative paths to the most diagnostic on-disk artifacts. Rendered
+        as a clickable list so the operator can ``cat`` them without
+        guessing the directory layout.
+      * ``commands_to_try`` — one to three CLI commands the operator can
+        copy-paste. Rendered as Syntax blocks in the rich panel.
+
+    All fields default to empty/sensible values so partial population
+    (e.g. an early site that knows the class but not the evidence path)
+    still validates. The schema is OPTIONAL on :class:`Task`
+    (``recovery_hint: RecoveryHint | None = None``) so v0.31.x plans on
+    disk deserialise cleanly with ``recovery_hint=None`` and behave
+    identically to pre-v0.32.0 — backward-compatible by construction.
+
+    The ``class_`` field is aliased to ``class`` on the wire so the
+    JSON payload reads naturally (``"class": "thin_review_evidence"``)
+    even though Python's reserved-word rules force the in-Python name
+    to a trailing underscore. ``populate_by_name=True`` lets callers
+    construct the model with either ``class_=...`` or ``**{"class": ...}``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    class_: Literal[
+        "missing_test_output",
+        "thin_review_evidence",
+        "architect_unconvergent",
+        "model_capacity_exhausted",
+        "user_decision_required",
+        "network_transient",
+    ] = Field(alias="class")
+    recommended_user_action: str
+    relevant_evidence_files: list[str] = Field(default_factory=list)
+    relevant_debug_files: list[str] = Field(default_factory=list)
+    commands_to_try: list[str] = Field(default_factory=list)
+
+
 class Task(BaseModel):
     """Leaf unit of work that the ``coder`` role implements.
 
@@ -241,6 +292,15 @@ class Task(BaseModel):
     # diff-producing task until the architect opts out via the
     # ``produces_diff: false`` body line in the plan markdown.
     produces_diff: bool = True
+
+    # v0.32.0 (Phase 5, Gap G): structured guidance for unblocking the
+    # task. Populated at every soft-block site (orchestrator side) so
+    # ``autodev status --blocked`` can render an actionable panel
+    # without the user hand-reading evidence files. ``None`` for tasks
+    # that have not been blocked, AND for tasks blocked under v0.31.x
+    # plans on disk (backward-compatible deserialisation). See
+    # :class:`RecoveryHint` for field semantics.
+    recovery_hint: RecoveryHint | None = None
 
 
 class Phase(BaseModel):
@@ -622,6 +682,7 @@ __all__ = [
     "ExploreEvidence",
     "Phase",
     "Plan",
+    "RecoveryHint",
     "ReviewCandidate",
     "ReviewEvidence",
     "ReviewTournamentEvidence",

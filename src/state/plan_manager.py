@@ -352,6 +352,20 @@ class PlanManager:
             payload = {"task_id": task_id, "status": status}
             if meta:
                 payload.update(meta)
+            # v0.32.0 (Phase 5, Gap G): normalise a RecoveryHint model
+                # instance into its dict payload before the ledger
+                # serialises (the ledger writes JSON; pydantic models
+                # are not JSON-encodable). Use ``by_alias=True`` so the
+                # wire shape matches the ``"class"`` alias every reader
+                # expects.
+            if "recovery_hint" in payload:
+                from state.schemas import RecoveryHint as _RecoveryHint
+
+                hint_val = payload["recovery_hint"]
+                if isinstance(hint_val, _RecoveryHint):
+                    payload["recovery_hint"] = hint_val.model_dump(
+                        by_alias=True
+                    )
             await append_entry(
                 self._cwd,
                 op="update_task_status",
@@ -385,6 +399,23 @@ class PlanManager:
                             f"verdict|infrastructure|cap|None, got {cls!r}"
                         )
                     task.block_reason_class = cls
+                # v0.32.0 (Phase 5, Gap G): structured recovery hint.
+                # Accept either a :class:`RecoveryHint` model instance OR
+                # the equivalent ``dict`` payload (covers callers that
+                # built the meta from JSON / persisted ledger ops).
+                # ``None`` clears the field.
+                if "recovery_hint" in meta:
+                    from state.schemas import RecoveryHint as _RecoveryHint
+
+                    raw_hint = meta["recovery_hint"]
+                    if raw_hint is None:
+                        task.recovery_hint = None
+                    elif isinstance(raw_hint, _RecoveryHint):
+                        task.recovery_hint = raw_hint
+                    else:
+                        task.recovery_hint = _RecoveryHint.model_validate(
+                            raw_hint
+                        )
             plan = plan.model_copy(update={"updated_at": _iso_now()})
             await snapshot_plan(self._cwd, plan, session_id=self._session_id)
             self._log.info(
@@ -1418,6 +1449,20 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
             task.escalated = bool(payload["escalated"])
         if "evidence_bundle" in payload:
             task.evidence_bundle = payload["evidence_bundle"]
+        # v0.32.0 (Phase 5, Gap G): replay the recovery_hint payload
+        # back onto the task so resumed sessions surface the same hint
+        # the original block site populated.
+        if "recovery_hint" in payload:
+            from state.schemas import RecoveryHint as _RecoveryHint
+
+            raw_hint = payload["recovery_hint"]
+            if raw_hint is None:
+                task.recovery_hint = None
+            else:
+                try:
+                    task.recovery_hint = _RecoveryHint.model_validate(raw_hint)
+                except Exception:  # noqa: BLE001 - tolerate legacy payloads
+                    task.recovery_hint = None
         return plan
 
     if op == "mark_blocked":

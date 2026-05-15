@@ -78,21 +78,36 @@ class ScopeDegradationResult:
         return self.new_plan is not None
 
 
-@dataclass(frozen=True)
-class RecoveryHintStub:
-    """v0.32.0 Phase 1.4 placeholder for the Phase 5 ``RecoveryHint``
-    schema.
+# v0.32.0 Phase 5 (Gap G): the placeholder ``RecoveryHintStub`` that
+# Phase 1.4 used as a forward reference has been replaced by the real
+# :class:`state.schemas.RecoveryHint` pydantic model. The alias below
+# preserves the import surface for any v0.31.x callers that imported
+# ``RecoveryHintStub`` directly — they now get the structured model
+# without the indirection. New callers should import ``RecoveryHint``
+# from :mod:`state.schemas` directly.
+def _get_recovery_hint_class() -> type:
+    """Lazy import to avoid a circular import at module load time
+    (``state.schemas`` does not import this module, but defer-by-default
+    keeps the dependency graph one-way)."""
+    from state.schemas import RecoveryHint  # noqa: PLC0415
 
-    Carries the single-class string + recommended action that the CLI
-    surfacing in Phase 5 will render. Kept as a frozen dataclass with
-    only the two strings the caller needs today; Phase 5 will replace
-    this with the full pydantic ``RecoveryHint`` model and rewire
-    every call site.
+    return RecoveryHint
+
+
+def __getattr__(name: str):
+    """Module-level ``__getattr__`` so ``from ... import RecoveryHintStub``
+    keeps resolving to the real :class:`state.schemas.RecoveryHint`.
+
+    PEP 562: this fires only when the regular attribute lookup misses,
+    so DO NOT bind ``RecoveryHintStub`` at module scope — that would
+    short-circuit the lookup and return ``None`` instead of the real
+    class. The ``__all__`` re-export below is fine because ``__all__``
+    is consulted only by ``from module import *`` (a code path the
+    test suite never takes), not by ``from module import RecoveryHintStub``.
     """
-
-    class_: str
-    action: str
-    archived_dumps: tuple[str, ...] = field(default_factory=tuple)
+    if name == "RecoveryHintStub":
+        return _get_recovery_hint_class()
+    raise AttributeError(name)
 
 
 def attempt_scope_degradation(
@@ -195,24 +210,33 @@ def should_escalate_model(current_model: str | None) -> bool:
 
 def surface_user_intervention_hint(
     archived_dumps: list[str],
-) -> RecoveryHintStub:
-    """Tier 6: build the ``RecoveryHint`` placeholder for the CLI.
+):
+    """Tier 6: build the structured :class:`RecoveryHint` for the CLI.
 
-    The full :class:`RecoveryHint` model lands in Phase 5. For now we
-    return a plain dataclass carrying the two strings the CLI
-    surfacing will need: a typed class and a recommended action.
+    v0.32.0 Phase 5 (Gap G): replaces the Phase 1.4 placeholder
+    ``RecoveryHintStub``. Returns a real
+    :class:`state.schemas.RecoveryHint` populated with the architect-
+    unconvergent class and an actionable user-facing message. The
+    archived ``architect-failed-*.md`` paths are surfaced via
+    ``relevant_debug_files`` so ``autodev status --blocked`` renders
+    the exact paths the operator can ``cat``.
 
     ``archived_dumps`` is the list of ``architect-failed-*.md`` paths
-    accumulated across the failed attempts — surfaced verbatim so
-    the operator can ``cat`` them.
+    accumulated across the failed attempts.
     """
-    return RecoveryHintStub(
+    RecoveryHint = _get_recovery_hint_class()
+    return RecoveryHint(
         class_="architect_unconvergent",
-        action=(
-            "Run `autodev status` to see architect-failed dumps in "
-            ".autodev/debug/"
+        recommended_user_action=(
+            "Architect cannot produce a valid plan. Inspect archived "
+            ".autodev/debug/architect-failed-*.md dumps and either narrow "
+            "the spec or run `autodev plan --force` with a smaller intent."
         ),
-        archived_dumps=tuple(archived_dumps),
+        relevant_debug_files=list(archived_dumps),
+        commands_to_try=[
+            "autodev status --blocked",
+            "autodev plan --force '<smaller intent>'",
+        ],
     )
 
 
@@ -249,7 +273,7 @@ def build_forensic_summary(
             f"Last error: {type(last_exception).__name__}: {last_exception}"
         )
     parts.append(
-        "Run `autodev status` for diagnostic + recovery options."
+        "Run `autodev status --blocked` for diagnostic + recovery options."
     )
     return "\n".join(parts)
 
@@ -273,7 +297,12 @@ class RecoveryOutcome:
     degraded_plan: "Plan | None" = None
     dropped_scope_entry: str | None = None
     escalated_model: str | None = None
-    recovery_hint: RecoveryHintStub | None = None
+    # v0.32.0 Phase 5 (Gap G): typed as ``Any`` to keep the import
+    # graph one-way (this module must not import :mod:`state.schemas`
+    # at module load — the lazy ``_get_recovery_hint_class`` helper
+    # constructs the model on demand). At runtime this is always a
+    # :class:`state.schemas.RecoveryHint` or ``None``.
+    recovery_hint: Any = None
     forensic_summary: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -325,13 +354,16 @@ def run_recovery_tiers(
         outcome.escalated_model = opus_model_id
         outcome.meta["tier5_reason"] = "sonnet_to_opus"
 
-    # Tier 6 — user-intervention hint.
+    # Tier 6 — user-intervention hint. v0.32.0 Phase 5 (Gap G): now a
+    # real :class:`state.schemas.RecoveryHint` model (the placeholder
+    # ``RecoveryHintStub`` shape was retired). The plan-phase caller
+    # stashes the model directly on the raised exception so the CLI
+    # surfacing layer can render it without re-marshalling.
     outcome.recovery_hint = surface_user_intervention_hint(archived_dumps)
-    # Mirror Phase 5's RecoveryHint payload shape on ``meta`` so the
-    # plan-phase caller can stash it on the eventual exception without
-    # waiting for Phase 5's full schema.
     outcome.meta["recovery_hint_class"] = outcome.recovery_hint.class_
-    outcome.meta["recovery_hint_action"] = outcome.recovery_hint.action
+    outcome.meta["recovery_hint_action"] = (
+        outcome.recovery_hint.recommended_user_action
+    )
 
     # Tier 7 — forensic summary.
     outcome.forensic_summary = build_forensic_summary(
