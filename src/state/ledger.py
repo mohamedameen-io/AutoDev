@@ -308,6 +308,40 @@ LedgerOp = Literal[
     # ``{from_max_turns: int, to_max_turns: int, attempt: int,
     # reason: str}``.
     "plan_phase_budget_escalation",
+    # v0.32.0 Phase 2: review-tournament lifecycle ops. All four are
+    # audit-only — they do NOT mutate plan state on replay (the
+    # underlying task status changes flow through the regular
+    # ``update_task_status`` ops emitted by the orchestrator's
+    # retry/escalation FSM). Payload shapes:
+    #
+    # - ``review_tournament_started``:
+    #   ``{tournament_id: str, task_id: str, diff_bytes: int,
+    #   convergence_k: int, max_rounds: int, num_judges: int}``.
+    #   Emitted once at the start of the loop so forensics can
+    #   correlate "this task triggered a review tournament" with the
+    #   final outcome.
+    # - ``review_tournament_judged``:
+    #   ``{tournament_id: str, task_id: str, round: int, winner: str,
+    #   borda_scores: dict[str, int], valid_judges: int}``.
+    #   Emitted once per round (one per Borda tally). Lets
+    #   post-mortems reconstruct "which round flipped, which round
+    #   stuck" without parsing the on-disk artifact tree.
+    # - ``review_tournament_converged``:
+    #   ``{tournament_id: str, task_id: str, rounds: int,
+    #   final_winner: str, final_verdict: str}``.
+    #   Emitted on the do-nothing convergence path (A wins
+    #   ``convergence_k`` times in a row). The orchestrator advances
+    #   or soft-blocks WITHOUT another developer-refine cycle.
+    # - ``review_tournament_escalated``:
+    #   ``{tournament_id: str, task_id: str, rounds: int,
+    #   final_winner: str, escalation_reason: str}``.
+    #   Emitted on the max-rounds-without-convergence path. The
+    #   orchestrator routes the task to ``critic_sounding_board`` so
+    #   the existing escalation ladder takes over.
+    "review_tournament_started",
+    "review_tournament_judged",
+    "review_tournament_converged",
+    "review_tournament_escalated",
 ]
 
 
@@ -773,6 +807,16 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # ``budget_escalation`` but scoped to the plan-phase
         # architect retry loop.
         "plan_phase_budget_escalation",
+        # v0.32.0 Phase 2: review-tournament lifecycle ops. All
+        # audit-only — they do NOT mutate plan state. The underlying
+        # task status changes (retry / escalate / soft-block) flow
+        # through the regular ``update_task_status`` ops emitted by
+        # the orchestrator's retry/escalation FSM. Mirrors the
+        # ``impl_tournament_complete`` op shape.
+        "review_tournament_started",
+        "review_tournament_judged",
+        "review_tournament_converged",
+        "review_tournament_escalated",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

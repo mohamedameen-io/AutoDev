@@ -470,6 +470,109 @@ class TournamentEvidence(_BaseEvidence):
     final_diff: str | None = None
 
 
+class ReviewCandidate(BaseModel):
+    """One A / B / AB candidate inside a :class:`ReviewTournamentEvidence`.
+
+    v0.32.0 Phase 2: the review tournament produces three candidates per
+    refinement round — A is the unchanged developer patch + original
+    reviewer verdict, B is the adversarial reviewer's alternative
+    assessment, AB is the merge synthesizer's resolution. Each candidate
+    carries a verdict + issues (the same shape :class:`ReviewEvidence`
+    persists for the single-shot reviewer path) plus a short diff
+    excerpt for forensics, so post-mortems can answer "what did the
+    judges actually rank against each other?" without crossing into the
+    tournament's on-disk artifact tree.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    diff_excerpt: str = ""
+    """First N bytes of the developer diff the candidate's review was
+    grounded against. All three candidates share the SAME diff excerpt
+    inside one tournament round — the difference between A / B / AB is
+    in the *review* of the diff, not the diff itself."""
+
+    verdict: str = "MALFORMED"
+    """Same value space as :class:`ReviewEvidence.verdict`:
+    ``APPROVED``, ``NEEDS_CHANGES``, ``REJECTED``, ``MALFORMED``.
+    Typed as ``str`` so future verdict tokens (e.g. ``CONDITIONAL``)
+    can be added by the prompts without a schema migration; the
+    runner validates each value against the reviewer parser at write
+    time."""
+
+    issues: list[str] = Field(default_factory=list)
+    """Bullet-point issues extracted from the candidate's response by
+    :func:`orchestrator.execute_phase._parse_review_verdict`."""
+
+    raw_response: str | None = None
+    """v0.31.0 Phase 1.2 parity: preserve the agent's raw response text
+    so post-mortems can answer "what did the model actually return?"
+    without depending on the on-disk tournament artifact tree."""
+
+
+class ReviewTournamentEvidence(_BaseEvidence):
+    """Summary of a review-tournament run (v0.32.0 Phase 2).
+
+    Distinct from :class:`TournamentEvidence` because:
+
+    * the phase is ALWAYS ``"review"`` (no plan / impl / phase_review
+      mix-up — the discriminator pins it);
+    * the candidate set is fixed at 3 (A / B / AB) — encoded as a
+      ``dict[str, ReviewCandidate]`` keyed on the canonical labels so
+      readers can deref by label without indexing magic;
+    * judge rankings are persisted as a list-of-lists (one entry per
+      judge, in cohort order) with ``None`` for parse failures —
+      matches the wire format
+      :func:`tournament.voting.BordaAggregator.aggregate` consumes;
+    * ``borda_scores`` records the aggregated point totals per label
+      so forensics can see *how close* the win was without re-running
+      the tally.
+
+    Written by :func:`orchestrator.review_tournament_runner.run_review_tournament`
+    after the loop converges or hits ``max_rounds``; a parallel ledger
+    breadcrumb (``review_tournament_converged`` / ``..._escalated``)
+    points back to this evidence file.
+    """
+
+    kind: Literal["review_tournament"] = "review_tournament"
+    tournament_id: str
+    candidates: dict[str, ReviewCandidate] = Field(default_factory=dict)
+    """Keyed on the canonical labels ``"A"``, ``"B"``, ``"AB"``. The
+    runner ALWAYS writes all three keys even when one candidate is
+    structurally identical to another (forensic completeness — the
+    no-progress detector reads the dict and decides what to do)."""
+
+    judge_rankings: list[list[str] | None] = Field(default_factory=list)
+    """One entry per judge in cohort order; each entry is a list of
+    canonical labels in best→worst order, or ``None`` for parse
+    failures. The list length matches the cohort size at write time
+    (``cfg.review_num_judges`` or the override length)."""
+
+    winner: str = "A"
+    """Borda winner. ``"A"`` on a tie via the conservative
+    ``tiebreak_winner="A"`` invariant."""
+
+    borda_scores: dict[str, int] = Field(default_factory=dict)
+    """Aggregated Borda points per label. Sum equals
+    ``valid_judges * len(labels)`` when all judges parsed cleanly —
+    see ``test_borda_score_invariant`` for the property test."""
+
+    valid_judges: int = 0
+    """Number of judges whose ranking parsed cleanly (``ranking is not
+    None``). Distinct from cohort size — a cohort of 3 with one
+    MALFORMED judge has ``valid_judges == 2``."""
+
+    converged: bool = False
+    """True iff the loop terminated via the ``convergence_k`` A-streak
+    rule (do-nothing semantics — the original verdict stood). False
+    when the loop exited via ``max_rounds`` or a B / AB winner."""
+
+    rounds: int = 1
+    """Number of refinement rounds the loop ran. ``1`` for the
+    happy-path single-pass A win; ``cfg.review_max_rounds`` on the
+    escalation path."""
+
+
 Evidence = Annotated[
     Union[
         CoderEvidence,
@@ -479,6 +582,7 @@ Evidence = Annotated[
         SMEEvidence,
         CriticEvidence,
         TournamentEvidence,
+        ReviewTournamentEvidence,
     ],
     Field(discriminator="kind"),
 ]
@@ -496,7 +600,9 @@ __all__ = [
     "ExploreEvidence",
     "Phase",
     "Plan",
+    "ReviewCandidate",
     "ReviewEvidence",
+    "ReviewTournamentEvidence",
     "SMEEvidence",
     "Task",
     "TaskStatus",
