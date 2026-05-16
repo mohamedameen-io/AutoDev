@@ -95,12 +95,16 @@ def test_resolve_task_max_turns_threads_overrides() -> None:
     )
 
 
-def test_task_overrides_config_default_is_none() -> None:
-    """The TaskOverridesConfig default carries None (=> baked-in curve)."""
+def test_task_overrides_config_default_is_populated() -> None:
+    """v0.36.0 E1: ``huge_repo_multipliers`` now defaults to a populated
+    role-keyed dict (was ``None`` through v0.35). Operators no longer
+    have to opt-in for huge-repo budget scaling on the standard roles.
+    """
     from config.schema import TaskOverridesConfig
 
     cfg = TaskOverridesConfig()
-    assert cfg.huge_repo_multipliers is None
+    assert isinstance(cfg.huge_repo_multipliers, dict)
+    assert cfg.huge_repo_multipliers.get("explorer") == 3.0
 
 
 def test_task_overrides_config_accepts_override_dict() -> None:

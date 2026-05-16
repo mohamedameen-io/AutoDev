@@ -269,3 +269,242 @@ jobs:
           fi
           echo "Promotion + decay anchor present."
 
+      # v0.36.0 Tiers D + E + F + G: retries, budgets, forensics, spec
+      # hygiene integration anchors. Each grep would have caught the
+      # corresponding finding's regression if it had existed.
+      - name: Recovery-tier + architect-attempt ops (v0.36 F1)
+        run: |
+          if ! grep -q "recovery_tier_attempted" src/state/ledger.py; then
+            echo "::error::src/state/ledger.py missing recovery_tier_attempted op (v0.36 F1)"
+            exit 1
+          fi
+          if ! grep -q "architect_attempt_failed" src/state/ledger.py; then
+            echo "::error::src/state/ledger.py missing architect_attempt_failed op (v0.36 F1)"
+            exit 1
+          fi
+          echo "v0.36 F1 ledger op anchors present."
+
+      - name: NetworkProbeFailure exception class (v0.36 F2)
+        run: |
+          if ! grep -q "class NetworkProbeFailure" src/adapters/base.py; then
+            echo "::error::src/adapters/base.py missing NetworkProbeFailure exception (v0.36 F2)"
+            exit 1
+          fi
+          echo "v0.36 F2 NetworkProbeFailure anchor present."
+
+      - name: Spec validator module exists (v0.36 G1)
+        run: |
+          if [ ! -f src/orchestrator/spec_validator.py ]; then
+            echo "::error::src/orchestrator/spec_validator.py missing (v0.36 G1)"
+            exit 1
+          fi
+          if ! grep -q "validate_spec_text" src/orchestrator/spec_validator.py; then
+            echo "::error::src/orchestrator/spec_validator.py missing validate_spec_text helper (v0.36 G1)"
+            exit 1
+          fi
+          echo "v0.36 G1 spec_validator anchor present."
+
+      - name: huge_repo_multipliers default factory (v0.36 E1)
+        run: |
+          if ! grep -q "huge_repo_multipliers: dict\[str, float\] = Field" src/config/schema.py; then
+            echo "::error::src/config/schema.py missing populated huge_repo_multipliers default factory (v0.36 E1)"
+            exit 1
+          fi
+          echo "v0.36 E1 huge_repo_multipliers default anchor present."
+
+      - name: Design-class diagnosis templates (v0.36 D1)
+        run: |
+          if ! grep -q "_DIAGNOSIS_TEMPLATES" src/orchestrator/retry_envelope.py; then
+            echo "::error::src/orchestrator/retry_envelope.py missing _DIAGNOSIS_TEMPLATES (v0.36 D1)"
+            exit 1
+          fi
+          echo "v0.36 D1 diagnosis-templates anchor present."
+
+      - name: Structural-retry routing helper (v0.36 D3)
+        run: |
+          if ! grep -q "should_change_model_for_class" src/orchestrator/plan_phase_recovery.py; then
+            echo "::error::src/orchestrator/plan_phase_recovery.py missing should_change_model_for_class (v0.36 D3)"
+            exit 1
+          fi
+          echo "v0.36 D3 structural-retry helper anchor present."
+
+  unit-tests:
+    name: Unit tests + E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Full pytest run (includes E2E with fake binaries)
+        run: uv run pytest tests/ -v
+
+  doctor-smoke:
+    name: Doctor smoke (built wheel)
+    runs-on: ubuntu-latest
+    needs: [preflight-checks, unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build wheel
+        run: uv build --wheel --out-dir dist
+
+      - name: Install built wheel into a fresh venv
+        run: |
+          python -m venv /tmp/smokevenv
+          /tmp/smokevenv/bin/pip install --upgrade pip
+          /tmp/smokevenv/bin/pip install dist/*.whl
+
+      - name: autodev --version
+        run: |
+          /tmp/smokevenv/bin/autodev --version
+
+      - name: autodev doctor against empty tmp dir
+        run: |
+          mkdir -p /tmp/empty_proj
+          cd /tmp/empty_proj
+          /tmp/smokevenv/bin/autodev doctor || true
+
+  manual-smoke-issue:
+    name: Open manual smoke checklist issue
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Open release-smoke issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh issue create \
+            --title "Manual smoke checklist for v$VERSION" \
+            --body "$(cat <<EOF
+          # Manual smoke checklist — v$VERSION
+
+          Walk this list against a real local install before signing off.
+
+          ## Adapter parity
+          - [ ] \`autodev init --platform claude_code\` then \`plan\` then \`execute\` (Phase 0 regression)
+          - [ ] \`autodev init --platform cursor\` then \`plan\` then \`execute\` (Phase 0 regression)
+
+          ## Recovery commands
+          - [ ] \`autodev requeue\` lists infrastructure-blocked tasks (Phase 0 fix)
+          - [ ] \`autodev rewind <task>\` restores the prior state (Phase 0 fix)
+
+          ## Doctor + fitness
+          - [ ] \`autodev doctor\` shows the detected language profile (Phase 5)
+          - [ ] \`autodev doctor\` shows fitness scores for each adapter (Phase 5)
+
+          ## Cursor downshift visibility
+          - [ ] After a forced usage-limit, \`autodev logs\` shows the downshift to \`auto+max-disabled\` (Phase 2.6)
+
+          ## Hygiene
+          - [ ] \`.autodev/execute_worktrees/\` is empty after \`execute\` finishes (Phase 5)
+          EOF
+          )"
+
+  tag-and-publish:
+    name: Tag and trigger publish
+    runs-on: ubuntu-latest
+    needs: [doctor-smoke]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.email "release-bot@autodev.local"
+          git config user.name "autodev-release-bot"
+
+      - name: Create and push tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag v$VERSION already exists"
+            exit 1
+          fi
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+
+      # GitHub limitation: workflows triggered by the default GITHUB_TOKEN
+      # do NOT trigger downstream workflows. The tag push above therefore
+      # does NOT fire publish.yml on its own. We invoke it explicitly via
+      # workflow_dispatch (publish.yml has both ``push: tags`` and
+      # ``workflow_dispatch`` triggers; this hits the latter directly).
+      # Discovered during the v0.31.0 release.
+      - name: Trigger publish workflow explicitly
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh workflow run Publish --ref "v$VERSION"
+
+  post-publish-smoke:
+    name: Post-publish smoke from PyPI
+    runs-on: ubuntu-latest
+    needs: [tag-and-publish]
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Wait for PyPI to index
+        run: sleep 30
+
+      - name: Install ai-autodev==${{ inputs.version }} from PyPI
+        id: pip_install
+        continue-on-error: true
+        run: |
+          python -m venv /tmp/postvenv
+          /tmp/postvenv/bin/pip install --upgrade pip
+          /tmp/postvenv/bin/pip install "ai-autodev==${{ inputs.version }}"
+
+      - name: autodev --version (from PyPI)
+        id: pyver
+        if: steps.pip_install.outcome == 'success'
+        continue-on-error: true
+        run: /tmp/postvenv/bin/autodev --version
+
+      - name: autodev doctor (from PyPI)
+        id: pydoc
+        if: steps.pip_install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/post_smoke
+          cd /tmp/post_smoke
+          /tmp/postvenv/bin/autodev doctor || true
+
+      - name: Open blocker issue if smoke failed
+        if: |
+          steps.pip_install.outcome == 'failure' ||
+          steps.pyver.outcome == 'failure' ||
+          steps.pydoc.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh issue create \
+            --title "Post-publish smoke FAILED for v$VERSION" \
+            --body "Post-publish smoke failed for v$VERSION. See workflow run for details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          exit 1

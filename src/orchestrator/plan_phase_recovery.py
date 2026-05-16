@@ -208,6 +208,40 @@ def should_escalate_model(current_model: str | None) -> bool:
     return any(tok in lowered for tok in _SONNET_MODEL_TOKENS)
 
 
+# v0.36.0 D3: error classes that map to a structural failure (the
+# architect's reasoning is fine; the path list isn't). Sonnet handles
+# these as well as opus and saves money per attempt.
+_STRUCTURAL_REJECTION_CLASSES: frozenset[str] = frozenset(
+    {"missing_on_disk", "new_md_deliverable"}
+)
+
+
+def should_change_model_for_class(
+    current_model: str | None,
+    error_class: str,
+    structural_retry_model: str,
+) -> str | None:
+    """v0.36.0 D3: pick a cheaper architect model for structural retries.
+
+    Returns the configured ``structural_retry_model`` (e.g. ``sonnet``)
+    when the current architect model is on opus AND the most-recent
+    failure's error_class is structural (missing-on-disk or
+    new-md-deliverable). Returns ``None`` otherwise (caller keeps the
+    current model unchanged).
+
+    Substring matching on ``"claude-opus"`` keeps the helper resilient
+    against version suffixes — the v0.32.0 fixture's opus pin was
+    ``claude-opus-4-7`` and future releases will append more.
+    """
+    if not current_model or not structural_retry_model:
+        return None
+    if error_class not in _STRUCTURAL_REJECTION_CLASSES:
+        return None
+    if not current_model.lower().startswith("claude-opus"):
+        return None
+    return structural_retry_model
+
+
 def surface_user_intervention_hint(
     archived_dumps: list[str],
 ):
@@ -381,6 +415,7 @@ __all__ = [
     "attempt_scope_degradation",
     "build_forensic_summary",
     "run_recovery_tiers",
+    "should_change_model_for_class",
     "should_escalate_model",
     "surface_user_intervention_hint",
 ]

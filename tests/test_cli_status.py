@@ -222,3 +222,138 @@ def test_print_knowledge_summary_zero_counts() -> None:
 
     rendered = output.getvalue()
     assert "0" in rendered
+
+
+# ---------------------------------------------------------------------------
+# v0.36.0 F3: status --blocked surfaces recovery outcomes + dump paths.
+# ---------------------------------------------------------------------------
+
+
+def _make_blocked_plan() -> Plan:
+    import datetime as _dt
+
+    task = Task(
+        id="1.1",
+        phase_id="1",
+        title="blocked task",
+        description="x",
+        files=[],
+        acceptance=[],
+        status="blocked",
+        blocked_reason="something went wrong",
+    )
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    return Plan(
+        plan_id="p-1",
+        spec_hash="h" * 16,
+        metadata={"title": "test plan"},
+        edit_scope=[],
+        phases=[
+            Phase(
+                id="1",
+                title="Phase 1",
+                tasks=[task],
+                edit_scope=None,
+            )
+        ],
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def test_status_blocked_renders_recovery_outcomes(tmp_path: Path) -> None:
+    from io import StringIO
+    import json as _json
+
+    from cli.commands.status import _render_blocked_section
+
+    # Synthesise the plan + ledger lines the F3 helpers parse.
+    (tmp_path / ".autodev").mkdir(parents=True)
+    ledger = tmp_path / ".autodev" / "plan-ledger.jsonl"
+    rows = [
+        {
+            "op": "recovery_tier_attempted",
+            "payload": {
+                "tier": 4,
+                "outcome": "applied",
+                "reason": "recurrent_path_failure",
+                "from_state": "undegraded",
+                "to_state": "dropped:notes/foo.md",
+            },
+        },
+        {
+            "op": "architect_attempt_failed",
+            "payload": {
+                "attempt": 1,
+                "model": "claude-opus-4-7",
+                "duration_s": 1.5,
+                "rejection_count": 2,
+                "primary_class": "new_md_deliverable",
+            },
+        },
+    ]
+    with ledger.open("w") as fh:
+        for r in rows:
+            fh.write(_json.dumps(r) + "\n")
+
+    plan = _make_blocked_plan()
+    out = StringIO()
+    console = Console(file=out, force_terminal=False)
+    _render_blocked_section(console, plan, cwd=tmp_path)
+    rendered = out.getvalue()
+    assert "Recovery Tier Outcomes" in rendered
+    assert "Architect Attempts" in rendered
+    assert "applied" in rendered
+    assert "claude-opus" in rendered
+
+
+def test_status_blocked_lists_dump_paths(tmp_path: Path) -> None:
+    from io import StringIO
+
+    from cli.commands.status import _render_blocked_section
+
+    (tmp_path / ".autodev" / "debug").mkdir(parents=True)
+    d1 = tmp_path / ".autodev" / "debug" / "architect-failed-1000.md"
+    d2 = tmp_path / ".autodev" / "debug" / "architect-failed-2000.md"
+    d1.write_text("# rejected attempt 1\n")
+    d2.write_text("# rejected attempt 2\n")
+
+    plan = _make_blocked_plan()
+    out = StringIO()
+    console = Console(file=out, force_terminal=False)
+    _render_blocked_section(console, plan, cwd=tmp_path)
+    rendered = out.getvalue()
+    assert "Archived Rejected Plans" in rendered
+    assert "architect-failed-" in rendered
+
+
+def test_status_blocked_shows_design_class_action(tmp_path: Path) -> None:
+    from io import StringIO
+    import json as _json
+
+    from cli.commands.status import _render_blocked_section
+
+    (tmp_path / ".autodev").mkdir(parents=True)
+    ledger = tmp_path / ".autodev" / "plan-ledger.jsonl"
+    with ledger.open("w") as fh:
+        fh.write(
+            _json.dumps(
+                {
+                    "op": "path_rejection_recorded",
+                    "payload": {
+                        "task_id": "",
+                        "path": "notes/foo.md",
+                        "class": "new_md_deliverable",
+                    },
+                }
+            )
+            + "\n"
+        )
+
+    plan = _make_blocked_plan()
+    out = StringIO()
+    console = Console(file=out, force_terminal=False)
+    _render_blocked_section(console, plan, cwd=tmp_path)
+    rendered = out.getvalue()
+    # The new_md_deliverable diagnosis paragraph mentions both options.
+    assert "Action hint" in rendered or "Choose ONE" in rendered

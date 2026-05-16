@@ -84,7 +84,7 @@ def test_plan_missing_config_exits_1(tmp_path: Path) -> None:
     """Plan in a directory without .autodev/config.json should exit 1."""
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        result = runner.invoke(cli, ["plan", "build a widget"])
+        result = runner.invoke(cli, ["plan", "build a widget", "--skip-spec-validation"])
     assert result.exit_code == 1
     assert "autodev init" in result.output
 
@@ -98,7 +98,7 @@ def test_plan_invalid_config_exits_1(tmp_path: Path) -> None:
         autodev_dir.mkdir(parents=True, exist_ok=True)
         (autodev_dir / "config.json").write_text("{invalid json!!}", encoding="utf-8")
 
-        result = runner.invoke(cli, ["plan", "build a widget"])
+        result = runner.invoke(cli, ["plan", "build a widget", "--skip-spec-validation"])
     assert result.exit_code == 1
     assert "config error" in result.output
 
@@ -124,7 +124,7 @@ def test_plan_success_renders_output(tmp_path: Path) -> None:
             mock_orch_cls.return_value = mock_orch
 
             result = runner.invoke(
-                cli, ["plan", "build a widget"], catch_exceptions=False
+                cli, ["plan", "build a widget", "--skip-spec-validation"], catch_exceptions=False
             )
 
     assert result.exit_code == 0, result.output
@@ -152,7 +152,7 @@ def test_plan_autodev_error_exits_2(tmp_path: Path) -> None:
             )
             mock_orch_cls.return_value = mock_orch
 
-            result = runner.invoke(cli, ["plan", "build a widget"])
+            result = runner.invoke(cli, ["plan", "build a widget", "--skip-spec-validation"])
 
     assert result.exit_code == 2
     assert "plan failed" in result.output
@@ -285,7 +285,7 @@ def test_plan_complexity_flag_overrides_config(tmp_path: Path) -> None:
 
             result = runner.invoke(
                 cli,
-                ["plan", "build a widget", "--complexity", "max"],
+                ["plan", "build a widget", "--skip-spec-validation", "--complexity", "max"],
                 catch_exceptions=False,
             )
 
@@ -321,7 +321,7 @@ def test_plan_complexity_flag_omitted_uses_config_value(tmp_path: Path) -> None:
             mock_orch_cls.side_effect = _capture
 
             result = runner.invoke(
-                cli, ["plan", "build a widget"], catch_exceptions=False
+                cli, ["plan", "build a widget", "--skip-spec-validation"], catch_exceptions=False
             )
 
     assert result.exit_code == 0, result.output
@@ -338,7 +338,7 @@ def test_plan_complexity_flag_invalid_value_rejected(tmp_path: Path) -> None:
         _write_config_with_complexity(cwd, user_complexity="medium")
 
         result = runner.invoke(
-            cli, ["plan", "build a widget", "--complexity", "garbage"]
+            cli, ["plan", "build a widget", "--skip-spec-validation", "--complexity", "garbage"]
         )
 
     assert result.exit_code != 0

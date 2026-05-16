@@ -2,7 +2,11 @@
 # Mirror of the grep-style preflights in .github/workflows/release.yml so
 # the same checks can be run locally before pushing a release tag.
 #
-# Usage: ci/release_preflight_greps.sh [v0.32 | v0.33 | v0.34 | v0.35 | all]   (default: all)
+# Usage: ci/release_preflight_greps.sh [v0.32 | v0.33 | all]   (default: all)
+#
+# Each block locks the integration of a shipped phase against accidental
+# removal. Adding a new release? Append a block and update the dispatch
+# below.
 
 set -euo pipefail
 
@@ -44,13 +48,23 @@ preflight_v034() {
 }
 
 preflight_v035() {
-  check "v0.35 C1 field"         src/state/knowledge.py "quarantined:"
-  check "v0.35 C1 audit file"    src/state/knowledge.py "quarantine_audit.jsonl"
-  check "v0.35 C1 evaluator"     src/state/knowledge.py "_evaluate_quarantine"
-  check "v0.35 C2 gate"          src/state/knowledge.py "_critic_evidence_quality"
-  check "v0.35 C3 decay curve"   src/state/knowledge.py "confirmations_7d"
-  check "v0.35 C1 quarantine op" src/state/ledger.py    "knowledge_entry_quarantined"
-  check "v0.35 C1 credit op"     src/state/ledger.py    "knowledge_lesson_credited"
+  check "v0.35 C1 field"          src/state/knowledge.py  "quarantined:"
+  check "v0.35 C1 audit file"     src/state/knowledge.py  "quarantine_audit.jsonl"
+  check "v0.35 C1 evaluator"      src/state/knowledge.py  "_evaluate_quarantine"
+  check "v0.35 C2 gate"           src/state/knowledge.py  "_critic_evidence_quality"
+  check "v0.35 C3 decay curve"    src/state/knowledge.py  "confirmations_7d"
+  check "v0.35 C1 quarantine op"  src/state/ledger.py     "knowledge_entry_quarantined"
+  check "v0.35 C1 credit op"      src/state/ledger.py     "knowledge_lesson_credited"
+}
+
+preflight_v036() {
+  check "v0.36 F1 recovery op"        src/state/ledger.py                          "recovery_tier_attempted"
+  check "v0.36 F1 attempt op"         src/state/ledger.py                          "architect_attempt_failed"
+  check "v0.36 F2 exception"          src/adapters/base.py                         "NetworkProbeFailure"
+  check "v0.36 G1 module"             src/orchestrator/spec_validator.py           "validate_spec_text"
+  check "v0.36 E1 default factory"    src/config/schema.py                         "huge_repo_multipliers: dict\[str, float\] = Field"
+  check "v0.36 D1 templates"          src/orchestrator/retry_envelope.py           "_DIAGNOSIS_TEMPLATES"
+  check "v0.36 D3 helper"             src/orchestrator/plan_phase_recovery.py      "should_change_model_for_class"
 }
 
 case "$target" in
@@ -58,8 +72,12 @@ case "$target" in
   v0.33) preflight_v033 ;;
   v0.34) preflight_v034 ;;
   v0.35) preflight_v035 ;;
-  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ;;
-  *)     echo "Unknown target: $target (try: v0.32 | v0.33 | v0.34 | v0.35 | all)"; exit 2 ;;
+  v0.36) preflight_v036 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ;;
+  *)
+    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | all)" >&2
+    exit 2
+    ;;
 esac
 
 echo "All preflight greps passed for: $target"

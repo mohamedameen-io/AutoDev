@@ -101,7 +101,13 @@ def test_render_rejection_history_empty_returns_empty_string() -> None:
 
 
 def test_render_rejection_history_includes_count_and_reason() -> None:
-    """Each entry renders count, raw, reason; suggestion only when present."""
+    """Each entry renders count, raw, reason; suggestion only when present.
+
+    v0.36.0 D1: the per-path line uses ``RECURRED N×`` (was
+    ``RECURRED N times``) AND is prefaced by a class-level diagnosis
+    paragraph. The path / reason / suggestion fragments survive the
+    rewrite so this test asserts on those.
+    """
     env = TypedRetryEnvelope(
         most_recent_failures=[
             PriorError(
@@ -115,7 +121,8 @@ def test_render_rejection_history_includes_count_and_reason() -> None:
     )
     rendered = env.render_rejection_history(attempt=2)
     assert "## PATH VALIDATION HISTORY (Retry Attempt 2)" in rendered
-    assert "RECURRED 3 times: notes" in rendered
+    assert "notes" in rendered
+    assert "RECURRED 3" in rendered
     assert "reason: missing_on_disk" in rendered
     # Suggestion is included when present.
     assert "suggestion: docs/notes.md" in rendered
@@ -175,7 +182,9 @@ async def test_architect_retry_includes_prior_path_failures(
     second_prompt = architect_prompts[1]
     assert "PATH VALIDATION HISTORY (Retry Attempt 2)" in second_prompt
     assert "imaginary.cpp" in second_prompt
-    assert "RECURRED 1 times: imaginary.cpp" in second_prompt
+    # v0.36.0 D1: per-path line format changed from
+    # ``RECURRED N times: <path>`` to ``<path> (RECURRED N× ...)``.
+    assert "RECURRED 1" in second_prompt
     # Reason name is verbatim.
     assert "reason: missing_on_disk" in second_prompt
 
@@ -213,7 +222,10 @@ async def test_architect_remembers_rejected_paths_across_attempts(
     # By the third attempt the architect should see "RECURRED 2 times"
     # for imaginary.cpp.
     assert "PATH VALIDATION HISTORY (Retry Attempt 3)" in third_prompt
-    assert "RECURRED 2 times: imaginary.cpp" in third_prompt
+    # v0.36.0 D1: per-path line format changed (see note in
+    # test_architect_retry_includes_prior_path_failures).
+    assert "imaginary.cpp" in third_prompt
+    assert "RECURRED 2" in third_prompt
 
 
 @pytest.mark.asyncio

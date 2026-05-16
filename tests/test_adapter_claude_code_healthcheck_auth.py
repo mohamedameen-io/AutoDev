@@ -129,14 +129,28 @@ async def test_healthcheck_returns_ok_on_pong() -> None:
 
 @pytest.mark.asyncio
 async def test_healthcheck_returns_network_on_timeout() -> None:
-    """When the PONG probe hangs past its deadline → ``network: ...``."""
+    """v0.36.0 F2: PONG hangs past deadline → after retries, the probe
+    raises :class:`NetworkProbeFailure`. The legacy ``(False,
+    "network:...")`` shape now lives on ``exc.last_error`` for callers
+    that haven't migrated.
+    """
+    from adapters.base import NetworkProbeFailure
+
     adapter = ClaudeCodeAdapter()
+
+    # Stub adapters cfg so backoff is instant (no real sleep).
+    class _Cfg:
+        probe_retry_attempts = 3
+        probe_backoff_initial_s = 0.0
+
+    adapter.bind_adapters_cfg(_Cfg())
+
     version_proc = _fake_proc(stdout="2.1.92 (Claude Code)\n", returncode=0)
-    pong_proc = _fake_proc(hang=True)
+    pong_procs = [_fake_proc(hang=True) for _ in range(3)]
 
     with patch(
         "adapters.claude_code.asyncio.create_subprocess_exec",
-        AsyncMock(side_effect=[version_proc, pong_proc]),
+        AsyncMock(side_effect=[version_proc, *pong_procs]),
     ):
         # Patch wait_for so the test doesn't actually sleep 10s.
         original_wait_for = asyncio.wait_for
@@ -147,8 +161,8 @@ async def test_healthcheck_returns_network_on_timeout() -> None:
             if call_idx["n"] == 1:
                 # Let --version drain normally.
                 return await original_wait_for(coro, timeout=2)
-            # Force timeout on the PONG stage (and close the coroutine
-            # so we don't leak a "coroutine was never awaited" warning).
+            # Force timeout on every PONG attempt (and close the coro
+            # to avoid "coroutine was never awaited" warnings).
             coro.close()
             raise asyncio.TimeoutError
 
@@ -156,10 +170,12 @@ async def test_healthcheck_returns_network_on_timeout() -> None:
             "adapters.claude_code.asyncio.wait_for",
             side_effect=_fake_wait_for,
         ):
-            ok, details = await adapter.healthcheck()
+            with pytest.raises(NetworkProbeFailure) as exc_info:
+                await adapter.healthcheck()
 
-    assert ok is False
-    assert details.startswith("network:")
+    exc = exc_info.value
+    assert exc.attempts == 3
+    assert "network:" in exc.last_error
 
 
 @pytest.mark.asyncio

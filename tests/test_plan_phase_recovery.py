@@ -396,3 +396,64 @@ async def test_hard_fail_after_all_tiers_exhausted(
     msg = str(exc_info.value)
     assert "Architect plan phase failed after 3 attempts" in msg
     assert "Archived rejected markdown dumps" in msg
+
+
+# ---------------------------------------------------------------------------
+# v0.36.0 D3: structural-retry model routing.
+# ---------------------------------------------------------------------------
+
+
+def test_structural_retry_routes_to_sonnet() -> None:
+    """A missing_on_disk failure on opus routes the architect to sonnet."""
+    from orchestrator.plan_phase_recovery import should_change_model_for_class
+
+    assert (
+        should_change_model_for_class(
+            current_model="claude-opus-4-7",
+            error_class="missing_on_disk",
+            structural_retry_model="sonnet",
+        )
+        == "sonnet"
+    )
+
+
+def test_structural_retry_routes_md_deliverable_to_sonnet() -> None:
+    from orchestrator.plan_phase_recovery import should_change_model_for_class
+
+    assert (
+        should_change_model_for_class(
+            current_model="claude-opus-4-7",
+            error_class="new_md_deliverable",
+            structural_retry_model="sonnet",
+        )
+        == "sonnet"
+    )
+
+
+def test_non_structural_retry_remains_on_opus() -> None:
+    """Reasoning-class failures (e.g. PlanParseError exception name) do
+    NOT trigger the model swap — opus stays."""
+    from orchestrator.plan_phase_recovery import should_change_model_for_class
+
+    assert (
+        should_change_model_for_class(
+            current_model="claude-opus-4-7",
+            error_class="PlanParseError",
+            structural_retry_model="sonnet",
+        )
+        is None
+    )
+
+
+def test_non_opus_current_model_no_swap() -> None:
+    """If the architect is already on sonnet, no swap fires."""
+    from orchestrator.plan_phase_recovery import should_change_model_for_class
+
+    assert (
+        should_change_model_for_class(
+            current_model="claude-sonnet-4-5",
+            error_class="missing_on_disk",
+            structural_retry_model="sonnet",
+        )
+        is None
+    )

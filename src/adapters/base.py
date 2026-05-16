@@ -9,6 +9,40 @@ from pathlib import Path
 from adapters.types import AgentInvocation, AgentResult, AgentSpec
 
 
+class NetworkProbeFailure(Exception):
+    """v0.36.0 F2: structured network-probe failure.
+
+    Adapters MAY raise this from :meth:`PlatformAdapter.healthcheck` to
+    signal that the probe retried the configured number of times AND
+    still failed. Distinct from the legacy ``(False, "network: ...")``
+    return path so callers can opt-in to a structured handler (the CLI
+    `autodev plan` catch site renders ``.suggestion`` and exits with
+    a dedicated code 5).
+
+    Fields:
+        adapter: short name of the failing adapter ("claude_code", …).
+        attempts: number of probes attempted before giving up.
+        last_error: stringified terminal-attempt exception / status.
+        suggestion: free-form remediation hint surfaced to the operator.
+    """
+
+    def __init__(
+        self,
+        adapter: str,
+        attempts: int,
+        last_error: str,
+        suggestion: str = "",
+    ) -> None:
+        super().__init__(
+            f"network probe for adapter {adapter!r} failed after "
+            f"{attempts} attempts: {last_error}"
+        )
+        self.adapter = adapter
+        self.attempts = attempts
+        self.last_error = last_error
+        self.suggestion = suggestion
+
+
 class PlatformAdapter(ABC):
     """Uniform subprocess-based contract for every LLM platform.
 
@@ -69,6 +103,12 @@ class PlatformAdapter(ABC):
                 credentials (HTTP 401/403 from the upstream LLM API).
               - ``"network: ..."``           → reachable CLI, transient
                 upstream failure (timeout, 5xx, connection error).
+
+        v0.36.0 F2: adapters MAY ALSO raise :class:`NetworkProbeFailure`
+        for structured probe failures (after exhausting the configured
+        retry budget). Callers that catch this exception get a typed
+        ``.suggestion`` field; callers that don't see the legacy
+        ``(False, "network: ...")`` tuple (back-compat).
 
         Implementations should fail fast (a few seconds, not minutes) so the
         check is safe to gate startup on. The Claude Code adapter implements

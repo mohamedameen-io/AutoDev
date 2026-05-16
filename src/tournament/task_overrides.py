@@ -62,6 +62,9 @@ def resolve_task_max_turns(
     spec_default: int | None,
     capacity: "RepoCapacity | None" = None,
     huge_repo_multipliers: dict[str, float] | None = None,
+    retry_attempt: int = 0,
+    retry_budget_multiplier: float = 2.0,
+    retry_budget_cap_turns: int = 200,
 ) -> int | None:
     """Return the per-task ``max_turns`` override or ``None``.
 
@@ -82,6 +85,12 @@ def resolve_task_max_turns(
     :data:`runtime.repo_probe._HUGE_BUCKET_MULTIPLIERS`. Operators may
     override via the ``huge_repo_multipliers`` arg (typically threaded
     through from ``cfg.task_overrides.huge_repo_multipliers``).
+
+    v0.36.0 E2: when ``retry_attempt >= 2``, multiply the resolved
+    value by ``retry_budget_multiplier`` (default 2.0), capped at
+    ``retry_budget_cap_turns`` (default 200). Lets a task that ran
+    out of budget on the first attempt actually finish on retry
+    instead of burning another retry slot at the same budget.
     """
     if task.complexity is None:
         return None
@@ -107,7 +116,10 @@ def resolve_task_max_turns(
             mult = _HUGE_BUCKET_MULTIPLIERS.get(
                 task.complexity, _HUGE_MULTIPLIER
             )
-        return int(round(base * mult))
+        base = int(round(base * mult))
+    if retry_attempt >= 2:
+        scaled = int(round(base * retry_budget_multiplier))
+        base = min(scaled, retry_budget_cap_turns)
     return base
 
 

@@ -69,18 +69,22 @@ def test_prior_errors_serialise_as_dicts() -> None:
     # field (default empty string) so the architect can see remediation
     # hints alongside the raw + reason. Older entries that don't set
     # it round-trip with ``suggestion=""``.
+    # v0.36.0 D1: PriorError gained ``error_class`` (default
+    # ``"missing_on_disk"``).
     assert payload["prior_errors"] == [
         {
             "raw": "src/foo.py",
             "reason": "missing_on_disk",
             "count": 2,
             "suggestion": "",
+            "error_class": "missing_on_disk",
         },
         {
             "raw": "notes",
             "reason": "missing_on_disk",
             "count": 3,
             "suggestion": "",
+            "error_class": "missing_on_disk",
         },
     ]
 
@@ -172,12 +176,16 @@ def test_build_retry_env_with_path_validation_error() -> None:
     assert ctx["path_error_reason"] == "missing_on_disk"
     assert ctx["path_error_suggestion"] == ""
     # v0.32.0 Phase 1.1: PriorError gained ``suggestion`` (default "").
+    # v0.36.0 D1: also gained ``error_class`` (default
+    # ``"missing_on_disk"``; the classifier picks this for a top-level
+    # ``notes`` path that does not end in .md).
     assert ctx["prior_errors"] == [
         {
             "raw": "notes",
             "reason": "missing_on_disk",
             "count": 2,
             "suggestion": "",
+            "error_class": "missing_on_disk",
         }
     ]
     assert ctx["dropped_entries"] == ["prior_drop"]
@@ -217,3 +225,72 @@ def test_build_retry_env_returns_new_envelope_not_mutating_input() -> None:
     assert base.context == base_context_before
     assert new is not base
     assert "prior_attempt" not in base.context
+
+
+# ---------------------------------------------------------------------------
+# v0.36.0 D1: rendered rejection history groups by error_class.
+# ---------------------------------------------------------------------------
+
+
+def test_render_rejection_history_collapses_md_class_to_single_diagnosis() -> None:
+    """Three sibling `.md` rejections render as ONE diagnosis paragraph
+    (the new_md_deliverable template) plus a list of paths — not three
+    independent RECURRED bullets."""
+    env = TypedRetryEnvelope(
+        most_recent_failures=[
+            PriorError(
+                raw="notes/foo.md",
+                reason="missing_on_disk",
+                count=1,
+                error_class="new_md_deliverable",
+            ),
+            PriorError(
+                raw="notes/bar.md",
+                reason="missing_on_disk",
+                count=1,
+                error_class="new_md_deliverable",
+            ),
+            PriorError(
+                raw="notes/baz.md",
+                reason="missing_on_disk",
+                count=1,
+                error_class="new_md_deliverable",
+            ),
+        ]
+    )
+    rendered = env.render_rejection_history(attempt=2)
+    # Diagnosis paragraph appears once.
+    assert rendered.count("Choose ONE") == 1
+    # All three paths appear under the same class section.
+    assert "notes/foo.md" in rendered
+    assert "notes/bar.md" in rendered
+    assert "notes/baz.md" in rendered
+    assert "new_md_deliverable" in rendered
+
+
+def test_rejection_diagnosis_includes_action_options() -> None:
+    """The new_md_deliverable diagnosis mentions both action options
+    (drop the deliverable, or tag with [new])."""
+    from orchestrator.retry_envelope import diagnosis_for_class
+
+    paragraph = diagnosis_for_class("new_md_deliverable")
+    assert "drop the documentation deliverable" in paragraph
+    assert "[new]" in paragraph
+
+
+def test_render_rejection_history_classifies_missing_on_disk() -> None:
+    """A path with a generic missing_on_disk class gets the default
+    diagnosis paragraph."""
+    env = TypedRetryEnvelope(
+        most_recent_failures=[
+            PriorError(
+                raw="src/missing.py",
+                reason="missing_on_disk",
+                count=2,
+                error_class="missing_on_disk",
+            )
+        ]
+    )
+    rendered = env.render_rejection_history(attempt=1)
+    assert "missing_on_disk" in rendered
+    assert "These paths do not exist on disk" in rendered

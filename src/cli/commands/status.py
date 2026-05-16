@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from config.loader import load_config
 from errors import AutodevError
 from state.evidence import list_evidence
 from state.knowledge import KnowledgeStore
-from state.paths import config_path
+from state.paths import autodev_root, config_path, ledger_path
 from state.plan_manager import PlanManager
 from state.schemas import Plan, Task
 
@@ -74,7 +75,7 @@ def status(blocked: bool) -> None:
         # ONLY the blocked-tasks panel and exit — the operator asked
         # specifically for the recovery surface.
         if blocked:
-            _render_blocked_section(console, plan)
+            _render_blocked_section(console, plan, cwd=cwd)
             return
 
         console.print(
@@ -127,7 +128,131 @@ def status(blocked: bool) -> None:
         sys.exit(2)
 
 
-def _render_blocked_section(console: Console, plan: Plan) -> None:
+def _collect_recovery_outcomes(ledger_pth: Path) -> list[dict]:
+    """v0.36.0 F3: parse the plan-ledger JSONL and return the F1 ops
+    for the most recent run.
+
+    Filters to ``recovery_tier_attempted`` and ``architect_attempt_failed``
+    ops. Returns them in append order. Best-effort — malformed ledger
+    lines are skipped silently (status is a forensic view; we want it
+    to render even when the ledger is partially corrupted).
+    """
+    if not ledger_pth.exists():
+        return []
+    rows: list[dict] = []
+    try:
+        with ledger_pth.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                op = obj.get("op")
+                if op in (
+                    "recovery_tier_attempted",
+                    "architect_attempt_failed",
+                    "path_rejection_recorded",
+                ):
+                    rows.append(obj)
+    except OSError:
+        return []
+    return rows
+
+
+def _find_architect_dumps(autodev_dir: Path) -> list[Path]:
+    """v0.36.0 F3: list ``.autodev/debug/architect-failed-*.md`` paths.
+
+    Sorted by mtime descending so the most recent dump renders first.
+    Empty list when the debug dir doesn't exist.
+    """
+    debug = autodev_dir / "debug"
+    if not debug.exists():
+        return []
+    try:
+        dumps = list(debug.glob("architect-failed-*.md"))
+    except OSError:
+        return []
+    dumps.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return dumps
+
+
+def _render_recovery_outcomes(
+    console: Console, rows: list[dict]
+) -> None:
+    """v0.36.0 F3: render the recovery-tier + architect-attempt sections."""
+    tier_rows = [r for r in rows if r.get("op") == "recovery_tier_attempted"]
+    attempt_rows = [
+        r for r in rows if r.get("op") == "architect_attempt_failed"
+    ]
+    rejection_rows = [
+        r for r in rows if r.get("op") == "path_rejection_recorded"
+    ]
+
+    if tier_rows:
+        table = Table(title="Recovery Tier Outcomes")
+        table.add_column("Tier", justify="right")
+        table.add_column("Outcome")
+        table.add_column("Reason")
+        table.add_column("From → To")
+        for r in tier_rows:
+            p = r.get("payload", {})
+            table.add_row(
+                str(p.get("tier", "")),
+                p.get("outcome", ""),
+                p.get("reason", ""),
+                f"{p.get('from_state') or '-'} → {p.get('to_state') or '-'}",
+            )
+        console.print(table)
+
+    if attempt_rows:
+        # Last 3 by ledger order (most recent first).
+        recent = attempt_rows[-3:]
+        table = Table(title="Architect Attempts (most recent 3)")
+        table.add_column("Attempt", justify="right")
+        table.add_column("Model")
+        table.add_column("Duration (s)", justify="right")
+        table.add_column("Rejections", justify="right")
+        table.add_column("Primary class")
+        for r in recent:
+            p = r.get("payload", {})
+            table.add_row(
+                str(p.get("attempt", "")),
+                p.get("model", ""),
+                str(p.get("duration_s", "")),
+                str(p.get("rejection_count", "")),
+                p.get("primary_class", ""),
+            )
+        console.print(table)
+
+    # Surface the most recent design-class action hint when we saw a
+    # rejection. Defers to D1's diagnosis library so the same text the
+    # architect-retry envelope renders also lands in the status surface.
+    if rejection_rows:
+        try:
+            from orchestrator.retry_envelope import diagnosis_for_class
+        except Exception:  # noqa: BLE001
+            diagnosis_for_class = lambda _c: ""  # noqa: E731
+        last = rejection_rows[-1].get("payload", {})
+        cls = last.get("class", "missing_on_disk")
+        action = diagnosis_for_class(cls)
+        if action:
+            console.print(
+                Panel(
+                    action,
+                    title=f"Action hint (class: {cls})",
+                    border_style="cyan",
+                )
+            )
+
+
+def _render_blocked_section(
+    console: Console,
+    plan: Plan,
+    cwd: Path | None = None,
+) -> None:
     """v0.32.0 (Phase 5, Gap G): render structured recovery panels for
     every blocked task in ``plan``.
 
@@ -219,6 +344,26 @@ def _render_blocked_section(console: Console, plan: Plan) -> None:
                 )
             )
         console.print("")
+
+    # v0.36.0 F3: surface recovery-tier outcomes, recent architect
+    # attempts, archived rejected-plan dumps, and the most recent
+    # design-class action hint. Skipped when ``cwd`` is None (back-
+    # compat for callers that haven't migrated to the new signature).
+    if cwd is not None:
+        try:
+            rows = _collect_recovery_outcomes(ledger_path(cwd))
+        except Exception:  # noqa: BLE001
+            rows = []
+        if rows:
+            _render_recovery_outcomes(console, rows)
+        try:
+            dumps = _find_architect_dumps(autodev_root(cwd))
+        except Exception:  # noqa: BLE001
+            dumps = []
+        if dumps:
+            console.print("[bold]Archived Rejected Plans[/bold]")
+            for path in dumps:
+                console.print(f"  - {path}")
 
 
 def _print_knowledge_summary(console: Console, swarm_count: int, hive_count: int) -> None:

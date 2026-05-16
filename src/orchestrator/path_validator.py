@@ -44,21 +44,29 @@ class PathValidationError(Exception):
 
     Carries enough fields to be passed back to the architect for a
     structured retry. The :class:`Exception` parent's message is the
-    human-readable form; ``raw``, ``reason``, ``suggestion`` are the
-    machine-readable surface used by the retry envelope.
+    human-readable form; ``raw``, ``reason``, ``suggestion``, and
+    (v0.36.0 D1) ``error_class`` are the machine-readable surface used
+    by the retry envelope.
+
+    ``error_class`` groups failures into design-class buckets so the
+    retry envelope can render one paragraph per class instead of one
+    bullet per path. Default ``"missing_on_disk"`` preserves backward
+    compat for sites that don't pass the kwarg.
     """
 
-    __slots__ = ("raw", "reason", "suggestion")
+    __slots__ = ("raw", "reason", "suggestion", "error_class")
 
     def __init__(
         self,
         raw: str,
         reason: str,
         suggestion: str | None = None,
+        error_class: str = "missing_on_disk",
     ) -> None:
         self.raw = raw
         self.reason = reason
         self.suggestion = suggestion
+        self.error_class = error_class
         super().__init__(
             f"path {raw!r} rejected: {reason}"
             + (f" — try: {suggestion!r}" if suggestion else "")

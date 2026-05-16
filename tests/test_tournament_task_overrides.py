@@ -153,3 +153,101 @@ def test_resolve_task_max_turns_huge_with_none_complexity_returns_none() -> None
         file_count=25_000, total_bytes=10_000_000_000, depth_max=10, is_huge=True
     )
     assert resolve_task_max_turns(_task(None), spec_default=10, capacity=cap) is None
+
+
+# ---------------------------------------------------------------------------
+# v0.36.0 E1: huge_repo_multipliers populated default.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_max_turns_applies_huge_repo_multipliers() -> None:
+    """When the dict carries the task complexity key AND the repo is
+    huge, the multiplier wins over the baked-in curve."""
+    from runtime.repo_probe import RepoCapacity
+
+    cap = RepoCapacity(
+        file_count=30_000, total_bytes=10_000_000_000, depth_max=12, is_huge=True
+    )
+    # Use complexity-keyed override (the resolver consults task.complexity).
+    out = resolve_task_max_turns(
+        _task("simple"),
+        spec_default=10,
+        capacity=cap,
+        huge_repo_multipliers={"simple": 4.0},
+    )
+    assert out == 40  # 10 base * 4.0 override
+
+
+def test_resolve_max_turns_unchanged_for_normal_repo() -> None:
+    """A non-huge repo ignores huge_repo_multipliers entirely."""
+    from runtime.repo_probe import RepoCapacity
+
+    cap = RepoCapacity(
+        file_count=500, total_bytes=1_000_000, depth_max=3, is_huge=False
+    )
+    out = resolve_task_max_turns(
+        _task("medium"),
+        spec_default=10,
+        capacity=cap,
+        huge_repo_multipliers={"medium": 99.0},
+    )
+    # Multiplier ignored — base medium = 20.
+    assert out == 20
+
+
+def test_huge_repo_multipliers_default_factory_is_populated() -> None:
+    """v0.36.0 E1: config default is now a populated role-keyed dict
+    (was ``None`` through v0.35)."""
+    from config.schema import TaskOverridesConfig
+
+    cfg = TaskOverridesConfig()
+    assert isinstance(cfg.huge_repo_multipliers, dict)
+    assert "explorer" in cfg.huge_repo_multipliers
+    assert cfg.huge_repo_multipliers["explorer"] == 3.0
+
+
+# ---------------------------------------------------------------------------
+# v0.36.0 E2: retry budget scaling.
+# ---------------------------------------------------------------------------
+
+
+def test_retry_budget_doubles_on_attempt_2() -> None:
+    """Retry attempt 2 doubles the resolved budget (default multiplier 2.0)."""
+    out = resolve_task_max_turns(
+        _task("medium"),
+        spec_default=10,
+        capacity=None,
+        retry_attempt=2,
+    )
+    # medium base = 20 → 40 on retry attempt 2.
+    assert out == 40
+
+
+def test_retry_budget_capped_at_ceiling() -> None:
+    """Retry budget can't exceed retry_budget_cap_turns."""
+    out = resolve_task_max_turns(
+        _task("complex"),
+        spec_default=10,
+        capacity=None,
+        retry_attempt=3,
+        retry_budget_multiplier=10.0,
+        retry_budget_cap_turns=200,
+    )
+    # complex base = 40, 40 * 10.0 = 400, capped to 200.
+    assert out == 200
+
+
+def test_retry_attempt_0_or_1_unchanged() -> None:
+    """No retry-scaling for attempts 0 and 1."""
+    assert (
+        resolve_task_max_turns(
+            _task("medium"), spec_default=10, capacity=None, retry_attempt=0
+        )
+        == 20
+    )
+    assert (
+        resolve_task_max_turns(
+            _task("medium"), spec_default=10, capacity=None, retry_attempt=1
+        )
+        == 20
+    )

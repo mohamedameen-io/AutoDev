@@ -33,15 +33,55 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 
+# v0.36.0 D1: per-design-class diagnosis paragraphs. Each template is
+# the standalone action paragraph that prefaces the list of paths in
+# that class. The architect-retry envelope renders one paragraph per
+# class instead of the v0.32.0 "RECURRED N times" path-bullet list,
+# which collapses N-sibling-same-class failures into one actionable
+# instruction.
+_DIAGNOSIS_TEMPLATES: dict[str, str] = {
+    "new_md_deliverable": (
+        "All `.md` paths you proposed are being rejected because they do "
+        "not exist on disk yet. The plan validator requires either (a) an "
+        "existing file or (b) the `[new]` prefix on every task that "
+        "references the file. Choose ONE: (i) drop the documentation "
+        "deliverable and embed findings in task descriptions, or (ii) tag "
+        "the .md file with `[new]` on every task that touches it."
+    ),
+    "missing_on_disk": (
+        "These paths do not exist on disk. Either correct the path to an "
+        "existing file or tag the path with `[new]` on every task that "
+        "references it (and on at least one creating task)."
+    ),
+}
+
+# Default template for any class not explicitly listed above. Mirrors
+# the missing_on_disk language since that's the most common shape.
+_DEFAULT_DIAGNOSIS: str = _DIAGNOSIS_TEMPLATES["missing_on_disk"]
+
+
+def diagnosis_for_class(error_class: str) -> str:
+    """Return the design-class action paragraph for ``error_class``.
+
+    Public helper so consumers (e.g. ``autodev status --blocked``) can
+    surface the same actionable text the architect-retry envelope
+    renders, without taking a dependency on the envelope's internals.
+    """
+    return _DIAGNOSIS_TEMPLATES.get(error_class, _DEFAULT_DIAGNOSIS)
+
+
 class PriorError(BaseModel):
     """One entry in :attr:`TypedRetryEnvelope.prior_errors` /
     :attr:`TypedRetryEnvelope.most_recent_failures`.
 
-    Records ``(raw, reason, count, suggestion)`` so the architect can
-    see "this same path failed N times — please correct it" rather
-    than just "something failed". ``suggestion`` is optional (empty
-    string when none) so the wire JSON shape stays uniform across
-    entries with and without a remediation hint.
+    Records ``(raw, reason, count, suggestion, error_class)`` so the
+    architect can see "this same path failed N times — please correct
+    it" rather than just "something failed". ``suggestion`` is optional
+    (empty string when none) so the wire JSON shape stays uniform
+    across entries with and without a remediation hint. ``error_class``
+    (v0.36.0 D1) groups failures into design buckets for the rendered
+    diagnosis paragraph; default ``"missing_on_disk"`` keeps backward
+    compat for envelopes built from pre-v0.36 code paths.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -50,6 +90,7 @@ class PriorError(BaseModel):
     reason: str
     count: int
     suggestion: str = ""
+    error_class: str = "missing_on_disk"
 
 
 class TypedRetryEnvelope(BaseModel):
@@ -108,8 +149,8 @@ class TypedRetryEnvelope(BaseModel):
     path_error_suggestion: str = ""
 
     def render_rejection_history(self, *, attempt: int) -> str:
-        """v0.32.0 Phase 1.1: render the architect's PATH VALIDATION HISTORY
-        block from :attr:`most_recent_failures`.
+        """v0.32.0 Phase 1.1 / v0.36.0 D1: render the architect's PATH
+        VALIDATION HISTORY block as one paragraph per design-class.
 
         Returns the empty string when no failures have been recorded so
         the ``{rejection_history}`` placeholder in ``architect.md``
@@ -119,21 +160,42 @@ class TypedRetryEnvelope(BaseModel):
         ``attempt`` is the human-facing 1-based architect attempt
         number — included verbatim in the header so the model sees
         which retry it's on.
+
+        v0.36.0 D1: collapses the v0.32.0 "RECURRED N times" path
+        bullet list into one design-class diagnosis paragraph + the
+        list of paths under that class. Sibling failures of the same
+        class (e.g. all `.md` deliverables) now render as a single
+        actionable instruction rather than N redundant bullets.
         """
         if not self.most_recent_failures:
             return ""
+
+        # Group by error_class, preserving first-seen order so the
+        # rendered output is deterministic across runs.
+        by_class: dict[str, list[PriorError]] = {}
+        order: list[str] = []
+        for entry in self.most_recent_failures:
+            if entry.error_class not in by_class:
+                by_class[entry.error_class] = []
+                order.append(entry.error_class)
+            by_class[entry.error_class].append(entry)
+
         lines: list[str] = [
             f"## PATH VALIDATION HISTORY (Retry Attempt {attempt})",
-            "These paths failed in your prior attempts; do NOT propose them again:",
         ]
-        for entry in self.most_recent_failures:
-            suggestion_part = (
-                f"; suggestion: {entry.suggestion}" if entry.suggestion else ""
-            )
-            lines.append(
-                f"- RECURRED {entry.count} times: {entry.raw} "
-                f"(reason: {entry.reason}{suggestion_part})"
-            )
+        for cls in order:
+            lines.append("")
+            lines.append(diagnosis_for_class(cls))
+            lines.append("")
+            lines.append(f"Paths in class `{cls}`:")
+            for entry in by_class[cls]:
+                suggestion_part = (
+                    f"; suggestion: {entry.suggestion}" if entry.suggestion else ""
+                )
+                lines.append(
+                    f"- {entry.raw} (RECURRED {entry.count}× "
+                    f"reason: {entry.reason}{suggestion_part})"
+                )
         return "\n".join(lines)
 
     def as_context_dict(self) -> dict[str, Any]:
@@ -167,4 +229,9 @@ class TypedRetryEnvelope(BaseModel):
         return payload
 
 
-__all__ = ["PriorError", "TypedRetryEnvelope"]
+__all__ = [
+    "PriorError",
+    "TypedRetryEnvelope",
+    "diagnosis_for_class",
+    "_DIAGNOSIS_TEMPLATES",
+]

@@ -11,7 +11,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from adapters.base import PlatformAdapter
+from adapters.base import NetworkProbeFailure, PlatformAdapter
 from adapters.git_utils import (
     _diff_files,
     _git_diff,
@@ -107,6 +107,21 @@ class ClaudeCodeAdapter(PlatformAdapter):
         # we-read-it value gracefully degrades to "no measurement this
         # pass" rather than a crash.
         self.last_pid: int | None = None
+        # v0.36.0 F2: optional adapters config (probe retry knobs).
+        # Set via :meth:`bind_adapters_cfg` after construction; the
+        # adapter is created by ``get_adapter()`` before the config is
+        # loaded in some call paths, so binding is decoupled from
+        # construction. ``None`` means "use defaults".
+        self._adapters_cfg: Any | None = None
+
+    def bind_adapters_cfg(self, cfg: Any) -> None:
+        """v0.36.0 F2: attach the loaded ``cfg.adapters`` block.
+
+        Used by orchestrator wiring to give the adapter access to
+        :class:`AdaptersConfig` (probe retry attempts / backoff)
+        without coupling adapter construction to the config loader.
+        """
+        self._adapters_cfg = cfg
 
     def _build_command(self, inv: AgentInvocation) -> list[str]:
         cmd: list[str] = [
@@ -599,9 +614,83 @@ class ClaudeCodeAdapter(PlatformAdapter):
     async def _pong_probe(self, version_str: str) -> tuple[bool, str]:
         """Run ``echo PONG | claude -p --max-turns 1`` and classify the result.
 
-        10s timeout is intentional: this runs at every ``autodev resume`` /
-        ``execute`` startup; a longer wait would defeat fail-fast semantics.
+        10s per-attempt timeout is intentional: this runs at every
+        ``autodev resume`` / ``execute`` startup; a longer wait would
+        defeat fail-fast semantics.
+
+        v0.36.0 F2: retry on transient network failures with exponential
+        backoff (1s, 3s, 9s by default). Auth failures short-circuit
+        and do NOT consume retry budget. After the final attempt fails
+        the method raises :class:`NetworkProbeFailure` with the last
+        error message and a remediation suggestion. Operators that
+        want the legacy ``(False, "network: ...")`` shape should
+        configure ``probe_retry_attempts=1`` — the loop still runs
+        once, the raise still fires, and CLI fallback code keeps the
+        legacy string match via ``last_error``.
         """
+        # Resolve retry knobs from config; degrade gracefully when the
+        # adapter is exercised outside a real autodev config (unit
+        # tests bind a minimal stub).
+        _adapters_cfg = getattr(self, "_adapters_cfg", None)
+        attempts = int(
+            getattr(_adapters_cfg, "probe_retry_attempts", 3)
+            if _adapters_cfg is not None
+            else 3
+        )
+        backoff_initial = float(
+            getattr(_adapters_cfg, "probe_backoff_initial_s", 1.0)
+            if _adapters_cfg is not None
+            else 1.0
+        )
+        if attempts < 1:
+            attempts = 1
+
+        last_error = ""
+        for i in range(attempts):
+            ok, msg = await self._pong_probe_once(version_str)
+            if ok:
+                return True, msg
+            # Auth failures short-circuit. The credential isn't going to
+            # become valid in 1, 3, or 9 seconds — retrying would just
+            # waste startup latency.
+            if msg.startswith("auth_failed:"):
+                return False, msg
+            last_error = msg
+            # Best-effort ledger emission — captures probe failures even
+            # on retry-success runs so operators can track flaky network
+            # baselines. Final-attempt op is emitted after the loop.
+            try:
+                from autologging import get_logger as _gl  # noqa: PLC0415
+
+                _gl(__name__).warning(
+                    "claude_code._pong_probe.retry",
+                    attempt=i + 1,
+                    of=attempts,
+                    err=msg,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            if i < attempts - 1:
+                # Backoff: 1s, 3s, 9s for the default config.
+                await asyncio.sleep(backoff_initial * (3 ** i))
+
+        # All attempts failed → raise structured exception. The CLI
+        # catch site renders ``.suggestion`` + exits with code 5; the
+        # legacy ``(False, "network: ...")`` shape stays observable via
+        # ``last_error`` for callers that haven't migrated.
+        raise NetworkProbeFailure(
+            adapter="claude_code",
+            attempts=attempts,
+            last_error=last_error,
+            suggestion=(
+                "Check VPN / proxy / adapter health. The probe runs "
+                "with a 10s per-attempt timeout and retried "
+                f"{attempts} times before giving up."
+            ),
+        )
+
+    async def _pong_probe_once(self, version_str: str) -> tuple[bool, str]:
+        """Single PONG round-trip without retry/backoff."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 self.binary,

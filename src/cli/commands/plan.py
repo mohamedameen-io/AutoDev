@@ -1,4 +1,14 @@
-"""``autodev plan`` — run the PLAN phase end-to-end."""
+"""``autodev plan`` — run the PLAN phase end-to-end.
+
+Exit codes:
+    0 — plan approved and persisted.
+    1 — config / setup error (missing config, bad load).
+    2 — runtime ``AutodevError`` raised inside the orchestrator.
+    4 — v0.36.0 G1: spec rejected by :func:`validate_spec_text` before
+        dispatch (under-specified intent — see printed reasons).
+    5 — v0.36.0 F2: structured ``NetworkProbeFailure`` from the
+        adapter healthcheck (probe retried + still failing).
+"""
 
 from __future__ import annotations
 
@@ -20,6 +30,7 @@ from cli._blocked_banner import _maybe_print_blocked_banner
 from config.loader import load_config
 from errors import AutodevError
 from orchestrator import Orchestrator
+from orchestrator.spec_validator import validate_spec_text
 from state.paths import config_path, index_db_path
 
 
@@ -70,7 +81,22 @@ def _maybe_refresh_index(cwd: Path, cfg) -> None:
         "architect's effort floor (xhigh for {low,medium,high}, max for max)."
     ),
 )
-def plan(intent: str, platform: str | None, complexity: str | None) -> None:
+@click.option(
+    "--skip-spec-validation",
+    is_flag=True,
+    default=False,
+    help=(
+        "v0.36.0 G1: bypass the front-gate spec validator. Use only when "
+        "dispatching a deliberately laconic spec (the architect has the "
+        "context it needs from elsewhere)."
+    ),
+)
+def plan(
+    intent: str,
+    platform: str | None,
+    complexity: str | None,
+    skip_spec_validation: bool,
+) -> None:
     """Run PLAN phase: explore, research, draft, gate, persist."""
     console = Console()
     cwd = Path.cwd()
@@ -89,6 +115,45 @@ def plan(intent: str, platform: str | None, complexity: str | None) -> None:
 
     if complexity is not None:
         cfg = cfg.model_copy(update={"user_complexity": complexity})
+
+    # v0.36.0 G1: cheap front-gate. Reject obviously under-specified
+    # intents before paying for explorer + domain_expert + architect.
+    # The validator inspects the intent text directly (intent is what
+    # ``run_plan_phase`` later writes to ``spec.md``); a path-based
+    # variant lives in :func:`orchestrator.spec_validator.validate_spec`
+    # for callers that hand in a file.
+    if not skip_spec_validation:
+        result = validate_spec_text(intent)
+        if not result.ok:
+            console.print(
+                "[red]autodev plan: spec rejected by validator[/red]"
+            )
+            for reason in result.reasons:
+                console.print(f"  - {reason}", style="red")
+            console.print(
+                "[yellow]Pass --skip-spec-validation to bypass.[/yellow]"
+            )
+            # Best-effort ledger emission. We may not have an
+            # initialised plan-manager yet; write directly via
+            # :func:`state.ledger.append_entry`.
+            try:
+                from state.ledger import append_entry
+                import uuid
+
+                asyncio.run(
+                    append_entry(
+                        cwd,
+                        op="spec_validation_failed",
+                        payload={
+                            "path": str(intent[:200]),
+                            "reasons": list(result.reasons),
+                        },
+                        session_id=str(uuid.uuid4()),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - never block exit on ledger I/O
+                logger.warning("plan.spec_validation_ledger_failed", err=str(exc))
+            sys.exit(4)
 
     # v0.25.0: incremental file/symbol index refresh before Orchestrator
     # construction. The planner queries the index for candidate files
@@ -117,9 +182,28 @@ def plan(intent: str, platform: str | None, complexity: str | None) -> None:
 
     try:
         asyncio.run(_run())
-    except AutodevError as exc:
-        console.print(f"[red]autodev plan failed[/red]: {exc}")
-        sys.exit(2)
+    except Exception as exc:  # noqa: BLE001 - branch on type below
+        # v0.36.0 F2: structured probe failure caught here; renders
+        # the typed ``.suggestion`` and exits with a dedicated code.
+        # Imported lazily so adapters-package import failures don't
+        # mask the much-more-common AutodevError path.
+        try:
+            from adapters.base import NetworkProbeFailure
+        except Exception:  # noqa: BLE001
+            NetworkProbeFailure = ()  # type: ignore[assignment]
+        if NetworkProbeFailure and isinstance(exc, NetworkProbeFailure):
+            console.print(
+                f"[red]autodev plan: network probe failed[/red] "
+                f"({exc.adapter}, {exc.attempts} attempts)"
+            )
+            console.print(f"  last_error: {exc.last_error}")
+            if exc.suggestion:
+                console.print(f"  [yellow]suggestion:[/yellow] {exc.suggestion}")
+            sys.exit(5)
+        if isinstance(exc, AutodevError):
+            console.print(f"[red]autodev plan failed[/red]: {exc}")
+            sys.exit(2)
+        raise
 
 
 def _render_plan_summary(console: Console, plan_obj) -> None:

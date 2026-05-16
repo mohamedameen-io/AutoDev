@@ -862,3 +862,99 @@ async def test_v0150_ops_can_appear_before_init_plan(tmp_path: Path) -> None:
     out, entries = replay_ledger(tmp_path)
     assert out is not None
     assert len(entries) == 2
+
+
+# ---------------------------------------------------------------------------
+# v0.36.0 round-trip cases for the new ledger ops.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_v036_ops_round_trip(tmp_path: Path) -> None:
+    """Every v0.36.0 op (architect_attempt_failed, recovery_tier_attempted,
+    path_rejection_recorded, network_probe_failed,
+    architect_model_changed_for_retry, huge_repo_multiplier_applied,
+    retry_budget_scaled, spec_validation_failed) appends + replays as
+    an audit-only no-op."""
+    plan = _mk_plan()
+    async with plan_lock(tmp_path):
+        await append_entry(
+            tmp_path,
+            op="init_plan",
+            payload={"plan": plan.model_dump(mode="json")},
+            session_id="s1",
+        )
+    ops = [
+        (
+            "architect_attempt_failed",
+            {
+                "attempt": 2,
+                "model": "claude-opus-4-7",
+                "duration_s": 1.23,
+                "rejection_count": 4,
+                "primary_class": "new_md_deliverable",
+            },
+        ),
+        (
+            "recovery_tier_attempted",
+            {
+                "tier": 4,
+                "outcome": "applied",
+                "reason": "recurrent_path_failure",
+                "from_state": "undegraded",
+                "to_state": "dropped:notes/foo.md",
+            },
+        ),
+        (
+            "path_rejection_recorded",
+            {"task_id": "1.1", "path": "notes/foo.md", "class": "new_md_deliverable"},
+        ),
+        (
+            "network_probe_failed",
+            {
+                "adapter": "claude_code",
+                "attempt": 3,
+                "last_error": "timeout",
+                "suggestion": "check VPN",
+                "final": True,
+            },
+        ),
+        (
+            "architect_model_changed_for_retry",
+            {
+                "attempt": 2,
+                "from_model": "claude-opus-4-7",
+                "to_model": "sonnet",
+                "rejection_class": "missing_on_disk",
+            },
+        ),
+        (
+            "huge_repo_multiplier_applied",
+            {
+                "role": "explorer",
+                "base": 10,
+                "multiplier": 3.0,
+                "effective": 30,
+            },
+        ),
+        (
+            "retry_budget_scaled",
+            {"task_id": "1.1", "attempt": 2, "base": 20, "effective": 40},
+        ),
+        (
+            "spec_validation_failed",
+            {"path": "fix", "reasons": ["spec_too_short"]},
+        ),
+    ]
+    for op_name, payload in ops:
+        async with plan_lock(tmp_path):
+            await append_entry(
+                tmp_path,
+                op=op_name,  # type: ignore[arg-type]
+                payload=payload,
+                session_id="s1",
+            )
+    out, entries = replay_ledger(tmp_path)
+    assert out is not None
+    # 1 init_plan + 8 audit-only ops.
+    assert len(entries) == 9

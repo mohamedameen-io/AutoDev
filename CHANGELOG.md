@@ -2,6 +2,64 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] - 2026-05-16
+
+Retries, budgets, forensics, spec hygiene (Tiers D + E + F + G from
+the v0.32.0 retrospective). The largest release in the v0.33→v0.36
+sequence: nine findings landed inline. The architect now retries
+structural failures on a cheaper model, huge-repo budgets are no
+longer a no-op, every architect attempt + recovery-tier transition
+shows up in the plan-ledger, the network probe survives transient
+timeouts via exponential backoff, and `autodev status --blocked`
+surfaces the design-class diagnosis + the archived rejected-plan
+dumps + the per-attempt timeline an operator needs to actually
+unwedge the run.
+
+### Added
+- Spec validator: `/autodev <spec>` now rejects empty, too-short, or
+  scope-less specs before dispatching the plan phase, with
+  `--skip-spec-validation` escape hatch (#G1).
+- Design-class rejection diagnosis: architect retry prompts now receive
+  one paragraph per error class (e.g. "all `.md` paths rejected —
+  choose: drop the deliverable or tag with `[new]`") instead of a raw
+  path list (#D1).
+- Structured `NetworkProbeFailure` exception + 3-attempt retry with
+  exponential backoff (1s, 3s, 9s); CLI catches it and surfaces a
+  suggestion (#F2).
+- `autodev status --blocked` now surfaces recovery-tier outcomes,
+  recent architect attempts, archived rejected-plan dumps, and the
+  most recent design-class action hint (#F3).
+- Per-attempt plan-ledger ops: `architect_attempt_failed`,
+  `recovery_tier_attempted`, `path_rejection_recorded`, plus
+  replacement of the `{0→0}` breadcrumb lie with truthful values (#F1).
+
+### Changed
+- Fuzzy "did you mean" hints suppressed when suggestion is in a
+  different top-level directory or similarity is low for short paths
+  (#D2).
+- Architect retries for structural failures (missing-on-disk,
+  new-md-deliverable) route to Sonnet instead of Opus on retry
+  attempt 2+ (#D3).
+- `task_overrides.huge_repo_multipliers` populated with sensible
+  defaults (explorer ×3, architect ×2, coder ×2, …) and now actually
+  applied at dispatch (#E1).
+- Per-task budget doubles on retry attempts ≥2, capped at 200 turns
+  (#E2).
+
+### Telemetry
+- New ops: `architect_attempt_failed`, `recovery_tier_attempted`,
+  `path_rejection_recorded`, `architect_model_changed_for_retry`,
+  `huge_repo_multiplier_applied`, `retry_budget_scaled`,
+  `network_probe_failed`, `spec_validation_failed`.
+
+### Config
+- `agents.architect.structural_retry_model: str = "sonnet"`
+- `task_overrides.huge_repo_multipliers`: populated dict (was None)
+- `task_overrides.retry_budget_multiplier: float = 2.0`
+- `task_overrides.retry_budget_cap_turns: int = 200`
+- `adapters.probe_retry_attempts: int = 3`
+- `adapters.probe_backoff_initial_s: float = 1.0`
+
 ## [0.35.0] - 2026-05-16
 
 Knowledge-base hygiene release (Tier C from the v0.32.0 retrospective).
