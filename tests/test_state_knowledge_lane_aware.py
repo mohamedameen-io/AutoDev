@@ -13,7 +13,11 @@ from state.knowledge import KnowledgeStore, TournamentEvent
 def _store(tmp_path: Path, lane_aware: bool = True) -> KnowledgeStore:
     cfg = default_config()
     cfg.knowledge.lane_aware_injection_enabled = lane_aware
-    return KnowledgeStore(cwd=tmp_path, cfg=cfg)
+    # Isolate from the user's real hive file: pin to a per-tmp path so
+    # this test's injection ranking is not contaminated by pre-existing
+    # global entries.
+    cfg.hive.path = tmp_path / "hive.jsonl"
+    return KnowledgeStore(cwd=tmp_path, cfg=cfg, hive_path=cfg.hive.path)
 
 
 @pytest.mark.asyncio
@@ -24,7 +28,7 @@ async def test_record_tournament_event_persists_lane_metadata(tmp_path: Path) ->
         event_type="winner_promoted",
         family="plan-tournament",
         hypothesis="hyp",
-        evidence="ev",
+        evidence="placeholder lane-aware test evidence body long enough to clear the v0.35.0 C2 thin-evidence gate threshold cleanly",
         lane="distant-scout",
     )
     entry = await store.record_tournament_event(event)
@@ -40,7 +44,7 @@ async def test_record_tournament_event_no_lane_omits_metadata(tmp_path: Path) ->
         event_type="discard",
         family="plan-tournament",
         hypothesis="hyp",
-        evidence="ev",
+        evidence="placeholder lane-aware test evidence body long enough to clear the v0.35.0 C2 thin-evidence gate threshold cleanly",
         # lane omitted → defaults to None
     )
     entry = await store.record_tournament_event(event)
@@ -58,21 +62,21 @@ async def test_inject_block_filters_by_lane(tmp_path: Path) -> None:
         event_type="winner_promoted",
         family="distant-scout-family",
         hypothesis="zzz unique distant abc xyz lesson 12345",
-        evidence="distant evidence aaa bbb ccc 9876",
+        evidence="distant evidence aaa bbb ccc 9876 distinct-distant-suffix 11ZZ22YY33XX44WW55VV66UU77TT88SS99RR",
         lane="distant-scout",
     ))
     await store.record_tournament_event(TournamentEvent(
         event_type="winner_promoted",
         family="local-tweak-family",
         hypothesis="qqq other local def ghi lesson 67890",
-        evidence="local evidence ddd eee fff 5432",
+        evidence="local evidence ddd eee fff 5432 distinct-local-suffix AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRRSSTT",
         lane="local-tweak",
     ))
     await store.record_tournament_event(TournamentEvent(
         event_type="winner_promoted",
         family="universal-family",
         hypothesis="rrr universal mno pqr lesson 24680",
-        evidence="universal evidence ggg hhh iii 1357",
+        evidence="universal evidence ggg hhh iii 1357 distinct-universal-suffix UUVVWWXXYYZZ00112233445566778899ABCDEF",
         # no lane → universal
     ))
 
@@ -93,14 +97,14 @@ async def test_inject_block_no_lane_argument_includes_all(tmp_path: Path) -> Non
         event_type="winner_promoted",
         family="distant-scout-family",
         hypothesis="zzz unique distant abc xyz lesson 12345",
-        evidence="distant evidence aaa bbb ccc 9876",
+        evidence="distant evidence aaa bbb ccc 9876 distinct-distant-suffix 11ZZ22YY33XX44WW55VV66UU77TT88SS99RR",
         lane="distant-scout",
     ))
     await store.record_tournament_event(TournamentEvent(
         event_type="winner_promoted",
         family="local-tweak-family",
         hypothesis="qqq other local def ghi lesson 67890",
-        evidence="local evidence ddd eee fff 5432",
+        evidence="local evidence ddd eee fff 5432 distinct-local-suffix AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRRSSTT",
         lane="local-tweak",
     ))
 
@@ -117,14 +121,14 @@ async def test_inject_block_lane_aware_disabled(tmp_path: Path) -> None:
         event_type="winner_promoted",
         family="distant-scout-family",
         hypothesis="zzz unique distant abc xyz lesson 12345",
-        evidence="distant evidence aaa bbb ccc 9876",
+        evidence="distant evidence aaa bbb ccc 9876 distinct-distant-suffix 11ZZ22YY33XX44WW55VV66UU77TT88SS99RR",
         lane="distant-scout",
     ))
     await store.record_tournament_event(TournamentEvent(
         event_type="winner_promoted",
         family="local-tweak-family",
         hypothesis="qqq other local def ghi lesson 67890",
-        evidence="local evidence ddd eee fff 5432",
+        evidence="local evidence ddd eee fff 5432 distinct-local-suffix AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRRSSTT",
         lane="local-tweak",
     ))
 
@@ -142,7 +146,7 @@ async def test_universal_lessons_always_injected(tmp_path: Path) -> None:
         event_type="winner_promoted",
         family="plan-tournament",
         hypothesis="universal-lesson",
-        evidence="ev",
+        evidence="placeholder lane-aware test evidence body long enough to clear the v0.35.0 C2 thin-evidence gate threshold cleanly",
     ))
 
     for lane in ("distant-scout", "local-tweak", "architectural"):

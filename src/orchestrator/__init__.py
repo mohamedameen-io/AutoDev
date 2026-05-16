@@ -63,7 +63,18 @@ class Orchestrator:
         self._plan_manager = PlanManager(
             self._cwd, self._session_id, lock_timeout_s=lock_timeout_s
         )
-        self._knowledge = KnowledgeStore(self._cwd, cfg=cfg)
+        self._knowledge = KnowledgeStore(
+            self._cwd, cfg=cfg, session_id=self._session_id
+        )
+        # v0.35.0 C1 prerequisite: ``(task_id, role) -> list[entry_id]``
+        # correlation populated when :meth:`KnowledgeStore.inject_block`
+        # admits an entry into a dispatch and drained when the matching
+        # task's worker reports success. Drives the
+        # ``succeeded_after_count`` increment that the quarantine
+        # evaluator (C1) consumes. In-memory only — a resumed session
+        # starts with an empty map, mirroring the existing PRM /
+        # trajectory-store cadence.
+        self._injected_lessons_by_task: dict[tuple[str, str], list[str]] = {}
         self._log = get_logger(component="orchestrator", session_id=self._session_id)
         self.guardrails = GuardrailEnforcer(cfg.guardrails)
         self.loop_detector = LoopDetector()

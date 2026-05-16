@@ -2,6 +2,47 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] - 2026-05-16
+
+Knowledge-base hygiene release (Tier C from the v0.32.0 retrospective).
+Long-lived knowledge entries that fire repeatedly without ever
+preceding a single successful task have been polluting injection
+slots and poisoning hive promotion. v0.35 soft-flags those entries,
+gates critic-derived events that arrive without substantive evidence,
+and raises the promotion bar so an entry must demonstrate at least
+one real success before it spreads to the global hive.
+
+### Added
+- Knowledge-store quarantine: entries with `applied_count > 10` and
+  success ratio < 10% are soft-flagged (`quarantined=True`) and
+  skipped by injection. A parallel `quarantine_audit.jsonl` records
+  each decision with the counts at decision time (#C1).
+- `succeeded_after_count` is now actually incremented when an injected
+  lesson precedes a successful task completion (correlated via an
+  in-memory `(task_id, role) -> [entry_id]` map maintained on the
+  Orchestrator), giving the quarantine evaluator real data to work
+  with instead of always-zero (#C1 prerequisite).
+
+### Changed
+- Promotion now requires at least 10 confirmations AND
+  `succeeded_after_count > 0`. Confirmations decay over 7 days via the
+  new `confirmations_7d` curve, applied during injection ranking only —
+  quarantine evaluation still operates on raw counts (#C3).
+
+### Fixed
+- Critic outputs flagged as thin (`"The evidence provided is critically
+  thin"` preamble, body shorter than 80 chars) or pure infrastructure
+  noise (adapter-failure strings echoed back) no longer increment
+  knowledge confirmations (#C2).
+
+### Telemetry
+- `knowledge_entry_quarantined`, `knowledge_lesson_credited`,
+  `critic_evidence_rejected`, `knowledge_entry_promotion_rejected`
+  ledger ops.
+
+### Config
+- `knowledge.promotion_min_confirmations`: default `3 → 10`.
+
 ## [0.34.0] - 2026-05-16
 
 Execute-phase unblock release (Tier B from the v0.32.0 retrospective).

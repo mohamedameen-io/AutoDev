@@ -33,7 +33,10 @@ async def test_promotes_after_three_confirmations_high_confidence(
 
     text = "always run the full test suite before committing any change"
     # Start confidence 0.8 -> plenty of headroom for the 0.7 threshold.
-    await store.record(text, role_source="developer", confidence=0.8)
+    e = await store.record(text, role_source="developer", confidence=0.8)
+    assert e is not None
+    # v0.35.0 C3: promotion now also requires succeeded_after_count > 0.
+    await store.credit_task_success([e.id], task_id="t1", role="developer")
     await store.record(text, role_source="developer", confidence=0.8)
     await store.record(text, role_source="developer", confidence=0.8)
 
@@ -81,7 +84,11 @@ async def test_promotion_is_idempotent(tmp_path: Path) -> None:
     store = KnowledgeStore(tmp_path, cfg=cfg, hive_path=cfg.hive.path)
 
     text = "always use tmp-then-rename for atomic writes; never write in place"
-    for _ in range(6):
+    e = await store.record(text, role_source="developer", confidence=0.8)
+    assert e is not None
+    # v0.35.0 C3: promotion now also requires succeeded_after_count > 0.
+    await store.credit_task_success([e.id], task_id="t1", role="developer")
+    for _ in range(5):
         await store.record(text, role_source="developer", confidence=0.8)
 
     hive_entries = await store.read_all(tier="hive")

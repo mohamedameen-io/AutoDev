@@ -39,7 +39,7 @@ async def test_repeat_detected_tags_branch_metadata(
             event_type="discard",
             family="distant-scout",
             hypothesis="distant-scout",
-            evidence="prior failure",
+            evidence="prior failure with substantial body filler text to clear the v0.35.0 C2 thin-evidence gate threshold for the test fixture",
         )
     )
 
@@ -123,7 +123,7 @@ async def test_repeat_detection_disabled_when_threshold_zero(
             event_type="discard",
             family="distant-scout",
             hypothesis="any text",
-            evidence="x",
+            evidence="x with substantial body filler text to clear the v0.35.0 C2 thin-evidence gate threshold for this second test fixture",
         )
     )
 

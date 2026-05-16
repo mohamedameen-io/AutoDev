@@ -53,11 +53,14 @@ async def test_parent_dir_auto_created_on_promotion(tmp_path: Path) -> None:
     store = KnowledgeStore(tmp_path, cfg=cfg, hive_path=hive)
 
     # Two confirmations at >=0.5 confidence triggers promotion.
-    await store.record(
+    e = await store.record(
         "use atomic tmp-then-rename writes everywhere",
         role_source="developer",
         confidence=0.6,
     )
+    assert e is not None
+    # v0.35.0 C3: promotion now also requires succeeded_after_count > 0.
+    await store.credit_task_success([e.id], task_id="t1", role="developer")
     await store.record(
         "use atomic tmp-then-rename writes everywhere",
         role_source="developer",

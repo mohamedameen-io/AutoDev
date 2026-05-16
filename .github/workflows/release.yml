@@ -228,3 +228,44 @@ jobs:
           fi
           echo "Drift-verifier v0.34 B3 anchors present."
 
+      # v0.35.0 Tier C: knowledge-base hygiene integration anchors.
+      - name: Quarantine soft-flag + audit JSONL wiring (v0.35 C1)
+        run: |
+          if ! grep -q "quarantined:" src/state/knowledge.py; then
+            echo "::error::src/state/knowledge.py missing quarantined field (v0.35 C1)"
+            exit 1
+          fi
+          if ! grep -q "quarantine_audit.jsonl" src/state/knowledge.py; then
+            echo "::error::src/state/knowledge.py missing quarantine_audit.jsonl literal (v0.35 C1)"
+            exit 1
+          fi
+          if ! grep -q "_evaluate_quarantine" src/state/knowledge.py; then
+            echo "::error::src/state/knowledge.py missing _evaluate_quarantine helper (v0.35 C1)"
+            exit 1
+          fi
+          if ! grep -q "knowledge_entry_quarantined" src/state/ledger.py; then
+            echo "::error::src/state/ledger.py missing knowledge_entry_quarantined op (v0.35 C1)"
+            exit 1
+          fi
+          if ! grep -q "knowledge_lesson_credited" src/state/ledger.py; then
+            echo "::error::src/state/ledger.py missing knowledge_lesson_credited op (v0.35 C1)"
+            exit 1
+          fi
+          echo "Quarantine + lesson-credit anchors present."
+
+      - name: Critic-evidence quality gate (v0.35 C2)
+        run: |
+          if ! grep -q "_critic_evidence_quality" src/state/knowledge.py; then
+            echo "::error::src/state/knowledge.py missing _critic_evidence_quality (v0.35 C2)"
+            exit 1
+          fi
+          echo "Critic-evidence gate anchor present."
+
+      - name: Promotion threshold + 7-day decay curve (v0.35 C3)
+        run: |
+          if ! grep -q "confirmations_7d" src/state/knowledge.py; then
+            echo "::error::src/state/knowledge.py missing confirmations_7d curve key (v0.35 C3)"
+            exit 1
+          fi
+          echo "Promotion + decay anchor present."
+

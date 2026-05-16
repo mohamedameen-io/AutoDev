@@ -28,7 +28,7 @@ async def test_record_tournament_event_persists_to_swarm_tier(tmp_path: Path) ->
         event_type="winner_promoted",
         family="plan-tournament",
         hypothesis="opengles-only edit_scope keeps developer focused",
-        evidence="branch-1-glesonly converged in 2 passes; competing branches diverged",
+        evidence="branch-1-glesonly converged in 2 passes; competing branches diverged after producing materially wider edit scopes",
         rollback_reason=None,
         next_action_hint="prefer narrow edit_scope when refactoring inside Unity-class repos",
     )
@@ -53,7 +53,7 @@ async def test_record_tournament_event_winner_promoted_high_confidence(
         event_type="winner_promoted",
         family="plan-tournament",
         hypothesis="hypothesis A",
-        evidence="evidence body for winner",
+        evidence="evidence body for winner with at least eighty characters total to clear the v0.35.0 C2 thin-evidence gate threshold",
     )
     written = await store.record_tournament_event(event)
     assert written is not None
@@ -69,7 +69,7 @@ async def test_record_tournament_event_discard_medium_confidence(tmp_path: Path)
         event_type="discard",
         family="plan-tournament",
         hypothesis="discarded candidate B widened scope unnecessarily",
-        evidence="judges 1,3,4 demoted on growth-ratio cap",
+        evidence="judges 1,3,4 demoted on growth-ratio cap; full deliberation log shows 7 distinct objections across the panel",
         rollback_reason="oversize-AB demotion",
     )
     written = await store.record_tournament_event(event)
@@ -86,7 +86,7 @@ async def test_record_tournament_event_escalation_confidence(tmp_path: Path) -> 
         event_type="escalation",
         family="execute-phase",
         hypothesis="task ABC repeatedly fails",
-        evidence="3 retries exhausted",
+        evidence="3 retries exhausted with no progress; last attempt produced an identical diff to attempt one, confirming a stable loop",
     )
     written = await store.record_tournament_event(event)
     assert written is not None
@@ -104,7 +104,7 @@ async def test_record_tournament_event_course_correction_confidence(
         event_type="course_correction",
         family="prm",
         hypothesis="repetition_loop pattern detected",
-        evidence="3 identical (developer, edit, src/foo.py) calls",
+        evidence="3 identical (developer, edit, src/foo.py) calls within the past 90 seconds; trajectory store flagged the repetition pattern",
     )
     written = await store.record_tournament_event(event)
     assert written is not None
@@ -120,7 +120,7 @@ async def test_record_tournament_event_soft_blocker_confidence(tmp_path: Path) -
         event_type="soft_blocker",
         family="execute-phase",
         hypothesis="task X requires human decision on FFI ABI",
-        evidence="3 pivots failed; critic flagged soft-blocker",
+        evidence="3 pivots failed; critic flagged soft-blocker citing missing external decision; further work requires a human policy choice",
     )
     written = await store.record_tournament_event(event)
     assert written is not None
@@ -137,7 +137,7 @@ async def test_record_tournament_event_disabled_returns_none(tmp_path: Path) -> 
         event_type="winner_promoted",
         family="plan-tournament",
         hypothesis="...",
-        evidence="...",
+        evidence="placeholder evidence body long enough to clear the v0.35.0 C2 thin-evidence gate threshold without saying anything load-bearing",
     )
     assert await store.record_tournament_event(event) is None
 
@@ -155,7 +155,7 @@ async def test_record_tournament_event_writes_role_source_critic_t(
         event_type="discard",
         family="plan-tournament",
         hypothesis="X widened scope",
-        evidence="...",
+        evidence="placeholder evidence body long enough to clear the v0.35.0 C2 thin-evidence gate threshold without saying anything load-bearing",
     )
     written = await store.record_tournament_event(event)
     assert written is not None

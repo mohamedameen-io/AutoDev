@@ -56,7 +56,7 @@ async def test_plateau_forces_distant_scout_lane(
             event_type="discard",
             family="alpha",
             hypothesis=f"discard {i}: {distinct[i]} unique structure",
-            evidence=f"failure {i}: {distinct[i]} forensic detail extra",
+            evidence=f"failure {i}: {distinct[i]} forensic detail extra with substantial body filler text to clear the v0.35.0 thin gate",
         ))
 
     # Patch _run_one_branch to capture the actual branch_config lane used.
@@ -125,7 +125,7 @@ async def test_plateau_disabled_no_lane_change(
             event_type="discard",
             family="alpha",
             hypothesis=f"discard {i}: {distinct[i]} unique structure",
-            evidence=f"failure {i}: {distinct[i]} forensic detail extra",
+            evidence=f"failure {i}: {distinct[i]} forensic detail extra with substantial body filler text to clear the v0.35.0 thin gate",
         ))
 
     captured_lanes: list[str | None] = []

@@ -2,11 +2,7 @@
 # Mirror of the grep-style preflights in .github/workflows/release.yml so
 # the same checks can be run locally before pushing a release tag.
 #
-# Usage: ci/release_preflight_greps.sh [v0.32 | v0.33 | v0.34 | all]   (default: all)
-#
-# Each block locks the integration of a shipped phase against accidental
-# removal. Adding a new release? Append a block and update the dispatch
-# below.
+# Usage: ci/release_preflight_greps.sh [v0.32 | v0.33 | v0.34 | v0.35 | all]   (default: all)
 
 set -euo pipefail
 
@@ -47,12 +43,23 @@ preflight_v034() {
   check "v0.34 B3 ledger op"     src/state/ledger.py              "drift_convergence_failure"
 }
 
+preflight_v035() {
+  check "v0.35 C1 field"         src/state/knowledge.py "quarantined:"
+  check "v0.35 C1 audit file"    src/state/knowledge.py "quarantine_audit.jsonl"
+  check "v0.35 C1 evaluator"     src/state/knowledge.py "_evaluate_quarantine"
+  check "v0.35 C2 gate"          src/state/knowledge.py "_critic_evidence_quality"
+  check "v0.35 C3 decay curve"   src/state/knowledge.py "confirmations_7d"
+  check "v0.35 C1 quarantine op" src/state/ledger.py    "knowledge_entry_quarantined"
+  check "v0.35 C1 credit op"     src/state/ledger.py    "knowledge_lesson_credited"
+}
+
 case "$target" in
   v0.32) preflight_v032 ;;
   v0.33) preflight_v033 ;;
   v0.34) preflight_v034 ;;
-  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ;;
-  *)     echo "Unknown target: $target (try: v0.32 | v0.33 | v0.34 | all)"; exit 2 ;;
+  v0.35) preflight_v035 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ;;
+  *)     echo "Unknown target: $target (try: v0.32 | v0.33 | v0.34 | v0.35 | all)"; exit 2 ;;
 esac
 
 echo "All preflight greps passed for: $target"

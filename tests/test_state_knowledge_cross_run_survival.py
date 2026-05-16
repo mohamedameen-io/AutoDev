@@ -36,7 +36,7 @@ async def test_swarm_tier_survives_across_runs(tmp_path: Path) -> None:
         event_type="winner_promoted",
         family="plan-tournament",
         hypothesis="narrow edit_scope produces faster convergence",
-        evidence="branch 1 converged in 2 passes; branch 2 in 5",
+        evidence="branch 1 converged in 2 passes; branch 2 in 5; the surviving plan is materially narrower than the discarded alternative",
         next_action_hint="prefer narrow edit_scope on Unity-class repos",
     )
     written = await first.record_tournament_event(event)
@@ -75,7 +75,7 @@ async def test_inject_block_returns_prior_run_content(tmp_path: Path) -> None:
             event_type="discard",
             family="plan-tournament",
             hypothesis="phase 1 collapsed to 'investigate' with no concrete files",
-            evidence="reviewer flagged scope leak",
+            evidence="reviewer flagged scope leak with a fully-quoted excerpt and three concrete file references making this a substantive finding",
             rollback_reason="phase too vague to execute",
         )
     )

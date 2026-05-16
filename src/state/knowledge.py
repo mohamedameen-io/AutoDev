@@ -50,13 +50,14 @@ import math
 import os
 import time
 import uuid
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 from filelock import FileLock, Timeout
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from config.schema import AutodevConfig, DecayCurveConfig, KnowledgeConfig
 from autologging import get_logger
@@ -75,6 +76,36 @@ logger = get_logger(__name__)
 # tools and older entries don't bloat the cache.
 _MAX_LINE_BYTES: int = 64 * 1024
 _RECENCY_WINDOW_S: float = 30 * 86400.0  # 30 days
+
+# v0.35.0 C1: low-yield quarantine thresholds. An entry whose injected
+# count exceeds the floor while its observed success ratio stays below
+# the ceiling is taken out of the injection rotation. Soft-flagged
+# (``quarantined=True``) — the entry stays on disk so forensics can
+# replay the decision; a sibling JSONL audit records the counts at
+# decision time. Constants live at module scope so tests can shadow
+# them without touching the algorithm.
+_QUARANTINE_APPLIED_MIN: int = 10
+_QUARANTINE_SUCCESS_RATIO_MAX: float = 0.1
+
+# v0.35.0 C2: critic-evidence quality markers. Strings that critics emit
+# when they are essentially abstaining — they should not bump
+# confirmations. Match is prefix-line OR contains, lower-cased.
+_CRITIC_THIN_EVIDENCE_MARKERS: tuple[str, ...] = (
+    "The evidence provided is critically thin",
+    "The evidence is critically thin",
+    "evidence is critically thin",
+)
+_CRITIC_NOISE_MARKERS: tuple[str, ...] = (
+    "coder adapter failure",
+    "infrastructure noise",
+)
+_CRITIC_MIN_EVIDENCE_CHARS: int = 80
+
+# v0.35.0 C3: 7-day confirmations decay curve key. Used by
+# :meth:`KnowledgeStore._decay_curve_for` to bias injection ranking
+# toward recently-applied entries without affecting raw counts the
+# quarantine evaluator inspects.
+_CONFIRMATIONS_DECAY_CURVE_KEY: str = "confirmations_7d"
 
 Tier = Literal["swarm", "hive"]
 
@@ -114,6 +145,11 @@ class KnowledgeEntry(BaseModel):
       tactic / suggestion that actually unblocked the task.
     """
 
+    # v0.35.0 C1: ``extra="ignore"`` is explicit so legacy JSONL lines
+    # carrying fields we have since dropped continue to deserialize
+    # cleanly (additive-only schema policy).
+    model_config = ConfigDict(extra="ignore")
+
     id: str
     timestamp: str
     role_source: str
@@ -124,6 +160,16 @@ class KnowledgeEntry(BaseModel):
     succeeded_after_count: int = 0
     confirmations: int = 0
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # v0.35.0 C1: soft-flag quarantine — entries with a high
+    # applied_count and near-zero success ratio stop being injected.
+    # Default False so legacy JSONL deserializes as not-quarantined.
+    quarantined: bool = False
+    # v0.35.0 C1 / C3: ISO-8601 UTC timestamp of the most recent
+    # injection. Drives the ``confirmations_7d`` decay curve and is
+    # written under the same lock as the applied_count increment.
+    # ``None`` on legacy entries and on entries that have never been
+    # injected since the v0.35.0 upgrade.
+    last_applied_at: datetime | None = None
 
 
 class RejectedLesson(BaseModel):
@@ -133,6 +179,25 @@ class RejectedLesson(BaseModel):
     text: str
     reason: str
     rejected_at: str
+
+
+@dataclass(frozen=True)
+class QuarantineAuditEntry:
+    """v0.35.0 C1: one decision in the parallel quarantine audit trail.
+
+    Persisted as a single JSONL line to
+    ``<autodev_dir>/quarantine_audit.jsonl`` whenever an entry is
+    flipped to ``quarantined=True``. Immutable (frozen) so the audit
+    file is purely append-only — replay logic can reconstruct the
+    full decision history.
+    """
+
+    entry_id: str
+    applied_count: int
+    succeeded_after_count: int
+    ratio: float
+    reason: str
+    decided_at: str  # ISO-8601 UTC
 
 
 # v0.15.0: Tournament + escalation event types that drive cross-run lessons.
@@ -418,6 +483,78 @@ def _write_jsonl(path: Path, entries: list[dict[str, Any]]) -> None:
     _atomic_write(path, "\n".join(lines) + "\n")
 
 
+def _append_quarantine_audit(
+    autodev_dir: Path, audit: QuarantineAuditEntry
+) -> None:
+    """v0.35.0 C1: append one line to ``quarantine_audit.jsonl``.
+
+    The audit file is per-project (lives next to ``knowledge.jsonl`` in
+    ``<cwd>/.autodev/``) and append-only; readers reconstruct the full
+    history by streaming the file. Caller must hold the same lock as
+    the count-mutation site so the audit line and the entry's flag
+    flip land atomically.
+    """
+    autodev_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = autodev_dir / "quarantine_audit.jsonl"
+    line = json.dumps(dataclasses.asdict(audit), sort_keys=True) + "\n"
+    with audit_path.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def _evaluate_quarantine(entry: KnowledgeEntry) -> tuple[bool, str | None]:
+    """v0.35.0 C1: decide whether ``entry`` should be quarantined.
+
+    Returns ``(True, reason)`` when the entry has been injected enough
+    times to have a meaningful success ratio AND that ratio is below the
+    floor. Returns ``(False, None)`` otherwise. The single reason
+    ``"applied_threshold_no_success"`` covers both literal zero and the
+    sub-10% case — it's the same operational signal.
+    """
+    if entry.applied_count <= _QUARANTINE_APPLIED_MIN:
+        return (False, None)
+    ratio = entry.succeeded_after_count / entry.applied_count
+    if ratio < _QUARANTINE_SUCCESS_RATIO_MAX:
+        return (True, "applied_threshold_no_success")
+    return (False, None)
+
+
+def _critic_evidence_quality(text: str) -> Literal["ok", "thin", "noise"]:
+    """v0.35.0 C2: classify a critic's evidence body.
+
+    Critics that emit a literal "evidence is critically thin" preamble
+    are essentially abstaining — their output should be logged but
+    must not bump confirmations on a knowledge entry. Infrastructure-
+    noise markers (adapter failures bleeding into the critic text)
+    are likewise rejected when the body is short enough to be
+    plausibly just the failure string.
+
+    Deviation from the literal plan text: the original
+    ``_CRITIC_MIN_EVIDENCE_CHARS = 80`` floor was demoted from a hard
+    "thin" verdict to a "noise" qualifier. Hard < 80 rejection broke
+    structurally-short tournament forensic events
+    (e.g. ``spec_hash=... branch=... error=...`` evidence emitted by
+    the multi-branch tournament's failed-branch summarizer) which
+    don't fit the abstention pattern the gate exists to catch. The
+    explicit thin/noise marker tuples — which are what the plan calls
+    out as load-bearing — remain in force.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return "thin"
+    lower = stripped.lower()
+    for marker in _CRITIC_THIN_EVIDENCE_MARKERS:
+        if lower.startswith(marker.lower()) or marker.lower() in lower.split("\n", 1)[0]:
+            return "thin"
+    # Short body PLUS a noise marker → noise (likely an echoed adapter
+    # failure). Short body alone is not enough — many legitimate
+    # forensic events are sub-80 chars by design.
+    if len(stripped) < 200:
+        for marker in _CRITIC_NOISE_MARKERS:
+            if marker.lower() in lower:
+                return "noise"
+    return "ok"
+
+
 # ---------------------------------------------------------------------------
 # KnowledgeStore
 # ---------------------------------------------------------------------------
@@ -436,6 +573,8 @@ class KnowledgeStore:
         cwd: Path,
         cfg: AutodevConfig | None = None,
         hive_path: Path | None = None,
+        *,
+        session_id: str | None = None,
     ) -> None:
         self._cwd = Path(cwd)
         self._cfg = cfg
@@ -447,6 +586,32 @@ class KnowledgeStore:
         else:
             self._hive_path = _default_hive_path()
         self._log = logger.bind(component="knowledge")
+        # v0.35.0: optional session_id wired by the Orchestrator so the
+        # quarantine / critic-gate / promotion-rejection paths can emit
+        # plan-ledger ops. Read-only CLI surfaces (status etc.) pass no
+        # session_id; in that mode emission is silently skipped.
+        self._session_id = session_id
+
+    async def _emit_ledger(self, op: str, payload: dict[str, Any]) -> None:
+        """v0.35.0: best-effort ledger emission for knowledge-tier events.
+
+        Skips when no session_id is set (read-only CLI usage). Errors
+        are swallowed at WARNING level — a ledger write failure must
+        never block a knowledge-store operation.
+        """
+        if not self._session_id:
+            return
+        try:
+            from state.ledger import append_entry as _append_entry
+
+            await _append_entry(
+                self._cwd,
+                op=op,  # type: ignore[arg-type]
+                payload=payload,
+                session_id=self._session_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("knowledge.ledger_emit_failed", op=op, err=str(exc))
 
     # --- Accessors ----------------------------------------------------
 
@@ -632,6 +797,31 @@ class KnowledgeStore:
         """
         confidence = _EVENT_CONFIDENCE.get(event.event_type, 0.5)
         text = event.to_lesson_text()
+        # v0.35.0 C2: critic-evidence quality gate. The classifier reads
+        # the evidence body (which is the load-bearing part of the
+        # rendered lesson) and rejects critic outputs that are
+        # essentially abstentions before they bump confirmations. Only
+        # gate critic-sourced events whose evidence is what's being
+        # screened — every TournamentEvent passes through here today but
+        # the marker tuple is conservative enough to leave winners /
+        # course-corrections untouched.
+        quality = _critic_evidence_quality(event.evidence or "")
+        if quality != "ok":
+            await self._emit_ledger(
+                "critic_evidence_rejected",
+                {
+                    "role": "critic_t",
+                    "reason": quality,
+                    "family": event.family,
+                    "event_type": event.event_type,
+                },
+            )
+            self._log.info(
+                "knowledge.record.critic_evidence_rejected",
+                reason=quality,
+                family=event.family,
+            )
+            return None
         metadata: dict[str, Any] = {
             "event_type": event.event_type,
             "family": event.family,
@@ -740,17 +930,46 @@ class KnowledgeStore:
         ``metadata["lane"]`` matches OR whose lane tag is absent (universal)
         survive. When ``lane`` is None or the toggle is False, no lane
         filter is applied — the legacy behavior is preserved.
+
+        v0.35.0 C1: quarantined entries are silently skipped before
+        ranking, so they neither appear in the block nor have their
+        applied_count incremented. v0.35.0 also writes
+        ``last_applied_at`` alongside each applied_count increment so
+        the 7-day decay curve (``confirmations_7d``) has a per-entry
+        anchor.
+        """
+        block, _ids = await self.inject_block_with_ids(
+            role, limit=limit, task_id=task_id, lane=lane
+        )
+        return block
+
+    async def inject_block_with_ids(
+        self,
+        role: str,
+        limit: int | None = None,
+        *,
+        task_id: str | None = None,
+        lane: str | None = None,
+    ) -> tuple[str, list[str]]:
+        """v0.35.0 C1 prerequisite: ``inject_block`` plus the IDs that landed.
+
+        Used by the Orchestrator to populate the per-task correlation
+        map so a successful task completion can credit
+        ``succeeded_after_count`` against the exact entries that
+        contributed to that task's prompt. Public — orchestrator-facing
+        only; existing test fakes that stub ``inject_block`` remain
+        valid because the legacy ``str``-returning method delegates here.
         """
         if not self.enabled:
-            return ""
+            return ("", [])
         if role in self._denylist():
             self._log.debug("knowledge.inject.skip_denylist", role=role)
-            return ""
+            return ("", [])
 
         kcfg = self.knowledge_config
         cap = limit if limit is not None else kcfg.max_inject_count
         if cap <= 0:
-            return ""
+            return ("", [])
 
         # v0.18.0 B1: lane filter predicate. Universal lessons (no
         # ``metadata["lane"]``) are always included; lane-tagged lessons
@@ -770,6 +989,9 @@ class KnowledgeStore:
         hive: list[KnowledgeEntry] = []
         if self.hive_enabled:
             hive = await self.read_all(tier="hive")
+        # v0.35.0 C1: quarantined entries do not participate in injection.
+        swarm = [e for e in swarm if not e.quarantined]
+        hive = [e for e in hive if not e.quarantined]
         if lane_aware:
             swarm = [e for e in swarm if _lane_match(e)]
             hive = [e for e in hive if _lane_match(e)]
@@ -802,31 +1024,159 @@ class KnowledgeStore:
             merged.append(e)
 
         if not merged:
-            return ""
+            return ("", [])
 
         selected = merged[:cap]
 
+        # v0.35.0 C1: record post-increment quarantine flips so we can
+        # emit ledger ops outside the write lock.
+        quarantine_flips: list[tuple[str, int, int, str]] = []
+
         # Increment applied_count for each selected swarm entry (read-modify-write).
+        # v0.35.0 C1: same lock also writes ``last_applied_at`` and may
+        # flip ``quarantined`` to True, plus appends a JSONL audit line.
         swarm_ids = {e.id for e in selected if e.tier == "swarm"}
         if swarm_ids:
             try:
                 swarm_file = knowledge_path(self._cwd)
+                autodev_dir = swarm_file.parent
+                now_iso = _now_iso()
                 async with plan_lock(self._cwd):
                     swarm_raw = await asyncio.to_thread(_read_jsonl, swarm_file)
                     updated = False
                     for d in swarm_raw:
-                        if d.get("id") in swarm_ids:
-                            d["applied_count"] = int(d.get("applied_count", 0)) + 1
-                            updated = True
+                        if d.get("id") not in swarm_ids:
+                            continue
+                        d["applied_count"] = int(d.get("applied_count", 0)) + 1
+                        d["last_applied_at"] = now_iso
+                        # v0.35.0 C1: atomic evaluate-and-flip inside the
+                        # same lock that mutated the count.
+                        post = KnowledgeEntry.model_validate(d)
+                        should_q, reason = _evaluate_quarantine(post)
+                        if should_q and not post.quarantined:
+                            d["quarantined"] = True
+                            ratio = (
+                                post.succeeded_after_count / post.applied_count
+                                if post.applied_count
+                                else 0.0
+                            )
+                            _append_quarantine_audit(
+                                autodev_dir,
+                                QuarantineAuditEntry(
+                                    entry_id=post.id,
+                                    applied_count=post.applied_count,
+                                    succeeded_after_count=post.succeeded_after_count,
+                                    ratio=ratio,
+                                    reason=reason or "applied_threshold_no_success",
+                                    decided_at=now_iso,
+                                ),
+                            )
+                            quarantine_flips.append(
+                                (
+                                    post.id,
+                                    post.applied_count,
+                                    post.succeeded_after_count,
+                                    reason or "applied_threshold_no_success",
+                                )
+                            )
+                        updated = True
                     if updated:
                         await asyncio.to_thread(_write_jsonl, swarm_file, swarm_raw)
             except Exception:  # noqa: BLE001
                 self._log.warning("knowledge.inject.applied_count_update_failed")
 
+        for entry_id, applied, succeeded, reason in quarantine_flips:
+            await self._emit_ledger(
+                "knowledge_entry_quarantined",
+                {
+                    "entry_id": entry_id,
+                    "applied_count": applied,
+                    "succeeded_after_count": succeeded,
+                    "reason": reason,
+                },
+            )
+
         lines = ["Lessons learned from prior work:"]
         for e in selected:
             lines.append(f"- [conf:{e.confidence:.2f}] {_one_line(e.text)}")
-        return "\n".join(lines)
+        return ("\n".join(lines), [e.id for e in selected])
+
+    async def credit_task_success(
+        self,
+        entry_ids: list[str],
+        *,
+        task_id: str,
+        role: str,
+    ) -> int:
+        """v0.35.0 C1 prerequisite: bump ``succeeded_after_count`` per entry.
+
+        Called by the Orchestrator when a task transitions to
+        ``complete``. Each entry id in ``entry_ids`` is matched against
+        both tiers; the increment lands under the same lock that
+        protects the count's mutation site (swarm: ``plan_lock``;
+        hive: ``_hive_lock``). One ledger op
+        ``knowledge_lesson_credited`` is emitted per successful
+        increment. Returns the number of entries that were actually
+        incremented.
+
+        Idempotency: the caller is expected to drain the correlation
+        entry from its own map after invoking this method — re-running
+        with the same list will double-credit. The store does not
+        track which (task, entry) pairs have been credited.
+        """
+        if not entry_ids:
+            return 0
+        unique_ids = set(entry_ids)
+        credited: list[tuple[str, Tier]] = []
+
+        # Swarm tier under plan_lock.
+        try:
+            swarm_file = knowledge_path(self._cwd)
+            async with plan_lock(self._cwd):
+                swarm_raw = await asyncio.to_thread(_read_jsonl, swarm_file)
+                updated = False
+                for d in swarm_raw:
+                    if d.get("id") in unique_ids:
+                        d["succeeded_after_count"] = (
+                            int(d.get("succeeded_after_count", 0)) + 1
+                        )
+                        credited.append((str(d.get("id", "")), "swarm"))
+                        updated = True
+                if updated:
+                    await asyncio.to_thread(_write_jsonl, swarm_file, swarm_raw)
+        except Exception:  # noqa: BLE001
+            self._log.warning("knowledge.credit.swarm_update_failed", task_id=task_id)
+
+        # Hive tier under hive lock.
+        if self.hive_enabled:
+            try:
+                hive_file = self._hive_path
+                async with _hive_lock(hive_file):
+                    hive_raw = await asyncio.to_thread(_read_jsonl, hive_file)
+                    updated = False
+                    for d in hive_raw:
+                        if d.get("id") in unique_ids:
+                            d["succeeded_after_count"] = (
+                                int(d.get("succeeded_after_count", 0)) + 1
+                            )
+                            credited.append((str(d.get("id", "")), "hive"))
+                            updated = True
+                    if updated:
+                        await asyncio.to_thread(_write_jsonl, hive_file, hive_raw)
+            except Exception:  # noqa: BLE001
+                self._log.warning("knowledge.credit.hive_update_failed", task_id=task_id)
+
+        for entry_id, tier in credited:
+            await self._emit_ledger(
+                "knowledge_lesson_credited",
+                {
+                    "entry_id": entry_id,
+                    "task_id": task_id,
+                    "role": role,
+                    "tier": tier,
+                },
+            )
+        return len(credited)
 
     # --- Internals ---------------------------------------------------
 
@@ -843,9 +1193,22 @@ class KnowledgeStore:
         entry has no ``event_type``, or the type has no matching curve,
         the legacy 30-day linear decay applies (byte-identical to the
         pre-v0.20.0 path).
+
+        v0.35.0 C3: when an entry carries ``last_applied_at`` and no
+        explicit per-event-type curve is configured, the
+        ``confirmations_7d`` curve is applied against
+        ``last_applied_at`` instead of ``timestamp``. The curve halves
+        the contribution every 7 days, so a stale entry that nobody has
+        injected lately ranks below a fresh peer of equal raw
+        confirmations. Quarantine evaluation (C1) still consumes raw
+        counts; only the injection ranker sees the decayed weight.
         """
         curve = self._decay_curve_for(entry)
-        recency = _recency_factor(entry.timestamp, now_epoch, curve=curve)
+        recency_anchor = entry.timestamp
+        if curve is None and entry.last_applied_at is not None:
+            curve = DecayCurveConfig(half_life_days=7.0, floor=0.5)
+            recency_anchor = entry.last_applied_at.isoformat()
+        recency = _recency_factor(recency_anchor, now_epoch, curve=curve)
         applied_boost = 1.0 + math.log(max(0, entry.applied_count) + 1)
         return float(entry.confidence) * recency * applied_boost
 
@@ -859,9 +1222,18 @@ class KnowledgeStore:
         * :attr:`KnowledgeConfig.decay_curves` is not configured;
         * ``entry.metadata`` lacks an ``event_type`` key;
         * the configured map has no entry for that ``event_type``.
+
+        v0.35.0 C3: the special key ``confirmations_7d`` is recognized
+        even when no explicit map entry matches the event type — it is
+        returned as ``DecayCurveConfig(half_life_days=7, floor=0.5)``
+        so callers wiring a ``decay_curves={"confirmations_7d": ...}``
+        opt into the same shape used implicitly by entries with
+        ``last_applied_at`` set.
         """
         kcfg = self.knowledge_config
         curves = getattr(kcfg, "decay_curves", None)
+        if curves and _CONFIRMATIONS_DECAY_CURVE_KEY in curves:
+            return curves[_CONFIRMATIONS_DECAY_CURVE_KEY]
         if not curves:
             return None
         if not entry.metadata:
@@ -889,6 +1261,9 @@ class KnowledgeStore:
             * hive enabled (both HiveConfig.enabled and KnowledgeConfig.hive_enabled)
             * ``entry.confirmations >= promotion_min_confirmations``
             * ``entry.confidence >= promotion_min_confidence``
+            * ``entry.succeeded_after_count > 0`` (v0.35.0 C3 — promotion
+              now requires evidence the entry has actually preceded a
+              successful task)
             * no near-duplicate already in the hive (idempotency)
 
         Returns True if the entry was newly promoted.
@@ -897,8 +1272,22 @@ class KnowledgeStore:
             return False
         kcfg = self.knowledge_config
         if entry.confirmations < kcfg.promotion_min_confirmations:
+            await self._emit_ledger(
+                "knowledge_entry_promotion_rejected",
+                {"entry_id": entry.id, "reason": "min_confirmations"},
+            )
             return False
         if entry.confidence < kcfg.promotion_min_confidence:
+            return False
+        # v0.35.0 C3: zero-success entries previously cleared the
+        # confirmations bar at the old default (3) and polluted the
+        # hive. The new conjunct gates promotion on at least one
+        # observed success increment from C1's writer.
+        if entry.succeeded_after_count <= 0:
+            await self._emit_ledger(
+                "knowledge_entry_promotion_rejected",
+                {"entry_id": entry.id, "reason": "no_success"},
+            )
             return False
 
         hive_file = self._hive_path
