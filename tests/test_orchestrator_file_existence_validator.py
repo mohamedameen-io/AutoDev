@@ -219,6 +219,118 @@ def test_path_traversal_already_rejected_by_schema(tmp_path: Path) -> None:
         )
 
 
+def _make_two_task_plan(
+    *,
+    task_a_files: list[str] | None = None,
+    task_a_files_new: list[str] | None = None,
+    task_b_files: list[str] | None = None,
+    task_b_files_new: list[str] | None = None,
+) -> Plan:
+    """v0.33.0 A1 fixture: two tasks across one phase. Used to exercise the
+    plan-global ``[new]`` union behaviour where one task declares the file
+    and a later task references it without ``[new]``."""
+    task_a = Task(
+        id="1.1",
+        phase_id="1",
+        title="creator",
+        description="d",
+        files=task_a_files or [],
+        files_new=task_a_files_new or [],
+        acceptance=[AcceptanceCriterion(id="ac-a", description="passes")],
+    )
+    task_b = Task(
+        id="3.1",
+        phase_id="1",
+        title="consumer",
+        description="d",
+        files=task_b_files or [],
+        files_new=task_b_files_new or [],
+        acceptance=[AcceptanceCriterion(id="ac-b", description="passes")],
+    )
+    phase = Phase(
+        id="1",
+        title="p",
+        description="d",
+        tasks=[task_a, task_b],
+        edit_scope=None,
+    )
+    return Plan(
+        plan_id="plan-two-task",
+        spec_hash="deadbeef",
+        phases=[phase],
+        edit_scope=[],
+        created_at="2026-05-16T00:00:00+00:00",
+        updated_at="2026-05-16T00:00:00+00:00",
+    )
+
+
+def test_validate_files_exist_plan_global_new(tmp_path: Path) -> None:
+    """v0.33.0 A1: task A declares ``new_artifact.md`` as ``[new]``; task B
+    references the same path with no ``[new]`` prefix. Validation passes
+    because the path is admitted via the plan-global ``files_new`` union."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.cpp").write_text("// foo\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+
+    plan = _make_two_task_plan(
+        task_a_files=["new_artifact.md"],
+        task_a_files_new=["new_artifact.md"],
+        task_b_files=["new_artifact.md"],
+    )
+    resolutions: list[dict[str, str]] = []
+    assert validate_files_exist(plan, tmp_path, resolutions=resolutions) is None
+    # task A's reference resolves trivially via its own files_new (not
+    # recorded as a plan-global admission); task B's resolution flows
+    # through the new path and surfaces in the out-channel.
+    assert len(resolutions) == 1
+    assert resolutions[0]["task_id"] == "3.1"
+    assert resolutions[0]["path"] == "new_artifact.md"
+    assert resolutions[0]["declaring_task_id"] == "1.1"
+
+
+def test_validate_files_exist_plan_global_new_normalizes_paths(
+    tmp_path: Path,
+) -> None:
+    """v0.33.0 A1: declared path with a trailing slash collapses to the
+    same key as the consumer's bare reference. ``_normalize_path_entry``
+    is the canonical hop on both sides — it strips trailing slashes and
+    inline ``# comment`` tails, so the union lookup matches even when
+    the architect emits a stylistic variant."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.cpp").write_text("// foo\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+
+    plan = _make_two_task_plan(
+        task_a_files_new=["new_artifact.md/"],
+        task_b_files=["new_artifact.md"],
+    )
+    # No raise — both sides canonicalise to "new_artifact.md".
+    assert validate_files_exist(plan, tmp_path) is None
+
+
+def test_missing_on_disk_raises_when_no_task_declares_new(
+    tmp_path: Path,
+) -> None:
+    """v0.33.0 A1 negative case: neither task declares ``new_artifact.md``
+    via ``[new]``. The plan-global union is empty for this path, so the
+    on-disk existence check fires and ``PathValidationError`` raises."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.cpp").write_text("// foo\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+
+    plan = _make_two_task_plan(
+        task_a_files=["src/foo.cpp"],
+        task_b_files=["new_artifact.md"],
+    )
+    with pytest.raises(PathValidationError) as excinfo:
+        validate_files_exist(plan, tmp_path)
+    assert excinfo.value.raw == "new_artifact.md"
+    assert excinfo.value.reason == "missing_on_disk"
+
+
 def test_snapshot_caches_one_subprocess_call(tmp_path: Path) -> None:
     """Three lookups against the same ``_RepoFileSnapshot`` instance must
     only invoke ``subprocess.run`` once — the snapshot is built lazily on
@@ -239,3 +351,49 @@ def test_snapshot_caches_one_subprocess_call(tmp_path: Path) -> None:
         snapshot.is_dir_prefix("src")
         snapshot.closest("src/imaginary.cpp")
     assert mock_run.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# v0.36.0 D2: low-quality "did you mean" hint suppression.
+# ---------------------------------------------------------------------------
+
+
+def test_closest_suppresses_unrelated_top_level_dir_hint(tmp_path: Path) -> None:
+    """A rejection in one top-level dir must not surface a hint pointing
+    at a completely different subtree. Pre-D2 the validator could return
+    a path under ``.claude/skills/`` for the rejected token ``notes``."""
+    _git_init(tmp_path)
+    (tmp_path / ".claude" / "skills").mkdir(parents=True)
+    (tmp_path / ".claude" / "skills" / "notes_helper.md").write_text(
+        "x\n", encoding="utf-8"
+    )
+    _git_add_and_commit(tmp_path)
+
+    snapshot = _RepoFileSnapshot.for_cwd(tmp_path)
+    # ``notes`` (rejected) lives in a different top-level dir than the
+    # only tracked file (under ``.claude/``); the hint should be None.
+    assert snapshot.closest("notes") is None
+
+
+def test_closest_returns_none_for_short_path_low_similarity(tmp_path: Path) -> None:
+    """Short rejected paths with low similarity to the best candidate
+    get suppressed rather than mis-suggested."""
+    _git_init(tmp_path)
+    (tmp_path / "abc.py").write_text("# x\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+    snapshot = _RepoFileSnapshot.for_cwd(tmp_path)
+    # ``xyz`` is short AND nothing like ``abc.py`` — D2 suppresses.
+    assert snapshot.closest("xyz") is None
+
+
+def test_closest_returns_hint_when_in_same_subtree(tmp_path: Path) -> None:
+    """The plausibility gate does not suppress legitimate intra-subtree
+    suggestions."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foobar.py").write_text("# x\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+    snapshot = _RepoFileSnapshot.for_cwd(tmp_path)
+    # ``src/foobaz.py`` is a plausible typo of ``src/foobar.py``.
+    suggestion = snapshot.closest("src/foobaz.py")
+    assert suggestion == "src/foobar.py"

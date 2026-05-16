@@ -49,7 +49,67 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.path_validator import PathValidationError
+from orchestrator.plan_parser import _normalize_path_entry
 from state.schemas import Plan
+
+
+def _hint_is_plausible(rejected: str, suggested: str) -> bool:
+    """v0.36.0 D2: gate fuzzy "did you mean" suggestions.
+
+    Returns ``False`` (suppress the hint) when:
+
+    * The top-level directory component differs (e.g. ``notes`` vs
+      ``.claude/skills/...``). Cross-tree suggestions almost always
+      misdirect the architect — the correct path lives in the same
+      subtree the rejection came from.
+    * The rejected path is short (< 8 chars) AND the difflib similarity
+      to the suggestion is < 0.85. Short paths produce noisy matches
+      under the legacy 0.7 cutoff; this is the second filter on top of
+      the closest()-level cutoff bump.
+    """
+    if not rejected or not suggested:
+        return False
+    rejected_top = rejected.split("/", 1)[0]
+    suggested_top = suggested.split("/", 1)[0]
+    if rejected_top != suggested_top:
+        return False
+    if len(rejected) < 8:
+        similarity = difflib.SequenceMatcher(None, rejected, suggested).ratio()
+        if similarity < 0.85:
+            return False
+    return True
+
+
+def _classify_rejection(raw_path: str) -> str:
+    """v0.36.0 D1: bucket a rejected path into a design-class string.
+
+    Two classes today:
+
+    * ``"new_md_deliverable"`` — the path looks like a brand-new
+      documentation deliverable the architect wants to author. The
+      retry envelope renders the action options for that class
+      (drop the deliverable OR tag with ``[new]`` everywhere it's
+      referenced).
+    * ``"missing_on_disk"`` — generic missing-file rejection. Default
+      class so additions to the rejection class catalogue don't
+      retroactively reclassify older sites.
+
+    The classifier is intentionally narrow — it recognises only the
+    well-understood offender pattern from the v0.32.0 fixture (a new
+    `.md` file under ``notes/`` or ``investigation/``). Other path
+    shapes fall through to the generic class so the retry-envelope
+    diagnosis stays accurate.
+    """
+    lower = raw_path.lower()
+    if lower.endswith(".md"):
+        # The classifier matches paths that look like the architect is
+        # proposing a fresh investigation/notes deliverable (the v0.32.0
+        # fixture's offender shape).
+        if "notes" in lower or "investigation" in lower or lower.startswith(
+            "notes/"
+        ):
+            return "new_md_deliverable"
+    return "missing_on_disk"
 
 
 class _RepoFileSnapshot:
@@ -160,32 +220,90 @@ class _RepoFileSnapshot:
         Fallback (no index, or index query returned no hits): the v0.24.3
         path — :func:`difflib.get_close_matches` over the cached
         ``git ls-files`` snapshot. ``cutoff=0.7`` filters hopelessly-
-        different paths (returns ``None`` rather than a misleading
-        suggestion). ``n=1`` keeps the suggestion surface single-shot.
+        different paths; v0.36.0 D2 bumps the cutoff to ``0.85`` for
+        short paths (< 12 chars) where 0.7 produced too many spurious
+        matches.
+
+        v0.36.0 D2: the final candidate (from either source) is gated
+        by :func:`_hint_is_plausible` — suggestions whose top-level
+        directory differs from the rejected path are suppressed, since
+        cross-directory hints are nearly always misleading.
         """
         # v0.25.0: index-first path. ``IndexQuery.search_files`` returns
         # a list of ``FileHit``; take the top hit's ``.path``. Wrap in a
         # broad except so a transient index error never blocks the
         # validator's primary job (raising PathValidationError on the
         # caller side).
+        candidate: str | None = None
         if self._index_query is not None:
             try:
                 hits = self._index_query.search_files(rel_path, limit=1)
                 if hits:
-                    return hits[0].path
+                    candidate = hits[0].path
             except Exception:  # noqa: BLE001 - fall through to difflib
-                pass
+                candidate = None
 
-        self._ensure_loaded()
-        if not self._tracked:
+        if candidate is None:
+            self._ensure_loaded()
+            if not self._tracked:
+                return None
+            # v0.36.0 D2: tighter cutoff for short paths. Short rejected
+            # paths produce too many spurious matches at 0.7 — the
+            # archived v0.32 incident was ``closest("notes")``
+            # returning a path under ``.claude/skills/``.
+            cutoff = 0.85 if len(rel_path) < 12 else 0.7
+            matches = difflib.get_close_matches(
+                rel_path, self._tracked, n=1, cutoff=cutoff
+            )
+            candidate = matches[0] if matches else None
+
+        if candidate is None:
             return None
-        matches = difflib.get_close_matches(
-            rel_path, self._tracked, n=1, cutoff=0.7
-        )
-        return matches[0] if matches else None
+        if not _hint_is_plausible(rel_path, candidate):
+            return None
+        return candidate
 
 
-def validate_files_exist(plan: Plan, cwd: Path) -> None:
+def _collect_plan_new_files(plan: Plan) -> frozenset[str]:
+    """v0.33.0 A1: union of every task's ``files_new`` across the plan.
+
+    Each entry is canonicalised through :func:`_normalize_path_entry`
+    (same code path the parser uses on the ``Files:`` line) so leading
+    ``./`` segments and trailing slashes collapse to the same key the
+    snapshot lookup uses. Drop reports with ``path is None`` are
+    skipped — they would never have reached the validator anyway.
+    """
+    out: set[str] = set()
+    for phase in plan.phases:
+        for task in phase.tasks:
+            for entry in task.files_new or ():
+                report = _normalize_path_entry(entry)
+                if report.path is not None:
+                    out.add(report.path)
+    return frozenset(out)
+
+
+def _declaring_task_id(plan: Plan, path: str) -> str | None:
+    """First task whose ``files_new`` canonicalises to *path*.
+
+    Returns ``None`` if no task declares it (caller is responsible for
+    only invoking this on paths known to be in the plan-global union).
+    """
+    for phase in plan.phases:
+        for task in phase.tasks:
+            for entry in task.files_new or ():
+                report = _normalize_path_entry(entry)
+                if report.path == path:
+                    return task.id
+    return None
+
+
+def validate_files_exist(
+    plan: Plan,
+    cwd: Path,
+    *,
+    resolutions: list[dict[str, str]] | None = None,
+) -> None:
     """Raise :class:`PathValidationError` on the first missing path.
 
     Walks, in order:
@@ -221,6 +339,16 @@ def validate_files_exist(plan: Plan, cwd: Path) -> None:
     v0.25.0: when ``.autodev/index.db`` exists, the snapshot's ``closest``
     method queries it for higher-quality fuzzy suggestions; otherwise the
     v0.24.3 difflib-over-ls-files path runs.
+
+    v0.33.0 A1: ``Task.files`` membership also passes when the path is
+    declared ``[new]`` by ANY task in the plan (not just the current
+    task). The plan-global union is computed once and consulted as a
+    fallback after the per-task ``files_new`` check. The validator is
+    sync but ledger writes are async — when *resolutions* is provided,
+    each plan-global admission is appended to that list and the caller
+    is responsible for ledger emission. The
+    ``path_validation_resolved_via_plan_global`` op encodes the
+    ``{task_id, path, declaring_task_id}`` payload.
     """
     # v0.25.0: try to wire the IndexQuery for richer suggestions. Best-effort:
     # if the index module isn't importable (e.g. parallel agent's code not
@@ -240,6 +368,8 @@ def validate_files_exist(plan: Plan, cwd: Path) -> None:
     if snapshot.is_empty:
         return
 
+    plan_global_new = _collect_plan_new_files(plan)
+
     # Plan-level edit_scope: dir-prefix check.
     for entry in plan.edit_scope:
         if not snapshot.is_dir_prefix(entry):
@@ -247,6 +377,7 @@ def validate_files_exist(plan: Plan, cwd: Path) -> None:
                 raw=entry,
                 reason="missing_on_disk",
                 suggestion=snapshot.closest(entry),
+                error_class=_classify_rejection(entry),
             )
 
     for phase in plan.phases:
@@ -258,6 +389,7 @@ def validate_files_exist(plan: Plan, cwd: Path) -> None:
                         raw=entry,
                         reason="missing_on_disk",
                         suggestion=snapshot.closest(entry),
+                        error_class=_classify_rejection(entry),
                     )
 
         for task in phase.tasks:
@@ -266,12 +398,34 @@ def validate_files_exist(plan: Plan, cwd: Path) -> None:
             for entry in task.files:
                 if entry in new_files:
                     continue
-                if not snapshot.exists(entry):
-                    raise PathValidationError(
-                        raw=entry,
-                        reason="missing_on_disk",
-                        suggestion=snapshot.closest(entry),
-                    )
+                if snapshot.exists(entry):
+                    continue
+                # v0.33.0 A1: plan-global ``[new]`` admission. A sibling
+                # task declaring this path with ``[new]`` is enough — the
+                # earlier task will produce the file before this one runs.
+                # Normalise both sides through the parser helper so e.g.
+                # ``./foo.md`` matches ``foo.md``.
+                report = _normalize_path_entry(entry)
+                canonical = report.path
+                if canonical is not None and canonical in plan_global_new:
+                    if resolutions is not None:
+                        resolutions.append(
+                            {
+                                "task_id": task.id,
+                                "path": canonical,
+                                "declaring_task_id": _declaring_task_id(
+                                    plan, canonical
+                                )
+                                or "",
+                            }
+                        )
+                    continue
+                raise PathValidationError(
+                    raw=entry,
+                    reason="missing_on_disk",
+                    suggestion=snapshot.closest(entry),
+                    error_class=_classify_rejection(entry),
+                )
 
             for entry in task.extended_scope:
                 if not snapshot.is_dir_prefix(entry):
@@ -279,6 +433,7 @@ def validate_files_exist(plan: Plan, cwd: Path) -> None:
                         raw=entry,
                         reason="missing_on_disk",
                         suggestion=snapshot.closest(entry),
+                        error_class=_classify_rejection(entry),
                     )
 
 

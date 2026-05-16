@@ -374,6 +374,88 @@ LedgerOp = Literal[
     "repetition_loop_detected",
     "recovery_action_chosen",
     "tactic_switch",
+    # v0.33.0 A1: file-existence validator admitted a path because a
+    # sibling task in the same plan declared it ``[new]``. Audit-only;
+    # plan state is unchanged. Payload:
+    # ``{task_id, path, declaring_task_id}``. Lets forensics distinguish
+    # "real on-disk file" from "deferred to creator-task" admissions.
+    "path_validation_resolved_via_plan_global",
+    # v0.34.0 B2: sparse-checkout worktree was expanded with sibling
+    # C/C++ headers so the QA gates retain include-chain context.
+    # Audit-only. Payload: ``{task_id, added_paths: int, mode: str}``.
+    "sparse_worktree_expanded",
+    # v0.34.0 B3: drift verifier exited because the corrective patch
+    # was ≥90% identical to the prior patch. Audit-only. Payload:
+    # ``{task_id, similarity: float, attempt: int}``.
+    "drift_convergence_failure",
+    # v0.35.0 C1: knowledge entry was soft-flagged as low-yield because
+    # its applied_count crossed the floor with a success ratio below
+    # the ceiling. Audit-only — the flip lives in knowledge.jsonl and
+    # the per-decision counts live in quarantine_audit.jsonl; the
+    # ledger op exists so ops dashboards can count quarantine events
+    # without scraping the per-project audit file. Payload:
+    # ``{entry_id, applied_count, succeeded_after_count, reason}``.
+    "knowledge_entry_quarantined",
+    # v0.35.0 C1 prerequisite: an injected lesson preceded a
+    # successful task completion and its succeeded_after_count was
+    # incremented. Audit-only. Payload:
+    # ``{entry_id, task_id, role, tier}``.
+    "knowledge_lesson_credited",
+    # v0.35.0 C2: a critic-derived TournamentEvent was rejected by
+    # the evidence-quality gate before bumping confirmations. Audit-
+    # only — the underlying critic output is still observable via
+    # the normal critic-dispatch trace. Payload:
+    # ``{role, reason, family, event_type}``.
+    "critic_evidence_rejected",
+    # v0.35.0 C3: promotion to hive was rejected because the entry
+    # failed the new conjunct (confirmations floor or
+    # succeeded_after_count > 0). Audit-only. Payload:
+    # ``{entry_id, reason: "min_confirmations" | "no_success"}``.
+    "knowledge_entry_promotion_rejected",
+    # v0.36.0 F1: per-architect-attempt failure breadcrumb. Audit-only;
+    # plan state mutations flow through ``init_plan`` ops emitted on
+    # the eventual successful attempt or the recovery path. Payload:
+    # ``{attempt: int, model: str, duration_s: float,
+    # rejection_count: int, primary_class: str}``.
+    "architect_attempt_failed",
+    # v0.36.0 F1: per-recovery-tier transition. Audit-only. Payload:
+    # ``{tier: int, outcome: "applied" | "noop" | "failed",
+    # reason: str, from_state: str | None, to_state: str | None}``.
+    "recovery_tier_attempted",
+    # v0.36.0 D1: per-rejection breadcrumb classifying the architect's
+    # path-validation miss into a design class so F3's status surface
+    # can render the right action template. Audit-only. Payload:
+    # ``{task_id: str, path: str, class: str}``.
+    "path_rejection_recorded",
+    # v0.36.0 D3: architect retry routed to a different model because
+    # the failure was structural (missing-on-disk, new-md-deliverable)
+    # rather than reasoning. Audit-only. Payload:
+    # ``{attempt: int, from_model: str, to_model: str,
+    # rejection_class: str}``.
+    "architect_model_changed_for_retry",
+    # v0.36.0 E1: huge-repo multiplier was applied at dispatch time.
+    # Audit-only; the actual budget mutation lives only in the
+    # :class:`AgentInvocation` constructed at the call site. Payload:
+    # ``{role: str, base: int, multiplier: float, effective: int}``.
+    "huge_repo_multiplier_applied",
+    # v0.36.0 E2: retry-attempt budget multiplier was applied. Audit-
+    # only; same rationale as ``huge_repo_multiplier_applied``. Payload:
+    # ``{task_id: str, attempt: int, base: int, effective: int}``.
+    "retry_budget_scaled",
+    # v0.36.0 F2: structured probe failure (3-attempt backoff
+    # exhausted, or final attempt raised). Audit-only — the CLI
+    # surfaces the exception body separately via exit code 5. Payload:
+    # ``{adapter: str, attempt: int, last_error: str,
+    # suggestion: str, final: bool}``. ``final=True`` only on the
+    # terminal attempt.
+    "network_probe_failed",
+    # v0.36.0 G1: spec-validator rejection at the ``autodev plan``
+    # entry point. Audit-only. Payload:
+    # ``{path: str, reasons: list[str]}``. ``path`` carries the first
+    # 200 chars of the intent string (CLI passes intent text, not a
+    # file path) so post-mortems can correlate the rejection back to
+    # the operator's command line.
+    "spec_validation_failed",
 ]
 
 
@@ -856,6 +938,40 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         "repetition_loop_detected",
         "recovery_action_chosen",
         "tactic_switch",
+        # v0.33.0 A1: plan-global ``[new]`` admission breadcrumb.
+        # Audit-only; the plan is unchanged because the path was
+        # admitted, not dropped.
+        "path_validation_resolved_via_plan_global",
+        # v0.34.0 B2: sparse-checkout header expansion breadcrumb.
+        # Audit-only; the actual sparse-pattern update lives in git's
+        # own sparse-checkout state, not in the plan.
+        "sparse_worktree_expanded",
+        # v0.34.0 B3: drift-verifier convergence-failure breadcrumb.
+        # Audit-only; the escalation that follows flows through the
+        # regular phase-review corrective-direction path.
+        "drift_convergence_failure",
+        # v0.35.0 Tier C: knowledge-store hygiene ops. All audit-only —
+        # the underlying state (quarantined flag, succeeded_after_count
+        # bump, rejection-skip) lives in the per-project knowledge
+        # JSONL and not in plan state, so replay treats them as no-ops.
+        "knowledge_entry_quarantined",
+        "knowledge_lesson_credited",
+        "critic_evidence_rejected",
+        "knowledge_entry_promotion_rejected",
+        # v0.36.0 Tiers D/E/F/G: retry, budget, forensics, spec-hygiene
+        # telemetry. All audit-only — the actual state mutations
+        # (escalations, model swaps, dispatched budgets, CLI exit codes)
+        # live elsewhere; the ledger ops are forensic breadcrumbs that
+        # let ``autodev status --blocked`` and offline post-mortems
+        # reconstruct the architect-recovery decision tree.
+        "architect_attempt_failed",
+        "recovery_tier_attempted",
+        "path_rejection_recorded",
+        "architect_model_changed_for_retry",
+        "huge_repo_multiplier_applied",
+        "retry_budget_scaled",
+        "network_probe_failed",
+        "spec_validation_failed",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

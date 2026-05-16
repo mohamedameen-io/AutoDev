@@ -2,6 +2,28 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-05-16
+
+Plan-phase unblock release (Tier A from the v0.32.0 retrospective).
+The validator and the architect prompt are now aligned on cross-task
+file-creation semantics, so plans that declare a new artifact in an
+early task and reference it from a later task validate green without
+forcing the architect to repeat `[new]` everywhere.
+
+### Fixed
+- Plan validator now treats `[new]` as plan-global, eliminating cross-task
+  path rejection when a later task references an artifact declared `[new]`
+  by an earlier task (#A1).
+
+### Changed
+- Architect prompt documents the `[new]` rule (must be applied to every
+  task touching a to-be-created file) and forbids investigation-notes
+  deliverables (#A2, #A3).
+
+### Telemetry
+- New ledger op `path_validation_resolved_via_plan_global` emitted on each
+  plan-global resolution.
+
 ## [0.32.0] - 2026-05-16
 
 Hardening release closing the soft-block loop. v0.31.0 fixed every

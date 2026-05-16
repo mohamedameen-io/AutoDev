@@ -1342,6 +1342,18 @@ list over inventing paths. When you list a file in `Files:`:
   - Never list a path that is neither in CANDIDATE_FILES nor prefixed
     `[new]` — the path validator will reject the plan and force a retry.
 
+<!-- [new] PREFIX RULE -->
+If a task references a file that will be created by another task in the same
+plan, you MUST prefix the path with `[new]` on EVERY task that touches it —
+not only on the creator task. The plan validator rejects paths that don't
+exist on disk unless they are marked `[new]` somewhere in the plan.
+
+<!-- NO INVESTIGATION NOTES -->
+Do NOT produce investigation-notes plan artifacts (e.g. `notes-*.md`,
+`*-investigation.md`, `notes/...`). Findings belong in the task description
+and in the ledger evidence stream. Documentation deliverables are only
+appropriate when the spec explicitly asks for documentation.
+
 ## AUTONOMY
 
 <!-- shared: _autonomy_clause.md — keep in sync -->

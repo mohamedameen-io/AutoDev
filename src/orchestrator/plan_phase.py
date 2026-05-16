@@ -169,8 +169,22 @@ def _build_retry_env(
     from orchestrator.path_validator import PathValidationError
     from orchestrator.retry_envelope import PriorError, TypedRetryEnvelope
 
+    # v0.36.0 D1: derive error_class for each prior error. The
+    # ``errors_seen`` dict is keyed by ``(raw, reason)`` so we
+    # reclassify on the fly via the same helper the validator uses;
+    # non-path keys (parse-error class strings) fall through to the
+    # default ``missing_on_disk`` class which renders the generic
+    # diagnosis paragraph — fine since those entries never group with
+    # real path failures.
+    from orchestrator.file_existence_validator import _classify_rejection  # noqa: PLC0415
+
     prior_errors = [
-        PriorError(raw=r, reason=s, count=n)
+        PriorError(
+            raw=r,
+            reason=s,
+            count=n,
+            error_class=_classify_rejection(r) if s else "missing_on_disk",
+        )
         for (r, s), n in errors_seen.items()
     ]
     # v0.32.0 Phase 1.1: highlight the top-5 most-recurrent failures
@@ -375,7 +389,18 @@ async def _validate_with_persistent_drop(
 
     while True:
         try:
-            validate_files_exist(plan, cwd)
+            # v0.33.0 A1: collect plan-global ``[new]`` admissions here,
+            # emit ledger ops below — ``validate_files_exist`` is sync
+            # but ``ledger_append`` is async, so the validator surfaces
+            # resolutions via this out-channel rather than acquiring the
+            # async lock itself.
+            resolutions: list[dict[str, str]] = []
+            validate_files_exist(plan, cwd, resolutions=resolutions)
+            for res in resolutions:
+                await orch.plan_manager.ledger_append(
+                    op="path_validation_resolved_via_plan_global",
+                    payload=res,
+                )
             return plan
         except PathValidationError as exc:
             key = (exc.raw, exc.reason)
@@ -759,13 +784,76 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                             )
                         max_turns_override = _new_max
 
-            architect_result = await _delegate(
-                orch,
-                "architect",
-                env,
-                max_turns_override=max_turns_override,
-                system_prompt_substitutions=substitutions,
-            )
+            # v0.36.0 D3: on retry attempt ≥ 2, swap the architect to a
+            # cheaper model when the most-recent failure is structural
+            # (missing_on_disk / new_md_deliverable). Opus burns money
+            # on path-list corrections that sonnet handles just as well.
+            # We mutate-then-restore the registry entry for this single
+            # dispatch only (same pattern Tier 5 uses for the opus bump
+            # in ``_run_phase1_4_recovery``).
+            structural_model_swap: str | None = None
+            original_architect_spec_for_swap = None
+            if attempt >= 1 and isinstance(last_exc, PathValidationError):
+                from orchestrator.plan_phase_recovery import (  # noqa: PLC0415
+                    should_change_model_for_class,
+                )
+
+                current_model = (
+                    architect_spec.model if architect_spec is not None else None
+                )
+                # Read the configured cheaper-model identifier; falls
+                # back to the documented default ``"sonnet"`` if the
+                # cfg lacks the architect entry (defensive — older
+                # stub configs in unit tests).
+                _arch_cfg = getattr(
+                    orch.cfg, "agents", {}
+                ).get("architect") if hasattr(orch.cfg, "agents") else None
+                structural_retry_model = getattr(
+                    _arch_cfg, "structural_retry_model", "sonnet"
+                )
+                err_class = getattr(
+                    last_exc, "error_class", "missing_on_disk"
+                )
+                target = should_change_model_for_class(
+                    current_model, err_class, structural_retry_model
+                )
+                if target is not None and architect_spec is not None:
+                    structural_model_swap = target
+                    original_architect_spec_for_swap = architect_spec
+                    bumped = architect_spec.model_copy(update={"model": target})
+                    orch.registry["architect"] = bumped
+                    try:
+                        await orch.plan_manager.ledger_append(
+                            op="architect_model_changed_for_retry",
+                            payload={
+                                "attempt": attempt + 1,
+                                "from_model": current_model or "",
+                                "to_model": target,
+                                "rejection_class": err_class,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 - best-effort
+                        logger.warning(
+                            "plan_phase.model_swap_ledger_failed",
+                            err=str(exc),
+                        )
+
+            _dispatch_start_s = time.monotonic()
+            try:
+                architect_result = await _delegate(
+                    orch,
+                    "architect",
+                    env,
+                    max_turns_override=max_turns_override,
+                    system_prompt_substitutions=substitutions,
+                )
+            finally:
+                if (
+                    structural_model_swap is not None
+                    and original_architect_spec_for_swap is not None
+                ):
+                    orch.registry["architect"] = original_architect_spec_for_swap
+            _dispatch_duration_s = time.monotonic() - _dispatch_start_s
             # v0.32.0 Phase 1.2: feed the adapter's subtype back into
             # the tracker so the NEXT attempt's escalation decision
             # sees this attempt's outcome. ``error_max_turns`` and
@@ -824,6 +912,28 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                 if isinstance(exc, PathValidationError):
                     key = (exc.raw, exc.reason)
                     errors_seen[key] = errors_seen.get(key, 0) + 1
+                    # v0.36.0 D1: per-rejection class breadcrumb. The
+                    # path-validation walk doesn't know which task the
+                    # path lived on (the validator runs against the
+                    # full plan tree); use the empty-string sentinel
+                    # for ``task_id`` so F3's status surface still has
+                    # a row to display.
+                    try:
+                        await orch.plan_manager.ledger_append(
+                            op="path_rejection_recorded",
+                            payload={
+                                "task_id": "",
+                                "path": exc.raw,
+                                "class": getattr(
+                                    exc, "error_class", "missing_on_disk"
+                                ),
+                            },
+                        )
+                    except Exception as op_exc:  # noqa: BLE001 - best-effort
+                        logger.warning(
+                            "plan_phase.path_rejection_ledger_failed",
+                            err=str(op_exc),
+                        )
                 else:
                     # v0.27 Phase 4: route PlanParseError /
                     # PydValidationError through a typed error-class
@@ -856,6 +966,46 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                     attempt=attempt + 1,
                     max_attempts=_MAX_ARCHITECT_ATTEMPTS,
                 )
+                # v0.36.0 F1: per-attempt failure breadcrumb. Records
+                # model + duration + the primary rejection class so
+                # ``autodev status --blocked`` can render an attempt
+                # timeline without scanning the orchestrator's
+                # structured log. Best-effort — never let ledger I/O
+                # mask the upstream failure.
+                try:
+                    _primary_class = (
+                        getattr(exc, "error_class", "missing_on_disk")
+                        if isinstance(exc, PathValidationError)
+                        else type(exc).__name__
+                    )
+                    _attempt_model = (
+                        structural_model_swap
+                        if structural_model_swap is not None
+                        else (
+                            architect_spec.model
+                            if architect_spec is not None
+                            else ""
+                        )
+                    )
+                    await orch.plan_manager.ledger_append(
+                        op="architect_attempt_failed",
+                        payload={
+                            "attempt": attempt + 1,
+                            "model": _attempt_model or "",
+                            "duration_s": float(
+                                round(_dispatch_duration_s, 3)
+                            ),
+                            "rejection_count": int(
+                                sum(errors_seen.values())
+                            ),
+                            "primary_class": _primary_class,
+                        },
+                    )
+                except Exception as op_exc:  # noqa: BLE001
+                    logger.warning(
+                        "plan_phase.attempt_failed_ledger_failed",
+                        err=str(op_exc),
+                    )
                 if attempt == _MAX_ARCHITECT_ATTEMPTS - 1:
                     # v0.32.0 Phase 1.4: enter the four-tier recovery
                     # path BEFORE re-raising. Each tier is best-effort
@@ -1110,15 +1260,21 @@ async def _run_phase1_4_recovery(
         opus_model_id=opus_target,
     )
 
-    # Best-effort breadcrumb so the recovery-hint surfaces in the
-    # ledger / status CLI. Failures must NOT mask the eventual
-    # hard-fail.
+    # v0.36.0 F1: replace the v0.32.0 ``{0 → 0}`` lie with the truthful
+    # from/to budget values. ``retry_max`` is the architect-retry
+    # default budget; on entry the recovery path consumes one extra
+    # dispatch at that budget (Tier 5 re-prompt), so the breadcrumb
+    # carries ``base_max → retry_max``. Best-effort writes — never
+    # mask the eventual hard-fail.
+    _base_max = (
+        (architect_spec.max_turns or 5) if architect_spec is not None else 5
+    )
     try:
         await orch.plan_manager.ledger_append(
             op="plan_phase_budget_escalation",
             payload={
-                "from_max_turns": 0,
-                "to_max_turns": 0,
+                "from_max_turns": int(_base_max),
+                "to_max_turns": int(retry_max),
                 "attempt": attempts,
                 "reason": "phase1_4_recovery_entered",
             },
@@ -1127,6 +1283,74 @@ async def _run_phase1_4_recovery(
         logger.warning(
             "plan_phase.recovery_breadcrumb_failed", err=str(exc)
         )
+
+    # v0.36.0 F1: per-recovery-tier transition breadcrumbs. Tier 4
+    # (scope degradation) and Tier 5 (model escalation) each get one
+    # op — emitted with the from/to state and the outcome the tier
+    # produced. Tier 6 (recovery_hint) and Tier 7 (forensic summary)
+    # always succeed so we record them as "applied" with the
+    # rendered hint class / dump count as the to_state.
+    async def _emit_tier_op(
+        tier: int,
+        outcome: str,
+        reason: str,
+        from_state: str | None,
+        to_state: str | None,
+    ) -> None:
+        try:
+            await orch.plan_manager.ledger_append(
+                op="recovery_tier_attempted",
+                payload={
+                    "tier": tier,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "from_state": from_state,
+                    "to_state": to_state,
+                },
+            )
+        except Exception as ex:  # noqa: BLE001
+            logger.warning(
+                "plan_phase.recovery_tier_ledger_failed", err=str(ex)
+            )
+
+    await _emit_tier_op(
+        tier=4,
+        outcome=(
+            "applied" if outcome.degraded_plan is not None else "noop"
+        ),
+        reason=outcome.meta.get(
+            "tier4_reason", outcome.meta.get("tier4_skipped_reason", "")
+        ),
+        from_state="undegraded",
+        to_state=(
+            f"dropped:{outcome.dropped_scope_entry}"
+            if outcome.dropped_scope_entry
+            else None
+        ),
+    )
+    await _emit_tier_op(
+        tier=5,
+        outcome=(
+            "applied" if outcome.escalated_model is not None else "noop"
+        ),
+        reason=outcome.meta.get("tier5_reason", ""),
+        from_state=current_model,
+        to_state=outcome.escalated_model,
+    )
+    await _emit_tier_op(
+        tier=6,
+        outcome="applied",
+        reason="recovery_hint_emitted",
+        from_state=None,
+        to_state=outcome.meta.get("recovery_hint_class", ""),
+    )
+    await _emit_tier_op(
+        tier=7,
+        outcome="applied",
+        reason="forensic_summary_built",
+        from_state=None,
+        to_state=f"dumps:{len(archived_dumps)}",
+    )
 
     logger.warning(
         "plan_phase.recovery_tiers_engaged",
@@ -1309,10 +1533,34 @@ async def _delegate(
     block = envelope.render_as_task_message()
     parts.append("\n\n---\n")
     parts.append(block)
-    lessons = await orch.knowledge.inject_block(role, task_id=envelope.task_id)
+    # v0.35.0 C1 prerequisite: prefer the IDs-returning variant so the
+    # success path can credit the entries that contributed. Fall back
+    # to the legacy str-returning ``inject_block`` for test fakes that
+    # haven't been updated to expose the sister method.
+    inject_with_ids = getattr(orch.knowledge, "inject_block_with_ids", None)
+    if inject_with_ids is not None:
+        lessons, injected_ids = await inject_with_ids(
+            role, task_id=envelope.task_id
+        )
+    else:
+        lessons = await orch.knowledge.inject_block(role, task_id=envelope.task_id)
+        injected_ids = []
     if lessons:
         parts.append("\n\n")
         parts.append(lessons)
+    # v0.35.0 C1 prerequisite: record the per-(task, role) correlation
+    # so plan-phase tasks that later complete successfully also credit
+    # the lessons that contributed to their plan-time prompt. Defensive
+    # access so orchestrator stubs in unit tests are not forced to
+    # carry the slot.
+    if injected_ids and envelope.task_id:
+        correlation = getattr(orch, "_injected_lessons_by_task", None)
+        if correlation is not None:
+            key = (envelope.task_id, role)
+            existing = correlation.get(key, [])
+            correlation[key] = existing + [
+                i for i in injected_ids if i not in existing
+            ]
 
     # Resolve per-role effort: explicit override > architect floor > matrix > None.
     # In plan phase the plan doesn't exist yet for the architect call (and on
