@@ -95,6 +95,67 @@ _CPP_EXTS: frozenset[str] = frozenset(
 )
 
 
+# v0.34.0 B1: per-language symbol allowlist consulted before flagging.
+# Keys are language-profile names (matching the output of
+# ``runtime.language_profile.get_dominant_language``). Operators will be
+# able to extend this via config in a future release; for v0.34 the
+# defaults cover the macro-heavy C/C++ engine patterns that produced
+# false positives on the May-13 retrospective fixture.
+HALLUCINATION_ALLOWLISTS: dict[str, frozenset[str]] = {
+    "cpp": frozenset(
+        {
+            "ARRAY_SIZE",
+            "Assert",
+            "AssertMsg",
+            "AssertFormat",
+            "ANALYSIS_ASSUME",
+            "STATIC_ASSERT",
+            "UNUSED",
+            "FORCE_INLINE",
+            "ALIGN_AS",
+            "THREAD_LOCAL",
+        }
+    ),
+}
+
+
+# v0.34.0 B1: regex used to extract the offending symbol from a finding
+# string. The three scanners format findings as either
+# ``…hallucinated reference — <symbol> not found in <module>`` (Python)
+# or ``…hallucinated reference — call to '<symbol>' has no matching…``
+# (C++) or ``…hallucinated reference — package '<symbol>' not found…``
+# (TypeScript). One regex with alternation matches all three shapes.
+_FINDING_SYMBOL_RE = re.compile(
+    r"hallucinated reference —\s+(?:call to '([^']+)'|package '([^']+)'|(\S+) not found)"
+)
+
+
+def _finding_symbol(finding: str) -> str | None:
+    m = _FINDING_SYMBOL_RE.search(finding)
+    if m is None:
+        return None
+    return m.group(1) or m.group(2) or m.group(3)
+
+
+def _downgrade_in_sparse(finding: str, sparse_mode: bool) -> tuple[str, bool]:
+    """v0.34.0 B1: tag a finding as ``unresolved_symbol`` under sparse mode.
+
+    Returns ``(possibly-mutated finding, is_blocking)``. When
+    ``sparse_mode`` is True and the finding looks like a hallucinated
+    API reference, the finding string is rewritten to flag it as
+    ``unresolved_symbol`` (warn-level) so callers can drop it from the
+    blocking-failure list while still surfacing it for forensics.
+    """
+    if not sparse_mode:
+        return finding, True
+    if "hallucinated reference" not in finding:
+        return finding, True
+    return (
+        finding.replace("hallucinated reference", "unresolved_symbol (sparse)"),
+        False,
+    )
+
+
 def _iter_files(
     cwd: Path,
     paths: list[Path] | None,
@@ -383,16 +444,25 @@ def _scan_cpp_file_dispatch(path: Path, repo_root: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _dispatch(path: Path, repo_root: Path) -> list[str]:
+def _dispatch(
+    path: Path,
+    repo_root: Path,
+    *,
+    allowlist: frozenset[str] = frozenset(),
+) -> list[str]:
     """Pick the right scanner for *path* by extension."""
     ext = path.suffix.lower()
     if ext in _PY_EXTS:
-        return _scan_python_file(path, repo_root)
-    if ext in _TS_EXTS:
-        return _scan_typescript_file(path, repo_root)
-    if ext in _CPP_EXTS:
-        return _scan_cpp_file_dispatch(path, repo_root)
-    return []
+        findings = _scan_python_file(path, repo_root)
+    elif ext in _TS_EXTS:
+        findings = _scan_typescript_file(path, repo_root)
+    elif ext in _CPP_EXTS:
+        findings = _scan_cpp_file_dispatch(path, repo_root)
+    else:
+        return []
+    if not allowlist:
+        return findings
+    return [f for f in findings if (_finding_symbol(f) or "") not in allowlist]
 
 
 async def _dispatch_with_timeout(
@@ -401,6 +471,7 @@ async def _dispatch_with_timeout(
     timeout_s: float = DEFAULT_PER_FILE_TIMEOUT_S,
     *,
     emit_ledger_op: bool = True,
+    allowlist: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Run :func:`_dispatch` in a worker thread with a wall-clock ceiling.
 
@@ -420,7 +491,7 @@ async def _dispatch_with_timeout(
     """
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_dispatch, path, repo_root),
+            asyncio.to_thread(_dispatch, path, repo_root, allowlist=allowlist),
             timeout=timeout_s,
         )
     except asyncio.TimeoutError:
@@ -459,6 +530,9 @@ async def run_hallucination_guard(
     per_file_timeout_s: float = DEFAULT_PER_FILE_TIMEOUT_S,
     *,
     extra_skip_dirs: list[str] | frozenset[str] | None = None,
+    allowlist: frozenset[str] = frozenset(),
+    sparse_mode: bool = False,
+    task_id: str | None = None,
 ) -> GateResult:
     """Scan *cwd* (or *paths*) for hallucinated API references.
 
@@ -489,18 +563,44 @@ async def run_hallucination_guard(
     else:
         skip_set = frozenset(extra_skip_dirs)
     files = _iter_files(cwd, paths, extra_skip_dirs=skip_set)
-    all_findings: list[str] = []
+    blocking: list[str] = []
+    warn_only: list[str] = []
+    # v0.34.0 B1: track allowlist suppression for telemetry. The
+    # per-file dispatch drops allowlisted findings entirely, but we
+    # need a per-symbol pre-image to emit downgrade log lines.
     for f in files:
-        findings = await _dispatch_with_timeout(
+        raw = await _dispatch_with_timeout(
             f, repo_root=cwd, timeout_s=per_file_timeout_s
         )
-        all_findings.extend(findings)
+        for finding in raw:
+            symbol = _finding_symbol(finding) or ""
+            if symbol and symbol in allowlist:
+                _log.info(
+                    "hallucination_finding_downgraded task_id=%s file=%s "
+                    "symbol=%s reason=allowlist",
+                    task_id,
+                    str(f),
+                    symbol,
+                )
+                continue
+            mutated, is_blocking = _downgrade_in_sparse(finding, sparse_mode)
+            if not is_blocking:
+                _log.info(
+                    "hallucination_finding_downgraded task_id=%s file=%s "
+                    "symbol=%s reason=sparse_mode",
+                    task_id,
+                    str(f),
+                    symbol,
+                )
+                warn_only.append(mutated)
+            else:
+                blocking.append(mutated)
 
-    if all_findings:
-        detail_lines = all_findings[:20]
+    if blocking:
+        detail_lines = blocking[:20]
         suffix = (
-            f"\n… and {len(all_findings) - 20} more"
-            if len(all_findings) > 20
+            f"\n… and {len(blocking) - 20} more"
+            if len(blocking) > 20
             else ""
         )
         return GateResult(
@@ -509,6 +609,19 @@ async def run_hallucination_guard(
                 "potential hallucinated API references:\n"
                 + "\n".join(detail_lines)
                 + suffix
+            ),
+        )
+    if warn_only:
+        # v0.34.0 B1: downgraded-only run still passes the gate; the
+        # warn-level body is forensics for the operator. Severity stays
+        # at the default "block" so the orchestrator's existing dispatch
+        # treats ``passed=True`` as silent (no surfaced warning) — the
+        # log line above is the operator-visible signal.
+        return GateResult(
+            passed=True,
+            details=(
+                "no blocking hallucinations; "
+                f"{len(warn_only)} downgraded to unresolved_symbol (sparse)"
             ),
         )
     return GateResult(passed=True, details="no hallucinated references detected")
@@ -521,6 +634,7 @@ def _scan_file(path: Path, repo_root: Path) -> list[str]:
 
 
 __all__ = [
+    "HALLUCINATION_ALLOWLISTS",
     "TS_TREESITTER_AVAILABLE",
     "_scan_typescript_regex",
     "run_hallucination_guard",

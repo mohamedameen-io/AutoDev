@@ -191,3 +191,40 @@ jobs:
           fi
           echo "Architect prompt v0.33 anchors present."
 
+      # v0.34.0 Tier B: execute-phase unblock integration anchors.
+      - name: Hallucination guard allowlist + downgrade wiring (v0.34 B1)
+        run: |
+          if ! grep -q "HALLUCINATION_ALLOWLISTS" src/qa/hallucination_guard.py; then
+            echo "::error::src/qa/hallucination_guard.py missing HALLUCINATION_ALLOWLISTS (v0.34 B1)"
+            exit 1
+          fi
+          if ! grep -q "hallucination_finding_downgraded" src/qa/hallucination_guard.py; then
+            echo "::error::src/qa/hallucination_guard.py missing hallucination_finding_downgraded log op (v0.34 B1)"
+            exit 1
+          fi
+          echo "Hallucination guard v0.34 B1 anchors present."
+
+      - name: Sparse-checkout sibling-header helper + config (v0.34 B2)
+        run: |
+          if ! grep -q "_sibling_header_paths" src/orchestrator/worktree.py; then
+            echo "::error::src/orchestrator/worktree.py missing _sibling_header_paths helper (v0.34 B2)"
+            exit 1
+          fi
+          if ! grep -q "include_headers_for_sparse" src/config/schema.py; then
+            echo "::error::src/config/schema.py missing include_headers_for_sparse field (v0.34 B2)"
+            exit 1
+          fi
+          echo "Sparse-checkout v0.34 B2 anchors present."
+
+      - name: Drift-verifier convergence helper + ledger op (v0.34 B3)
+        run: |
+          if ! grep -q "_patch_similarity" src/orchestrator/drift_verifier.py; then
+            echo "::error::src/orchestrator/drift_verifier.py missing _patch_similarity helper (v0.34 B3)"
+            exit 1
+          fi
+          if ! grep -q "drift_convergence_failure" src/state/ledger.py; then
+            echo "::error::src/state/ledger.py missing drift_convergence_failure ledger op (v0.34 B3)"
+            exit 1
+          fi
+          echo "Drift-verifier v0.34 B3 anchors present."
+

@@ -59,6 +59,41 @@ _DRIFT_REPORT_RE = re.compile(
 )
 
 
+def _patch_similarity(prev_diff: str, curr_diff: str) -> float:
+    """v0.34.0 B3: Jaccard similarity over the added/removed line set.
+
+    Strips diff metadata (``diff --git``, ``index``, ``+++``, ``---``,
+    ``@@`` hunk headers, blank lines) and the leading ``+``/``-``/`` ``
+    marker so the comparison is over the actual edited content.
+    Returns ``0.0`` when either input is empty.
+    """
+    if not prev_diff or not curr_diff:
+        return 0.0
+    prev = _diff_line_set(prev_diff)
+    curr = _diff_line_set(curr_diff)
+    if not prev or not curr:
+        return 0.0
+    inter = len(prev & curr)
+    union = len(prev | curr)
+    return inter / union if union else 0.0
+
+
+def _diff_line_set(diff_text: str) -> set[str]:
+    out: set[str] = set()
+    for raw in diff_text.splitlines():
+        if not raw:
+            continue
+        if raw.startswith(("diff --git", "index ", "+++ ", "--- ", "@@")):
+            continue
+        if raw[0] not in ("+", "-", " "):
+            continue
+        body = raw[1:].strip()
+        if not body:
+            continue
+        out.add(body)
+    return out
+
+
 @dataclass
 class DriftVerdict:
     """Structured outcome of one drift-verifier run.
@@ -70,11 +105,15 @@ class DriftVerdict:
         drift_findings: List of human-readable drift descriptions
             extracted from the response. Empty when ``passed=True``.
         evidence_path: On-disk path to the persisted evidence JSON.
+        convergence_failure: v0.34.0 B3 — True when the runner exited
+            early because the corrective patch was ≥90% identical to
+            the prior patch. Drives escalation routing in the caller.
     """
 
     passed: bool
     drift_findings: list[str]
     evidence_path: Path
+    convergence_failure: bool = False
 
 
 def _build_drift_verify_prompt(
@@ -201,12 +240,17 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
         raise
 
 
+_CONVERGENCE_SIMILARITY_THRESHOLD = 0.90
+
+
 async def run_drift_verifier(
     *,
     orch: object,
     phase: "Phase",
     evidence_dir: Path,
     diff_text: str = "",
+    prior_corrective_diff: str | None = None,
+    attempt: int = 0,
 ) -> DriftVerdict:
     """Dispatch the drift-verifier critic and return its parsed verdict.
 
@@ -225,6 +269,47 @@ async def run_drift_verifier(
         :class:`DriftVerdict`. ``passed=True`` requires both an explicit
         ``VERDICT: APPROVED`` line AND zero MISSING/DRIFTED task entries.
     """
+    # v0.34.0 B3: convergence exit BEFORE dispatching the agent. When
+    # the corrective patch we're about to verify is ≥90% identical to
+    # the prior patch, the corrective loop is not making progress and
+    # we escalate via the caller's phase-review-decision path instead
+    # of paying another critic dispatch.
+    if prior_corrective_diff is not None and diff_text:
+        sim = _patch_similarity(prior_corrective_diff, diff_text)
+        if sim >= _CONVERGENCE_SIMILARITY_THRESHOLD:
+            finding = (
+                "drift_convergence_failure: corrective patch is "
+                f"≥{int(_CONVERGENCE_SIMILARITY_THRESHOLD * 100)}% identical to "
+                f"prior (similarity={sim:.2f}); escalating"
+            )
+            evidence_path = (
+                evidence_dir / f"{_safe_phase_id(phase.id)}-drift-verifier.json"
+            )
+            _atomic_write_json(
+                evidence_path,
+                {
+                    "phase_id": phase.id,
+                    "passed": False,
+                    "drift_findings": [finding],
+                    "raw_response": "",
+                    "convergence_failure": True,
+                    "similarity": sim,
+                    "attempt": attempt,
+                },
+            )
+            logger.info(
+                "drift_verifier.convergence_failure",
+                phase_id=phase.id,
+                similarity=sim,
+                attempt=attempt,
+            )
+            return DriftVerdict(
+                passed=False,
+                drift_findings=[finding],
+                evidence_path=evidence_path,
+                convergence_failure=True,
+            )
+
     spec = orch.registry.get("critic_drift_verifier")  # type: ignore[attr-defined]
     if spec is None:
         # Fail-safe: no agent spec → cannot run, mark as drifted with a

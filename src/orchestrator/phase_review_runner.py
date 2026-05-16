@@ -399,14 +399,35 @@ async def run_phase_review_tournament(
     if accept_phase and drift_enabled:
         drift_evidence_dir = autodev_root(orch.cwd) / "evidence"
         try:
-            from orchestrator.drift_verifier import run_drift_verifier
+            from orchestrator.drift_verifier import (
+                _CONVERGENCE_SIMILARITY_THRESHOLD,
+                run_drift_verifier,
+            )
 
+            # v0.34.0 B3: thread the prior corrective diff (if any)
+            # so the runner can short-circuit when the new patch is
+            # ≥90% identical to the previous one — the corrective loop
+            # is not making progress and another dispatch is wasted.
+            prior_diff_memo = getattr(orch, "_drift_prior_diff_by_phase", None)
+            if prior_diff_memo is None:
+                prior_diff_memo = {}
+                setattr(orch, "_drift_prior_diff_by_phase", prior_diff_memo)
+            attempt_memo = getattr(orch, "_drift_attempt_by_phase", None)
+            if attempt_memo is None:
+                attempt_memo = {}
+                setattr(orch, "_drift_attempt_by_phase", attempt_memo)
+            prior_diff = prior_diff_memo.get(phase.id)
+            attempt_no = int(attempt_memo.get(phase.id, 0))
             drift_verdict = await run_drift_verifier(
                 orch=orch,
                 phase=phase,
                 evidence_dir=drift_evidence_dir,
                 diff_text=diff_text,
+                prior_corrective_diff=prior_diff,
+                attempt=attempt_no,
             )
+            prior_diff_memo[phase.id] = diff_text
+            attempt_memo[phase.id] = attempt_no + 1
         except Exception as exc:  # noqa: BLE001
             # Drift-verifier failures must never block phase promotion;
             # log and continue with the tournament's verdict. Telemetry
@@ -432,6 +453,25 @@ async def run_phase_review_tournament(
                 phase_id=phase.id,
                 n_findings=len(drift_verdict.drift_findings),
             )
+            # v0.34.0 B3: convergence-failure ledger breadcrumb so
+            # operators can see when the corrective loop self-aborted
+            # without parsing the evidence file. Audit-only.
+            if getattr(drift_verdict, "convergence_failure", False):
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="drift_convergence_failure",
+                        payload={
+                            "task_id": phase.id,
+                            "similarity": _CONVERGENCE_SIMILARITY_THRESHOLD,
+                            "attempt": int(attempt_memo.get(phase.id, 0)),
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "drift_convergence_failure.ledger_append_failed",
+                        phase_id=phase.id,
+                        err=str(exc),
+                    )
 
         # v0.16.0: ledger breadcrumb so post-hoc analysis can replay the
         # drift-verifier's verdict without re-reading the evidence file.

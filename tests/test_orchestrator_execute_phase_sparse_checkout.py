@@ -52,6 +52,7 @@ async def test_sparse_paths_forwarded_when_enabled(
     async def fake_create_per_task(
         self, task_id: str, base_ref: str = "HEAD",
         sparse_paths: list[str] | None = None,
+        **_kw: object,
     ) -> Path:
         captured["sparse_paths"] = sparse_paths
         captured["task_id"] = task_id
@@ -122,6 +123,7 @@ async def test_sparse_paths_none_when_disabled(
     async def fake_create_per_task(
         self, task_id: str, base_ref: str = "HEAD",
         sparse_paths: list[str] | None = None,
+        **_kw: object,
     ) -> Path:
         captured["sparse_paths"] = sparse_paths
         return tmp_path / "fake_wt"
@@ -182,6 +184,7 @@ async def test_phase_scope_overrides_plan_scope(
     async def fake_create_per_task(
         self, task_id: str, base_ref: str = "HEAD",
         sparse_paths: list[str] | None = None,
+        **_kw: object,
     ) -> Path:
         captured["sparse_paths"] = sparse_paths
         return tmp_path / "fake_wt"

@@ -1067,6 +1067,31 @@ def _indent_block(text: str, prefix: str = "  ") -> str:
     return "\n".join(prefix + line for line in text.splitlines())
 
 
+async def _credit_injected_lessons_for_task(
+    orch: "Orchestrator", task_id: str
+) -> None:
+    """v0.35.0 C1 prerequisite: drain + credit lessons that landed for a task.
+
+    Walks every ``(task_id, role)`` slot the dispatcher populated for
+    this task, asks the knowledge store to increment
+    ``succeeded_after_count`` for each entry id, and removes the slot
+    from the in-memory correlation map so re-entry on a resumed
+    session does not double-credit.
+    """
+    correlation = getattr(orch, "_injected_lessons_by_task", None)
+    if correlation is None:
+        return
+    keys_to_drain = [key for key in list(correlation.keys()) if key[0] == task_id]
+    for key in keys_to_drain:
+        entry_ids = correlation.pop(key, [])
+        if not entry_ids:
+            continue
+        credit = getattr(orch.knowledge, "credit_task_success", None)
+        if credit is None:
+            continue
+        await credit(entry_ids, task_id=task_id, role=key[1])
+
+
 # Maximum number of "rewrite" rounds before forcing abandon. Caps the
 # critic-developer ping-pong so a misbehaving critic cannot loop
 # indefinitely.
@@ -3023,7 +3048,11 @@ async def _execute_one(
                     sparse_paths = _resolved
         try:
             worktree = await worktree_mgr.create_per_task(
-                task.id, sparse_paths=sparse_paths
+                task.id,
+                sparse_paths=sparse_paths,
+                include_headers_for_sparse=bool(
+                    getattr(orch.cfg, "include_headers_for_sparse", True)
+                ),
             )
         except WorktreeError as exc:
             logger.warning(
@@ -3032,6 +3061,24 @@ async def _execute_one(
                 err=str(exc),
             )
             worktree = None
+        # v0.34.0 B2: emit the ``sparse_worktree_expanded`` ledger op
+        # when the worktree manager folded sibling headers into the
+        # sparse set. Best-effort — ledger failures must never block
+        # task dispatch (this mirrors the existing ``attempt_started``
+        # pattern downstream).
+        added_h = getattr(worktree_mgr, "last_sparse_headers_added", 0) or 0
+        if added_h:
+            try:
+                await orch.plan_manager.ledger_append(
+                    op="sparse_worktree_expanded",
+                    payload={
+                        "task_id": task.id,
+                        "added_paths": int(added_h),
+                        "mode": "sibling_headers",
+                    },
+                )
+            except Exception:  # noqa: BLE001 — telemetry-only
+                pass
 
     orch.guardrails.start_task(task.id)
     try:
@@ -3683,6 +3730,18 @@ async def _execute_one(
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "execute_phase.reset_stuck_state_failed",
+                    task_id=task.id,
+                    err=str(exc),
+                )
+            # v0.35.0 C1 prerequisite: credit every lesson that landed
+            # in a prompt for this task with one succeeded_after_count
+            # increment. Drain the per-task slice of the correlation
+            # map so re-entry doesn't double-credit.
+            try:
+                await _credit_injected_lessons_for_task(orch, task.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.credit_lessons_failed",
                     task_id=task.id,
                     err=str(exc),
                 )
@@ -4392,10 +4451,37 @@ async def delegate(
     if extra_context:
         parts.append("\n\n")
         parts.append(extra_context)
-    lessons = await orch.knowledge.inject_block(role, task_id=envelope.task_id)
+    # v0.35.0 C1 prerequisite: prefer the IDs-returning variant so the
+    # success path can credit the entries that contributed. Fall back
+    # to the legacy str-returning ``inject_block`` for test fakes that
+    # haven't been updated to expose the sister method.
+    inject_with_ids = getattr(orch.knowledge, "inject_block_with_ids", None)
+    if inject_with_ids is not None:
+        lessons, injected_ids = await inject_with_ids(
+            role, task_id=envelope.task_id
+        )
+    else:
+        lessons = await orch.knowledge.inject_block(role, task_id=envelope.task_id)
+        injected_ids = []
     if lessons:
         parts.append("\n\n")
         parts.append(lessons)
+    # v0.35.0 C1 prerequisite: stash the (task_id, role) -> ids
+    # correlation so the success path can credit succeeded_after_count
+    # on the entries that actually contributed to this prompt. The map
+    # accumulates across roles for the same task so one task that
+    # injects in both coder and reviewer prompts credits both. Cleared
+    # by the success-recording helper after the task transitions to
+    # ``complete``. Defensive ``getattr`` so test fakes for Orchestrator
+    # don't have to carry the slot.
+    if injected_ids and envelope.task_id:
+        correlation = getattr(orch, "_injected_lessons_by_task", None)
+        if correlation is not None:
+            key = (envelope.task_id, role)
+            existing = correlation.get(key, [])
+            correlation[key] = existing + [
+                i for i in injected_ids if i not in existing
+            ]
 
     # v0.15.0: PRM trajectory pattern detection. Before this dispatch,
     # consult the trajectory store for any patterns observed since the
@@ -4561,16 +4647,90 @@ async def delegate(
             if _task_overrides_cfg is not None
             else None
         )
+        # v0.36.0 E2: thread retry attempt + multiplier/cap into the
+        # resolver so retry attempt ≥ 2 actually gets more runway.
+        retry_mult = (
+            getattr(_task_overrides_cfg, "retry_budget_multiplier", 2.0)
+            if _task_overrides_cfg is not None
+            else 2.0
+        )
+        retry_cap = (
+            getattr(_task_overrides_cfg, "retry_budget_cap_turns", 200)
+            if _task_overrides_cfg is not None
+            else 200
+        )
+        _base_max = resolve_task_max_turns(
+            task,
+            spec.max_turns,
+            capacity=repo_capacity,
+            huge_repo_multipliers=huge_mult_overrides,
+            retry_attempt=0,
+        )
         max_turns = (
             resolve_task_max_turns(
                 task,
                 spec.max_turns,
                 capacity=repo_capacity,
                 huge_repo_multipliers=huge_mult_overrides,
+                retry_attempt=retry_count,
+                retry_budget_multiplier=retry_mult,
+                retry_budget_cap_turns=retry_cap,
             )
             or spec.max_turns
             or 1
         )
+        # v0.36.0 E2 telemetry: emit retry_budget_scaled when retry
+        # actually changed the budget. Best-effort — never block the
+        # dispatch.
+        if (
+            retry_count >= 2
+            and _base_max is not None
+            and max_turns != _base_max
+        ):
+            try:
+                await orch.plan_manager.ledger_append(
+                    op="retry_budget_scaled",
+                    payload={
+                        "task_id": envelope.task_id,
+                        "attempt": retry_count,
+                        "base": int(_base_max),
+                        "effective": int(max_turns),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.retry_budget_ledger_failed", err=str(exc)
+                )
+        # v0.36.0 E1 telemetry: if a role-keyed multiplier > 1 applies
+        # AND the repo is huge, emit huge_repo_multiplier_applied.
+        # Reads role-keyed entries from the same cfg dict the
+        # complexity-keyed resolver consults — the dict carries both
+        # key shapes for forward-compat with future role-aware
+        # resolution.
+        if (
+            repo_capacity is not None
+            and getattr(repo_capacity, "is_huge", False)
+            and isinstance(huge_mult_overrides, dict)
+            and role in huge_mult_overrides
+            and huge_mult_overrides[role] > 1.0
+        ):
+            try:
+                _role_mult = float(huge_mult_overrides[role])
+                _role_base = _base_max if _base_max is not None else spec_max_turns
+                _role_effective = int(round(_role_base * _role_mult))
+                await orch.plan_manager.ledger_append(
+                    op="huge_repo_multiplier_applied",
+                    payload={
+                        "role": role,
+                        "base": int(_role_base),
+                        "multiplier": _role_mult,
+                        "effective": _role_effective,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.huge_repo_ledger_failed", err=str(exc)
+                )
         timeout_s = resolve_task_timeout_s(task, _DEFAULT_DEVELOPER_TIMEOUT_S)
         if timeout_s is None:
             timeout_s = _DEFAULT_DEVELOPER_TIMEOUT_S
@@ -5287,6 +5447,51 @@ def _run_secretscan_with_cfg(
     )
 
 
+# v0.34.0 B1: language-profile lookup for the hallucination allowlist.
+# We use the cached ``.autodev/language_profile.json`` (written by
+# ``runtime.language_profile``) so the QA-gate hot path does not pay
+# the cost of a fresh repo scan on every dispatch. When the cache is
+# absent the profile is recomputed once and persisted by that module.
+def _hallucination_allowlist_for(cwd: Path) -> frozenset[str]:
+    from qa.hallucination_guard import HALLUCINATION_ALLOWLISTS
+    from runtime.language_profile import (
+        compute_language_profile,
+        get_dominant_language,
+    )
+
+    try:
+        profile = compute_language_profile(cwd)
+    except Exception:  # noqa: BLE001 — telemetry must never block the gate
+        return frozenset()
+    dominant = get_dominant_language(profile)
+    return HALLUCINATION_ALLOWLISTS.get(dominant, frozenset())
+
+
+# v0.34.0 B1: sparse-mode heuristic. The hallucination guard cannot see
+# the full include / import chain in a sparse worktree, so the gate
+# downgrades unresolved-symbol findings to warnings instead of blocking.
+# True when sparse-checkout is opted into AND the repo is in huge-repo
+# mode — the same conditions ``create_per_task`` uses to choose the
+# sparse code path.
+def _hallucination_sparse_mode_for(orch: "Orchestrator", cfg: object) -> bool:
+    if not bool(getattr(cfg, "hallucination_guard_sparse_downgrade", True)):
+        return False
+    sparse_opted_in = bool(
+        getattr(orch.cfg, "worktree_sparse_checkout_enabled", False)
+    )
+    huge_mode_cfg = getattr(orch.cfg, "worktree_huge_repo_mode", "auto")
+    is_huge = bool(
+        getattr(getattr(orch, "_repo_capacity", None), "is_huge", False)
+    )
+    if huge_mode_cfg == "on":
+        huge_active = True
+    elif huge_mode_cfg == "off":
+        huge_active = False
+    else:
+        huge_active = is_huge
+    return sparse_opted_in and huge_active
+
+
 async def _run_qa_gates(
     orch: "Orchestrator",
     task: "Task",
@@ -5386,6 +5591,9 @@ async def _run_qa_gates(
                 extra_skip_dirs=getattr(
                     cfg, "hallucination_guard_skip_dirs", None
                 ),
+                allowlist=_hallucination_allowlist_for(cwd),
+                sparse_mode=_hallucination_sparse_mode_for(orch, cfg),
+                task_id=task.id,
             ),
         ),
         (

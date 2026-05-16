@@ -2,6 +2,34 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] - 2026-05-16
+
+Execute-phase unblock release (Tier B from the v0.32.0 retrospective).
+The hallucination guard, the sparse-checkout worktree, and the
+drift-verifier each carried a sharp edge that fired on large
+macro-heavy C/C++ codebases. v0.34 sands all three down without
+loosening the corresponding gates on projects where they still work.
+
+### Fixed
+- Hallucination guard no longer flags allowlisted engine macros on
+  large macro-heavy C/C++ codebases; in sparse-checkout worktrees,
+  unresolved symbols downgrade to warnings instead of blocking the
+  gate (#B1).
+- Sparse-checkout worktrees now include sibling C/C++ headers in the
+  same directory as edited source files, restoring symbol-resolution
+  context for the QA gates (#B2).
+- Drift-verifier exits with `drift_convergence_failure` when a
+  corrective patch is ≥90% identical to the prior patch, replacing
+  the unbounded corrective loop (#B3).
+
+### Telemetry
+- `hallucination_finding_downgraded`, `sparse_worktree_expanded`,
+  `drift_convergence_failure` ledger ops.
+
+### Config
+- `qa_gates.hallucination_guard_sparse_downgrade: bool = True`
+- `worktree.include_headers_for_sparse: bool = True`
+
 ## [0.33.0] - 2026-05-16
 
 Plan-phase unblock release (Tier A from the v0.32.0 retrospective).

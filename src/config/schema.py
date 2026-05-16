@@ -38,6 +38,14 @@ class AgentConfig(BaseModel):
     # user-global default in ``~/.claude/settings.json``). Validated at the
     # config layer; the adapter accepts any string for forward-compat.
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    # v0.36.0 D3: model used for architect retries when the failure
+    # class is structural (path validation, plan parse) rather than
+    # reasoning. Bumps from opus → sonnet on retry 2+ for the
+    # ``missing_on_disk`` / ``new_md_deliverable`` classes — sonnet
+    # corrects path lists as well as opus and saves ~$3-5/attempt.
+    # Currently honoured only by the architect role (other roles ignore
+    # it). Set to None / empty to disable the routing.
+    structural_retry_model: str = "sonnet"
 
 
 class BranchConfig(BaseModel):
@@ -505,6 +513,13 @@ class QAGatesConfig(BaseModel):
     # ``third-party``, plus the build-artifact set). Use for project-
     # specific vendor directories not covered by the defaults.
     hallucination_guard_skip_dirs: list[str] = Field(default_factory=list)
+    # v0.34.0 B1: in sparse-checkout worktrees the hallucination guard
+    # cannot see the full include / import chain, so unresolved symbols
+    # are downgraded to non-blocking ``unresolved_symbol`` findings. Flip
+    # to False to preserve the legacy "block on any hallucination" path
+    # even when the worktree is sparse (operators on small projects or
+    # with full local resolution may prefer the strict default).
+    hallucination_guard_sparse_downgrade: bool = True
 
 
 class GuardrailsConfig(BaseModel):
@@ -576,24 +591,63 @@ class PlateauDetectorConfig(BaseModel):
 class TaskOverridesConfig(BaseModel):
     """v0.20.0 D1: per-task overrides for the ``max_turns`` resolver.
 
-    Currently scopes the per-bucket huge-repo multipliers introduced in
-    v0.20.0 D1. ``None`` (default) uses the curve baked into
-    :data:`runtime.repo_probe._HUGE_BUCKET_MULTIPLIERS` (simple 3.0×,
-    medium 2.0×, complex 1.5×). Operator overrides are merged on a
-    per-bucket basis: any bucket missing from the dict falls through to
-    the default.
+    Scopes both the per-bucket huge-repo multipliers (v0.20.0 D1) and,
+    as of v0.36.0 E1, role-keyed huge-repo multipliers applied at
+    dispatch time. The complexity-keyed lookup remains the canonical
+    code path; the role-keyed dict feeds the
+    ``huge_repo_multiplier_applied`` telemetry op AND surfaces in the
+    config for operators who tune per-role budgets directly.
 
-    Example::
+    v0.36.0 E1: default populated with role-shaped keys so operators
+    don't have to opt-in for the v0.32 fixture (huge-repo explorer
+    needs 3×, architect 2×, …). Any key absent from the dict falls
+    through to the default curve baked into
+    :data:`runtime.repo_probe._HUGE_BUCKET_MULTIPLIERS`.
 
-        cfg.task_overrides.huge_repo_multipliers = {
-            "simple":  4.0,   # navigate-heavy huge repo
-            "complex": 1.2,   # already-generous bucket; modest bump
-        }
+    v0.36.0 E2: ``retry_budget_multiplier`` doubles the resolved budget
+    on retry attempt ≥ 2 (capped at ``retry_budget_cap_turns``) so a
+    task that legitimately needs more runway on retry gets it instead
+    of burning another retry slot at the same budget.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    huge_repo_multipliers: dict[str, float] | None = None
+    # v0.36.0 E1: now defaults to a populated role-keyed dict (was
+    # ``None`` through v0.35). Operators may still override with their
+    # own role / complexity keys; missing keys fall through to the
+    # baked-in default curve in :mod:`runtime.repo_probe`.
+    huge_repo_multipliers: dict[str, float] = Field(
+        default_factory=lambda: {
+            "explorer": 3.0,
+            "architect": 2.0,
+            "coder": 2.0,
+            "developer": 2.0,
+            "reviewer": 1.5,
+            "domain_expert": 1.5,
+            "test_engineer": 1.5,
+        }
+    )
+    # v0.36.0 E2: multiplier applied to the resolved ``max_turns`` on
+    # retry attempts ≥ 2. Capped by ``retry_budget_cap_turns`` so a
+    # cascade of retries can't push the per-task budget to infinity.
+    retry_budget_multiplier: float = 2.0
+    retry_budget_cap_turns: int = 200
+
+
+class AdaptersConfig(BaseModel):
+    """v0.36.0 F2: adapter-level knobs (network probes today).
+
+    ``probe_retry_attempts`` and ``probe_backoff_initial_s`` govern the
+    Claude Code adapter's ``_pong_probe`` retry loop. Backoff doubles
+    on each attempt (1s → 3s → 9s by default). Set
+    ``probe_retry_attempts=1`` to disable retries entirely (legacy
+    single-shot behaviour).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    probe_retry_attempts: int = Field(default=3, ge=1, le=10)
+    probe_backoff_initial_s: float = Field(default=1.0, gt=0.0)
 
 
 class HiveConfig(BaseModel):
@@ -663,7 +717,13 @@ class KnowledgeConfig(BaseModel):
     dedup_threshold: float = 0.6
     max_inject_count: int = 5
     hive_enabled: bool = True
-    promotion_min_confirmations: int = 3
+    # v0.35.0 C3: bumped 3 → 10. Zero-success entries previously
+    # promoted at confirmations=3 polluted the hive with anti-patterns
+    # that the swarm-tier dedup couldn't catch (entries differing
+    # enough on text to dodge the 0.6 Jaccard threshold). The
+    # promotion gate now also requires ``succeeded_after_count > 0``
+    # (enforced in :meth:`state.knowledge.KnowledgeStore._promote_if_qualified`).
+    promotion_min_confirmations: int = 10
     promotion_min_confidence: float = 0.7
     denylist_roles: list[str] = Field(
         default_factory=lambda: [
@@ -776,6 +836,13 @@ class AutodevConfig(BaseModel):
     # older than 2.25. Default False — sparse-checkout speeds up huge
     # repos but breaks tasks that need files outside the declared scope.
     worktree_sparse_checkout_enabled: bool = False
+    # v0.34.0 B2: when a sparse worktree edits a C/C++ source file, also
+    # admit ``*.h``/``*.hpp``/``*.hh``/``*.hxx`` siblings in the same
+    # directory so the QA gates retain include-chain context for symbol
+    # resolution. Capped at
+    # :data:`orchestrator.worktree.WORKTREE_HEADER_EXPANSION_CAP` paths
+    # — dense include trees regress to a full checkout otherwise.
+    include_headers_for_sparse: bool = True
     # v0.23.0 C1: huge-repo mode. ``"auto"`` keys off
     # ``runtime.repo_probe.RepoCapacity.is_huge`` (file_count > 20K OR
     # total_bytes > 5 GB) — when True, sparse-checkout becomes the
@@ -885,6 +952,9 @@ class AutodevConfig(BaseModel):
     # transient 5xx bursts shouldn't kill the run.
     circuit_breaker_threshold: int = Field(default=3, ge=1)
     circuit_breaker_window_s: float = Field(default=60.0, gt=0.0)
+
+    # v0.36.0 F2: adapter-level network probe retry knobs.
+    adapters: AdaptersConfig = Field(default_factory=AdaptersConfig)
 
     @model_validator(mode="after")
     def _migrate_inline_platform(self) -> "AutodevConfig":

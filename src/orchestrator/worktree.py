@@ -28,9 +28,100 @@ from typing import Iterable
 from errors import AutodevError
 from autologging import get_logger
 from orchestrator import worktree_state
+from runtime.language_profile import EXTENSION_WEIGHTS
 
 
 logger = get_logger(__name__)
+
+
+# v0.34.0 B2: cap on how many sibling header paths the sparse-checkout
+# expansion may add. When the expansion exceeds this ceiling we skip
+# the union entirely — dense include trees can balloon a 5-file edit
+# scope into thousands of paths, defeating the point of sparse mode.
+WORKTREE_HEADER_EXPANSION_CAP: int = 500
+
+
+# v0.34.0 B2: source extensions sourced from
+# ``runtime.language_profile.EXTENSION_WEIGHTS`` so the C/C++ family
+# stays in lockstep with the language-profile classifier (the canonical
+# list of source-file extensions in the codebase).
+_CPP_SOURCE_EXTS: frozenset[str] = frozenset(
+    {
+        ext
+        for ext, (lang, _w) in EXTENSION_WEIGHTS.items()
+        if lang in ("cpp", "c") and ext not in (".h", ".hpp", ".hh", ".hxx")
+    }
+    | {".m", ".mm"}
+)
+_CPP_HEADER_GLOBS: tuple[str, ...] = ("*.h", "*.hpp", "*.hh", "*.hxx")
+
+
+def _sibling_header_paths(
+    source_files: Iterable[Path],
+    git_root: Path,
+    language_profile: dict | None = None,
+) -> set[str]:
+    """v0.34.0 B2: return repo-relative C/C++ header siblings of *source_files*.
+
+    For each path whose extension is a C/C++ source extension, enumerate
+    files in the SAME directory matching the C/C++ header globs. Only
+    tracked files (per ``git ls-files <dir>``) are returned so the result
+    is a strict subset of what the worktree already knows about.
+
+    ``language_profile`` is accepted for future per-language gating but
+    is not consulted in v0.34.0 — the source-extension filter alone is
+    the gate.
+    """
+    del language_profile  # reserved for future per-language gating
+    out: set[str] = set()
+    seen_dirs: set[Path] = set()
+    for src in source_files:
+        if src.suffix.lower() not in _CPP_SOURCE_EXTS:
+            continue
+        parent = src.parent
+        if parent in seen_dirs:
+            continue
+        seen_dirs.add(parent)
+        try:
+            rel_dir = parent.relative_to(git_root)
+        except ValueError:
+            rel_dir = parent
+        rel_dir_posix = rel_dir.as_posix()
+        for glob in _CPP_HEADER_GLOBS:
+            spec = (
+                f"{rel_dir_posix}/{glob}" if rel_dir_posix not in ("", ".") else glob
+            )
+            try:
+                completed = subprocess_run_ls_files(git_root, spec)
+            except OSError:
+                continue
+            for line in completed.splitlines():
+                line = line.strip()
+                if line:
+                    out.add(line)
+    return out
+
+
+def subprocess_run_ls_files(git_root: Path, pathspec: str) -> str:
+    """v0.34.0 B2: thin synchronous ``git ls-files`` wrapper.
+
+    Sync rather than async because the call site is the sparse-paths
+    computation in :meth:`WorktreeManager.create_per_task`, which is
+    already running inside an async function but does its sparse-path
+    setup synchronously. ``OSError`` is allowed to propagate so the
+    caller can fall back cleanly when git is unavailable.
+    """
+    import subprocess
+
+    completed = subprocess.run(
+        ["git", "-C", str(git_root), "ls-files", pathspec],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout
 
 
 class WorktreeError(AutodevError):
@@ -80,6 +171,12 @@ class WorktreeManager:
             main_repo=str(self._main),
             tournament_dir=str(self._dir),
         )
+        # v0.34.0 B2: count of sibling headers folded into the most
+        # recent sparse create_per_task. The async caller emits the
+        # ``sparse_worktree_expanded`` ledger op based on this counter
+        # so the ledger write stays at the orchestrator's PlanManager
+        # site (the manager does not own ledger access).
+        self.last_sparse_headers_added: int = 0
 
     def _create_timeout_s(self) -> float:
         """Per-call timeout for slow ``git worktree add`` operations.
@@ -224,6 +321,8 @@ class WorktreeManager:
         task_id: str,
         base_ref: str = "HEAD",
         sparse_paths: list[str] | None = None,
+        *,
+        include_headers_for_sparse: bool = True,
     ) -> Path:
         """Create a per-task worktree at ``tournament_dir/tasks/<task_id>``.
 
@@ -270,9 +369,32 @@ class WorktreeManager:
                     f"git worktree add --no-checkout failed (rc={rc}): "
                     f"{err.strip() or out.strip()}"
                 )
+            # v0.34.0 B2: union sibling C/C++ headers into the sparse
+            # set so include-chain-aware QA gates (hallucination guard,
+            # build_check) keep symbol-resolution context. Capped at
+            # WORKTREE_HEADER_EXPANSION_CAP — dense include trees would
+            # otherwise regress to a near-full checkout.
+            effective_paths = list(sparse_paths or [])
+            added_headers = 0
+            if include_headers_for_sparse and effective_paths:
+                source_files = [self._main / p for p in effective_paths]
+                extra = _sibling_header_paths(
+                    source_files, self._main, language_profile=None
+                )
+                new_paths = sorted(extra - set(effective_paths))
+                if len(new_paths) > WORKTREE_HEADER_EXPANSION_CAP:
+                    self._log.warning(
+                        "worktree.sparse_header_expansion.capped",
+                        task_id=task_id,
+                        proposed=len(new_paths),
+                        cap=WORKTREE_HEADER_EXPANSION_CAP,
+                    )
+                else:
+                    effective_paths.extend(new_paths)
+                    added_headers = len(new_paths)
             for cmd in (
                 ["sparse-checkout", "init", "--cone"],
-                ["sparse-checkout", "set", *(sparse_paths or [])],
+                ["sparse-checkout", "set", *effective_paths],
                 ["checkout"],
             ):
                 rc, out, err = await _run_git(wt, cmd)
@@ -285,8 +407,20 @@ class WorktreeManager:
                 "worktree.created_per_task_sparse",
                 task_id=task_id,
                 path=str(wt),
-                paths=sparse_paths,
+                paths=effective_paths,
             )
+            self.last_sparse_headers_added = added_headers
+            if added_headers:
+                # v0.34.0 B2: telemetry breadcrumb for sparse header
+                # expansion. The caller (execute_phase dispatcher) is
+                # the one with PlanManager access for ledger writes;
+                # the manager itself only logs the structured event.
+                self._log.info(
+                    "sparse_worktree_expanded",
+                    task_id=task_id,
+                    added_paths=added_headers,
+                    mode="sibling_headers",
+                )
             worktree_state.record_create(
                 self._autodev_root,
                 path=wt,

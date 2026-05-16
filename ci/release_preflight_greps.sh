@@ -2,7 +2,7 @@
 # Mirror of the grep-style preflights in .github/workflows/release.yml so
 # the same checks can be run locally before pushing a release tag.
 #
-# Usage: ci/release_preflight_greps.sh [v0.32 | v0.33 | all]   (default: all)
+# Usage: ci/release_preflight_greps.sh [v0.32 | v0.33 | v0.34 | all]   (default: all)
 #
 # Each block locks the integration of a shipped phase against accidental
 # removal. Adding a new release? Append a block and update the dispatch
@@ -38,11 +38,21 @@ preflight_v033() {
   check "v0.33 A3 anchor"        src/agents/prompts/architect.md              "NO INVESTIGATION NOTES"
 }
 
+preflight_v034() {
+  check "v0.34 B1 allowlist"     src/qa/hallucination_guard.py    "HALLUCINATION_ALLOWLISTS"
+  check "v0.34 B1 downgrade op"  src/qa/hallucination_guard.py    "hallucination_finding_downgraded"
+  check "v0.34 B2 helper"        src/orchestrator/worktree.py     "_sibling_header_paths"
+  check "v0.34 B2 config"        src/config/schema.py             "include_headers_for_sparse"
+  check "v0.34 B3 helper"        src/orchestrator/drift_verifier.py "_patch_similarity"
+  check "v0.34 B3 ledger op"     src/state/ledger.py              "drift_convergence_failure"
+}
+
 case "$target" in
   v0.32) preflight_v032 ;;
   v0.33) preflight_v033 ;;
-  all)   preflight_v032 ; preflight_v033 ;;
-  *)     echo "Unknown target: $target (try: v0.32 | v0.33 | all)"; exit 2 ;;
+  v0.34) preflight_v034 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ;;
+  *)     echo "Unknown target: $target (try: v0.32 | v0.33 | v0.34 | all)"; exit 2 ;;
 esac
 
 echo "All preflight greps passed for: $target"

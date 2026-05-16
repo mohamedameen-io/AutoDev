@@ -32,7 +32,7 @@ async def test_dispatch_with_timeout_returns_findings_on_clean_run(tmp_path: Pat
 async def test_dispatch_with_timeout_skips_on_runaway(tmp_path: Path) -> None:
     """A scan that exceeds timeout returns empty findings (skip-and-warn)."""
 
-    def slow_dispatch(path: Path, repo_root: Path) -> list[str]:
+    def slow_dispatch(path: Path, repo_root: Path, **_kw: object) -> list[str]:
         time.sleep(2.0)
         return ["should-not-appear"]
 
@@ -57,7 +57,7 @@ async def test_run_hallucination_guard_survives_runaway_file(tmp_path: Path) -> 
 
     real_dispatch = hallucination_guard._dispatch
 
-    def maybe_slow(path: Path, repo_root: Path) -> list[str]:
+    def maybe_slow(path: Path, repo_root: Path, **_kw: object) -> list[str]:
         if path.name == "bad.py":
             time.sleep(2.0)
             return ["fake-finding"]
