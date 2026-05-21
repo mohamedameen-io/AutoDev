@@ -688,6 +688,10 @@ class TaskOverridesConfig(BaseModel):
             "max_duration_s_per_task": 2.5,
             "max_diff_bytes": 3.0,
             "max_corrective_tasks_per_phase": 2.0,
+            # v0.38.0 I3: plan-scope corrective ceiling mirrors the
+            # per-phase auto-scale on huge repos. 2.0× = same elbow as
+            # the per-phase knob so the two stay in sync.
+            "max_corrective_tasks_per_plan": 2.0,
             "test_diag_breaker_window_s": 2.0,
             "recent_evidence_max_chars_per_kind": 1.5,
             "circuit_breaker_threshold": 2.0,
@@ -1110,6 +1114,19 @@ class AutodevConfig(BaseModel):
     # where legitimate large refactors routinely need more, or rely on
     # the H5 huge-repo auto-bump for codebases past the probe threshold.
     max_corrective_tasks_per_phase: int = Field(default=8, ge=1)
+    # v0.38.0 I3: cumulative cap on correction tasks across ALL phases of
+    # a plan. Mirrors :attr:`max_corrective_tasks_per_phase` at plan scope
+    # to prevent multi-phase corrective accumulation. Default 24 ≈
+    # 8 × 3 phases of headroom. The orchestrator computes the plan-scope
+    # remaining budget at both corrective-injection sites (architect-refine
+    # and phase-review) and feeds ``min(per_phase_remaining,
+    # per_plan_remaining)`` into the parser; when the plan-scope cap is
+    # the binding ceiling, the originating task soft-blocks (or skip-
+    # rounds, per :attr:`corrective_cap_action`) and the ledger op
+    # ``corrective_cap_reached`` carries ``scope="plan"`` so dashboards
+    # can distinguish the two ceilings. Auto-scales 2.0× on huge repos
+    # via :attr:`huge_repo_multipliers`.
+    max_corrective_tasks_per_plan: int = Field(default=24, ge=1)
     # v0.37.0 H2: behaviour when a phase reaches its corrective-task
     # budget. ``soft_block_phase`` (default) routes the originating task
     # to operator triage via the recovery-hint pipeline so the

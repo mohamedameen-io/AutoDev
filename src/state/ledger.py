@@ -483,6 +483,19 @@ LedgerOp = Literal[
     # retrospectives quantify how often the fallback path actually
     # runs.
     "adapter_selected",
+    # v0.38.0 I3 (HK5): stuck skip_corrective_round loop suspected.
+    # Audit-only — fired when a phase's
+    # ``Phase.metadata["skip_corrective_count"]`` counter reaches
+    # ``>= 3`` without an intervening successful corrective round.
+    # Payload shape: ``{phase_id: str, count: int, action: str}`` where
+    # ``action`` is the configured
+    # :attr:`AutodevConfig.corrective_cap_action` so the retrospective
+    # can correlate the loop against the cap-action regime in force.
+    # The orchestrator does NOT auto-soft-block on this in v0.38.0 —
+    # the goal is to collect frequency data first. Plan state is not
+    # mutated by this op; the counter itself flows through the regular
+    # ``update_phase_meta`` op.
+    "skip_corrective_loop_detected",
 ]
 
 
@@ -1011,6 +1024,11 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # :func:`adapters.detect.get_adapter` at the next session boot;
         # this op is observability for "which selection arm fired".
         "adapter_selected",
+        # v0.38.0 I3 (HK5): stuck skip_corrective_round loop detected.
+        # Audit-only — counter state is persisted via the regular
+        # ``update_phase_meta`` op emitted alongside (the
+        # ``Phase.metadata["skip_corrective_count"]`` delta).
+        "skip_corrective_loop_detected",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.
@@ -1149,6 +1167,8 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # carries ``baseline_commit``, ``review_status``, and
         # ``end_checkpoint_commit`` (v0.21.0 B1). Idempotent: re-applying
         # overwrites with the same values.
+        # v0.38.0 I3: ``metadata`` is shallow-merged into
+        # ``Phase.metadata`` (substrate for HK5's skip_corrective_count).
         phase_id = payload.get("phase_id")
         if not isinstance(phase_id, str):
             raise LedgerCorruptError(
@@ -1168,6 +1188,12 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         if "end_checkpoint_commit" in payload:
             val = payload["end_checkpoint_commit"]
             phase.end_checkpoint_commit = val if isinstance(val, str) else None
+        if "metadata" in payload:
+            md_delta = payload.get("metadata")
+            if isinstance(md_delta, dict):
+                merged = dict(phase.metadata or {})
+                merged.update(md_delta)
+                phase.metadata = merged
         return plan
 
     if op == "mark_blocked_descendants":

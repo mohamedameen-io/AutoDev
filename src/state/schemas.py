@@ -378,6 +378,16 @@ class Phase(BaseModel):
     # ``Plan.edit_scope`` (trim trailing slash, reject absolute, reject
     # ``..`` segments).
     edit_scope: list[str] | None = None
+    # v0.38.0 I3 (HK5): phase-scoped general-purpose metadata bag. Used by
+    # the orchestrator to persist counters that survive plan reloads
+    # without minting a new typed field per knob. Today's keys:
+    # ``skip_corrective_count`` (int) — incremented each time the
+    # architect-consult or phase-review cap-reached path takes the
+    # ``skip_corrective_round`` branch; reset to 0 on a successful
+    # corrective round. Diagnostic-only in v0.38.0 (used by the
+    # ``skip_corrective_loop_suspected`` warning + ledger op); the
+    # orchestrator does NOT auto-soft-block on it yet.
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("edit_scope", mode="after")
     @classmethod

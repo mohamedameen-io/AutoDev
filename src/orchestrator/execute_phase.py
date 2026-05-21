@@ -965,6 +965,107 @@ def _dump_architect_consult_envelope(
         )
 
 
+# v0.38.0 I3 (HK5): plan-global corrective ceiling diagnostics.
+# ``skip_corrective_count`` lives on ``Phase.metadata`` and is bumped
+# each time a corrective round takes the ``skip_corrective_round``
+# branch — both the architect-refine cap-hit path AND the phase-review
+# cap-hit path. It resets to 0 on a successful corrective injection.
+# When the counter reaches ``_SKIP_CORRECTIVE_LOOP_THRESHOLD`` (3) the
+# orchestrator emits the diagnostic-only ``skip_corrective_loop_suspected``
+# warning + ``skip_corrective_loop_detected`` ledger op. v0.38.0 does
+# NOT auto-soft-block on this — the goal is to gather frequency data
+# before locking in a recovery policy.
+_SKIP_CORRECTIVE_LOOP_THRESHOLD = 3
+
+
+async def _bump_skip_corrective_counter(
+    orch: "Orchestrator",
+    *,
+    phase_id: str,
+    cap_action: str,
+) -> None:
+    """Increment the per-phase ``skip_corrective_count`` counter under
+    the plan_manager's lock so concurrent observers always see the
+    persisted value. Emits the loop-suspected warning + ledger op when
+    the counter crosses :data:`_SKIP_CORRECTIVE_LOOP_THRESHOLD`.
+
+    Defensive: a failure here must never mask the upstream cap-hit
+    decision (the executor still proceeds to its terminal-skip
+    handling). All exceptions log + swallow.
+    """
+    try:
+        plan = await orch.plan_manager.load()
+        if plan is None:
+            return
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            return
+        prior = int((phase.metadata or {}).get("skip_corrective_count", 0))
+        new_count = prior + 1
+        await orch.plan_manager.update_phase_meta(
+            phase_id,
+            metadata={"skip_corrective_count": new_count},
+        )
+        if new_count >= _SKIP_CORRECTIVE_LOOP_THRESHOLD:
+            logger.warning(
+                "execute_phase.skip_corrective_loop_suspected",
+                phase_id=phase_id,
+                count=new_count,
+                action=cap_action,
+            )
+            try:
+                await orch.plan_manager.ledger_append(
+                    op="skip_corrective_loop_detected",
+                    payload={
+                        "phase_id": phase_id,
+                        "count": new_count,
+                        "action": cap_action,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.ledger_append_failed",
+                    op="skip_corrective_loop_detected",
+                    err=str(exc),
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.skip_corrective_counter_bump_failed",
+            phase_id=phase_id,
+            err=str(exc),
+        )
+
+
+async def _reset_skip_corrective_counter(
+    orch: "Orchestrator",
+    *,
+    phase_id: str,
+) -> None:
+    """Reset ``Phase.metadata['skip_corrective_count']`` to 0 after a
+    successful corrective round. No-op when the counter is already 0
+    (avoids a redundant ledger entry on the happy path)."""
+    try:
+        plan = await orch.plan_manager.load()
+        if plan is None:
+            return
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            return
+        prior = int((phase.metadata or {}).get("skip_corrective_count", 0))
+        if prior == 0:
+            return
+        await orch.plan_manager.update_phase_meta(
+            phase_id,
+            metadata={"skip_corrective_count": 0},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.skip_corrective_counter_reset_failed",
+            phase_id=phase_id,
+            err=str(exc),
+        )
+
+
 async def _dispatch_architect_consult(
     orch: "Orchestrator",
     task: Task,
@@ -1083,8 +1184,18 @@ async def _dispatch_architect_consult(
         cap_action = str(
             getattr(orch.cfg, "corrective_cap_action", "soft_block_phase")
         )
+        # v0.38.0 I3: plan-scope cap is read directly off the config
+        # (not currently auto-scaled inline because the per-knob H5
+        # resolver fires on the per-phase key; the plan-scope multiplier
+        # rides on the same dict entry but applies at config-resolution
+        # time for operator-configured values). Default 24 keeps three
+        # 8-task phases of headroom on a normal repo.
+        plan_cap = int(
+            getattr(orch.cfg, "max_corrective_tasks_per_plan", 24)
+        )
         base_task_count = 0
         phase_corrective_count = 0
+        total_plan_corrective = 0
         try:
             plan = await orch.plan_manager.load()
             if plan is not None:
@@ -1094,22 +1205,34 @@ async def _dispatch_architect_consult(
                 if phase is not None:
                     base_task_count = len(phase.tasks)
                     phase_corrective_count = len(phase.corrective_task_ids or [])
+                total_plan_corrective = sum(
+                    len(p.corrective_task_ids or []) for p in plan.phases
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "execute_phase.architect_refine_load_failed",
                 task_id=task.id,
                 err=str(exc),
             )
-        remaining_budget = max(0, cap - phase_corrective_count)
+        per_phase_remaining = max(0, cap - phase_corrective_count)
+        per_plan_remaining = max(0, plan_cap - total_plan_corrective)
+        remaining_budget = min(per_phase_remaining, per_plan_remaining)
+        cap_scope = "plan" if per_plan_remaining < per_phase_remaining else "phase"
+        binding_cap = plan_cap if cap_scope == "plan" else cap
 
         if remaining_budget == 0:
             # Cap reached: operator-recoverable soft block (default) or
             # silent skip, controlled by ``corrective_cap_action``.
+            # v0.38.0 I3: ``cap_scope`` records WHICH ceiling fired (the
+            # plan-wide budget or the per-phase budget) so dashboards can
+            # attribute the cap-hit. The smaller remaining budget wins;
+            # ties go to "phase" (the older ceiling).
             logger.info(
                 "execute_phase.corrective_cap_reached",
                 phase_id=phase_id,
                 task_id=task.id,
-                cap=cap,
+                cap=binding_cap,
+                scope=cap_scope,
                 action=cap_action,
                 site="architect_refine",
             )
@@ -1119,7 +1242,8 @@ async def _dispatch_architect_consult(
                     payload={
                         "phase_id": phase_id,
                         "task_id": task.id,
-                        "cap": cap,
+                        "cap": binding_cap,
+                        "scope": cap_scope,
                         "action": cap_action,
                         "site": "architect_refine",
                     },
@@ -1131,13 +1255,28 @@ async def _dispatch_architect_consult(
                     err=str(exc),
                 )
             if cap_action == "soft_block_phase":
+                if cap_scope == "plan":
+                    cap_action_text = (
+                        f"Plan reached the plan-wide correction-task cap "
+                        f"({binding_cap}); manual triage required."
+                    )
+                    cap_reason_text = (
+                        f"corrective_cap_reached: plan hit the "
+                        f"{binding_cap}-task plan-wide budget"
+                    )
+                else:
+                    cap_action_text = (
+                        f"Phase {phase_id} reached the correction-task cap "
+                        f"({binding_cap}); manual triage required."
+                    )
+                    cap_reason_text = (
+                        f"corrective_cap_reached: phase {phase_id} "
+                        f"hit the {binding_cap}-task budget"
+                    )
                 cap_hint = _build_recovery_hint(
                     task_id=task.id,
                     hint_class="user_decision_required",
-                    action=(
-                        f"Phase {phase_id} reached the correction-task cap "
-                        f"({cap}); manual triage required."
-                    ),
+                    action=cap_action_text,
                     commands=[
                         f"autodev requeue --task {task.id}",
                         f"autodev rewind --to-phase {phase_id}",
@@ -1148,10 +1287,7 @@ async def _dispatch_architect_consult(
                         task.id,
                         "blocked",
                         meta={
-                            "blocked_reason": (
-                                f"corrective_cap_reached: phase {phase_id} "
-                                f"hit the {cap}-task budget"
-                            ),
+                            "blocked_reason": cap_reason_text,
                             "architect_consult_action": "cap_reached",
                             "recovery_hint": cap_hint,
                         },
@@ -1166,6 +1302,12 @@ async def _dispatch_architect_consult(
             # ``skip_corrective_round``: drop silently and fall through
             # to the existing terminal-skip handling so the executor
             # treats this round as a no-op corrective pass.
+            # v0.38.0 I3 (HK5): track skip frequency on Phase.metadata to
+            # surface stuck loops via the diagnostic-only
+            # ``skip_corrective_loop_detected`` warning + ledger op.
+            await _bump_skip_corrective_counter(
+                orch, phase_id=phase_id, cap_action=cap_action
+            )
             return task
 
         try:
@@ -1180,11 +1322,18 @@ async def _dispatch_architect_consult(
                 # v0.37.0 H2: pass the cap to plan_manager for
                 # defence-in-depth even though we already truncated
                 # upstream.
+                # v0.38.0 I3: pass the plan-scope cap too so the
+                # defensive layer can fire ``scope="plan"`` on bypass.
                 await orch.plan_manager.append_corrective_tasks(
                     phase_id,
                     corrective_tasks,
                     max_corrective_tasks_per_phase=cap,
+                    max_corrective_tasks_per_plan=plan_cap,
                 )
+                # v0.38.0 I3 (HK5): a successful corrective injection
+                # resets the skip-loop counter so we only warn on
+                # consecutive skips.
+                await _reset_skip_corrective_counter(orch, phase_id=phase_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "execute_phase.architect_refine_inject_failed",
@@ -3267,12 +3416,29 @@ async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
     else:
         cap = _cap_base
     phase_corrective_count = len(phase.corrective_task_ids or [])
-    remaining_budget = max(0, cap - phase_corrective_count)
+    # v0.38.0 I3: plan-scope ceiling fires alongside the per-phase ceiling.
+    # The smaller remaining budget wins; ``cap_scope`` records which
+    # ceiling was binding so the ledger op + warning attribution is correct.
+    plan_cap = int(
+        getattr(orch.cfg, "max_corrective_tasks_per_plan", 24)
+    )
+    plan_for_total = await orch.plan_manager.load()
+    total_plan_corrective = 0
+    if plan_for_total is not None:
+        total_plan_corrective = sum(
+            len(p.corrective_task_ids or []) for p in plan_for_total.phases
+        )
+    per_phase_remaining = max(0, cap - phase_corrective_count)
+    per_plan_remaining = max(0, plan_cap - total_plan_corrective)
+    remaining_budget = min(per_phase_remaining, per_plan_remaining)
+    cap_scope = "plan" if per_plan_remaining < per_phase_remaining else "phase"
+    binding_cap = plan_cap if cap_scope == "plan" else cap
     if remaining_budget == 0:
         logger.info(
             "execute_phase.corrective_cap_reached",
             phase_id=phase.id,
-            cap=cap,
+            cap=binding_cap,
+            scope=cap_scope,
             site="phase_review",
             winner=outcome.winner,
         )
@@ -3281,7 +3447,8 @@ async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
                 op="corrective_cap_reached",
                 payload={
                     "phase_id": phase.id,
-                    "cap": cap,
+                    "cap": binding_cap,
+                    "scope": cap_scope,
                     "site": "phase_review",
                     "winner": outcome.winner,
                 },
@@ -3302,6 +3469,17 @@ async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
                 phase_id=phase.id,
                 err=str(exc),
             )
+        # v0.38.0 I3 (HK5): the phase-review path also burns a
+        # "skip" on the corrective round when the cap fires (the
+        # round produces no new corrective tasks). Increment the
+        # diagnostic counter so two cap-hits across two reviews
+        # surface the stuck-loop warning.
+        cap_action = str(
+            getattr(orch.cfg, "corrective_cap_action", "soft_block_phase")
+        )
+        await _bump_skip_corrective_counter(
+            orch, phase_id=phase.id, cap_action=cap_action
+        )
         return
 
     rollup = _phase_complexity_rollup(phase)
@@ -3332,10 +3510,13 @@ async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
     try:
         # v0.37.0 H2: pass the cap to plan_manager for defence-in-depth
         # even though we already truncated upstream via the parser.
+        # v0.38.0 I3: thread the plan-scope cap too so the defensive
+        # layer can fire ``scope="plan"`` on a bypass.
         await orch.plan_manager.append_corrective_tasks(
             phase.id,
             corrective_tasks,
             max_corrective_tasks_per_phase=cap,
+            max_corrective_tasks_per_plan=plan_cap,
         )
         logger.info(
             "execute_phase.phase_review_corrective_injected",
@@ -3343,6 +3524,10 @@ async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
             winner=outcome.winner,
             count=len(corrective_tasks),
         )
+        # v0.38.0 I3 (HK5): a successful corrective injection resets
+        # the skip-loop counter on this phase so the warning only
+        # fires on three consecutive skip rounds.
+        await _reset_skip_corrective_counter(orch, phase_id=phase.id)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "execute_phase.append_corrective_failed",

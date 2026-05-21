@@ -1265,6 +1265,7 @@ class PlanManager:
         tasks: list[Task],
         review_status: str = "corrective_required",
         max_corrective_tasks_per_phase: int | None = None,
+        max_corrective_tasks_per_plan: int | None = None,
     ) -> Plan:
         """Append corrective sub-tasks to ``phase_id`` and update review_status.
 
@@ -1275,17 +1276,27 @@ class PlanManager:
         ``append_corrective_tasks`` op).
 
         v0.37.0 H2: when ``max_corrective_tasks_per_phase`` is supplied,
-        the function enforces the cumulative cap defensively — if the
-        phase's existing ``corrective_task_ids`` plus the new ``tasks``
-        would exceed the cap, the tail of ``tasks`` is truncated to fit
-        and a ``corrective_cap_reached`` ledger op is appended with
-        ``defended=True`` so dashboards can distinguish the defensive
-        firing from the orchestrator-level upstream firing. This is
-        defence-in-depth: the orchestrator always computes the budget
-        upstream and threads it through
+        the function enforces the cumulative per-phase cap defensively —
+        if the phase's existing ``corrective_task_ids`` plus the new
+        ``tasks`` would exceed the cap, the tail of ``tasks`` is
+        truncated to fit and a ``corrective_cap_reached`` ledger op is
+        appended with ``defended=True`` so dashboards can distinguish
+        the defensive firing from the orchestrator-level upstream
+        firing.
+
+        v0.38.0 I3: when ``max_corrective_tasks_per_plan`` is supplied,
+        the function ALSO enforces the cumulative plan-wide cap. The
+        plan-scope check fires FIRST (it's the harder ceiling): the
+        truncated batch is then subjected to the per-phase check on
+        top, so both invariants hold on disk. The ``corrective_cap_reached``
+        ledger op carries ``scope="plan"`` for the plan-scope firing and
+        ``scope="phase"`` for the per-phase firing so dashboards can
+        attribute the cap-hit to the right ceiling. Defence-in-depth:
+        the orchestrator always computes the effective budget upstream
+        and threads it through
         :func:`orchestrator.corrective_parser.parse_corrective_direction`,
-        but a future caller bypassing that path would still hit this
-        invariant.
+        but a future caller bypassing that path would still hit these
+        invariants.
 
         Returns the updated plan.
         """
@@ -1301,12 +1312,52 @@ class PlanManager:
                     f"phase_id={phase_id!r} not found in current plan"
                 )
 
-            # v0.37.0 H2: defensive cap check — truncate before any
-            # mutation so the on-disk invariant
-            # ``len(phase.corrective_task_ids) <= cap`` holds even if
-            # the caller skipped the upstream budget computation.
-            defended_dropped = 0
+            # v0.38.0 I3: plan-scope defensive truncation. Fires BEFORE
+            # the per-phase check because it's the harder ceiling — a
+            # 24-task plan-wide budget with three 8-task phases ALL
+            # at the per-phase ceiling collectively breaches the plan
+            # cap before any individual phase does. The ``scope``
+            # field on the emitted ``corrective_cap_reached`` op tells
+            # dashboards which ceiling fired.
             tasks_to_append: list[Task] = list(tasks)
+            if max_corrective_tasks_per_plan is not None:
+                plan_cap = int(max_corrective_tasks_per_plan)
+                total_plan_corrective = sum(
+                    len(p.corrective_task_ids or []) for p in plan.phases
+                )
+                plan_remaining = max(0, plan_cap - total_plan_corrective)
+                if len(tasks_to_append) > plan_remaining:
+                    plan_dropped = len(tasks_to_append) - plan_remaining
+                    tasks_to_append = tasks_to_append[:plan_remaining]
+                    self._log.info(
+                        "plan_manager.corrective_cap_defended",
+                        scope="plan",
+                        phase_id=phase_id,
+                        cap=plan_cap,
+                        dropped=plan_dropped,
+                        total_plan_corrective=total_plan_corrective,
+                    )
+                    await append_entry(
+                        self._cwd,
+                        op="corrective_cap_reached",
+                        payload={
+                            "scope": "plan",
+                            "phase_id": phase_id,
+                            "cap": plan_cap,
+                            "dropped": plan_dropped,
+                            "defended": True,
+                            "total_plan_corrective": total_plan_corrective,
+                        },
+                        session_id=self._session_id,
+                    )
+
+            # v0.37.0 H2: per-phase defensive cap check — truncate so the
+            # on-disk invariant ``len(phase.corrective_task_ids) <= cap``
+            # holds even if the caller skipped the upstream budget
+            # computation. Operates on the (possibly already-trimmed)
+            # ``tasks_to_append`` so the per-phase ``dropped`` count only
+            # reflects the per-phase ceiling's contribution.
+            defended_dropped = 0
             if max_corrective_tasks_per_phase is not None:
                 cap = int(max_corrective_tasks_per_phase)
                 existing_count = len(phase.corrective_task_ids or [])
@@ -1316,6 +1367,7 @@ class PlanManager:
                     tasks_to_append = tasks_to_append[:budget]
                     self._log.info(
                         "plan_manager.corrective_cap_defended",
+                        scope="phase",
                         phase_id=phase_id,
                         cap=cap,
                         dropped=defended_dropped,
@@ -1324,6 +1376,7 @@ class PlanManager:
                         self._cwd,
                         op="corrective_cap_reached",
                         payload={
+                            "scope": "phase",
                             "phase_id": phase_id,
                             "cap": cap,
                             "dropped": defended_dropped,
@@ -1371,6 +1424,7 @@ class PlanManager:
         baseline_commit: str | None = None,
         review_status: str | None = None,
         end_checkpoint_commit: str | None = None,
+        metadata: dict | None = None,
     ) -> Plan:
         """Update phase-level metadata fields.
 
@@ -1380,6 +1434,15 @@ class PlanManager:
         Lock + ledger + snapshot. Any field can be ``None`` to leave
         unchanged. Mirrors :meth:`update_task_status` semantics so
         resumes / replays reproduce the metadata transitions exactly.
+
+        v0.38.0 I3 (HK5): ``metadata`` (when supplied) is shallow-merged
+        into :attr:`Phase.metadata` — existing keys are preserved, the
+        delta's keys overwrite. The delta is recorded on the
+        ``update_phase_meta`` payload so replay reproduces the merge.
+        This is the substrate for HK5's ``skip_corrective_count``
+        counter (tracked per-phase to detect stuck
+        ``skip_corrective_round`` loops without minting a new typed
+        field per knob).
         """
         async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
             plan = self._load_sync()
@@ -1403,6 +1466,11 @@ class PlanManager:
             if end_checkpoint_commit is not None:
                 phase.end_checkpoint_commit = end_checkpoint_commit
                 payload["end_checkpoint_commit"] = end_checkpoint_commit
+            if metadata is not None:
+                merged = dict(phase.metadata or {})
+                merged.update(metadata)
+                phase.metadata = merged
+                payload["metadata"] = dict(metadata)
 
             await append_entry(
                 self._cwd,
@@ -1418,6 +1486,7 @@ class PlanManager:
                 baseline_commit=baseline_commit,
                 review_status=review_status,
                 end_checkpoint_commit=end_checkpoint_commit,
+                metadata_keys=list(metadata.keys()) if metadata else None,
             )
             return plan
 
