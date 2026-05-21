@@ -133,6 +133,9 @@ _HUGE_CPP_SKIP_DIR_NAMES: frozenset[str] = frozenset(
 )
 
 # Threshold (share of language profile) above which auto-inclusion fires.
+# v0.38.0 I1 (HK12): operator-tunable via ``cfg.huge_cpp_lang_threshold``.
+# This constant stays as the fallback used when ``cfg is None`` (test
+# fixtures / ad-hoc callers).
 _HUGE_CPP_LANG_THRESHOLD = 0.80
 
 
@@ -145,6 +148,10 @@ def _huge_cpp_auto_skip_active(
 
     Returns ``(active, profile)`` so callers can log the profile when
     auto-inclusion fires.
+
+    v0.38.0 I1: the share threshold is now read from
+    ``cfg.huge_cpp_lang_threshold`` when *cfg* is supplied (falls back
+    to :data:`_HUGE_CPP_LANG_THRESHOLD` for None / unset).
     """
     try:
         from orchestrator.repo_size import is_huge_repo
@@ -161,7 +168,16 @@ def _huge_cpp_auto_skip_active(
     except Exception:  # noqa: BLE001 — defensive: never block the gate
         return False, None
     cpp_share = float(profile.get("cpp", 0.0)) + float(profile.get("c", 0.0))
-    if cpp_share < _HUGE_CPP_LANG_THRESHOLD:
+    # v0.38.0 I1: honour operator-tuned threshold when available.
+    threshold = _HUGE_CPP_LANG_THRESHOLD
+    if cfg is not None:
+        cfg_threshold = getattr(cfg, "huge_cpp_lang_threshold", None)
+        if cfg_threshold is not None:
+            try:
+                threshold = float(cfg_threshold)
+            except (TypeError, ValueError):
+                threshold = _HUGE_CPP_LANG_THRESHOLD
+    if cpp_share < threshold:
         return False, profile
     return True, profile
 

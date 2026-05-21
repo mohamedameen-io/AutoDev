@@ -76,7 +76,15 @@ class Orchestrator:
         # trajectory-store cadence.
         self._injected_lessons_by_task: dict[tuple[str, str], list[str]] = {}
         self._log = get_logger(component="orchestrator", session_id=self._session_id)
-        self.guardrails = GuardrailEnforcer(cfg.guardrails)
+        # v0.38.0 I1: pass cwd + the top-level AutodevConfig so the
+        # enforcer can resolve huge-repo-scaled effective caps for
+        # ``max_duration_s_per_task`` and ``max_diff_bytes`` once at
+        # construction. Legacy ``GuardrailEnforcer(cfg.guardrails)`` call
+        # sites still work — they fall through to the raw guardrail
+        # values when ``cwd`` / ``parent_cfg`` is omitted.
+        self.guardrails = GuardrailEnforcer(
+            cfg.guardrails, cwd=self._cwd, parent_cfg=cfg
+        )
         self.loop_detector = LoopDetector()
         self.plugin_registry: PluginRegistry | None = plugin_registry
 

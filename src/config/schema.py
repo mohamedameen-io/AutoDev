@@ -829,6 +829,21 @@ class AutodevConfig(BaseModel):
     # ``TournamentPhaseConfig.huge_repo_overrides_disabled`` field
     # (which gates only the plan-tournament multi-branch fast-path).
     huge_repo_overrides_disabled: bool = False
+    # v0.38.0 I1 (HK12): C/C++ language-profile fraction threshold above
+    # which :func:`orchestrator.repo_size.is_huge_repo`-detected repos
+    # that are also C/C++-dominant get the H5 auto-skip set applied in
+    # :mod:`qa.hallucination_guard`. Lower this (e.g. ``0.5``) for
+    # mixed-language codebases where shader / asm / DSL files dilute the
+    # C/C++ share below the default 0.80 but the bulk of generated
+    # output still lives under the same engine-shaped tree layout.
+    #
+    # NOT scaled by ``huge_repo_multipliers``: this is a language-share
+    # fraction (∈ [0, 1]), not a budget. Multiplying by 2.5× would push
+    # the threshold above the maximum permitted share and disable the
+    # auto-skip on every huge repo — the opposite of the operator's
+    # intent. The field is operator-tunable; multiplier scaling is not
+    # the right lever here.
+    huge_cpp_lang_threshold: float = Field(default=0.80, ge=0.0, le=1.0)
     # v0.20.0 A1: PRM (trajectory pattern) detection strategy + threshold.
     # Default ``strategy="rules"`` preserves byte-identical v0.19.0 behavior.
     prm: PRMConfig = Field(default_factory=PRMConfig)

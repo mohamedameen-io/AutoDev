@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from adapters.types import AgentInvocation, AgentResult
@@ -66,7 +67,7 @@ class GuardrailEnforcer:
 
     Lifecycle::
 
-        enf = GuardrailEnforcer(cfg.guardrails)
+        enf = GuardrailEnforcer(cfg.guardrails, cwd=cwd)
         enf.start_task("1.1")
         try:
             for ... :
@@ -75,12 +76,65 @@ class GuardrailEnforcer:
                 enf.post_invocation("1.1", result)      # may raise
         finally:
             enf.end_task("1.1")
+
+    v0.38.0 I1: ``cwd`` is optional. When supplied AND the orchestrator
+    config (held by the top-level :class:`AutodevConfig` rather than the
+    nested :class:`GuardrailsConfig`) registers huge-repo multipliers for
+    ``max_duration_s_per_task`` / ``max_diff_bytes``, the effective caps
+    are scaled at construction time and cached on the enforcer instance.
+    The top-level cfg is supplied via the optional ``parent_cfg`` arg —
+    when only :class:`GuardrailsConfig` is available (legacy / unit
+    tests), the resolver receives ``cfg=None`` and falls through to the
+    raw guardrail values. ``cwd=None`` skips the resolver entirely.
     """
 
-    def __init__(self, cfg: GuardrailsConfig) -> None:
+    def __init__(
+        self,
+        cfg: GuardrailsConfig,
+        cwd: Path | None = None,
+        *,
+        parent_cfg: Any | None = None,
+    ) -> None:
         self.cfg = cfg
         self._metrics: dict[str, TaskMetrics] = {}
         self.plan_cost_usd: float = 0.0
+
+        # v0.38.0 I1: resolve huge-repo-scaled caps ONCE at construction.
+        # Uses the sync resolver — enforcer init is on the sync path
+        # (Orchestrator.__init__), so the async ``apply_and_log`` variant
+        # would force the whole stack async. Telemetry is captured via a
+        # structured log instead of a ledger op (ledger writes are async).
+        base_duration = float(cfg.max_duration_s_per_task)
+        base_diff = float(cfg.max_diff_bytes)
+        eff_duration = base_duration
+        eff_diff = base_diff
+        if cwd is not None and parent_cfg is not None:
+            from orchestrator.huge_repo_overrides import resolve_huge_repo_value
+
+            eff_duration, mult_d = resolve_huge_repo_value(
+                key="max_duration_s_per_task",
+                base_value=base_duration,
+                cwd=cwd,
+                cfg=parent_cfg,
+            )
+            eff_diff, mult_b = resolve_huge_repo_value(
+                key="max_diff_bytes",
+                base_value=base_diff,
+                cwd=cwd,
+                cfg=parent_cfg,
+            )
+            if mult_d is not None or mult_b is not None:
+                log.info(
+                    "guardrails.enforcer.huge_repo_caps_applied",
+                    duration_base=base_duration,
+                    duration_eff=eff_duration,
+                    duration_multiplier=mult_d,
+                    diff_base=base_diff,
+                    diff_eff=eff_diff,
+                    diff_multiplier=mult_b,
+                )
+        self._eff_max_duration_s: float = eff_duration
+        self._eff_max_diff_bytes: float = eff_diff
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -104,10 +158,10 @@ class GuardrailEnforcer:
             # treat as lenient. Callers that want enforcement must start_task.
             return
 
-        if m.elapsed_s >= self.cfg.max_duration_s_per_task:
+        if m.elapsed_s >= self._eff_max_duration_s:
             raise GuardrailExceededError(
                 f"task {task_id}: duration cap "
-                f"{self.cfg.max_duration_s_per_task}s exceeded "
+                f"{self._eff_max_duration_s}s exceeded "
                 f"(elapsed={m.elapsed_s:.1f}s)"
             )
 
@@ -137,10 +191,10 @@ class GuardrailEnforcer:
 
         if result.diff:
             m.total_diff_bytes += len(result.diff.encode("utf-8"))
-            if m.total_diff_bytes > self.cfg.max_diff_bytes:
+            if m.total_diff_bytes > self._eff_max_diff_bytes:
                 raise GuardrailExceededError(
                     f"task {task_id}: diff-size cap "
-                    f"{self.cfg.max_diff_bytes} bytes exceeded "
+                    f"{self._eff_max_diff_bytes} bytes exceeded "
                     f"(hit {m.total_diff_bytes})"
                 )
 

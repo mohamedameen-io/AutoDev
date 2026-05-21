@@ -243,3 +243,67 @@ async def test_escape_hatch_disables_huge_cpp_auto_skip(
 
     # Escape hatch flips is_huge_repo → False → no auto-skip → finding visible.
     assert out.passed is False
+
+
+# ---------------------------------------------------------------------------
+# v0.38.0 I1 (HK12): operator-tunable ``huge_cpp_lang_threshold``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _force_huge_mixed_cpp_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Huge repo where C/C++ is 60% — between the lowered (0.5) and the
+    default (0.8) thresholds. Lets us assert the operator-tuned knob
+    flips behaviour without changing the profile fixture."""
+    import orchestrator.repo_size as size_mod
+    import runtime.language_profile as lp_mod
+
+    def _huge(cwd: Path, threshold: int | None = None, *, cfg: Any = None) -> bool:  # noqa: ARG001
+        if cfg is not None and getattr(cfg, "huge_repo_overrides_disabled", False):
+            return False
+        return True
+
+    def _mixed_profile(cwd: Path, *, force_recompute: bool = False) -> dict[str, float]:  # noqa: ARG001
+        # 60% C/C++ — below the 0.80 default, above a tuned 0.50.
+        return {"cpp": 0.60, "python": 0.30, "shader": 0.10}
+
+    monkeypatch.setattr(size_mod, "is_huge_repo", _huge)
+    monkeypatch.setattr(lp_mod, "compute_language_profile", _mixed_profile)
+
+
+@pytest.mark.asyncio
+async def test_huge_cpp_lang_threshold_default_skips_mixed_repo(
+    _force_huge_mixed_cpp_repo: None,
+    tmp_path: Path,
+) -> None:
+    """60% C/C++ < default 0.80 threshold → no H5 auto-skip → finding visible."""
+    _write(tmp_path / "src" / "good.py", "import os\n")
+    _write(
+        tmp_path / "Engine" / "core.py",
+        "from os import nonexistent_func\n",
+    )
+
+    out = await run_hallucination_guard(tmp_path, cfg=_FakeCfg())
+
+    assert out.passed is False
+    assert "nonexistent_func" in (out.details or "")
+
+
+@pytest.mark.asyncio
+async def test_huge_cpp_lang_threshold_lowered_engages_auto_skip(
+    _force_huge_mixed_cpp_repo: None,
+    tmp_path: Path,
+) -> None:
+    """Operator lowers threshold to 0.50 → 60% C/C++ now crosses it → auto-skip fires."""
+    _write(tmp_path / "src" / "good.py", "import os\n")
+    _write(
+        tmp_path / "Engine" / "core.py",
+        "from os import nonexistent_func\n",
+    )
+
+    cfg = _FakeCfg()
+    cfg.huge_cpp_lang_threshold = 0.50  # HK12 operator knob.
+    out = await run_hallucination_guard(tmp_path, cfg=cfg)
+
+    # Threshold lowered → auto-skip engages → engine path elided → no finding.
+    assert out.passed is True
