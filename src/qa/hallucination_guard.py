@@ -95,6 +95,77 @@ _CPP_EXTS: frozenset[str] = frozenset(
 )
 
 
+# v0.37.0 H5: glob patterns auto-added to the skip set on huge C/C++
+# repos. These are the directories where large engine-style codebases
+# stash generated headers, intermediates, and vendored build artefacts
+# that the guard's regex / AST machinery would waste cycles on and
+# produce noisy unresolved-symbol findings against. Activation is
+# gated on BOTH ``is_huge_repo(cwd)`` AND a language profile showing
+# ≥80% C/C++ — keeps small Python repos untouched.
+_HUGE_CPP_SKIP_PATTERNS: frozenset[str] = frozenset(
+    {
+        "**/PrecompiledHeaders/**",
+        "**/Generated/**",
+        "**/Intermediate/**",
+        "**/Engine/**",
+        "**/build/**",
+        "**/cmake-build-*/**",
+    }
+)
+
+# Bare directory names extracted from :data:`_HUGE_CPP_SKIP_PATTERNS`.
+# The current ``_iter_files`` skip path matches on path-part membership
+# in a directory-name set rather than glob; we extract the
+# inner-segment names from the patterns above so the same skip-set
+# style works without rewriting the walker. ``build`` is already in
+# the base set; the rest are H5-new.
+_HUGE_CPP_SKIP_DIR_NAMES: frozenset[str] = frozenset(
+    {
+        "PrecompiledHeaders",
+        "Generated",
+        "Intermediate",
+        "Engine",
+        # ``build`` is already in the module-level _SKIP_DIRS, kept here
+        # for completeness so callers reading the set get the full
+        # H5-cpp picture.
+        "build",
+    }
+)
+
+# Threshold (share of language profile) above which auto-inclusion fires.
+_HUGE_CPP_LANG_THRESHOLD = 0.80
+
+
+def _huge_cpp_auto_skip_active(
+    cwd: Path,
+    *,
+    cfg: object | None = None,
+) -> tuple[bool, dict[str, float] | None]:
+    """v0.37.0 H5: decide whether the huge-cpp auto-skip set should apply.
+
+    Returns ``(active, profile)`` so callers can log the profile when
+    auto-inclusion fires.
+    """
+    try:
+        from orchestrator.repo_size import is_huge_repo
+    except ImportError:
+        return False, None
+    if not is_huge_repo(cwd, cfg=cfg):
+        return False, None
+    try:
+        from runtime.language_profile import compute_language_profile
+    except ImportError:
+        return False, None
+    try:
+        profile = compute_language_profile(cwd)
+    except Exception:  # noqa: BLE001 — defensive: never block the gate
+        return False, None
+    cpp_share = float(profile.get("cpp", 0.0)) + float(profile.get("c", 0.0))
+    if cpp_share < _HUGE_CPP_LANG_THRESHOLD:
+        return False, profile
+    return True, profile
+
+
 # v0.34.0 B1: per-language symbol allowlist consulted before flagging.
 # Keys are language-profile names (matching the output of
 # ``runtime.language_profile.get_dominant_language``). Operators will be
@@ -533,6 +604,7 @@ async def run_hallucination_guard(
     allowlist: frozenset[str] = frozenset(),
     sparse_mode: bool = False,
     task_id: str | None = None,
+    cfg: object | None = None,
 ) -> GateResult:
     """Scan *cwd* (or *paths*) for hallucinated API references.
 
@@ -549,6 +621,12 @@ async def run_hallucination_guard(
             names UNIONED with :data:`_SKIP_DIRS`. Pass-through from
             ``cfg.qa_gates.hallucination_guard_skip_dirs``. Has no effect
             when ``paths`` is non-None (the whitelist path doesn't walk).
+        cfg: v0.37.0 H5 — :class:`config.schema.AutodevConfig` (or
+            duck-typed stand-in) used to gate the huge-repo escape
+            hatch. When provided AND the repo is huge AND the language
+            profile shows ≥80% C/C++, the built-in skip set is unioned
+            with :data:`_HUGE_CPP_SKIP_DIR_NAMES` so engine-style
+            generated/intermediate trees are excluded from the walk.
 
     Returns:
         :class:`GateResult` with ``passed=False`` and a finding list when
@@ -562,6 +640,23 @@ async def run_hallucination_guard(
         skip_set = extra_skip_dirs
     else:
         skip_set = frozenset(extra_skip_dirs)
+
+    # v0.37.0 H5: huge C/C++ repos auto-skip the engine-shape generated
+    # / intermediate trees. The auto-set UNIONs with operator-provided
+    # extras — never replaces.
+    huge_cpp_active, profile = _huge_cpp_auto_skip_active(cwd, cfg=cfg)
+    if huge_cpp_active:
+        if skip_set is None:
+            skip_set = _HUGE_CPP_SKIP_DIR_NAMES
+        else:
+            skip_set = skip_set | _HUGE_CPP_SKIP_DIR_NAMES
+        _log.info(
+            "hallucination_guard.huge_repo_cpp_paths_included "
+            "patterns=%s language_profile=%s",
+            sorted(_HUGE_CPP_SKIP_PATTERNS),
+            profile,
+        )
+
     files = _iter_files(cwd, paths, extra_skip_dirs=skip_set)
     blocking: list[str] = []
     warn_only: list[str] = []
@@ -636,6 +731,8 @@ def _scan_file(path: Path, repo_root: Path) -> list[str]:
 __all__ = [
     "HALLUCINATION_ALLOWLISTS",
     "TS_TREESITTER_AVAILABLE",
+    "_HUGE_CPP_SKIP_DIR_NAMES",
+    "_HUGE_CPP_SKIP_PATTERNS",
     "_scan_typescript_regex",
     "run_hallucination_guard",
 ]

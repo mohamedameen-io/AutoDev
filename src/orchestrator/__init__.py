@@ -128,16 +128,41 @@ class Orchestrator:
         # collaborator wiring works.
         from orchestrator.circuit_breaker import InfraFailureCircuitBreaker
 
+        # v0.37.0 H5: scale breaker knobs on huge repos before
+        # constructing the breaker. The resolver returns the base
+        # value when the repo isn't huge or the escape hatch is set,
+        # so small-repo behavior is byte-identical.
+        from orchestrator.huge_repo_overrides import resolve_huge_repo_value
+
+        _cb_threshold_eff, _ = resolve_huge_repo_value(
+            key="circuit_breaker_threshold",
+            base_value=float(cfg.circuit_breaker_threshold),
+            cwd=self._cwd,
+            cfg=cfg,
+        )
+        _td_threshold_eff, _ = resolve_huge_repo_value(
+            key="test_diag_breaker_threshold",
+            base_value=float(cfg.test_diag_breaker_threshold),
+            cwd=self._cwd,
+            cfg=cfg,
+        )
+        _td_window_eff, _ = resolve_huge_repo_value(
+            key="test_diag_breaker_window_s",
+            base_value=float(cfg.test_diag_breaker_window_s),
+            cwd=self._cwd,
+            cfg=cfg,
+        )
+
         # v0.37.0 H3: pass the new test-diagnosis knobs through. The
         # breaker holds an independent rolling counter for test-runner
         # infrastructure-class diagnoses (default: ``capture_failed``)
         # fed from ``execute_phase`` whenever the test_engineer leg
         # returns one of the configured diagnoses.
         self._circuit_breaker = InfraFailureCircuitBreaker(
-            threshold=cfg.circuit_breaker_threshold,
+            threshold=int(round(_cb_threshold_eff)),
             window_s=cfg.circuit_breaker_window_s,
-            test_diag_threshold=cfg.test_diag_breaker_threshold,
-            test_diag_window_s=cfg.test_diag_breaker_window_s,
+            test_diag_threshold=int(round(_td_threshold_eff)),
+            test_diag_window_s=_td_window_eff,
             test_diag_diagnoses=frozenset(cfg.test_diag_breaker_diagnoses),
         )
 

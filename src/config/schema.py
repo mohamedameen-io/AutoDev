@@ -612,12 +612,23 @@ class TaskOverridesConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # v0.36.0 E1: now defaults to a populated role-keyed dict (was
-    # ``None`` through v0.35). Operators may still override with their
-    # own role / complexity keys; missing keys fall through to the
-    # baked-in default curve in :mod:`runtime.repo_probe`.
+    # v0.36.0 E1 / v0.37.0 H5: populated role-keyed dict (was ``None``
+    # through v0.35). Operators may still override with their own role
+    # / complexity keys; missing keys fall through to the baked-in
+    # default curve in :mod:`runtime.repo_probe`.
+    #
+    # v0.37.0 H5 added the H1/H2/H3 knob keys
+    # (``max_corrective_tasks_per_phase``, ``test_diag_breaker_window_s``,
+    # ``recent_evidence_max_chars_per_kind``, ``circuit_breaker_threshold``,
+    # ``test_diag_breaker_threshold``, ``max_duration_s_per_task``,
+    # ``max_diff_bytes``) so that the new H1–H3 caps auto-scale on huge
+    # repos without operator config tuning. The
+    # :func:`orchestrator.huge_repo_overrides.resolve_huge_repo_value`
+    # resolver consults this dict and emits a
+    # ``huge_repo_multiplier_applied`` telemetry op per scaled key.
     huge_repo_multipliers: dict[str, float] = Field(
         default_factory=lambda: {
+            # Role-keyed (v0.36.0 E1).
             "explorer": 3.0,
             "architect": 2.0,
             "coder": 2.0,
@@ -625,6 +636,16 @@ class TaskOverridesConfig(BaseModel):
             "reviewer": 1.5,
             "domain_expert": 1.5,
             "test_engineer": 1.5,
+            # v0.37.0 H5: knob-keyed. The :mod:`orchestrator.huge_repo_overrides`
+            # resolver looks these up by knob name and applies the
+            # multiplier to the operator's configured base value.
+            "max_duration_s_per_task": 2.5,
+            "max_diff_bytes": 3.0,
+            "max_corrective_tasks_per_phase": 2.0,
+            "test_diag_breaker_window_s": 2.0,
+            "recent_evidence_max_chars_per_kind": 1.5,
+            "circuit_breaker_threshold": 2.0,
+            "test_diag_breaker_threshold": 2.0,
         }
     )
     # v0.36.0 E2: multiplier applied to the resolved ``max_turns`` on
@@ -797,6 +818,17 @@ class AutodevConfig(BaseModel):
     # ``huge_repo_multipliers=None`` — the resolver uses the baked-in
     # curve (simple 3.0×, medium 2.0×, complex 1.5×).
     task_overrides: TaskOverridesConfig = Field(default_factory=TaskOverridesConfig)
+    # v0.37.0 H5: master escape hatch for all H5 large-codebase auto-
+    # defaults (multiplier scaling of H1/H2/H3 caps, hallucination-guard
+    # skip-list extension on huge C/C++ repos, ``AUTODEV_LANG_WEIGHT``
+    # default = 0.5 on huge repos). When True,
+    # :func:`orchestrator.repo_size.is_huge_repo` ALWAYS returns False
+    # regardless of the actual file count, restoring pre-v0.37.0
+    # behaviour. Operators who want the old small-repo defaults on a
+    # huge repo set this to True. Independent of the per-tournament
+    # ``TournamentPhaseConfig.huge_repo_overrides_disabled`` field
+    # (which gates only the plan-tournament multi-branch fast-path).
+    huge_repo_overrides_disabled: bool = False
     # v0.20.0 A1: PRM (trajectory pattern) detection strategy + threshold.
     # Default ``strategy="rules"`` preserves byte-identical v0.19.0 behavior.
     prm: PRMConfig = Field(default_factory=PRMConfig)

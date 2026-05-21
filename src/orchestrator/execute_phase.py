@@ -264,7 +264,24 @@ async def _build_recent_evidence_block(
     """
     from state.evidence import read_evidence  # noqa: PLC0415 — break cycle
 
-    cap = int(getattr(orch.cfg, "recent_evidence_max_chars_per_kind", 0))
+    cap_base = int(getattr(orch.cfg, "recent_evidence_max_chars_per_kind", 0))
+    # v0.37.0 H5: auto-scale the per-kind cap on huge repos. Resolver
+    # short-circuits (returns base) when repo is small or the escape
+    # hatch is set — sync wrapper (no ledger) because this helper is
+    # called synchronously from many sites and the telemetry op is
+    # already emitted at the orchestrator-init / cap-check call sites.
+    try:
+        from orchestrator.huge_repo_overrides import resolve_huge_repo_value
+
+        cap_eff, _ = resolve_huge_repo_value(
+            key="recent_evidence_max_chars_per_kind",
+            base_value=float(cap_base),
+            cwd=orch._cwd,
+            cfg=orch.cfg,
+        )
+        cap = int(round(cap_eff))
+    except Exception:  # noqa: BLE001 — defensive: never block evidence path
+        cap = cap_base
     include_kinds = list(
         getattr(orch.cfg, "recent_evidence_include_kinds", []) or []
     )
@@ -949,9 +966,28 @@ async def _dispatch_architect_consult(
         # cannot bypass the cap by emitting a long bullet list in a
         # single architect-refine round. The budget is cumulative across
         # all corrective rounds for this phase.
-        cap = int(
+        # v0.37.0 H5: auto-scale on huge repos via the knob-keyed
+        # multiplier dict (effective value emitted as
+        # ``huge_repo_multiplier_applied`` telemetry op). Falls back to
+        # the base value when the orchestrator stub omits ``_cwd``
+        # (unit-test fakes) so test fixtures predating H5 keep working.
+        cap_base = int(
             getattr(orch.cfg, "max_corrective_tasks_per_phase", 8)
         )
+        _cwd_for_h5 = getattr(orch, "_cwd", None)
+        if _cwd_for_h5 is not None:
+            from orchestrator.huge_repo_overrides import apply_and_log_huge_repo_value
+
+            cap_eff = await apply_and_log_huge_repo_value(
+                key="max_corrective_tasks_per_phase",
+                base_value=float(cap_base),
+                cwd=_cwd_for_h5,
+                cfg=orch.cfg,
+                ledger_append=orch.plan_manager.ledger_append,
+            )
+            cap = int(round(cap_eff))
+        else:
+            cap = cap_base
         cap_action = str(
             getattr(orch.cfg, "corrective_cap_action", "soft_block_phase")
         )
@@ -3121,7 +3157,23 @@ async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
     # BEFORE parsing. The budget is cumulative across all corrective
     # rounds for this phase so two consecutive B/AB-winner tournaments
     # cannot collectively breach the cap.
-    cap = int(getattr(orch.cfg, "max_corrective_tasks_per_phase", 8))
+    # v0.37.0 H5: auto-scale on huge repos via the knob-keyed multiplier.
+    # Defensive: orchestrator stubs in unit tests may lack ``_cwd``.
+    _cap_base = int(getattr(orch.cfg, "max_corrective_tasks_per_phase", 8))
+    _cwd_for_h5 = getattr(orch, "_cwd", None)
+    if _cwd_for_h5 is not None:
+        from orchestrator.huge_repo_overrides import apply_and_log_huge_repo_value
+
+        _cap_eff = await apply_and_log_huge_repo_value(
+            key="max_corrective_tasks_per_phase",
+            base_value=float(_cap_base),
+            cwd=_cwd_for_h5,
+            cfg=orch.cfg,
+            ledger_append=orch.plan_manager.ledger_append,
+        )
+        cap = int(round(_cap_eff))
+    else:
+        cap = _cap_base
     phase_corrective_count = len(phase.corrective_task_ids or [])
     remaining_budget = max(0, cap - phase_corrective_count)
     if remaining_budget == 0:
@@ -5886,6 +5938,7 @@ async def _run_qa_gates(
                 allowlist=_hallucination_allowlist_for(cwd),
                 sparse_mode=_hallucination_sparse_mode_for(orch, cfg),
                 task_id=task.id,
+                cfg=cfg,
             ),
         ),
         (

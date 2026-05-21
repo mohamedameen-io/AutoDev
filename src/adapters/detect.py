@@ -148,9 +148,26 @@ async def detect_platform(
         return env  # type: ignore[return-value]
 
     # v0.31.0 (Phase 5.5): language-weighted selection (opt-in).
-    try:
-        weight = float(os.environ.get("AUTODEV_LANG_WEIGHT", "0.0"))
-    except ValueError:
+    # v0.37.0 H5: on huge repos, default the weight to 0.5 so the
+    # fitness-weighted path engages by default (operator can still
+    # override via the env var). Trigger-context (H4) precedence above
+    # already short-circuited if applicable, so this only affects the
+    # fallback/auto path. Tested in
+    # ``tests/test_adapter_detect_huge_repo_weight.py``.
+    env_weight = os.environ.get("AUTODEV_LANG_WEIGHT")
+    if env_weight is not None:
+        try:
+            weight = float(env_weight)
+        except ValueError:
+            weight = 0.0
+    elif cwd is not None:
+        try:
+            from orchestrator.repo_size import is_huge_repo
+
+            weight = 0.5 if is_huge_repo(cwd) else 0.0
+        except Exception:  # noqa: BLE001 — defensive: never block on probe
+            weight = 0.0
+    else:
         weight = 0.0
 
     claude = ClaudeCodeAdapter()
