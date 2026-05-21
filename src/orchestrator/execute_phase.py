@@ -221,6 +221,110 @@ def _build_recovery_hint(
     )
 
 
+# v0.37.0 H1: map user-facing ``include_kinds`` labels to the on-disk
+# evidence file kinds. ``coder`` is the operator-friendly label that
+# matches the ``CODER_RAW:`` section header; ``developer`` is the
+# discriminator literal used by :class:`state.schemas.CoderEvidence`
+# and :func:`state.evidence.read_evidence`.
+_RECENT_EVIDENCE_KIND_TO_DISK: dict[str, str] = {
+    "review": "review",
+    "test": "test",
+    "coder": "developer",
+}
+_RECENT_EVIDENCE_KIND_TO_LABEL: dict[str, str] = {
+    "review": "REVIEWER_RAW",
+    "test": "TEST_RAW",
+    "coder": "CODER_RAW",
+}
+
+
+async def _build_recent_evidence_block(
+    orch: "Orchestrator",
+    task: Task,
+    reason: str,
+    web_context_block: str = "",
+) -> str:
+    """v0.37.0 H1: thread reviewer / test / coder ``raw_response`` bodies
+    into the ``recent_evidence`` block sent to stuck-recovery prompts.
+
+    The legacy one-liner (``reason`` plus optional ``web_context_block``)
+    gave architect-consult and sounding-board agents only the verdict
+    token — they could not refine without seeing what was actually
+    rejected. This helper reads the latest evidence files for ``task.id``,
+    extracts each kind's ``raw_response`` (falling back to
+    ``output_text``), truncates from the END to
+    ``cfg.recent_evidence_max_chars_per_kind`` chars (the tail typically
+    carries the verdict + reasoning), and renders labelled blocks under
+    ``REVIEWER_RAW:``, ``TEST_RAW:``, ``CODER_RAW:``.
+
+    Returns the legacy one-liner verbatim when the feature is disabled
+    (per-kind cap = 0 OR include_kinds = []). Tolerates missing /
+    unreadable evidence per kind — the kind is silently skipped, never
+    raised.
+    """
+    from state.evidence import read_evidence  # noqa: PLC0415 — break cycle
+
+    cap = int(getattr(orch.cfg, "recent_evidence_max_chars_per_kind", 0))
+    include_kinds = list(
+        getattr(orch.cfg, "recent_evidence_include_kinds", []) or []
+    )
+    if cap <= 0 or not include_kinds:
+        return f"{web_context_block}{reason}" if web_context_block else reason
+
+    populated_kinds: list[str] = []
+    blocks: list[str] = []
+    for label_kind in include_kinds:
+        disk_kind = _RECENT_EVIDENCE_KIND_TO_DISK.get(label_kind)
+        if disk_kind is None:
+            continue
+        try:
+            ev = await read_evidence(orch.cwd, task.id, disk_kind)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.recent_evidence_read_failed",
+                task_id=task.id,
+                kind=label_kind,
+                err=str(exc),
+            )
+            continue
+        if ev is None:
+            continue
+        blob = getattr(ev, "raw_response", None) or getattr(ev, "output_text", "") or ""
+        if not blob:
+            continue
+        tail = blob[-cap:]
+        section_label = _RECENT_EVIDENCE_KIND_TO_LABEL.get(
+            label_kind, label_kind.upper() + "_RAW"
+        )
+        blocks.append(f"{section_label}:\n{tail}")
+        populated_kinds.append(label_kind)
+
+    if not blocks:
+        legacy = (
+            f"{web_context_block}{reason}" if web_context_block else reason
+        )
+        logger.info(
+            "execute_phase.recent_evidence_built",
+            task_id=task.id,
+            kinds=[],
+            total_chars=len(legacy),
+        )
+        return legacy
+
+    joined = "\n\n".join(blocks)
+    if web_context_block:
+        rendered = f"{web_context_block}{reason}\n\n{joined}"
+    else:
+        rendered = f"{reason}\n\n{joined}"
+    logger.info(
+        "execute_phase.recent_evidence_built",
+        task_id=task.id,
+        kinds=populated_kinds,
+        total_chars=len(rendered),
+    )
+    return rendered
+
+
 def _build_recovery_hint_from_reason(
     *, task_id: str, reason: str
 ) -> "state.schemas.RecoveryHint":  # noqa: F821 — string annotation, lazy import
@@ -802,13 +906,16 @@ async def _dispatch_architect_consult(
     await orch.plan_manager.increment_architect_consult(task.id)
 
     # 2) Invoke the architect in consult mode.
+    # v0.37.0 H1: fold reviewer/test/coder raw_response bodies into the
+    # evidence block so the architect can refine on substance, not just
+    # the verdict token.
     arch_resolution = await _escalate_stuck_to_architect(
         orch,
         task,
         stuck_state=stuck_state,
         ladder_step="ARCHITECT_CONSULT",
-        recent_evidence=(
-            web_context_block + reason if web_context_block else reason
+        recent_evidence=await _build_recent_evidence_block(
+            orch, task, reason, web_context_block
         ),
         prior_attempts=prior_attempts,
     )
@@ -4165,13 +4272,14 @@ async def _try_retry_or_escalate(
                 return arch_resolution
 
         try:
+            # v0.37.0 H1: same evidence-body threading as architect-consult.
             resolution = await _escalate_stuck_to_critic(
                 orch,
                 task,
                 stuck_state=stuck_state,
                 ladder_step=step,
-                recent_evidence=(
-                    web_context_block + reason if web_context_block else reason
+                recent_evidence=await _build_recent_evidence_block(
+                    orch, task, reason, web_context_block
                 ),
                 prior_attempts=prior_attempts,
             )

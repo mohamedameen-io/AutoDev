@@ -953,6 +953,24 @@ class AutodevConfig(BaseModel):
     circuit_breaker_threshold: int = Field(default=3, ge=1)
     circuit_breaker_window_s: float = Field(default=60.0, gt=0.0)
 
+    # v0.37.0 H1: per-kind tail cap (in characters) for the reviewer /
+    # test / coder ``raw_response`` bodies that
+    # :func:`orchestrator.execute_phase._build_recent_evidence_block`
+    # folds into the ``recent_evidence`` block sent to stuck-recovery
+    # prompts (architect-consult, critic_sounding_board). Set to ``0`` to
+    # disable evidence-body inclusion and restore the legacy one-liner
+    # behaviour for operators on tight token budgets.
+    recent_evidence_max_chars_per_kind: int = Field(default=4000, ge=0)
+    # v0.37.0 H1: which evidence kinds to fold into the ``recent_evidence``
+    # block. Order is preserved in the rendered prompt. ``"coder"`` is the
+    # user-facing label for the on-disk ``developer`` evidence kind
+    # (matches the ``CODER_RAW:`` section header). An empty list restores
+    # the legacy one-liner behaviour even when the per-kind cap is
+    # non-zero.
+    recent_evidence_include_kinds: list[str] = Field(
+        default_factory=lambda: ["review", "test", "coder"]
+    )
+
     # v0.36.0 F2: adapter-level network probe retry knobs.
     adapters: AdaptersConfig = Field(default_factory=AdaptersConfig)
 
