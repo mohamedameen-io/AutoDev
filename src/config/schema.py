@@ -974,6 +974,16 @@ class AutodevConfig(BaseModel):
     # v0.36.0 F2: adapter-level network probe retry knobs.
     adapters: AdaptersConfig = Field(default_factory=AdaptersConfig)
 
+    # v0.37.0 H4: when True (default), trigger-context env detection
+    # (``CLAUDECODE=1`` / ``CLAUDE_PROJECT_DIR`` for Claude Code,
+    # ``TERM_PROGRAM=Cursor`` / ``CURSOR_*`` for Cursor) overrides the
+    # ``AUTODEV_PLATFORM`` env in ``preferred="auto"`` mode so that
+    # ``autodev`` invoked from inside a Claude Code session selects the
+    # ``claude_code`` adapter, and likewise for Cursor. Explicit
+    # ``--platform X`` always wins. Set to False to restore the
+    # pre-v0.37.0 precedence (env beats host context).
+    adapter_respect_trigger_context: bool = Field(default=True)
+
     @model_validator(mode="after")
     def _migrate_inline_platform(self) -> "AutodevConfig":
         """v0.26.0: rewrite legacy ``platform: "inline"`` to ``"claude_code"``.

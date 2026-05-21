@@ -93,7 +93,8 @@ def resume(platform: str | None) -> None:
         nonlocal preflight_failure
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
         adapter: PlatformAdapter = await get_adapter(
-            cast("Literal['claude_code', 'cursor', 'auto']", platform_pref)
+            cast("Literal['claude_code', 'cursor', 'auto']", platform_pref),
+            respect_trigger_context=cfg.adapter_respect_trigger_context,
         )
 
         # Mandatory re-probe — NOT cached. If ``get_adapter`` succeeded but

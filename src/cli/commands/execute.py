@@ -122,7 +122,8 @@ def execute(
         nonlocal preflight_failure
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
         adapter = await get_adapter(
-            cast("Literal['claude_code', 'cursor', 'auto']", platform_pref)
+            cast("Literal['claude_code', 'cursor', 'auto']", platform_pref),
+            respect_trigger_context=cfg.adapter_respect_trigger_context,
         )
 
         # v0.31.0 (Phase 5.4): emit a fitness telemetry line + warn on

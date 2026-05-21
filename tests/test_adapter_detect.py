@@ -12,6 +12,20 @@ from adapters.detect import detect_platform, get_adapter
 from errors import AdapterError
 
 
+# v0.37.0 H4: ensure trigger-context env vars (Claude Code / Cursor
+# host signals) don't bleed in from the developer shell and pre-empt
+# the AUTODEV_PLATFORM-env / fitness / fallback precedence these tests
+# assert. The trigger-context path has dedicated coverage in
+# ``test_adapter_detect_trigger_context.py``.
+@pytest.fixture(autouse=True)
+def _clear_trigger_context_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("TERM_PROGRAM", raising=False)
+    for key in [k for k in list(__import__("os").environ) if k.startswith("CURSOR_")]:
+        monkeypatch.delenv(key, raising=False)
+
+
 @pytest.mark.asyncio
 async def test_preferred_claude_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AUTODEV_PLATFORM", raising=False)

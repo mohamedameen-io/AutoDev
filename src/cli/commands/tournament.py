@@ -621,7 +621,10 @@ def phase_review_subcommand(
         )
         from state.paths import autodev_root, spec_path
 
-        adapter = await get_adapter(cfg.platform)
+        adapter = await get_adapter(
+            cfg.platform,
+            respect_trigger_context=cfg.adapter_respect_trigger_context,
+        )
         registry = build_registry(cfg)
         orch = Orchestrator(
             cwd=cwd,
@@ -752,7 +755,10 @@ async def _run_plan_tournament_cli(
         # don't want to load during --dry-run or in tests.
         from adapters.detect import get_adapter
 
-        adapter = await get_adapter(cfg.platform)
+        adapter = await get_adapter(
+            cfg.platform,
+            respect_trigger_context=cfg.adapter_respect_trigger_context,
+        )
         # Pass the loaded plan markdown so _cli_role_overrides can extract
         # the architect's COMPLEXITY: classification and resolve per-role
         # effort + timeout_s accordingly.
@@ -871,7 +877,10 @@ async def _run_impl_tournament_cli(
     else:
         from adapters.detect import get_adapter
 
-        adapter = await get_adapter(cfg.platform)
+        adapter = await get_adapter(
+            cfg.platform,
+            respect_trigger_context=cfg.adapter_respect_trigger_context,
+        )
         rmt, rat, rts, ref = _cli_role_overrides(cfg)
         client = AdapterLLMClient(
             adapter,
