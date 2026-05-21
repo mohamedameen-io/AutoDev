@@ -3780,6 +3780,36 @@ async def _execute_one(
                 # hard-fail with the diagnosis preserved in evidence.
                 attempts = test_diag_attempts.get(diagnosis, 0) + 1
                 test_diag_attempts[diagnosis] = attempts
+
+                # v0.37.0 H3: feed the cross-task test-diag breaker
+                # BEFORE branching on retry-vs-hard-fail so the count
+                # advances on every occurrence (including the first
+                # retry attempt). Defensive ``getattr`` matches the
+                # delegate-site pattern — orchestrator stubs without a
+                # breaker silently no-op. The breaker itself ignores
+                # diagnoses not in ``cfg.test_diag_breaker_diagnoses``
+                # (default: ``capture_failed`` only), so feeding all
+                # three here is safe and keeps the routing simple.
+                _breaker_h3 = getattr(orch, "_circuit_breaker", None)
+                if _breaker_h3 is not None:
+                    _breaker_h3.record_test_diagnosis(
+                        task.id,
+                        diagnosis,
+                        _dt.datetime.now(_dt.timezone.utc),
+                    )
+                    _halt_h3, _reason_h3 = _breaker_h3.should_halt()
+                    if _halt_h3:
+                        logger.error(
+                            "execute_phase.test_diag_breaker_trip",
+                            task_id=task.id,
+                            diagnosis=diagnosis,
+                            count=len(_breaker_h3._test_diag_failures),
+                            window_s=_breaker_h3.test_diag_window_s,
+                        )
+                        raise InfrastructureCircuitOpenError(
+                            _reason_h3 or "test-diagnosis circuit open"
+                        )
+
                 if attempts == 1:
                     log_method = (
                         logger.error
@@ -5189,7 +5219,17 @@ async def delegate(
     _breaker = getattr(orch, "_circuit_breaker", None)
     if _breaker is not None:
         if result.success:
-            _breaker.reset()
+            # v0.37.0 H3: adapter success clears only the adapter-class
+            # stream — the test-diagnosis stream must accumulate across
+            # intervening healthy adapter calls (developer/reviewer) so
+            # the "many tasks each producing one capture_failed" pattern
+            # is detectable cross-task. Use ``reset_adapter`` if
+            # available (post-H3 breaker); fall back to ``reset`` for
+            # legacy stubs.
+            _reset_method = getattr(
+                _breaker, "reset_adapter", None
+            ) or _breaker.reset
+            _reset_method()
         else:
             from datetime import datetime as _datetime, timezone as _tz
 

@@ -953,6 +953,36 @@ class AutodevConfig(BaseModel):
     circuit_breaker_threshold: int = Field(default=3, ge=1)
     circuit_breaker_window_s: float = Field(default=60.0, gt=0.0)
 
+    # v0.37.0 H3: cross-task test-diagnosis circuit. Independent of
+    # ``circuit_breaker_threshold`` (which counts adapter-class
+    # subtypes) so adapter flakes and test-runner flakes are tuned
+    # per-stream. Real-world operator runs surfaced a cascading pattern
+    # where many tasks each produced a single ``capture_failed`` test
+    # diagnosis (empty stdout, null returncode); each retried once and
+    # hard-failed in isolation but no cross-task signal halted the run.
+    # The shared :class:`InfraFailureCircuitBreaker` now feeds a second
+    # deque from the test-diag classifier; on trip it raises the same
+    # :class:`InfrastructureCircuitOpenError` and the existing v0.29.0
+    # quarantine catch sites handle it identically.
+    test_diag_breaker_threshold: int = Field(default=3, ge=1)
+    """Number of test-diagnosis infrastructure failures
+    (e.g. ``capture_failed``) within ``test_diag_breaker_window_s`` that
+    opens the breaker. Separate from ``circuit_breaker_threshold``
+    which counts adapter-class infrastructure failures."""
+
+    test_diag_breaker_window_s: float = Field(default=600.0, gt=0.0)
+    """Rolling window for the test-diagnosis breaker. Test runs are
+    slower than adapter calls so the default is wider (10 minutes vs
+    60 seconds)."""
+
+    test_diag_breaker_diagnoses: list[str] = Field(
+        default_factory=lambda: ["capture_failed"]
+    )
+    """Which :class:`~orchestrator.test_result_classifier.TestDiagnosis`
+    values count toward the test-diag breaker. ``capture_failed`` is
+    always recommended; ``runtime_crash`` and ``collection_failed`` are
+    opt-in because they can be legitimate per-task issues."""
+
     # v0.37.0 H1: per-kind tail cap (in characters) for the reviewer /
     # test / coder ``raw_response`` bodies that
     # :func:`orchestrator.execute_phase._build_recent_evidence_block`

@@ -128,9 +128,17 @@ class Orchestrator:
         # collaborator wiring works.
         from orchestrator.circuit_breaker import InfraFailureCircuitBreaker
 
+        # v0.37.0 H3: pass the new test-diagnosis knobs through. The
+        # breaker holds an independent rolling counter for test-runner
+        # infrastructure-class diagnoses (default: ``capture_failed``)
+        # fed from ``execute_phase`` whenever the test_engineer leg
+        # returns one of the configured diagnoses.
         self._circuit_breaker = InfraFailureCircuitBreaker(
             threshold=cfg.circuit_breaker_threshold,
             window_s=cfg.circuit_breaker_window_s,
+            test_diag_threshold=cfg.test_diag_breaker_threshold,
+            test_diag_window_s=cfg.test_diag_breaker_window_s,
+            test_diag_diagnoses=frozenset(cfg.test_diag_breaker_diagnoses),
         )
 
         # v0.31.0 (Phase 3): per-(task_id, role) consecutive

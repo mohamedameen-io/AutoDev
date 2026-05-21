@@ -48,10 +48,19 @@ TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
         "quarantined",
     },
     # auto-gates retry back to in_progress on failure
-    "coded": {"auto_gated", "in_progress", "blocked"},
-    "auto_gated": {"reviewed", "in_progress", "blocked"},
-    "reviewed": {"tested", "in_progress", "blocked"},
-    "tested": {"tournamented", "in_progress", "blocked"},
+    # v0.37.0 H3: also allow ``coded``/``auto_gated``/``reviewed``/
+    # ``tested`` → ``quarantined`` so a typed infrastructure halt that
+    # raises mid-pipeline (e.g. the test-diag circuit breaker tripping
+    # while the task is in the ``reviewed`` slot waiting on the test-
+    # engineer call) can stamp the offending task as resumable rather
+    # than silently failing the transition and leaving the phase
+    # un-paused. ``tournamented`` already terminates so adding the edge
+    # there would only matter if a tournament-stage typed halt surfaces;
+    # included for symmetry and forward-compat.
+    "coded": {"auto_gated", "in_progress", "blocked", "quarantined"},
+    "auto_gated": {"reviewed", "in_progress", "blocked", "quarantined"},
+    "reviewed": {"tested", "in_progress", "blocked", "quarantined"},
+    "tested": {"tournamented", "in_progress", "blocked", "quarantined"},
     "tournamented": {"complete", "blocked"},
     "complete": set(),
     # Blocked tasks can only be moved back to in_progress by an explicit

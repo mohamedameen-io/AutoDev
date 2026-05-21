@@ -9,6 +9,20 @@ which the existing :class:`AuthenticationFailedError` catch sites
 (v0.29.0 Bug 7) treat identically — quarantine the in-flight task,
 park the phase at ``review_status="paused"``, surface a non-zero exit.
 
+v0.37.0 Phase H3 extension — *test-diagnosis* stream:
+A SECOND independent rolling counter tracks test-runner self-diagnoses
+(``capture_failed`` by default) fed by ``execute_phase`` whenever the
+test-engineer leg returns an infrastructure-class
+:class:`~orchestrator.test_result_classifier.TestDiagnosis`. Real-world
+operator runs surfaced a cascading pattern where many distinct tasks
+each produced a single ``capture_failed`` event (empty stdout, null
+returncode); each retried once and hard-failed in isolation, but no
+cross-task signal ever halted the run. The two streams use separate
+deques and separate thresholds so adapter-class flakes and test-runner
+flakes are diagnosed and tuned independently. ``record_test_diagnosis``
+is a strict no-op for diagnoses outside the configured set, mirroring
+the ``record_failure`` non-infra subtype branch.
+
 Why a *cross-task* breaker on top of the per-task
 :class:`AuthenticationFailedError` halt: a single bad token already
 trips the v0.28.0 path on the first adapter call. The breaker covers
@@ -85,9 +99,30 @@ class InfraFailureCircuitBreaker:
         ``cfg.circuit_breaker_threshold`` default.
     :param window_s: Rolling window in seconds. Default 60.0 mirrors
         the ``cfg.circuit_breaker_window_s`` default.
+    :param test_diag_threshold: v0.37.0 H3 — separate threshold for the
+        test-diagnosis stream (default 3, mirrors
+        ``cfg.test_diag_breaker_threshold``). Independent of
+        ``threshold`` so adapter-class and test-runner flakes are tuned
+        per-stream.
+    :param test_diag_window_s: v0.37.0 H3 — rolling window for the
+        test-diagnosis stream (default 600s = 10 minutes, mirrors
+        ``cfg.test_diag_breaker_window_s``). Wider than the adapter
+        window because test runs are slower per attempt.
+    :param test_diag_diagnoses: v0.37.0 H3 — which
+        :class:`~orchestrator.test_result_classifier.TestDiagnosis`
+        values count toward this stream. Defaults to
+        ``frozenset({"capture_failed"})``; pass a wider set (e.g.
+        adding ``"runtime_crash"``) to also count those.
     """
 
-    def __init__(self, threshold: int = 3, window_s: float = 60.0) -> None:
+    def __init__(
+        self,
+        threshold: int = 3,
+        window_s: float = 60.0,
+        test_diag_threshold: int = 3,
+        test_diag_window_s: float = 600.0,
+        test_diag_diagnoses: frozenset[str] | None = None,
+    ) -> None:
         self._threshold = threshold
         self._window_s = window_s
         # Stored as (task_id, subtype, timestamp) so a future
@@ -96,6 +131,18 @@ class InfraFailureCircuitBreaker:
         # ``should_halt`` — keeps ``record_failure`` O(1).
         self._failures: deque[tuple[str, str, datetime]] = deque()
 
+        # v0.37.0 H3: independent test-diagnosis stream. Same
+        # (task_id, label, ts) shape as ``_failures`` so the lazy-evict
+        # pattern in ``should_halt`` works uniformly for both deques.
+        self._test_diag_threshold = test_diag_threshold
+        self._test_diag_window_s = test_diag_window_s
+        self._test_diag_diagnoses = (
+            test_diag_diagnoses
+            if test_diag_diagnoses is not None
+            else frozenset({"capture_failed"})
+        )
+        self._test_diag_failures: deque[tuple[str, str, datetime]] = deque()
+
     @property
     def threshold(self) -> int:
         return self._threshold
@@ -103,6 +150,18 @@ class InfraFailureCircuitBreaker:
     @property
     def window_s(self) -> float:
         return self._window_s
+
+    @property
+    def test_diag_threshold(self) -> int:
+        return self._test_diag_threshold
+
+    @property
+    def test_diag_window_s(self) -> float:
+        return self._test_diag_window_s
+
+    @property
+    def test_diag_diagnoses(self) -> frozenset[str]:
+        return self._test_diag_diagnoses
 
     def record_failure(
         self, task_id: str, subtype: str | None, ts: datetime
@@ -128,45 +187,112 @@ class InfraFailureCircuitBreaker:
             ts = ts.replace(tzinfo=timezone.utc)
         self._failures.append((task_id, subtype, ts))
 
-    def should_halt(self) -> tuple[bool, str | None]:
-        """Return ``(True, reason)`` if the trip threshold is met.
+    def record_test_diagnosis(
+        self, task_id: str, diagnosis: str, ts: datetime
+    ) -> None:
+        """v0.37.0 H3: record a test-runner infrastructure-class diagnosis.
 
-        Lazy-evicts entries older than the rolling window relative to
-        the most recent failure. Returns a reason string suitable for
-        operator-facing messages (mentions the count and window
-        explicitly). When closed, returns ``(False, None)``.
+        No-op if ``diagnosis`` is not in
+        :attr:`test_diag_diagnoses` (mirrors the non-infra subtype
+        skip in :meth:`record_failure`). Independent of the adapter-
+        class counter — feeding this method does not affect the
+        adapter-class deque, and vice versa.
+
+        ``ts`` is taken explicitly so the orchestrator passes a single
+        ``datetime.now(timezone.utc)`` per call site and tests can
+        drive the breaker with a fixed clock.
         """
-        if not self._failures:
-            return (False, None)
-        # The "now" for window math is the most recent failure's
-        # timestamp — NOT real-time. This means a long pause between
-        # bursts doesn't artificially expire prior failures we already
-        # judged safe; the next failure that arrives is what re-runs the
-        # check and triggers eviction relative to its own timestamp.
-        most_recent_ts = self._failures[-1][2]
-        cutoff = most_recent_ts - timedelta(seconds=self._window_s)
-        # Pop from the left until the oldest entry is inside the window.
-        while self._failures and self._failures[0][2] < cutoff:
-            self._failures.popleft()
+        if diagnosis not in self._test_diag_diagnoses:
+            return
+        # Normalize to UTC-aware so window math is consistent regardless
+        # of whether the caller passed a naive UTC stamp or an aware one.
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        self._test_diag_failures.append((task_id, diagnosis, ts))
 
-        count = len(self._failures)
-        if count >= self._threshold:
-            return (
-                True,
-                (
-                    f"infrastructure circuit open — {count} failures in "
-                    f"{self._window_s:.0f} seconds. Refresh credentials "
-                    f"and `autodev resume`."
-                ),
+    def should_halt(self) -> tuple[bool, str | None]:
+        """Return ``(True, reason)`` if either stream's trip threshold is met.
+
+        Lazy-evicts entries older than each stream's own rolling window
+        relative to that stream's most recent entry. Adapter-class
+        stream is checked first so its operator-facing reason text
+        (and the existing log-grep anchors) are preserved unchanged
+        when both would trip. Returns a reason string suitable for
+        operator-facing messages (mentions the count and window
+        explicitly). When both streams are closed, returns
+        ``(False, None)``.
+        """
+        # --- adapter-class stream (v0.30.0 — unchanged behaviour) ---
+        if self._failures:
+            # The "now" for window math is the most recent failure's
+            # timestamp — NOT real-time. This means a long pause between
+            # bursts doesn't artificially expire prior failures we already
+            # judged safe; the next failure that arrives is what re-runs
+            # the check and triggers eviction relative to its own timestamp.
+            most_recent_ts = self._failures[-1][2]
+            cutoff = most_recent_ts - timedelta(seconds=self._window_s)
+            while self._failures and self._failures[0][2] < cutoff:
+                self._failures.popleft()
+            count = len(self._failures)
+            if count >= self._threshold:
+                return (
+                    True,
+                    (
+                        f"infrastructure circuit open — {count} failures in "
+                        f"{self._window_s:.0f} seconds. Refresh credentials "
+                        f"and `autodev resume`."
+                    ),
+                )
+
+        # --- test-diagnosis stream (v0.37.0 H3) ---
+        if self._test_diag_failures:
+            most_recent_ts = self._test_diag_failures[-1][2]
+            cutoff = most_recent_ts - timedelta(
+                seconds=self._test_diag_window_s
             )
+            while (
+                self._test_diag_failures
+                and self._test_diag_failures[0][2] < cutoff
+            ):
+                self._test_diag_failures.popleft()
+            count = len(self._test_diag_failures)
+            if count >= self._test_diag_threshold:
+                # Pick the dominant diagnosis label for the message; if
+                # mixed, name the most recent one to match the trip
+                # event the operator just saw.
+                dominant = self._test_diag_failures[-1][1]
+                return (
+                    True,
+                    (
+                        f"test-diagnosis circuit open — {count} {dominant} in "
+                        f"{self._test_diag_window_s:.0f} seconds. Inspect "
+                        f"runner; `autodev doctor`."
+                    ),
+                )
         return (False, None)
 
     def reset(self) -> None:
-        """Zero the counters. Called after every successful adapter result.
+        """Zero ALL counters (both streams). Intentionally cheap and idempotent.
 
-        Intentionally cheap and idempotent — the orchestrator calls this
-        on every ``result.success=True`` path without checking whether
-        the breaker has prior state.
+        v0.37.0 H3 distinction: the orchestrator's ``delegate()`` site
+        only wants to clear the adapter-class stream on a successful
+        adapter call (a healthy reviewer / developer return does NOT
+        imply test-runner health — the whole point of the cross-task
+        test-diag stream is to accumulate across many otherwise
+        successful adapter calls). Production callers that want
+        adapter-only reset use :meth:`reset_adapter` instead. Tests and
+        explicit operator reset use this method.
+        """
+        self._failures.clear()
+        self._test_diag_failures.clear()
+
+    def reset_adapter(self) -> None:
+        """v0.37.0 H3: clear only the adapter-class deque.
+
+        Called by the ``delegate()`` site on every adapter success.
+        Preserves the test-diagnosis stream so the cross-task
+        accumulation pattern is not erased by intervening healthy
+        developer / reviewer calls.
         """
         self._failures.clear()
 
