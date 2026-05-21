@@ -348,6 +348,12 @@ class Phase(BaseModel):
     # phase-review tournament on a partial / halted phase; instead it
     # parks the phase here so :meth:`Orchestrator.resume` can re-trigger
     # the review once the quarantined tasks resolve.
+    # v0.37.0 H2: ``"capped"`` is a terminal review state set when the
+    # phase exhausts its cumulative correction-task budget
+    # (``cfg.max_corrective_tasks_per_phase``). The phase-review
+    # aggregator does NOT re-fire on a capped phase; operators recover
+    # via ``autodev requeue`` / ``autodev rewind`` per the recovery-hint
+    # surfaced on the originating task.
     review_status: (
         Literal[
             "pending",
@@ -356,6 +362,7 @@ class Phase(BaseModel):
             "corrective_required",
             "skipped",
             "paused",
+            "capped",
         ]
         | None
     ) = None

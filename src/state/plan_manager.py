@@ -1264,6 +1264,7 @@ class PlanManager:
         phase_id: str,
         tasks: list[Task],
         review_status: str = "corrective_required",
+        max_corrective_tasks_per_phase: int | None = None,
     ) -> Plan:
         """Append corrective sub-tasks to ``phase_id`` and update review_status.
 
@@ -1272,6 +1273,19 @@ class PlanManager:
         are updated atomically alongside the ``tasks`` list. Idempotent on
         replay (see :func:`state.ledger._apply_op` for the
         ``append_corrective_tasks`` op).
+
+        v0.37.0 H2: when ``max_corrective_tasks_per_phase`` is supplied,
+        the function enforces the cumulative cap defensively — if the
+        phase's existing ``corrective_task_ids`` plus the new ``tasks``
+        would exceed the cap, the tail of ``tasks`` is truncated to fit
+        and a ``corrective_cap_reached`` ledger op is appended with
+        ``defended=True`` so dashboards can distinguish the defensive
+        firing from the orchestrator-level upstream firing. This is
+        defence-in-depth: the orchestrator always computes the budget
+        upstream and threads it through
+        :func:`orchestrator.corrective_parser.parse_corrective_direction`,
+        but a future caller bypassing that path would still hit this
+        invariant.
 
         Returns the updated plan.
         """
@@ -1287,9 +1301,40 @@ class PlanManager:
                     f"phase_id={phase_id!r} not found in current plan"
                 )
 
+            # v0.37.0 H2: defensive cap check — truncate before any
+            # mutation so the on-disk invariant
+            # ``len(phase.corrective_task_ids) <= cap`` holds even if
+            # the caller skipped the upstream budget computation.
+            defended_dropped = 0
+            tasks_to_append: list[Task] = list(tasks)
+            if max_corrective_tasks_per_phase is not None:
+                cap = int(max_corrective_tasks_per_phase)
+                existing_count = len(phase.corrective_task_ids or [])
+                budget = max(0, cap - existing_count)
+                if len(tasks_to_append) > budget:
+                    defended_dropped = len(tasks_to_append) - budget
+                    tasks_to_append = tasks_to_append[:budget]
+                    self._log.info(
+                        "plan_manager.corrective_cap_defended",
+                        phase_id=phase_id,
+                        cap=cap,
+                        dropped=defended_dropped,
+                    )
+                    await append_entry(
+                        self._cwd,
+                        op="corrective_cap_reached",
+                        payload={
+                            "phase_id": phase_id,
+                            "cap": cap,
+                            "dropped": defended_dropped,
+                            "defended": True,
+                        },
+                        session_id=self._session_id,
+                    )
+
             existing_ids = {t.id for t in phase.tasks}
             appended: list[Task] = []
-            for t in tasks:
+            for t in tasks_to_append:
                 if t.id in existing_ids:
                     continue
                 phase.tasks.append(t)

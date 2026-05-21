@@ -971,6 +971,28 @@ class AutodevConfig(BaseModel):
         default_factory=lambda: ["review", "test", "coder"]
     )
 
+    # v0.37.0 H2: cumulative cap on correction tasks per phase across all
+    # corrective rounds (architect-refine + phase-review tournament). The
+    # orchestrator computes each phase's remaining budget upstream and
+    # threads it into :func:`orchestrator.corrective_parser.parse_corrective_direction`
+    # via ``max_tasks``. When the budget is exhausted the configured
+    # :attr:`corrective_cap_action` fires. Default ``8`` matches the
+    # observed natural ceiling on normal-sized repos; raise on projects
+    # where legitimate large refactors routinely need more, or rely on
+    # the H5 huge-repo auto-bump for codebases past the probe threshold.
+    max_corrective_tasks_per_phase: int = Field(default=8, ge=1)
+    # v0.37.0 H2: behaviour when a phase reaches its corrective-task
+    # budget. ``soft_block_phase`` (default) routes the originating task
+    # to operator triage via the recovery-hint pipeline so the
+    # ``autodev status --blocked`` panel surfaces the cap-hit with an
+    # actionable next-step. ``skip_corrective_round`` drops the round
+    # silently and continues — useful for unattended fleets where
+    # operator intervention is unavailable and the safer default is to
+    # let the phase land on whatever was completed.
+    corrective_cap_action: Literal[
+        "soft_block_phase", "skip_corrective_round"
+    ] = "soft_block_phase"
+
     # v0.36.0 F2: adapter-level network probe retry knobs.
     adapters: AdaptersConfig = Field(default_factory=AdaptersConfig)
 

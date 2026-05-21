@@ -456,6 +456,20 @@ LedgerOp = Literal[
     # file path) so post-mortems can correlate the rejection back to
     # the operator's command line.
     "spec_validation_failed",
+    # v0.37.0 H2: phase exhausted its cumulative correction-task budget
+    # (``cfg.max_corrective_tasks_per_phase``). Fired from one of two
+    # sites: (a) the orchestrator's architect-refine / phase-review
+    # paths when ``remaining_budget == 0`` BEFORE the parser is invoked,
+    # carrying ``{phase_id, task_id, cap: int, action: str}``; (b) the
+    # plan_manager's defensive cap when an upstream caller bypasses the
+    # budget computation, carrying
+    # ``{phase_id, cap: int, dropped: int, defended: True}``. The
+    # ``defended`` flag distinguishes the two so dashboards can spot
+    # the upstream regression separately from the legitimate cap-hit.
+    # Plan state mutations (``review_status="capped"``, task soft-block)
+    # flow through the regular ``update_phase_meta`` /
+    # ``update_task_status`` ops emitted alongside.
+    "corrective_cap_reached",
 ]
 
 
@@ -972,6 +986,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         "retry_budget_scaled",
         "network_probe_failed",
         "spec_validation_failed",
+        # v0.37.0 H2: per-phase corrective-task cap was reached. Audit-
+        # only — the plan-state mutations (``review_status="capped"`` on
+        # the phase-review path, ``status="blocked"`` + ``recovery_hint``
+        # on the architect-refine path) flow through the regular
+        # ``update_phase_meta`` / ``update_task_status`` ops emitted
+        # alongside. Replay treats this op as a no-op.
+        "corrective_cap_reached",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

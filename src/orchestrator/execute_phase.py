@@ -944,22 +944,118 @@ async def _dispatch_architect_consult(
     if arch_resolution.action == "architect-refine":
         # Inject corrective sub-tasks via the existing pipeline.
         phase_id = task.phase_id
+        # v0.37.0 H2: compute the phase's remaining corrective-task budget
+        # BEFORE parsing so plan inflation observed in real-world runs
+        # cannot bypass the cap by emitting a long bullet list in a
+        # single architect-refine round. The budget is cumulative across
+        # all corrective rounds for this phase.
+        cap = int(
+            getattr(orch.cfg, "max_corrective_tasks_per_phase", 8)
+        )
+        cap_action = str(
+            getattr(orch.cfg, "corrective_cap_action", "soft_block_phase")
+        )
+        base_task_count = 0
+        phase_corrective_count = 0
         try:
             plan = await orch.plan_manager.load()
-            base_task_count = 0
             if plan is not None:
-                phase = next((p for p in plan.phases if p.id == phase_id), None)
+                phase = next(
+                    (p for p in plan.phases if p.id == phase_id), None
+                )
                 if phase is not None:
                     base_task_count = len(phase.tasks)
+                    phase_corrective_count = len(phase.corrective_task_ids or [])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.architect_refine_load_failed",
+                task_id=task.id,
+                err=str(exc),
+            )
+        remaining_budget = max(0, cap - phase_corrective_count)
+
+        if remaining_budget == 0:
+            # Cap reached: operator-recoverable soft block (default) or
+            # silent skip, controlled by ``corrective_cap_action``.
+            logger.info(
+                "execute_phase.corrective_cap_reached",
+                phase_id=phase_id,
+                task_id=task.id,
+                cap=cap,
+                action=cap_action,
+                site="architect_refine",
+            )
+            try:
+                await orch.plan_manager.ledger_append(
+                    op="corrective_cap_reached",
+                    payload={
+                        "phase_id": phase_id,
+                        "task_id": task.id,
+                        "cap": cap,
+                        "action": cap_action,
+                        "site": "architect_refine",
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_phase.ledger_append_failed",
+                    op="corrective_cap_reached",
+                    err=str(exc),
+                )
+            if cap_action == "soft_block_phase":
+                cap_hint = _build_recovery_hint(
+                    task_id=task.id,
+                    hint_class="user_decision_required",
+                    action=(
+                        f"Phase {phase_id} reached the correction-task cap "
+                        f"({cap}); manual triage required."
+                    ),
+                    commands=[
+                        f"autodev requeue --task {task.id}",
+                        f"autodev rewind --to-phase {phase_id}",
+                    ],
+                )
+                try:
+                    return await orch.plan_manager.update_task_status(
+                        task.id,
+                        "blocked",
+                        meta={
+                            "blocked_reason": (
+                                f"corrective_cap_reached: phase {phase_id} "
+                                f"hit the {cap}-task budget"
+                            ),
+                            "architect_consult_action": "cap_reached",
+                            "recovery_hint": cap_hint,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.corrective_cap_soft_block_failed",
+                        task_id=task.id,
+                        err=str(exc),
+                    )
+                    return task
+            # ``skip_corrective_round``: drop silently and fall through
+            # to the existing terminal-skip handling so the executor
+            # treats this round as a no-op corrective pass.
+            return task
+
+        try:
             corrective_tasks = parse_corrective_direction(
                 arch_resolution.guidance,
                 phase_id=phase_id,
                 base_task_count=base_task_count,
                 phase_complexity=task.complexity,
+                max_tasks=remaining_budget,
             )
             if corrective_tasks:
+                # v0.37.0 H2: pass the cap to plan_manager for
+                # defence-in-depth even though we already truncated
+                # upstream.
                 await orch.plan_manager.append_corrective_tasks(
-                    phase_id, corrective_tasks
+                    phase_id,
+                    corrective_tasks,
+                    max_corrective_tasks_per_phase=cap,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -3021,12 +3117,56 @@ async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
             )
         return
 
+    # v0.37.0 H2: compute the phase's remaining corrective-task budget
+    # BEFORE parsing. The budget is cumulative across all corrective
+    # rounds for this phase so two consecutive B/AB-winner tournaments
+    # cannot collectively breach the cap.
+    cap = int(getattr(orch.cfg, "max_corrective_tasks_per_phase", 8))
+    phase_corrective_count = len(phase.corrective_task_ids or [])
+    remaining_budget = max(0, cap - phase_corrective_count)
+    if remaining_budget == 0:
+        logger.info(
+            "execute_phase.corrective_cap_reached",
+            phase_id=phase.id,
+            cap=cap,
+            site="phase_review",
+            winner=outcome.winner,
+        )
+        try:
+            await orch.plan_manager.ledger_append(
+                op="corrective_cap_reached",
+                payload={
+                    "phase_id": phase.id,
+                    "cap": cap,
+                    "site": "phase_review",
+                    "winner": outcome.winner,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.ledger_append_failed",
+                op="corrective_cap_reached",
+                err=str(exc),
+            )
+        try:
+            await orch.plan_manager.update_phase_meta(
+                phase.id, review_status="capped"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "execute_phase.review_status_capped_failed",
+                phase_id=phase.id,
+                err=str(exc),
+            )
+        return
+
     rollup = _phase_complexity_rollup(phase)
     corrective_tasks = parse_corrective_direction(
         outcome.corrective_direction,
         phase_id=phase.id,
         base_task_count=len(phase.tasks),
         phase_complexity=rollup,
+        max_tasks=remaining_budget,
     )
     if not corrective_tasks:
         logger.warning(
@@ -3046,8 +3186,12 @@ async def _run_phase_review(orch: "Orchestrator", phase: Phase) -> None:
         return
 
     try:
+        # v0.37.0 H2: pass the cap to plan_manager for defence-in-depth
+        # even though we already truncated upstream via the parser.
         await orch.plan_manager.append_corrective_tasks(
-            phase.id, corrective_tasks
+            phase.id,
+            corrective_tasks,
+            max_corrective_tasks_per_phase=cap,
         )
         logger.info(
             "execute_phase.phase_review_corrective_injected",

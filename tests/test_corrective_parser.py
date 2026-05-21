@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.corrective_parser import parse_corrective_direction
 
 
@@ -138,3 +140,80 @@ def test_nested_bullets_stay_within_parent_description() -> None:
     assert len(tasks) == 2
     assert "sub-bullet 1" in tasks[0].description
     assert "sub-bullet 2" in tasks[0].description
+
+
+def test_parse_corrective_direction_caps_at_max_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.37.0 H2: ``max_tasks=N`` truncates to N tasks and surfaces the
+    dropped count via the ``corrective_parser.parsed`` log event.
+
+    Pinned because plan inflation observed in real-world runs can emit
+    long bullet lists in a single round; without this cap a single
+    architect-refine response could exhaust the phase's lifetime budget.
+    """
+    from orchestrator import corrective_parser
+
+    captured: list[dict] = []
+
+    class _CaptureLogger:
+        def info(self, event: str, **kwargs) -> None:  # noqa: ANN003
+            captured.append({"event": event, **kwargs})
+
+        def warning(self, event: str, **kwargs) -> None:  # noqa: ANN003
+            captured.append({"event": event, "level": "warning", **kwargs})
+
+    monkeypatch.setattr(corrective_parser, "logger", _CaptureLogger())
+
+    text = (
+        "- one\n"
+        "- two\n"
+        "- three\n"
+        "- four\n"
+        "- five\n"
+        "- six\n"
+        "- seven\n"
+    )
+    tasks = parse_corrective_direction(
+        text,
+        phase_id="1",
+        base_task_count=0,
+        max_tasks=3,
+    )
+    assert len(tasks) == 3
+    assert [t.title for t in tasks] == ["one", "two", "three"]
+
+    parsed = [c for c in captured if c["event"] == "corrective_parser.parsed"]
+    assert len(parsed) == 1
+    assert parsed[0]["produced"] == 3
+    assert parsed[0]["dropped"] == 4
+    assert parsed[0]["max_tasks"] == 3
+
+
+def test_parse_corrective_direction_no_cap_preserves_legacy_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``max_tasks=None`` (default) emits ``dropped=0`` and keeps all
+    bullets, matching pre-v0.37.0 behaviour for callers that have not
+    opted into the cap path."""
+    from orchestrator import corrective_parser
+
+    captured: list[dict] = []
+
+    class _CaptureLogger:
+        def info(self, event: str, **kwargs) -> None:  # noqa: ANN003
+            captured.append({"event": event, **kwargs})
+
+        def warning(self, event: str, **kwargs) -> None:  # noqa: ANN003
+            captured.append({"event": event, "level": "warning", **kwargs})
+
+    monkeypatch.setattr(corrective_parser, "logger", _CaptureLogger())
+
+    text = "- one\n- two\n- three\n"
+    tasks = parse_corrective_direction(
+        text, phase_id="1", base_task_count=0
+    )
+    assert len(tasks) == 3
+    parsed = [c for c in captured if c["event"] == "corrective_parser.parsed"]
+    assert parsed[0]["dropped"] == 0
+    assert parsed[0]["max_tasks"] is None

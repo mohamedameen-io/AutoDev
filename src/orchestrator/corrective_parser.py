@@ -39,6 +39,7 @@ def parse_corrective_direction(
     base_task_count: int,
     phase_complexity: str | None = None,
     tournament_id: str | None = None,
+    max_tasks: int | None = None,
 ) -> list[Task]:
     """Parse architect_b's corrective direction into ``Task`` objects.
 
@@ -60,10 +61,20 @@ def parse_corrective_direction(
         tournament_id: Optional tournament id, recorded in the task
             metadata for observability ("which tournament generated this
             sub-task?").
+        max_tasks: v0.37.0 H2: optional per-call cap on the number of
+            corrective tasks returned. The caller (orchestrator) supplies
+            the phase's remaining cumulative budget so plan inflation
+            observed in real-world runs cannot bypass the cap by emitting
+            a long bullet list in a single round. Bullets beyond the cap
+            are silently dropped; the count lands in the ``dropped``
+            field of the ``corrective_parser.parsed`` log event for
+            forensics. ``None`` (default) preserves pre-v0.37.0 behaviour
+            (no per-call cap).
 
     Returns:
         A list of :class:`Task` objects. Empty if ``text`` has no
-        recognisable top-level bullets.
+        recognisable top-level bullets. Length never exceeds ``max_tasks``
+        when supplied.
     """
     if not text or not text.strip():
         return []
@@ -96,11 +107,23 @@ def parse_corrective_direction(
                 metadata=metadata,
             )
         )
+        # v0.37.0 H2: stop as soon as we reach the per-call cap so we
+        # don't materialise Tasks the caller would throw away.
+        if max_tasks is not None and len(tasks) >= max_tasks:
+            break
+
+    # v0.37.0 H2: count of recognised top-level bullets that did NOT make
+    # it into the returned list — either because we hit ``max_tasks`` or
+    # because they were body-empty (filtered by the ``not title`` skip
+    # above). Both are interesting to forensics.
+    dropped = max(0, len(bullets) - len(tasks))
     logger.info(
         "corrective_parser.parsed",
         phase_id=phase_id,
         base_task_count=base_task_count,
         produced=len(tasks),
+        dropped=dropped,
+        max_tasks=max_tasks,
     )
     return tasks
 
