@@ -86,6 +86,33 @@ preflight_v037() {
   check "v0.37 H5 master switch"      src/config/schema.py                         "huge_repo_overrides_disabled"
 }
 
+preflight_v038() {
+  check "v0.38 I1 enforcer cwd"       src/guardrails/enforcer.py                   "_eff_max_duration_s"
+  check "v0.38 I1 enforcer log"       src/guardrails/enforcer.py                   "huge_repo_caps_applied"
+  check "v0.38 I1 ttl helper"         src/orchestrator/repo_size.py                "is_huge_repo_with_ttl"
+  check "v0.38 I1 lang threshold"     src/config/schema.py                         "huge_cpp_lang_threshold"
+  check "v0.38 I2 capped-phases"      src/cli/commands/requeue.py                  "capped-phases"
+  check "v0.38 I2 capped panel"       src/cli/commands/status.py                   "_render_capped_phases_panel"
+  check "v0.38 I2 count helper"       src/cli/commands/status.py                   "_count_ops_by_name"
+  check "v0.38 I2 audit op"           src/state/ledger.py                          "capped_phases_selected"
+  check "v0.38 I3 plan cap config"    src/config/schema.py                         "max_corrective_tasks_per_plan"
+  check "v0.38 I3 scope field"        src/state/plan_manager.py                    "scope.*plan"
+  check "v0.38 I3 skip loop op"       src/state/ledger.py                          "skip_corrective_loop_detected"
+  check "v0.38 I3 phase metadata"     src/state/schemas.py                         "Phase.metadata\|metadata: dict"
+  check "v0.38 I4 backoff method"     src/orchestrator/circuit_breaker.py          "next_backoff_s_for_test_diag"
+  check "v0.38 I4 success method"     src/orchestrator/circuit_breaker.py          "record_test_success"
+  check "v0.38 I4 budget method"      src/orchestrator/circuit_breaker.py          "test_diag_budget_exhausted"
+  check "v0.38 I4 backoff config"     src/config/schema.py                         "test_diag_backoff_total_budget_s"
+  check "v0.38 I4 typed halt"         src/tournament/errors.py                     "halted_task_id"
+  check "v0.38 I4 drain timeout"     src/config/schema.py                         "parallel_pool_drain_timeout_s"
+  check "v0.38 I5 envelope dump"      src/orchestrator/execute_phase.py            "_dump_architect_consult_envelope"
+  check "v0.38 I5 developer label"    src/orchestrator/execute_phase.py            "DEVELOPER_RAW"
+  check "v0.38 I5 cursor allowlist"   src/adapters/detect.py                       "_CURSOR_ENV_ALLOWLIST"
+  check "v0.38 I5 tmux warn"          src/adapters/detect.py                       "tmux_screen_detected"
+  check "v0.38 I5 adapter_selected"   src/state/ledger.py                          "adapter_selected"
+  check "v0.38 I5 selection source"   src/adapters/detect.py                       "_classify_selection_source"
+}
+
 case "$target" in
   v0.32) preflight_v032 ;;
   v0.33) preflight_v033 ;;
@@ -93,9 +120,10 @@ case "$target" in
   v0.35) preflight_v035 ;;
   v0.36) preflight_v036 ;;
   v0.37) preflight_v037 ;;
-  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ;;
+  v0.38) preflight_v038 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ;;
   *)
-    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | all)" >&2
+    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | all)" >&2
     exit 2
     ;;
 esac

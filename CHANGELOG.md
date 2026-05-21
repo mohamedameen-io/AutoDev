@@ -2,6 +2,144 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-05-21
+
+Convergence polish (Tier I). Closes the four named "next layer of
+failure" items from the v0.37.0 retrospective and bundles the
+implementation-agent housekeeping deferrals into a single coherent
+release: the H5 wiring gap is now closed end-to-end, capped phases
+drain with one command, corrective explosion is bounded plan-wide,
+flaky test suites recover via exponential backoff with auto-reset
+instead of permanently arming the breaker, and forensics gaps are
+closed for the v0.39 retrospective slot.
+
+### Soft breaking changes
+
+- **HK1: `recent_evidence_include_kinds` label `"coder"` is deprecated
+  in favour of `"developer"`** (the canonical on-disk
+  `CoderEvidence.kind` literal). Existing config values are migrated
+  automatically with a one-shot `DeprecationWarning`. The migration
+  shim will be removed in v0.39.0 — operators should update their
+  `.autodev/config.json` to use `"developer"` directly. The prompt
+  section header changes from `CODER_RAW:` to `DEVELOPER_RAW:` as a
+  consequence.
+- **`get_adapter()` now returns `tuple[PlatformAdapter, dict]`** —
+  the second element is `selection_meta` (`platform`, `source`,
+  `trigger_context_detected`, `healthcheck_ok`). All internal CLI
+  call sites updated. Downstream plugins / scripts that called
+  `adapter = await get_adapter(...)` need to update to
+  `adapter, _ = await get_adapter(...)`.
+
+### Added
+- `GuardrailEnforcer` accepts `cwd` and `parent_cfg` at construction;
+  resolves effective `max_duration_s_per_task` / `max_diff_bytes`
+  through the v0.37.0 H5 `resolve_huge_repo_value` resolver. Closes
+  the H5 wiring gap — these caps now actually scale on huge repos
+  (#I1).
+- `is_huge_repo_with_ttl(cwd, ttl_s=3600)` sibling helper in
+  `orchestrator/repo_size.py` for long-lived resume sessions; existing
+  `is_huge_repo` lru-cache unchanged (#I1 HK11).
+- `huge_cpp_lang_threshold` config knob (default 0.80) replaces the
+  hard-coded `_HUGE_CPP_LANG_THRESHOLD` in `hallucination_guard`;
+  operators with shader-heavy or asm-heavy codebases can lower the
+  threshold (#I1 HK12).
+- End-to-end huge-repo integration test that synthesises 5001 `.cpp`
+  files on disk and asserts the multiplied caps fire (#I1 HK13).
+- `autodev requeue --capped-phases` selects all blocked tasks in
+  phases where `review_status='capped'`. Composes with the existing
+  `--task` / `--phase` / `--infrastructure` / `--all-blocked`
+  selectors (#I2).
+- `autodev status --blocked` renders a "Capped phases" panel at the
+  top of the blocked section when any phase is capped, with per-phase
+  lifetime `corrective_cap_reached` counts, scope breakdown, and the
+  recovery command (#I2).
+- `max_corrective_tasks_per_plan` config knob (default 24 ≈ 8 × 3
+  phases of headroom) — plan-scope corrective ceiling mirroring H2's
+  per-phase cap. Has `huge_repo_multipliers` entry (#I3).
+- `Phase.metadata: dict[str, Any]` field — substrate for the new
+  HK5 skip-loop counter. `update_phase_meta` accepts a `metadata`
+  shallow-merge kwarg; the ledger replay handler also merges so
+  counters survive replay (#I3 HK5).
+- Per-phase `skip_corrective_count` counter wired through
+  `Phase.metadata`. Increments on `skip_corrective_round`; resets on
+  successful corrective injection. At threshold 3 emits
+  `skip_corrective_loop_suspected` log + new
+  `skip_corrective_loop_detected` ledger op (audit-only; no auto-
+  soft-block — collect data first) (#I3 HK5).
+- `InfraFailureCircuitBreaker.record_test_success` +
+  `next_backoff_s_for_test_diag` + `test_diag_budget_exhausted`.
+  Replaces hard-halt-on-3rd with exponential backoff (5s, 10s, 20s,
+  ..., 120s cap). Cumulative-backoff budget escape hatch (default
+  600s) still raises. Auto-reset clears the failure deque after N
+  successful test runs within a window (#I4).
+- `InfrastructureCircuitOpenError.halted_task_id` keyword-only
+  attribute. `_halt_for_auth_failed` prefers it over the existing
+  plan-walk lookup (#I4 HK7).
+- `parallel_pool_drain_timeout_s` config knob (default 10.0). Halt
+  path now uses bounded `asyncio.wait(timeout=...)` + force-`gather`
+  on stragglers. The v0.37.0 H3 integration test that took ~30s on
+  teardown now completes in ~0.3s (~100x speedup) (#I4 HK6).
+- Architect-consult prompt envelope dump to
+  `.autodev/debug/architect_consult-{task_id}-{unix_ms}.json`.
+  Gated on new `dump_architect_consult_envelopes` config knob
+  (default `True`). Mirrors the existing `_dump_empty_context`
+  pattern (#I5 HK3).
+- Head+tail truncation for `"developer"` evidence bodies in
+  `_build_recent_evidence_block` — long diffs preserve both imports
+  (head) and verdict/summary (tail). Reviewer/test kinds keep
+  tail-only (#I5 HK2).
+- Explicit `_CURSOR_ENV_ALLOWLIST` (`CURSOR_TRACE_ID`,
+  `CURSOR_AGENT`, `CURSOR_VERSION`, `CURSOR_AGENT_ID`) replaces the
+  broad `startswith("CURSOR_")` heuristic in
+  `_detect_trigger_context`. New `cursor_trigger_env_extra` config
+  knob lets operators extend without code change (#I5 HK9).
+- Multiplexer-detection diagnostic log
+  `detect_platform.tmux_screen_detected` fires when `TMUX` or `STY`
+  env is present AND trigger context fires. Info-only — no behaviour
+  change (#I5 HK8).
+- `adapter_selected` ledger op (audit-only) records the resolved
+  adapter + source per orchestrator boot. Retros can answer "which
+  adapter and why" from the ledger alone (#I5 HK10).
+
+### Changed
+- `corrective_cap_reached` ledger op gains a `scope: "phase"|"plan"`
+  field. All four emission sites (orchestrator architect-refine,
+  orchestrator phase-review, plan_manager defensive per-phase,
+  plan_manager defensive plan-wide) populate it (#I3).
+- `_select_task_ids` in `cli/commands/requeue.py` now returns a
+  3-tuple `(runnable, unknown, matched_capped_phases)` so the
+  audit op can record the phase set the flag matched (#I2).
+- `InfraFailureCircuitBreaker.should_halt()` no longer trips on the
+  test-diag stream — the backoff path supersedes hard-halt. The
+  adapter-class stream behaviour is unchanged (#I4).
+
+### Telemetry
+- New ops: `corrective_cap_reached scope=plan`,
+  `skip_corrective_loop_detected`, `adapter_selected`,
+  `requeue.capped_phases_selected`.
+- New structured logs: `guardrails.enforcer.huge_repo_caps_applied`,
+  `execute_phase.skip_corrective_loop_suspected`,
+  `execute_phase.test_diag_backoff`,
+  `execute_phase.test_diag_budget_exhausted`,
+  `circuit_breaker.test_diag_auto_reset`,
+  `execute_phase.parallel_pool.drain_slow`,
+  `detect_platform.tmux_screen_detected`,
+  `config.deprecated_kind_label`,
+  `hallucination_guard.huge_repo_cpp_paths_included`.
+
+### Config
+- `huge_cpp_lang_threshold: float = 0.80`
+- `max_corrective_tasks_per_plan: int = 24` (+ huge-repo multiplier)
+- `test_diag_backoff_initial_s: float = 5.0`
+- `test_diag_backoff_multiplier: float = 2.0`
+- `test_diag_backoff_max_s: float = 120.0`
+- `test_diag_backoff_total_budget_s: float = 600.0` (+ huge-repo ×2)
+- `test_diag_auto_reset_after_n_successes: int = 3`
+- `test_diag_auto_reset_window_s: float = 900.0` (+ huge-repo ×2)
+- `parallel_pool_drain_timeout_s: float = 10.0`
+- `dump_architect_consult_envelopes: bool = True`
+- `cursor_trigger_env_extra: list[str] = []`
+
 ## [0.37.0] - 2026-05-21
 
 Cascading-failure closure (Tier H). The compounding pattern observed
