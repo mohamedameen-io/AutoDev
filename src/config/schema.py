@@ -696,6 +696,14 @@ class TaskOverridesConfig(BaseModel):
             "recent_evidence_max_chars_per_kind": 1.5,
             "circuit_breaker_threshold": 2.0,
             "test_diag_breaker_threshold": 2.0,
+            # v0.38.0 I4: budget-shaped knobs — wider window + bigger
+            # cumulative budget so huge repos absorb their longer
+            # per-run cadence before tripping the hard halt. The
+            # per-event knobs (initial, multiplier, max-per-iter,
+            # auto-reset-N) are NOT scaled because they're shaped per
+            # event, not by total runtime.
+            "test_diag_backoff_total_budget_s": 2.0,
+            "test_diag_auto_reset_window_s": 2.0,
         }
     )
     # v0.36.0 E2: multiplier applied to the resolved ``max_turns`` on
@@ -1079,6 +1087,64 @@ class AutodevConfig(BaseModel):
     values count toward the test-diag breaker. ``capture_failed`` is
     always recommended; ``runtime_crash`` and ``collection_failed`` are
     opt-in because they can be legitimate per-task issues."""
+
+    # v0.38.0 I4: exponential backoff + auto-reset for the test-diag
+    # stream. Threshold-crossing no longer hard-halts immediately —
+    # the orchestrator first sleeps ``initial * (multiplier ** n)``
+    # capped at ``max_s`` (mirrors the
+    # :meth:`adapters.claude_code.ClaudeCodeAdapter._pong_probe` backoff
+    # pattern). Only when ``cumulative_backoff_s`` crosses
+    # ``test_diag_backoff_total_budget_s`` does the breaker raise
+    # :class:`InfrastructureCircuitOpenError`. Auto-reset clears the
+    # failure deque after ``N`` successful test runs within
+    # ``window_s`` so a single flaky burst doesn't permanently arm the
+    # circuit on an otherwise healthy runner.
+    test_diag_backoff_initial_s: float = Field(default=5.0, ge=0.0)
+    """First backoff delay (seconds) once the test-diag threshold
+    crosses. ``0.0`` disables the sleep but still consumes budget."""
+
+    test_diag_backoff_multiplier: float = Field(default=2.0, gt=1.0)
+    """Exponential growth factor between successive backoffs. ``2.0``
+    doubles each iteration; matches the ``_pong_probe`` 3× shape's
+    spirit but tuned slower for the longer test-run cadence."""
+
+    test_diag_backoff_max_s: float = Field(default=120.0, gt=0.0)
+    """Per-iteration backoff ceiling — caps the growth before it
+    consumes the entire budget on one sleep. Default 120s matches the
+    operator-observed sweet spot for transient runner flakes."""
+
+    test_diag_backoff_total_budget_s: float = Field(default=600.0, gt=0.0)
+    """Cumulative backoff budget per task. When the sum of sleeps
+    crosses this ceiling the breaker raises
+    :class:`InfrastructureCircuitOpenError` (the hard halt). Auto-scales
+    2.0× on huge repos via :attr:`huge_repo_multipliers`."""
+
+    test_diag_auto_reset_after_n_successes: int = Field(default=3, ge=1)
+    """Number of successful test runs within
+    ``test_diag_auto_reset_window_s`` that clears the failure deque.
+    Lets a healthy run recover from a prior flaky burst without
+    operator intervention."""
+
+    test_diag_auto_reset_window_s: float = Field(default=900.0, gt=0.0)
+    """Rolling window for the auto-reset success counter. 15 minutes
+    by default — wide enough that a slow phase's successive successes
+    accumulate, narrow enough that ancient successes don't artificially
+    clear a fresh burst. Auto-scales 2.0× on huge repos via
+    :attr:`huge_repo_multipliers`."""
+
+    # v0.38.0 I4 (HK6): drain timeout for the cross-task / cross-phase
+    # parallel pool when a typed halt cancels in-flight workers. Before
+    # I4 the halt path called ``asyncio.gather`` unbounded, which let
+    # slow-teardown adapters (real-world enterprise runs) stall the
+    # whole process for ~30s after the trip. With the timeout the
+    # drainer cancels, waits up to ``drain_timeout_s``, then forces
+    # ``return_exceptions=True`` on any straggler so ``CancelledError``
+    # doesn't propagate.
+    parallel_pool_drain_timeout_s: float = Field(default=10.0, gt=0.0)
+    """Max seconds to wait for in-flight parallel workers to cancel
+    after a typed halt (``AuthenticationFailedError`` /
+    ``InfrastructureCircuitOpenError``). Stragglers past the timeout
+    are absorbed via ``gather(return_exceptions=True)`` and logged."""
 
     # v0.37.0 H1: per-kind tail cap (in characters) for the reviewer /
     # test / coder ``raw_response`` bodies that

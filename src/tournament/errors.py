@@ -64,7 +64,28 @@ class InfrastructureCircuitOpenError(TournamentError):
     backend. A single bad token still trips the breaker via repeated
     ``auth_failed`` events, but the v0.28.0 single-shot path catches
     that case sooner.
+
+    v0.38.0 I4 (HK7): the optional ``halted_task_id`` carries the
+    in-flight task id from the raise site to the typed-halt handler
+    (:func:`orchestrator.execute_phase._halt_for_auth_failed`). Pre-I4
+    that handler walked the plan and inferred the halted task from
+    its status — fine when only one task was in flight, but on the
+    parallel pool the inference would race the worker stamp and
+    sometimes attribute the halt to the wrong task. Passing the id
+    explicitly removes the race; the handler still falls back to the
+    plan-walk lookup for legacy callers that haven't been migrated.
     """
+
+    def __init__(
+        self,
+        *args: object,
+        halted_task_id: str | None = None,
+    ) -> None:
+        super().__init__(*args)
+        # v0.38.0 I4 (HK7): explicit identity across the
+        # raise→catch→halt boundary. ``None`` preserves the legacy
+        # plan-walk fallback in ``_halt_for_auth_failed``.
+        self.halted_task_id = halted_task_id
 
 
 __all__ = ["AuthenticationFailedError", "InfrastructureCircuitOpenError"]

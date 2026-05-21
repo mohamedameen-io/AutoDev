@@ -2233,7 +2233,14 @@ async def _halt_for_auth_failed(
     from the same ``delegate()`` site and the catch-and-treat-identically
     contract is preserved here via the union type.
     """
-    in_flight_task_id = "<unknown>"
+    # v0.38.0 I4 (HK7): prefer the typed identifier on
+    # :class:`InfrastructureCircuitOpenError` when present (avoids
+    # the race-prone plan-walk in the parallel pool where the worker
+    # stamp may not have landed yet). Fall back to the legacy
+    # plan-walk lookup for ``AuthenticationFailedError`` and for
+    # legacy callers that haven't been migrated.
+    explicit_task_id = getattr(exc, "halted_task_id", None)
+    in_flight_task_id = explicit_task_id or "<unknown>"
     halted_phase_id: str | None = None
     halted_phase_review_status: str | None = None
     try:
@@ -2241,12 +2248,24 @@ async def _halt_for_auth_failed(
         if plan is not None:
             for phase in plan.phases:
                 for t in phase.tasks:
-                    if t.status in ("quarantined", "in_progress"):
+                    if explicit_task_id is not None:
+                        # We already know which task — only need to
+                        # find its owning phase for the pause step.
+                        if t.id == explicit_task_id:
+                            halted_phase_id = phase.id
+                            halted_phase_review_status = phase.review_status
+                            break
+                    elif t.status in ("quarantined", "in_progress"):
                         in_flight_task_id = t.id
                         halted_phase_id = phase.id
                         halted_phase_review_status = phase.review_status
                         break
-                if in_flight_task_id != "<unknown>":
+                if halted_phase_id is not None:
+                    break
+                if (
+                    explicit_task_id is None
+                    and in_flight_task_id != "<unknown>"
+                ):
                     break
     except Exception as exc2:  # noqa: BLE001 — never mask the original
         logger.warning(
@@ -2439,14 +2458,42 @@ async def _execute_phase_dag(
                 # ``blocked_reason="auth_failed: ..."`` (or
                 # ``infra_circuit_open:`` for Bug 5) retained for
                 # forensics before re-raising.
-                for other_id, other in list(in_flight.items()):
+                #
+                # v0.38.0 I4 (HK6): bounded drain. Pre-I4 the unbounded
+                # ``asyncio.gather`` stalled the process for ~30s on
+                # slow-teardown adapters (real-world enterprise runs);
+                # the H3 integration test was the canary. The drain
+                # now cancels, awaits up to ``drain_timeout_s``, and
+                # absorbs any straggler via
+                # ``gather(return_exceptions=True)`` so
+                # ``CancelledError`` doesn't propagate.
+                _drain_timeout_s = getattr(
+                    orch.cfg, "parallel_pool_drain_timeout_s", 10.0
+                )
+                for _other_id, other in list(in_flight.items()):
                     if other.done():
                         continue
                     other.cancel()
                 if in_flight:
-                    await asyncio.gather(
-                        *in_flight.values(), return_exceptions=True
-                    )
+                    try:
+                        _done_drain, _pending_drain = await asyncio.wait(
+                            list(in_flight.values()),
+                            timeout=_drain_timeout_s,
+                        )
+                        if _pending_drain:
+                            logger.warning(
+                                "execute_phase.parallel_pool.drain_slow",
+                                pending_count=len(_pending_drain),
+                                timeout_s=_drain_timeout_s,
+                            )
+                            await asyncio.gather(
+                                *_pending_drain, return_exceptions=True
+                            )
+                    except Exception as exc_drain:  # noqa: BLE001
+                        logger.warning(
+                            "execute_phase.parallel_pool.drain_error",
+                            err=str(exc_drain),
+                        )
                     for other_id in list(in_flight.keys()):
                         try:
                             await orch.plan_manager.clear_in_flight(
@@ -2705,14 +2752,36 @@ async def _execute_cross_phase_dag(
                 # stamped the offending task as ``quarantined`` with
                 # the typed prefix (``auth_failed:`` or
                 # ``infra_circuit_open:``) retained for forensics.
-                for other_id, other in list(in_flight.items()):
+                #
+                # v0.38.0 I4 (HK6): bounded drain — see the matching
+                # block in :func:`_execute_phase_dag` for the rationale.
+                _drain_timeout_s = getattr(
+                    orch.cfg, "parallel_pool_drain_timeout_s", 10.0
+                )
+                for _other_id, other in list(in_flight.items()):
                     if other.done():
                         continue
                     other.cancel()
                 if in_flight:
-                    await asyncio.gather(
-                        *in_flight.values(), return_exceptions=True
-                    )
+                    try:
+                        _done_drain, _pending_drain = await asyncio.wait(
+                            list(in_flight.values()),
+                            timeout=_drain_timeout_s,
+                        )
+                        if _pending_drain:
+                            logger.warning(
+                                "execute_phase.parallel_pool.drain_slow",
+                                pending_count=len(_pending_drain),
+                                timeout_s=_drain_timeout_s,
+                            )
+                            await asyncio.gather(
+                                *_pending_drain, return_exceptions=True
+                            )
+                    except Exception as exc_drain:  # noqa: BLE001
+                        logger.warning(
+                            "execute_phase.parallel_pool.drain_error",
+                            err=str(exc_drain),
+                        )
                     for other_id in list(in_flight.keys()):
                         try:
                             await orch.plan_manager.clear_in_flight(
@@ -3672,6 +3741,13 @@ async def _execute_one(
         # the loop, which would clobber attribute mutations. A simple
         # local dict survives the entire ``while True`` body.
         test_diag_attempts: dict[str, int] = {}
+        # v0.38.0 I4: per-task cumulative backoff (seconds) consumed
+        # by the H3 test-diag exponential backoff. Threaded into
+        # ``InfraFailureCircuitBreaker.test_diag_budget_exhausted`` to
+        # gate the hard halt; resets implicitly per task because the
+        # variable lives in this function's scope (one ``_execute_one``
+        # invocation per task).
+        cumulative_backoff_s: float = 0.0
         while True:
             try:
                 # v0.22.2 B3: emit a pre-flight marker BEFORE the developer
@@ -4077,6 +4153,19 @@ async def _execute_one(
                 )
             elif diagnosis == "ok" and failed == 0 and test_result.success:
                 # Existing happy path — all tests passed.
+                # v0.38.0 I4: feed the auto-reset success counter so a
+                # healthy run can clear a prior flaky burst without
+                # operator intervention. Defensive ``getattr`` mirrors
+                # the delegate-site pattern for test stubs without a
+                # breaker; method itself is best-effort + idempotent.
+                _breaker_i4 = getattr(orch, "_circuit_breaker", None)
+                if _breaker_i4 is not None and hasattr(
+                    _breaker_i4, "record_test_success"
+                ):
+                    _breaker_i4.record_test_success(
+                        task.id,
+                        _dt.datetime.now(_dt.timezone.utc),
+                    )
                 task = await orch.plan_manager.update_task_status(
                     task.id, "tested"
                 )
@@ -4110,15 +4199,27 @@ async def _execute_one(
                 attempts = test_diag_attempts.get(diagnosis, 0) + 1
                 test_diag_attempts[diagnosis] = attempts
 
-                # v0.37.0 H3: feed the cross-task test-diag breaker
-                # BEFORE branching on retry-vs-hard-fail so the count
-                # advances on every occurrence (including the first
-                # retry attempt). Defensive ``getattr`` matches the
-                # delegate-site pattern — orchestrator stubs without a
-                # breaker silently no-op. The breaker itself ignores
-                # diagnoses not in ``cfg.test_diag_breaker_diagnoses``
-                # (default: ``capture_failed`` only), so feeding all
-                # three here is safe and keeps the routing simple.
+                # v0.37.0 H3 / v0.38.0 I4: feed the cross-task test-
+                # diag breaker BEFORE branching on retry-vs-hard-fail
+                # so the count advances on every occurrence (including
+                # the first retry attempt). Defensive ``getattr``
+                # matches the delegate-site pattern — orchestrator
+                # stubs without a breaker silently no-op. The breaker
+                # itself ignores diagnoses not in
+                # ``cfg.test_diag_breaker_diagnoses`` (default:
+                # ``capture_failed`` only), so feeding all three here
+                # is safe and keeps the routing simple.
+                #
+                # I4 (HK7): on threshold cross the breaker no longer
+                # hard-halts immediately — it returns the next
+                # exponential backoff via
+                # ``next_backoff_s_for_test_diag``. The orchestrator
+                # sleeps for that delay, accumulates into the per-
+                # task ``cumulative_backoff_s``, and only raises the
+                # hard halt once the cumulative crosses the
+                # configured budget (the operator-observed real-world
+                # enterprise-runs flaky pattern that motivated I4
+                # often resolves in a single backoff iteration).
                 _breaker_h3 = getattr(orch, "_circuit_breaker", None)
                 if _breaker_h3 is not None:
                     _breaker_h3.record_test_diagnosis(
@@ -4126,8 +4227,12 @@ async def _execute_one(
                         diagnosis,
                         _dt.datetime.now(_dt.timezone.utc),
                     )
-                    _halt_h3, _reason_h3 = _breaker_h3.should_halt()
-                    if _halt_h3:
+                    # Adapter-class stream check (unchanged path).
+                    _halt_adapter, _reason_adapter = _breaker_h3.should_halt()
+                    if _halt_adapter:
+                        # Adapter-class trip still hard-halts here for
+                        # back-compat with v0.30.0 (auth_failed mixed
+                        # with capture_failed bursts).
                         logger.error(
                             "execute_phase.test_diag_breaker_trip",
                             task_id=task.id,
@@ -4136,8 +4241,50 @@ async def _execute_one(
                             window_s=_breaker_h3.test_diag_window_s,
                         )
                         raise InfrastructureCircuitOpenError(
-                            _reason_h3 or "test-diagnosis circuit open"
+                            _reason_adapter
+                            or "infrastructure circuit open",
+                            halted_task_id=task.id,
                         )
+                    # I4: test-diag stream — backoff-then-budget.
+                    backoff_s = _breaker_h3.next_backoff_s_for_test_diag()
+                    if backoff_s is not None:
+                        cumulative_backoff_s += backoff_s
+                        tripped, reason = (
+                            _breaker_h3.test_diag_budget_exhausted(
+                                cumulative_backoff_s
+                            )
+                        )
+                        if tripped:
+                            logger.error(
+                                "execute_phase.test_diag_budget_exhausted",
+                                task_id=task.id,
+                                diagnosis=diagnosis,
+                                cumulative_s=cumulative_backoff_s,
+                                budget_s=(
+                                    _breaker_h3.test_diag_backoff_total_budget_s
+                                ),
+                            )
+                            raise InfrastructureCircuitOpenError(
+                                reason
+                                or "test-diagnosis backoff budget exhausted",
+                                halted_task_id=task.id,
+                            )
+                        logger.warning(
+                            "execute_phase.test_diag_backoff",
+                            task_id=task.id,
+                            diagnosis=diagnosis,
+                            backoff_s=backoff_s,
+                            cumulative_s=cumulative_backoff_s,
+                            budget_s=(
+                                _breaker_h3.test_diag_backoff_total_budget_s
+                            ),
+                        )
+                        await asyncio.sleep(backoff_s)
+                        # Continue retry — don't raise. The
+                        # per-task retry counter below still gates
+                        # the legacy attempts==2 hard-fail, so
+                        # back-to-back capture_failed on a single
+                        # task still ends blocked.
 
                 if attempts == 1:
                     log_method = (
@@ -5574,8 +5721,14 @@ async def delegate(
             )
             _halt, _reason = _breaker.should_halt()
             if _halt:
+                # v0.38.0 I4 (HK7): pass the in-flight task id
+                # explicitly so the typed-halt handler doesn't have
+                # to race-walk the plan to find which task this
+                # raise belongs to. ``envelope.task_id`` is the
+                # canonical identifier at this raise site.
                 raise InfrastructureCircuitOpenError(
-                    _reason or "infrastructure circuit open"
+                    _reason or "infrastructure circuit open",
+                    halted_task_id=envelope.task_id,
                 )
 
     if result.success and result.text:

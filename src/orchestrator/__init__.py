@@ -160,18 +160,44 @@ class Orchestrator:
             cwd=self._cwd,
             cfg=cfg,
         )
+        # v0.38.0 I4: budget-shaped backoff knobs auto-scale on huge
+        # repos; per-event knobs do not. Mirrors the schema's
+        # ``huge_repo_multipliers`` entries.
+        _td_backoff_budget_eff, _ = resolve_huge_repo_value(
+            key="test_diag_backoff_total_budget_s",
+            base_value=float(cfg.test_diag_backoff_total_budget_s),
+            cwd=self._cwd,
+            cfg=cfg,
+        )
+        _td_auto_reset_window_eff, _ = resolve_huge_repo_value(
+            key="test_diag_auto_reset_window_s",
+            base_value=float(cfg.test_diag_auto_reset_window_s),
+            cwd=self._cwd,
+            cfg=cfg,
+        )
 
         # v0.37.0 H3: pass the new test-diagnosis knobs through. The
         # breaker holds an independent rolling counter for test-runner
         # infrastructure-class diagnoses (default: ``capture_failed``)
         # fed from ``execute_phase`` whenever the test_engineer leg
         # returns one of the configured diagnoses.
+        # v0.38.0 I4: also pass the backoff + auto-reset knobs so the
+        # breaker can be driven externally by the orchestrator's
+        # per-task backoff loop.
         self._circuit_breaker = InfraFailureCircuitBreaker(
             threshold=int(round(_cb_threshold_eff)),
             window_s=cfg.circuit_breaker_window_s,
             test_diag_threshold=int(round(_td_threshold_eff)),
             test_diag_window_s=_td_window_eff,
             test_diag_diagnoses=frozenset(cfg.test_diag_breaker_diagnoses),
+            test_diag_backoff_initial_s=cfg.test_diag_backoff_initial_s,
+            test_diag_backoff_multiplier=cfg.test_diag_backoff_multiplier,
+            test_diag_backoff_max_s=cfg.test_diag_backoff_max_s,
+            test_diag_backoff_total_budget_s=_td_backoff_budget_eff,
+            test_diag_auto_reset_after_n_successes=(
+                cfg.test_diag_auto_reset_after_n_successes
+            ),
+            test_diag_auto_reset_window_s=_td_auto_reset_window_eff,
         )
 
         # v0.31.0 (Phase 3): per-(task_id, role) consecutive

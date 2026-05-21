@@ -27,6 +27,7 @@ either way (``classify_test_result`` resolves to ``capture_failed`` on
 from __future__ import annotations
 
 import datetime as _dt
+import time as _time
 from pathlib import Path
 
 import pytest
@@ -119,6 +120,17 @@ async def _make_orch(cwd: Path, adapter: StubAdapter) -> Orchestrator:
     cfg.test_diag_breaker_threshold = 3
     cfg.test_diag_breaker_window_s = 600.0
     cfg.test_diag_breaker_diagnoses = ["capture_failed"]
+    # v0.38.0 I4: fast backoff knobs so the integration test trips on
+    # budget exhaustion in well under 1s of real sleep time. Production
+    # defaults (initial=5s, budget=600s) would make this test take
+    # ~10 minutes; the contract under test is the same.
+    cfg.test_diag_backoff_initial_s = 0.05
+    cfg.test_diag_backoff_multiplier = 2.0
+    cfg.test_diag_backoff_max_s = 0.5
+    cfg.test_diag_backoff_total_budget_s = 0.4
+    # Also clamp the parallel-pool drain so the HK6 fast-teardown
+    # contract is exercised by this integration test.
+    cfg.parallel_pool_drain_timeout_s = 1.0
     registry = build_registry(cfg)
     orch = Orchestrator(
         cwd=cwd,
@@ -167,19 +179,43 @@ async def test_third_capture_failed_trips_circuit_and_pauses_phase(
     )
     orch = await _make_orch(tmp_path, adapter)
 
+    # v0.38.0 I4 (HK6): elapsed-time assertion. Pre-I4 the unbounded
+    # ``asyncio.gather`` drain stalled the process for ~30s post-trip.
+    # With the bounded drain + fast budget knobs the run should
+    # complete within a few seconds.
+    _t_start = _time.monotonic()
     with pytest.raises(InfrastructureCircuitOpenError) as exc_info:
         await ep.run_execute_phase(orch)
+    _elapsed = _time.monotonic() - _t_start
+    assert _elapsed < 15.0, (
+        f"v0.38.0 I4 HK6 regression: run took {_elapsed:.2f}s "
+        f"(expected < 15s with bounded drain)"
+    )
 
-    # Reason text must name the trip class so operators can grep logs.
+    # v0.38.0 I4: reason text now names the budget exhaustion path
+    # (test-diagnosis + capture_failed + budget seconds).
     assert "test-diagnosis" in str(exc_info.value)
     assert "capture_failed" in str(exc_info.value)
+    assert "backoff budget" in str(exc_info.value)
 
-    # Structured log line emitted just before the raise — structlog
-    # writes to stderr/stdout; capsys catches both. Pinned so
-    # forensics tooling can rely on the event name as a grep anchor.
+    # v0.38.0 I4 (HK7): the typed identifier is now carried on the
+    # exception so the halt handler doesn't have to walk the plan.
+    assert exc_info.value.halted_task_id is not None
+    assert exc_info.value.halted_task_id.startswith("1.")
+
+    # v0.38.0 I4: structured log line is now the budget-exhausted op.
+    # (The pre-I4 ``execute_phase.test_diag_breaker_trip`` op still
+    # fires on the adapter-class trip path, but the capture_failed-only
+    # stream now flows through the new event name.)
     captured = capsys.readouterr()
     combined = captured.out + captured.err
-    assert "execute_phase.test_diag_breaker_trip" in combined
+    assert (
+        "execute_phase.test_diag_budget_exhausted" in combined
+        or "execute_phase.test_diag_breaker_trip" in combined
+    )
+    # Backoff-iteration log lines should also fire at least once
+    # before the budget-exhaustion raise.
+    assert "execute_phase.test_diag_backoff" in combined
 
     plan = await orch.plan_manager.load()
     assert plan is not None
@@ -259,3 +295,54 @@ async def test_two_capture_failed_in_window_does_not_trip(
     assert phase.tasks[0].status == "blocked"
     # Phase is NOT paused (no breaker trip).
     assert phase.review_status != "paused"
+
+
+@pytest.mark.asyncio
+async def test_i4_auto_reset_clears_failure_burst(tmp_path: Path) -> None:
+    """v0.38.0 I4: ``record_test_success`` × N within the auto-reset
+    window clears the test-diag failure deque so a healthy run after
+    a flaky burst doesn't keep the circuit armed.
+
+    This test drives :class:`InfraFailureCircuitBreaker` directly via
+    the orchestrator's wired instance — the multi-task pipeline-level
+    integration of the auto-reset is exercised by the breaker's unit
+    tests; here we pin that the orchestrator's wiring exposes the
+    new method and that successive successes restore a closed state.
+    """
+    cfg = default_config()
+    cfg.tournaments.plan.enabled = False
+    cfg.tournaments.impl.enabled = False
+    cfg.test_diag_breaker_threshold = 3
+    cfg.test_diag_auto_reset_after_n_successes = 3
+    cfg.test_diag_auto_reset_window_s = 900.0
+    cfg.test_diag_backoff_initial_s = 0.01
+    cfg.test_diag_backoff_total_budget_s = 100.0  # well above 0.01
+
+    registry = build_registry(cfg)
+    orch = Orchestrator(
+        cwd=tmp_path,
+        cfg=cfg,
+        adapter=StubAdapter({}),
+        registry=registry,
+        session_id="sess-v038-i4-auto-reset",
+    )
+
+    cb = orch._circuit_breaker
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cb.record_test_diagnosis("1.1", "capture_failed", now)
+    cb.record_test_diagnosis(
+        "1.2", "capture_failed", now + _dt.timedelta(seconds=10)
+    )
+    cb.record_test_diagnosis(
+        "1.3", "capture_failed", now + _dt.timedelta(seconds=20)
+    )
+    # Threshold crossed → backoff returns.
+    assert cb.next_backoff_s_for_test_diag() == 0.01
+
+    # Three successes within window → clears.
+    for j in range(3):
+        cb.record_test_success(
+            f"ok_{j}", now + _dt.timedelta(seconds=30 + j * 10)
+        )
+    # Closed again — no backoff.
+    assert cb.next_backoff_s_for_test_diag() is None

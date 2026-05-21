@@ -113,6 +113,24 @@ class InfraFailureCircuitBreaker:
         values count toward this stream. Defaults to
         ``frozenset({"capture_failed"})``; pass a wider set (e.g.
         adding ``"runtime_crash"``) to also count those.
+    :param test_diag_backoff_initial_s: v0.38.0 I4 — first backoff
+        delay (seconds) after the test-diag threshold crosses.
+        Subsequent crossings grow by
+        ``test_diag_backoff_multiplier`` per occurrence, capped at
+        ``test_diag_backoff_max_s``.
+    :param test_diag_backoff_multiplier: v0.38.0 I4 — exponential
+        growth factor between successive backoffs.
+    :param test_diag_backoff_max_s: v0.38.0 I4 — per-iteration
+        backoff ceiling.
+    :param test_diag_backoff_total_budget_s: v0.38.0 I4 — cumulative
+        backoff budget per task. Threading the cumulative-so-far via
+        :meth:`test_diag_budget_exhausted` returns the hard-halt trip.
+    :param test_diag_auto_reset_after_n_successes: v0.38.0 I4 —
+        number of successful test runs within
+        ``test_diag_auto_reset_window_s`` that clears the failure
+        deque (and resets the backoff counter).
+    :param test_diag_auto_reset_window_s: v0.38.0 I4 — rolling window
+        for the auto-reset success counter.
     """
 
     def __init__(
@@ -122,6 +140,12 @@ class InfraFailureCircuitBreaker:
         test_diag_threshold: int = 3,
         test_diag_window_s: float = 600.0,
         test_diag_diagnoses: frozenset[str] | None = None,
+        test_diag_backoff_initial_s: float = 5.0,
+        test_diag_backoff_multiplier: float = 2.0,
+        test_diag_backoff_max_s: float = 120.0,
+        test_diag_backoff_total_budget_s: float = 600.0,
+        test_diag_auto_reset_after_n_successes: int = 3,
+        test_diag_auto_reset_window_s: float = 900.0,
     ) -> None:
         self._threshold = threshold
         self._window_s = window_s
@@ -143,6 +167,35 @@ class InfraFailureCircuitBreaker:
         )
         self._test_diag_failures: deque[tuple[str, str, datetime]] = deque()
 
+        # v0.38.0 I4: backoff + auto-reset state for the test-diag
+        # stream. The orchestrator drives backoff externally via
+        # :meth:`next_backoff_s_for_test_diag` (returns the sleep, or
+        # None when below threshold) and tracks ``cumulative_backoff_s``
+        # per-task. The breaker raises the hard halt only via
+        # :meth:`test_diag_budget_exhausted` once the cumulative
+        # crosses the budget.
+        self._test_diag_backoff_initial_s = test_diag_backoff_initial_s
+        self._test_diag_backoff_multiplier = test_diag_backoff_multiplier
+        self._test_diag_backoff_max_s = test_diag_backoff_max_s
+        self._test_diag_backoff_total_budget_s = (
+            test_diag_backoff_total_budget_s
+        )
+        # Number of times ``next_backoff_s_for_test_diag`` has returned
+        # a non-None value since the last reset / auto-reset. Used as
+        # the exponent ``n`` in ``initial * (multiplier ** (n - 1))``
+        # so the first backoff is ``initial`` exactly.
+        self._test_diag_failure_count_at_threshold: int = 0
+
+        # Auto-reset success stream — independent deque, same lazy-
+        # eviction shape as the failure deques. When the count reaches
+        # ``after_n_successes`` within the window, the failure deque
+        # and the backoff counter are both cleared.
+        self._test_diag_auto_reset_after_n_successes = (
+            test_diag_auto_reset_after_n_successes
+        )
+        self._test_diag_auto_reset_window_s = test_diag_auto_reset_window_s
+        self._test_diag_successes: deque[tuple[str, datetime]] = deque()
+
     @property
     def threshold(self) -> int:
         return self._threshold
@@ -162,6 +215,30 @@ class InfraFailureCircuitBreaker:
     @property
     def test_diag_diagnoses(self) -> frozenset[str]:
         return self._test_diag_diagnoses
+
+    @property
+    def test_diag_backoff_initial_s(self) -> float:
+        return self._test_diag_backoff_initial_s
+
+    @property
+    def test_diag_backoff_multiplier(self) -> float:
+        return self._test_diag_backoff_multiplier
+
+    @property
+    def test_diag_backoff_max_s(self) -> float:
+        return self._test_diag_backoff_max_s
+
+    @property
+    def test_diag_backoff_total_budget_s(self) -> float:
+        return self._test_diag_backoff_total_budget_s
+
+    @property
+    def test_diag_auto_reset_after_n_successes(self) -> int:
+        return self._test_diag_auto_reset_after_n_successes
+
+    @property
+    def test_diag_auto_reset_window_s(self) -> float:
+        return self._test_diag_auto_reset_window_s
 
     def record_failure(
         self, task_id: str, subtype: str | None, ts: datetime
@@ -211,16 +288,24 @@ class InfraFailureCircuitBreaker:
         self._test_diag_failures.append((task_id, diagnosis, ts))
 
     def should_halt(self) -> tuple[bool, str | None]:
-        """Return ``(True, reason)`` if either stream's trip threshold is met.
+        """Return ``(True, reason)`` if the adapter-class stream's
+        trip threshold is met.
 
-        Lazy-evicts entries older than each stream's own rolling window
-        relative to that stream's most recent entry. Adapter-class
-        stream is checked first so its operator-facing reason text
-        (and the existing log-grep anchors) are preserved unchanged
-        when both would trip. Returns a reason string suitable for
-        operator-facing messages (mentions the count and window
-        explicitly). When both streams are closed, returns
-        ``(False, None)``.
+        v0.38.0 I4: the test-diagnosis stream NO LONGER trips here on
+        threshold-cross — the orchestrator drives the backoff loop
+        externally via :meth:`next_backoff_s_for_test_diag` and the
+        hard halt is gated on :meth:`test_diag_budget_exhausted` once
+        the cumulative backoff crosses the budget. This method
+        therefore reports only the adapter-class stream's status; the
+        existing v0.30.0 contract (and log-grep anchors) for that
+        stream is unchanged. The test-diag stream's reason text is
+        synthesized inside :meth:`test_diag_budget_exhausted` instead.
+
+        Lazy-evicts entries older than the adapter rolling window
+        relative to the stream's most recent entry. Returns a reason
+        string suitable for operator-facing messages (mentions the
+        count and window explicitly). When the adapter stream is
+        closed, returns ``(False, None)``.
         """
         # --- adapter-class stream (v0.30.0 — unchanged behaviour) ---
         if self._failures:
@@ -244,7 +329,19 @@ class InfraFailureCircuitBreaker:
                     ),
                 )
 
-        # --- test-diagnosis stream (v0.37.0 H3) ---
+        # v0.38.0 I4: test-diag stream no longer trips via this
+        # method. The orchestrator handles backoff + budget externally.
+        return (False, None)
+
+    # -----------------------------------------------------------------
+    # v0.38.0 I4 — test-diag backoff + auto-reset
+    # -----------------------------------------------------------------
+
+    def _evict_test_diag_failures(self) -> int:
+        """Lazy-evict failure entries older than the test-diag window,
+        returning the post-eviction count. Mirrors the inline pattern
+        used in :meth:`should_halt` for the adapter stream.
+        """
         if self._test_diag_failures:
             most_recent_ts = self._test_diag_failures[-1][2]
             cutoff = most_recent_ts - timedelta(
@@ -255,24 +352,123 @@ class InfraFailureCircuitBreaker:
                 and self._test_diag_failures[0][2] < cutoff
             ):
                 self._test_diag_failures.popleft()
-            count = len(self._test_diag_failures)
-            if count >= self._test_diag_threshold:
-                # Pick the dominant diagnosis label for the message; if
-                # mixed, name the most recent one to match the trip
-                # event the operator just saw.
-                dominant = self._test_diag_failures[-1][1]
-                return (
-                    True,
-                    (
-                        f"test-diagnosis circuit open — {count} {dominant} in "
-                        f"{self._test_diag_window_s:.0f} seconds. Inspect "
-                        f"runner; `autodev doctor`."
-                    ),
+        return len(self._test_diag_failures)
+
+    def _evict_test_diag_successes(self) -> int:
+        """Lazy-evict success entries older than the auto-reset window."""
+        if self._test_diag_successes:
+            most_recent_ts = self._test_diag_successes[-1][1]
+            cutoff = most_recent_ts - timedelta(
+                seconds=self._test_diag_auto_reset_window_s
+            )
+            while (
+                self._test_diag_successes
+                and self._test_diag_successes[0][1] < cutoff
+            ):
+                self._test_diag_successes.popleft()
+        return len(self._test_diag_successes)
+
+    def record_test_success(self, task_id: str, ts: datetime) -> None:
+        """v0.38.0 I4: record a successful test run for auto-reset.
+
+        When the rolling-window success count reaches
+        :attr:`test_diag_auto_reset_after_n_successes`, the failure
+        deque AND the backoff counter are cleared — the runner is
+        considered healthy again and a fresh flaky burst would need to
+        cross the threshold from zero. Cheap, idempotent; safe to call
+        defensively from the orchestrator's test-OK path.
+        """
+        # Normalize to UTC-aware so window math is consistent regardless
+        # of whether the caller passed a naive UTC stamp or an aware one.
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        self._test_diag_successes.append((task_id, ts))
+        count = self._evict_test_diag_successes()
+        if count >= self._test_diag_auto_reset_after_n_successes:
+            # Healthy run — clear the failure history and the backoff
+            # exponent. Success deque stays in place so successive
+            # successes don't re-trigger this branch needlessly; the
+            # next failure burst is what re-arms via record_test_diagnosis.
+            self._test_diag_failures.clear()
+            self._test_diag_failure_count_at_threshold = 0
+            try:
+                # Best-effort structured log via the orchestrator's
+                # logger — autologging is package-optional in some test
+                # fixtures, so a bare except is correct here.
+                from autologging import get_logger as _gl  # noqa: PLC0415
+
+                _gl(__name__).info(
+                    "circuit_breaker.test_diag_auto_reset",
+                    successes=count,
+                    window_s=self._test_diag_auto_reset_window_s,
                 )
-        return (False, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def next_backoff_s_for_test_diag(self) -> float | None:
+        """v0.38.0 I4: compute the next backoff delay (seconds).
+
+        Returns ``None`` when the current failure count is below the
+        trip threshold — the orchestrator should NOT sleep and should
+        let the existing per-task retry/hard-fail branch run. When
+        threshold is crossed, increments the internal exponent and
+        returns ``min(initial * (multiplier ** (n - 1)), max_s)``; the
+        orchestrator sleeps for the returned value and accumulates it
+        into a per-task ``cumulative_backoff_s``. Idempotent eviction
+        of stale entries runs first so a long pause between bursts
+        doesn't artificially keep the threshold met.
+        """
+        count = self._evict_test_diag_failures()
+        if count < self._test_diag_threshold:
+            return None
+        # Crossed the threshold — increment the exponent counter so
+        # ``n=1`` on the first crossing yields ``initial * multiplier ** 0
+        # == initial``.
+        self._test_diag_failure_count_at_threshold += 1
+        n = self._test_diag_failure_count_at_threshold
+        delay = self._test_diag_backoff_initial_s * (
+            self._test_diag_backoff_multiplier ** (n - 1)
+        )
+        return min(delay, self._test_diag_backoff_max_s)
+
+    def test_diag_budget_exhausted(
+        self, cumulative_backoff_s: float
+    ) -> tuple[bool, str | None]:
+        """v0.38.0 I4: return ``(True, reason)`` when the per-task
+        cumulative backoff has crossed the configured budget.
+
+        The orchestrator threads its own ``cumulative_backoff_s``
+        accumulator in (per-task local) and calls this after every
+        :meth:`next_backoff_s_for_test_diag` to decide whether the
+        next iteration should sleep-and-retry or raise the hard halt.
+        Reason text mirrors the v0.37.0 H3 wording (mentions the
+        test-diagnosis class, the dominant diagnosis label, and the
+        budget) so operator log-greps stay aligned across versions.
+        """
+        if cumulative_backoff_s < self._test_diag_backoff_total_budget_s:
+            return (False, None)
+        # Pick the dominant diagnosis label from the most recent
+        # failure for the operator message; deque is non-empty whenever
+        # this is reached because the caller already accumulated
+        # backoff via :meth:`next_backoff_s_for_test_diag`.
+        dominant = (
+            self._test_diag_failures[-1][1]
+            if self._test_diag_failures
+            else "capture_failed"
+        )
+        count = len(self._test_diag_failures)
+        return (
+            True,
+            (
+                f"test-diagnosis circuit open — {count} {dominant} exhausted "
+                f"backoff budget {self._test_diag_backoff_total_budget_s:.0f}s. "
+                f"Inspect runner; `autodev doctor`."
+            ),
+        )
 
     def reset(self) -> None:
-        """Zero ALL counters (both streams). Intentionally cheap and idempotent.
+        """Zero ALL counters (both streams + auto-reset state).
+        Intentionally cheap and idempotent.
 
         v0.37.0 H3 distinction: the orchestrator's ``delegate()`` site
         only wants to clear the adapter-class stream on a successful
@@ -282,9 +478,14 @@ class InfraFailureCircuitBreaker:
         successful adapter calls). Production callers that want
         adapter-only reset use :meth:`reset_adapter` instead. Tests and
         explicit operator reset use this method.
+
+        v0.38.0 I4: also clears the auto-reset success deque and the
+        backoff exponent so a post-reset state is fully fresh.
         """
         self._failures.clear()
         self._test_diag_failures.clear()
+        self._test_diag_successes.clear()
+        self._test_diag_failure_count_at_threshold = 0
 
     def reset_adapter(self) -> None:
         """v0.37.0 H3: clear only the adapter-class deque.

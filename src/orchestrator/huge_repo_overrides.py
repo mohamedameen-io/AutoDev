@@ -157,6 +157,10 @@ def resolve_all_h5_knobs(
         "test_diag_breaker_threshold": "test_diag_breaker_threshold",
         "recent_evidence_max_chars_per_kind": "recent_evidence_max_chars_per_kind",
         "circuit_breaker_threshold": "circuit_breaker_threshold",
+        # v0.38.0 I4: budget-shaped backoff knobs (per-event knobs
+        # stay 1.0x — see ``huge_repo_multipliers`` defaults).
+        "test_diag_backoff_total_budget_s": "test_diag_backoff_total_budget_s",
+        "test_diag_auto_reset_window_s": "test_diag_auto_reset_window_s",
     }
 
     out: dict[str, tuple[float, float, float]] = {}
