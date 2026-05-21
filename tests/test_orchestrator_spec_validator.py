@@ -131,7 +131,8 @@ def test_plan_command_skip_spec_validation_flag_bypasses_check(
             patch("cli.commands.plan.get_adapter") as mock_get_adapter,
             patch("cli.commands.plan.Orchestrator") as mock_orch_cls,
         ):
-            mock_get_adapter.return_value = MagicMock()
+            # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+            mock_get_adapter.return_value = (MagicMock(), {"platform": "claude_code"})
             mock_orch = MagicMock()
             # Plan return value must walk like a Plan; the rendering
             # helper accesses ``.metadata``, ``.plan_id``, ``.phases``.

@@ -123,7 +123,8 @@ def test_execute_success_renders_table(tmp_path: Path) -> None:
             mock_adapter = MagicMock()
             # v0.28.0 (Bug 10): preflight re-probe must succeed.
             mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
-            mock_get_adapter.return_value = mock_adapter
+            # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
 
             mock_orch = MagicMock()
             mock_orch.execute = AsyncMock(return_value=tasks)
@@ -152,7 +153,8 @@ def test_execute_autodev_error_exits_2(tmp_path: Path) -> None:
             mock_adapter = MagicMock()
             # v0.28.0 (Bug 10): preflight re-probe must succeed.
             mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
-            mock_get_adapter.return_value = mock_adapter
+            # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
 
             mock_orch = MagicMock()
             mock_orch.execute = AsyncMock(
@@ -190,7 +192,8 @@ def test_execute_with_task_id(tmp_path: Path) -> None:
             mock_adapter = MagicMock()
             # v0.28.0 (Bug 10): preflight re-probe must succeed.
             mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
-            mock_get_adapter.return_value = mock_adapter
+            # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
 
             mock_orch = MagicMock()
             mock_orch.execute = AsyncMock(return_value=[task])

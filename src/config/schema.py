@@ -26,6 +26,47 @@ REQUIRED_AGENT_ROLES: tuple[str, ...] = (
 )
 
 
+# v0.38.0 HK1: one-shot warning ledger for the ``"coder"`` → ``"developer"``
+# kind-label migration shim. Pydantic's ``model_validator(mode="after")``
+# can fire many times per process (one per config load + per model copy),
+# so the warning is gated on this module-level set to avoid log spam in
+# long-running fleets and test runs. Scheduled for removal in v0.39.0
+# alongside the shim itself.
+_warned_kind_labels: set[str] = set()
+
+
+def _emit_kind_deprecation_warning() -> None:
+    """Emit a one-shot warning for the legacy ``"coder"`` kind label.
+
+    Re-entrant by design: the second + Nth call within the same process
+    are no-ops so resume / replay / repeated config loads do not flood
+    the log. The structured warning fires through the autologging
+    pipeline so operators see it in both the stdlib ``warnings`` stream
+    and the structured-log forensics trail.
+    """
+    if "coder" in _warned_kind_labels:
+        return
+    _warned_kind_labels.add("coder")
+    import warnings as _warnings
+
+    from autologging import get_logger as _get_logger
+
+    _warnings.warn(
+        "recent_evidence_include_kinds: 'coder' is deprecated in "
+        "v0.38.0 and will be removed in v0.39.0. Treated as "
+        "'developer' (the on-disk kind label). Update "
+        ".autodev/config.json to use 'developer' directly.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    _get_logger(__name__).warning(
+        "config.deprecated_kind_label",
+        deprecated="coder",
+        replacement="developer",
+        scheduled_removal="v0.39.0",
+    )
+
+
 class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -631,6 +672,11 @@ class TaskOverridesConfig(BaseModel):
             # Role-keyed (v0.36.0 E1).
             "explorer": 3.0,
             "architect": 2.0,
+            # v0.38.0 HK1: ``"coder"`` is preserved as a back-compat
+            # alias for ``"developer"`` in the role-keyed dict —
+            # removing it would silently de-scale operator configs that
+            # pinned the legacy role name. Scheduled for removal in
+            # v0.39.0 alongside the recent_evidence_include_kinds shim.
             "coder": 2.0,
             "developer": 2.0,
             "reviewer": 1.5,
@@ -1039,13 +1085,19 @@ class AutodevConfig(BaseModel):
     # behaviour for operators on tight token budgets.
     recent_evidence_max_chars_per_kind: int = Field(default=4000, ge=0)
     # v0.37.0 H1: which evidence kinds to fold into the ``recent_evidence``
-    # block. Order is preserved in the rendered prompt. ``"coder"`` is the
-    # user-facing label for the on-disk ``developer`` evidence kind
-    # (matches the ``CODER_RAW:`` section header). An empty list restores
+    # block. Order is preserved in the rendered prompt. ``"developer"`` is
+    # the canonical label matching the on-disk
+    # :class:`state.schemas.CoderEvidence.kind` discriminator and the
+    # rendered ``DEVELOPER_RAW:`` section header. An empty list restores
     # the legacy one-liner behaviour even when the per-kind cap is
     # non-zero.
+    #
+    # v0.38.0 HK1 (soft breaking change): legacy ``"coder"`` is accepted
+    # by the validator below and rewritten to ``"developer"`` with a
+    # one-shot ``config.deprecated_kind_label`` warning. The shim ships
+    # for v0.38.x only and is scheduled for removal in v0.39.0.
     recent_evidence_include_kinds: list[str] = Field(
-        default_factory=lambda: ["review", "test", "coder"]
+        default_factory=lambda: ["review", "test", "developer"]
     )
 
     # v0.37.0 H2: cumulative cap on correction tasks per phase across all
@@ -1083,6 +1135,22 @@ class AutodevConfig(BaseModel):
     # pre-v0.37.0 precedence (env beats host context).
     adapter_respect_trigger_context: bool = Field(default=True)
 
+    # v0.38.0 HK9: explicit allowlist for Cursor shell env vars treated
+    # as a trigger-context signal in :func:`adapters.detect._detect_trigger_context`.
+    # The built-in allowlist already covers ``CURSOR_TRACE_ID`` /
+    # ``CURSOR_AGENT`` / ``CURSOR_VERSION`` / ``CURSOR_AGENT_ID``; this
+    # field lets operators on newer Cursor versions (which may set
+    # additional vars) extend the allowlist without waiting for a
+    # release. Replaces the v0.37.0 ``startswith("CURSOR_")`` heuristic
+    # which over-matched on shell rc files like ``CURSOR_RC_FILE``.
+    cursor_trigger_env_extra: list[str] = Field(default_factory=list)
+
+    # v0.38.0 HK3: when True (default), write a JSON envelope of every
+    # ARCHITECT_CONSULT dispatch to ``.autodev/debug/architect_consult-*.json``
+    # so post-mortems can reconstruct what the architect saw without
+    # tailing the orchestrator stdout. Forensics is cheap; default on.
+    dump_architect_consult_envelopes: bool = Field(default=True)
+
     @model_validator(mode="after")
     def _migrate_inline_platform(self) -> "AutodevConfig":
         """v0.26.0: rewrite legacy ``platform: "inline"`` to ``"claude_code"``.
@@ -1106,6 +1174,35 @@ class AutodevConfig(BaseModel):
                 stacklevel=2,
             )
             self.platform = "claude_code"
+        return self
+
+    @model_validator(mode="after")
+    def _migrate_recent_evidence_kinds(self) -> "AutodevConfig":
+        """v0.38.0 HK1 (soft breaking change): rewrite legacy ``"coder"``
+        in :attr:`recent_evidence_include_kinds` to ``"developer"``.
+
+        The user-facing label diverged from the on-disk
+        :class:`state.schemas.CoderEvidence.kind` discriminator
+        (``"developer"``) for one release. Unifying the names lets
+        operators map their config entries directly to evidence files
+        without an indirection table. A one-shot
+        ``config.deprecated_kind_label`` warning fires per legacy value
+        so the rewrite is visible in non-interactive runs. Scheduled
+        for hard-removal in v0.39.0.
+        """
+        if not self.recent_evidence_include_kinds:
+            return self
+        rewritten = []
+        legacy_seen = False
+        for kind in self.recent_evidence_include_kinds:
+            if kind == "coder":
+                rewritten.append("developer")
+                legacy_seen = True
+            else:
+                rewritten.append(kind)
+        if legacy_seen:
+            _emit_kind_deprecation_warning()
+            self.recent_evidence_include_kinds = rewritten
         return self
 
     def require_all_roles(self) -> None:

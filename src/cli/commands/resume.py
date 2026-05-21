@@ -92,10 +92,13 @@ def resume(platform: str | None) -> None:
         # ``cfg.platform`` is always one of {claude_code, cursor, auto}.
         nonlocal preflight_failure
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
-        adapter: PlatformAdapter = await get_adapter(
+        adapter_pair = await get_adapter(
             cast("Literal['claude_code', 'cursor', 'auto']", platform_pref),
             respect_trigger_context=cfg.adapter_respect_trigger_context,
+            cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
         )
+        adapter: PlatformAdapter = adapter_pair[0]
+        selection_meta = adapter_pair[1]
 
         # Mandatory re-probe — NOT cached. If ``get_adapter`` succeeded but
         # the underlying CLI / auth has flipped between then and now, we
@@ -112,6 +115,13 @@ def resume(platform: str | None) -> None:
 
         registry = build_registry(cfg)
         orch = Orchestrator(cwd=cwd, cfg=cfg, adapter=adapter, registry=registry)
+        # v0.38.0 HK10: see plan.py for rationale. Best-effort breadcrumb.
+        try:
+            await orch.plan_manager.ledger_append(
+                op="adapter_selected", payload=selection_meta
+            )
+        except Exception:  # noqa: BLE001 — forensics, not correctness
+            pass
         tasks = await orch.resume()
         _render_resume_summary(console, tasks)
 

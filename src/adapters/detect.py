@@ -21,6 +21,7 @@ pre-v0.37.0 behaviour.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Literal
 
@@ -38,20 +39,81 @@ _PreferredName = Literal["claude_code", "cursor", "auto"]
 _VALID_PLATFORMS = ("claude_code", "cursor")
 
 
-def _detect_trigger_context() -> PlatformName | None:
+# v0.38.0 HK9: explicit allowlist replaces the v0.37.0
+# ``startswith("CURSOR_")`` heuristic which over-matched on shell rc
+# files like ``CURSOR_RC_FILE`` that have nothing to do with Cursor IDE
+# trigger context. Operators on newer Cursor versions can extend this
+# via ``cfg.cursor_trigger_env_extra`` without waiting for a release.
+_CURSOR_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "CURSOR_TRACE_ID",
+        "CURSOR_AGENT",
+        "CURSOR_VERSION",
+        "CURSOR_AGENT_ID",
+    }
+)
+
+
+def _detect_trigger_context(
+    *, extra_cursor_env: Iterable[str] = (),
+) -> PlatformName | None:
     """Return the platform implied by the invoking host's env, or ``None``.
 
     Claude-context wins if both somehow co-occur (e.g. nested shells)
     because the Claude Code session is the actively-driving agent in
     that case.
+
+    v0.38.0 HK9: Cursor detection now uses an explicit allowlist
+    (``_CURSOR_ENV_ALLOWLIST``) unioned with the operator-supplied
+    ``extra_cursor_env`` (drawn from
+    :attr:`config.schema.AutodevConfig.cursor_trigger_env_extra`) instead
+    of the prefix-match heuristic — the prefix match was prone to
+    false positives on shell rc state.
     """
     if os.environ.get("CLAUDECODE") == "1" or os.environ.get("CLAUDE_PROJECT_DIR"):
         return "claude_code"
+    cursor_keys = _CURSOR_ENV_ALLOWLIST | set(extra_cursor_env)
     if os.environ.get("TERM_PROGRAM") == "Cursor" or any(
-        k.startswith("CURSOR_") for k in os.environ
+        k in cursor_keys for k in os.environ
     ):
         return "cursor"
     return None
+
+
+def _maybe_warn_multiplexer(
+    *,
+    respect_trigger_context: bool,
+    extra_cursor_env: Iterable[str] = (),
+) -> None:
+    """v0.38.0 HK8: log a single warning when running under tmux / GNU
+    screen AND a trigger-context env is present.
+
+    Multiplexers inherit envs across nested shells and mangle
+    ``TERM_PROGRAM``, which is the root cause of the most common
+    "AutoDev picked the wrong adapter" support tickets. The warning is
+    purely diagnostic — no behaviour change — so v0.39 retrospectives
+    can decide whether to add a hard precedence rule.
+    """
+    if not respect_trigger_context:
+        return
+    tmux = os.environ.get("TMUX")
+    sty = os.environ.get("STY")
+    if not (tmux or sty):
+        return
+    trigger = _detect_trigger_context(extra_cursor_env=extra_cursor_env)
+    if trigger is None:
+        return
+    if tmux and sty:
+        multiplexer = "BOTH"
+    elif tmux:
+        multiplexer = "TMUX"
+    else:
+        multiplexer = "STY"
+    logger.warning(
+        "detect_platform.tmux_screen_detected",
+        multiplexer=multiplexer,
+        trigger=trigger,
+    )
 
 
 async def detect_platform(
@@ -59,6 +121,7 @@ async def detect_platform(
     *,
     cwd: Path | None = None,
     respect_trigger_context: bool = True,
+    cursor_trigger_env_extra: Iterable[str] = (),
 ) -> PlatformName:
     """Return the platform name to use.
 
@@ -78,6 +141,16 @@ async def detect_platform(
       5. Try `claude --version`; if ok -> "claude_code".
       6. Try `cursor --version`; if ok -> "cursor".
       7. Raise `AdapterError`.
+
+    v0.38.0 HK9: ``cursor_trigger_env_extra`` extends the built-in
+    Cursor env allowlist (``_CURSOR_ENV_ALLOWLIST``). Caller threads
+    :attr:`config.schema.AutodevConfig.cursor_trigger_env_extra`.
+
+    v0.38.0 HK8: emits a single ``detect_platform.tmux_screen_detected``
+    warning when running under a terminal multiplexer AND a trigger
+    context is present, so v0.39 retrospectives can quantify how often
+    multiplexer state interferes with adapter selection. No behaviour
+    change — pure diagnostic.
     """
     if preferred not in ("claude_code", "cursor", "auto"):
         raise AdapterError(f"invalid preferred platform: {preferred!r}")
@@ -97,11 +170,24 @@ async def detect_platform(
         )
         return preferred  # type: ignore[return-value]
 
+    # v0.38.0 HK8: terminal-multiplexer diagnostic. tmux / GNU screen
+    # mangle TERM_PROGRAM and inherit envs across nested shells, which
+    # turns out to be the most common source of "AutoDev picked the
+    # wrong adapter" support tickets. Forensics-only: log the
+    # multiplexer + trigger combo so v0.39 retrospectives can decide
+    # whether to add a behaviour change here.
+    _maybe_warn_multiplexer(
+        respect_trigger_context=respect_trigger_context,
+        extra_cursor_env=cursor_trigger_env_extra,
+    )
+
     # v0.37.0 H4: trigger-context routing (between explicit preferred
     # and AUTODEV_PLATFORM env). Healthcheck the chosen adapter; on
     # failure, fall through to the env / fitness / fallback path.
     if respect_trigger_context:
-        trigger = _detect_trigger_context()
+        trigger = _detect_trigger_context(
+            extra_cursor_env=cursor_trigger_env_extra,
+        )
         if trigger is not None:
             trigger_adapter = _make_adapter(trigger)
             ok, details = await trigger_adapter.healthcheck()
@@ -243,12 +329,60 @@ async def detect_platform(
     raise AdapterError("No platform CLI found; install `claude` or `cursor` and log in")
 
 
+def _classify_selection_source(
+    preferred: _PreferredName,
+    *,
+    respect_trigger_context: bool,
+    cursor_trigger_env_extra: Iterable[str] = (),
+) -> tuple[str, bool]:
+    """v0.38.0 HK10: derive ``(source, trigger_context_detected)`` for
+    the :func:`get_adapter` selection-meta payload.
+
+    Sources mirror the ``source=`` tag on the
+    ``detect_platform.selected`` structured-log line:
+
+    * ``"preferred"`` — explicit ``--platform X`` was passed.
+    * ``"trigger_context"`` — Claude Code / Cursor host env was the
+      deciding factor.
+    * ``"env"`` — ``AUTODEV_PLATFORM`` env beat the fallback.
+    * ``"fitness"`` — language-fitness scoring picked between two
+      healthy adapters.
+    * ``"fallback"`` — first adapter that healthchecks.
+
+    The classifier mirrors the precedence in :func:`detect_platform`
+    but does NOT re-run the healthcheck — it answers "which arm did
+    the dispatcher take", forensics-only. The
+    ``trigger_context_detected`` flag is independent of ``source`` so
+    operators can spot the "host context was present but didn't win"
+    case (e.g. Cursor host, but ``--platform claude_code`` override).
+    """
+    trigger_detected = (
+        _detect_trigger_context(extra_cursor_env=cursor_trigger_env_extra)
+        is not None
+    )
+    if preferred != "auto":
+        return "preferred", trigger_detected
+    if respect_trigger_context and trigger_detected:
+        return "trigger_context", trigger_detected
+    if os.environ.get("AUTODEV_PLATFORM"):
+        return "env", trigger_detected
+    # Fitness vs fallback distinction depends on AUTODEV_LANG_WEIGHT
+    # and is best-effort here (the actual classifier inside
+    # detect_platform also factors huge-repo defaults). The "fitness"
+    # tag is only emitted when AUTODEV_LANG_WEIGHT was non-zero AND
+    # both adapters healthchecked — neither knowable without running
+    # the probe. Default to "fallback" so the forensics op never
+    # reports a false fitness selection.
+    return "fallback", trigger_detected
+
+
 async def get_adapter(
     platform: _PreferredName = "auto",
     cwd: Path | None = None,
     platform_hint: Literal["claude_code", "cursor"] | None = None,
     respect_trigger_context: bool = True,
-) -> PlatformAdapter:
+    cursor_trigger_env_extra: Iterable[str] = (),
+) -> tuple[PlatformAdapter, dict[str, object]]:
     """Resolve a PlatformAdapter instance for the given preference.
 
     v0.31.0 (Phase 5.5): ``cwd`` is forwarded into :func:`detect_platform`
@@ -260,11 +394,39 @@ async def get_adapter(
     callers in ``src/cli/`` thread it from ``cfg`` so the operator-facing
     escape hatch works without re-reading config inside the adapter
     layer.
+
+    v0.38.0 HK9: ``cursor_trigger_env_extra`` threads
+    :attr:`config.schema.AutodevConfig.cursor_trigger_env_extra` into
+    the trigger-context detector.
+
+    v0.38.0 HK10 (breaking change): returns ``(adapter, selection_meta)``
+    where ``selection_meta = {"platform", "source", "trigger_context_detected",
+    "healthcheck_ok"}``. CLI callers append this to the ledger as the
+    ``adapter_selected`` op so post-mortems can correlate "which
+    selection arm fired this session" with downstream behaviour.
     """
     name = await detect_platform(
-        platform, cwd=cwd, respect_trigger_context=respect_trigger_context
+        platform,
+        cwd=cwd,
+        respect_trigger_context=respect_trigger_context,
+        cursor_trigger_env_extra=cursor_trigger_env_extra,
     )
-    return _make_adapter(name, cwd=cwd, platform_hint=platform_hint)
+    source, trigger_detected = _classify_selection_source(
+        platform,
+        respect_trigger_context=respect_trigger_context,
+        cursor_trigger_env_extra=cursor_trigger_env_extra,
+    )
+    adapter = _make_adapter(name, cwd=cwd, platform_hint=platform_hint)
+    selection_meta: dict[str, object] = {
+        "platform": name,
+        "source": source,
+        "trigger_context_detected": trigger_detected,
+        # detect_platform already ran a healthcheck for whichever arm
+        # actually returned, so ``healthcheck_ok`` is implied True
+        # here — a failed probe raises AdapterError upstream.
+        "healthcheck_ok": True,
+    }
+    return adapter, selection_meta
 
 
 def _make_adapter(

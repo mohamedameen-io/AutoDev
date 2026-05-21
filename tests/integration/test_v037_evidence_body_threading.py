@@ -32,8 +32,12 @@ from state.schemas import ReviewEvidence, Task, TestEvidence
 class _FakeCfg:
     recent_evidence_max_chars_per_kind: int = 4000
     recent_evidence_include_kinds: list[str] = field(
-        default_factory=lambda: ["review", "test", "coder"]
+        default_factory=lambda: ["review", "test", "developer"]
     )
+    # v0.38.0 HK3: gate the architect-consult envelope dump. Default-on
+    # in real config; left True here so the integration test exercises
+    # the dump path end-to-end.
+    dump_architect_consult_envelopes: bool = True
 
 
 @dataclass
@@ -193,3 +197,86 @@ async def test_architect_consult_prompt_contains_reviewer_body(
     assert "test_null_at_boundary" in ctx
     # And the reason still propagates — operators rely on grepping for it.
     assert "reviewer NEEDS_CHANGES" in ctx
+
+    # v0.38.0 HK3: the architect-consult envelope dump landed on disk
+    # so post-mortems can grep `.autodev/debug/architect_consult-*.json`
+    # for "what did we ask the architect about this task?".
+    import json as _json
+
+    dump_dir = tmp_path / ".autodev" / "debug"
+    assert dump_dir.exists(), "HK3: .autodev/debug/ directory not created"
+    dumps = sorted(dump_dir.glob(f"architect_consult-{task.id}-*.json"))
+    assert dumps, (
+        "HK3: no architect-consult envelope dump landed in "
+        ".autodev/debug/ — the helper is gated off or failed silently"
+    )
+    payload = _json.loads(dumps[-1].read_text(encoding="utf-8"))
+    assert payload["task_id"] == task.id
+    assert payload["phase_id"] == task.phase_id
+    assert payload["reason"] == "reviewer NEEDS_CHANGES"
+    # The reviewer body must be in the dumped recent_evidence too — same
+    # contract as the live prompt thread.
+    assert "REVIEWER_RAW:" in payload["recent_evidence"]
+    assert "fix needs to be at the boundary" in payload["recent_evidence"]
+    # prior_attempts thread-through.
+    assert payload["prior_attempts"] == [
+        "attempt 1: guard at line 42 — REJECTED"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_architect_consult_dump_disabled_by_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.38.0 HK3: ``dump_architect_consult_envelopes=False`` skips
+    the dump cleanly — no debug file, no exception."""
+    task = Task(
+        id="3.7",
+        phase_id="1",
+        title="t",
+        description="d",
+        files=[],
+    )
+
+    async def _fake_delegate(
+        orch: Any,
+        role: str,
+        envelope: Any,
+        extra_context: str = "",
+        **kwargs: Any,
+    ) -> AgentResult:
+        return AgentResult(
+            text="RESOLUTION: continue",
+            success=True,
+            files_changed=[],
+            duration_s=0.1,
+        )
+
+    monkeypatch.setattr(execute_phase_mod, "delegate", _fake_delegate)
+
+    @dataclass
+    class _StuckState:
+        discard_count: int = 0
+        pivot_count: int = 0
+        search_count: int = 0
+        architect_count: int = 0
+        last_event: str = ""
+
+    cfg = _FakeCfg()
+    cfg.dump_architect_consult_envelopes = False
+    orch = _FakeOrch(cwd=tmp_path, cfg=cfg, plan_manager=_FakePlanManager())
+
+    await _dispatch_architect_consult(
+        orch,  # type: ignore[arg-type]
+        task,
+        stuck_state=_StuckState(),
+        reason="reviewer NEEDS_CHANGES",
+        prior_attempts=None,
+        web_context_block="",
+    )
+
+    dump_dir = tmp_path / ".autodev" / "debug"
+    if dump_dir.exists():
+        assert not list(dump_dir.glob(f"architect_consult-{task.id}-*.json")), (
+            "HK3: dump landed despite dump_architect_consult_envelopes=False"
+        )

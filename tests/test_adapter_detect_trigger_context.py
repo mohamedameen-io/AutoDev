@@ -29,6 +29,10 @@ def _clear_trigger_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TERM_PROGRAM", raising=False)
     monkeypatch.delenv("AUTODEV_PLATFORM", raising=False)
     monkeypatch.delenv("AUTODEV_LANG_WEIGHT", raising=False)
+    # v0.38.0 HK8: multiplexer envs leak in from the developer's tmux
+    # session — clear them so the warning test fires deterministically.
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("STY", raising=False)
     for key in [k for k in list(os.environ) if k.startswith("CURSOR_")]:
         monkeypatch.delenv(key, raising=False)
 
@@ -208,3 +212,151 @@ async def test_trigger_context_unhealthy_falls_through(
     captured = capsys.readouterr()
     assert "trigger_context_unhealthy" in (captured.out + captured.err)
     assert "claude_code" in (captured.out + captured.err)
+
+
+# ---------------------------------------------------------------------------
+# v0.38.0 HK9: CURSOR_* env allowlist (replaces prefix-match)
+# ---------------------------------------------------------------------------
+
+
+def test_hk9_allowlist_cursor_version_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.38.0 HK9: built-in allowlist covers ``CURSOR_VERSION`` —
+    pre-existing v0.37.0 behaviour preserved."""
+    monkeypatch.setenv("CURSOR_VERSION", "1.0")
+    assert _detect_trigger_context() == "cursor"
+
+
+def test_hk9_allowlist_cursor_agent_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.38.0 HK9: ``CURSOR_AGENT`` is in the built-in allowlist."""
+    monkeypatch.setenv("CURSOR_AGENT", "default")
+    assert _detect_trigger_context() == "cursor"
+
+
+def test_hk9_non_allowlist_cursor_var_does_not_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.38.0 HK9 (bug fix): random ``CURSOR_RC_FILE`` is NOT a
+    Cursor IDE signal — the v0.37.0 prefix match was over-eager."""
+    monkeypatch.setenv("CURSOR_RC_FILE", "/etc/cursorrc")
+    assert _detect_trigger_context() is None
+
+
+def test_hk9_extra_env_extends_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.38.0 HK9: operators on newer Cursor versions extend the
+    allowlist via ``cursor_trigger_env_extra`` without waiting for a
+    release."""
+    monkeypatch.setenv("CURSOR_RC_FILE", "/etc/cursorrc")
+    # With the operator override, the previously-rejected var now triggers.
+    assert (
+        _detect_trigger_context(extra_cursor_env=["CURSOR_RC_FILE"])
+        == "cursor"
+    )
+
+
+@pytest.mark.asyncio
+async def test_hk9_detect_platform_threads_extra_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.38.0 HK9: ``detect_platform`` honours
+    ``cursor_trigger_env_extra``."""
+    monkeypatch.setenv("CURSOR_RC_FILE", "/etc/cursorrc")
+    with patch.object(
+        CursorAdapter, "healthcheck", AsyncMock(return_value=(True, "ok"))
+    ):
+        name = await detect_platform(
+            "auto",
+            cursor_trigger_env_extra=["CURSOR_RC_FILE"],
+        )
+    assert name == "cursor"
+
+
+# ---------------------------------------------------------------------------
+# v0.38.0 HK8: terminal-multiplexer diagnostic warning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hk8_tmux_triggers_multiplexer_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v0.38.0 HK8: tmux + a trigger context → single forensic
+    warning. No behaviour change — Claude still wins the selection."""
+    monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,12345,0")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    with patch.object(
+        ClaudeCodeAdapter, "healthcheck", AsyncMock(return_value=(True, "ok"))
+    ):
+        name = await detect_platform("auto")
+    assert name == "claude_code"  # behaviour unchanged
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert "tmux_screen_detected" in out, (
+        "HK8: multiplexer warning did not fire under TMUX + trigger context"
+    )
+    assert "TMUX" in out
+    assert "claude_code" in out
+
+
+@pytest.mark.asyncio
+async def test_hk8_screen_triggers_multiplexer_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v0.38.0 HK8: GNU screen STY env also fires the warning."""
+    monkeypatch.setenv("STY", "12345.pts-0.host")
+    monkeypatch.setenv("CURSOR_VERSION", "1.0")
+    with patch.object(
+        CursorAdapter, "healthcheck", AsyncMock(return_value=(True, "ok"))
+    ):
+        name = await detect_platform("auto")
+    assert name == "cursor"
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert "tmux_screen_detected" in out
+    assert "STY" in out
+
+
+@pytest.mark.asyncio
+async def test_hk8_multiplexer_without_trigger_context_silent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v0.38.0 HK8: tmux alone (no trigger context) → NO warning.
+    The warning is specifically about multiplexer + trigger combos
+    that may have caused the wrong selection."""
+    monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,12345,0")
+    with patch.object(
+        ClaudeCodeAdapter, "healthcheck", AsyncMock(return_value=(True, "ok"))
+    ):
+        await detect_platform("auto")
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert "tmux_screen_detected" not in out
+
+
+@pytest.mark.asyncio
+async def test_hk8_tmux_and_sty_both_set_reports_both(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v0.38.0 HK8: TMUX + STY simultaneously (nested tmux-in-screen
+    or vice versa) reports ``BOTH`` so forensics distinguishes the
+    case."""
+    monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,12345,0")
+    monkeypatch.setenv("STY", "12345.pts-0.host")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    with patch.object(
+        ClaudeCodeAdapter, "healthcheck", AsyncMock(return_value=(True, "ok"))
+    ):
+        await detect_platform("auto")
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert "tmux_screen_detected" in out
+    assert "BOTH" in out

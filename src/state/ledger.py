@@ -470,6 +470,19 @@ LedgerOp = Literal[
     # flow through the regular ``update_phase_meta`` /
     # ``update_task_status`` ops emitted alongside.
     "corrective_cap_reached",
+    # v0.38.0 HK10: per-boot adapter-selection breadcrumb. Audit-only.
+    # Fired exactly once per CLI entry (plan / execute / resume /
+    # tournament phase-review) right after :func:`adapters.detect.get_adapter`
+    # returns. Payload mirrors the ``detect_platform.selected`` log:
+    # ``{platform: str, source: "preferred" | "trigger_context" |
+    # "env" | "fitness" | "fallback", trigger_context_detected: bool,
+    # healthcheck_ok: bool}``. Replay treats it as a no-op — the
+    # selected adapter is recreated by ``get_adapter`` at resume time.
+    # Forensics goal: answer "which selection arm fired" without
+    # re-grepping stdout logs after the fact, and let v0.39
+    # retrospectives quantify how often the fallback path actually
+    # runs.
+    "adapter_selected",
 ]
 
 
@@ -993,6 +1006,11 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # ``update_phase_meta`` / ``update_task_status`` ops emitted
         # alongside. Replay treats this op as a no-op.
         "corrective_cap_reached",
+        # v0.38.0 HK10: per-boot adapter-selection breadcrumb. Audit-only.
+        # The actual adapter resolution lives in
+        # :func:`adapters.detect.get_adapter` at the next session boot;
+        # this op is observability for "which selection arm fired".
+        "adapter_selected",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

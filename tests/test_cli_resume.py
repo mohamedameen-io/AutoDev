@@ -74,7 +74,8 @@ def test_resume_autodev_error_exits_2(tmp_path: Path) -> None:
             # v0.28.0 (Bug 10): preflight re-probe must succeed so we reach
             # the orchestrator branch this test exercises.
             mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
-            mock_get_adapter.return_value = mock_adapter
+            # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
 
             mock_orch = MagicMock()
             mock_orch.resume = AsyncMock(
@@ -114,7 +115,8 @@ def test_resume_success_no_suspend_state(tmp_path: Path) -> None:
             # v0.28.0 (Bug 10): preflight probe must succeed for resume to
             # enter the orchestrator loop.
             mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
-            mock_get_adapter.return_value = mock_adapter
+            # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
 
             mock_orch = MagicMock()
             mock_orch.resume = AsyncMock(return_value=tasks)

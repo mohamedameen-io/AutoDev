@@ -166,8 +166,11 @@ async def test_get_adapter_returns_claude(
     with patch.object(
         ClaudeCodeAdapter, "healthcheck", AsyncMock(return_value=(True, "ok"))
     ):
-        adapter = await get_adapter("claude_code")
+        # v0.38.0 HK10: get_adapter now returns (adapter, selection_meta).
+        adapter, selection_meta = await get_adapter("claude_code")
     assert isinstance(adapter, ClaudeCodeAdapter)
+    assert selection_meta["platform"] == "claude_code"
+    assert selection_meta["source"] == "preferred"
 
 
 @pytest.mark.asyncio
@@ -187,8 +190,10 @@ async def test_get_adapter_auto_cursor(
             AsyncMock(return_value=(True, "cursor ok")),
         ),
     ):
-        adapter = await get_adapter("auto")
+        adapter, selection_meta = await get_adapter("auto")
     assert isinstance(adapter, CursorAdapter)
+    # auto-fallback path: no trigger / env, claude_code unhealthy, cursor wins
+    assert selection_meta["source"] == "fallback"
 
 
 # ---------------------------------------------------------------------------

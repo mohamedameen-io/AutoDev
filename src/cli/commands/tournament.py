@@ -621,9 +621,10 @@ def phase_review_subcommand(
         )
         from state.paths import autodev_root, spec_path
 
-        adapter = await get_adapter(
+        adapter, selection_meta = await get_adapter(
             cfg.platform,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
+            cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
         )
         registry = build_registry(cfg)
         orch = Orchestrator(
@@ -633,6 +634,13 @@ def phase_review_subcommand(
             registry=registry,
             session_id="cli-tournament-phase-review",
         )
+        # v0.38.0 HK10: see plan.py for rationale. Best-effort breadcrumb.
+        try:
+            await orch.plan_manager.ledger_append(
+                op="adapter_selected", payload=selection_meta
+            )
+        except Exception:  # noqa: BLE001 — forensics, not correctness
+            pass
 
         plan = await orch.plan_manager.load()
         if plan is None:
@@ -755,9 +763,15 @@ async def _run_plan_tournament_cli(
         # don't want to load during --dry-run or in tests.
         from adapters.detect import get_adapter
 
-        adapter = await get_adapter(
+        # v0.38.0 HK10: unpack the selection-meta tuple. This CLI path
+        # builds an AdapterLLMClient without an Orchestrator so the
+        # ``adapter_selected`` ledger op is not emitted here — operator
+        # tournament-driver invocations are forensics-skipped until a
+        # standalone ledger plumbing exists.
+        adapter, _selection_meta = await get_adapter(
             cfg.platform,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
+            cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
         )
         # Pass the loaded plan markdown so _cli_role_overrides can extract
         # the architect's COMPLEXITY: classification and resolve per-role
@@ -877,9 +891,12 @@ async def _run_impl_tournament_cli(
     else:
         from adapters.detect import get_adapter
 
-        adapter = await get_adapter(
+        # v0.38.0 HK10: see plan-tournament site above — same forensics
+        # skip rationale (no Orchestrator on this CLI path).
+        adapter, _selection_meta = await get_adapter(
             cfg.platform,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
+            cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
         )
         rmt, rat, rts, ref = _cli_role_overrides(cfg)
         client = AdapterLLMClient(

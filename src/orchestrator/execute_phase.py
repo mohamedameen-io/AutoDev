@@ -221,20 +221,22 @@ def _build_recovery_hint(
     )
 
 
-# v0.37.0 H1: map user-facing ``include_kinds`` labels to the on-disk
-# evidence file kinds. ``coder`` is the operator-friendly label that
-# matches the ``CODER_RAW:`` section header; ``developer`` is the
-# discriminator literal used by :class:`state.schemas.CoderEvidence`
-# and :func:`state.evidence.read_evidence`.
+# v0.37.0 H1 / v0.38.0 HK1: map user-facing ``include_kinds`` labels to
+# the on-disk evidence file kinds. v0.38.0 unified the user-facing label
+# ``"coder"`` with the on-disk
+# :class:`state.schemas.CoderEvidence.kind` discriminator
+# (``"developer"``) — the indirection now resolves to identity, but the
+# dict shape is preserved so future divergences (e.g. multi-evidence per
+# kind) can rewire without touching the call site.
 _RECENT_EVIDENCE_KIND_TO_DISK: dict[str, str] = {
     "review": "review",
     "test": "test",
-    "coder": "developer",
+    "developer": "developer",
 }
 _RECENT_EVIDENCE_KIND_TO_LABEL: dict[str, str] = {
     "review": "REVIEWER_RAW",
     "test": "TEST_RAW",
-    "coder": "CODER_RAW",
+    "developer": "DEVELOPER_RAW",
 }
 
 
@@ -244,18 +246,22 @@ async def _build_recent_evidence_block(
     reason: str,
     web_context_block: str = "",
 ) -> str:
-    """v0.37.0 H1: thread reviewer / test / coder ``raw_response`` bodies
-    into the ``recent_evidence`` block sent to stuck-recovery prompts.
+    """v0.37.0 H1: thread reviewer / test / developer ``raw_response``
+    bodies into the ``recent_evidence`` block sent to stuck-recovery
+    prompts.
 
     The legacy one-liner (``reason`` plus optional ``web_context_block``)
     gave architect-consult and sounding-board agents only the verdict
     token — they could not refine without seeing what was actually
     rejected. This helper reads the latest evidence files for ``task.id``,
     extracts each kind's ``raw_response`` (falling back to
-    ``output_text``), truncates from the END to
-    ``cfg.recent_evidence_max_chars_per_kind`` chars (the tail typically
-    carries the verdict + reasoning), and renders labelled blocks under
-    ``REVIEWER_RAW:``, ``TEST_RAW:``, ``CODER_RAW:``.
+    ``output_text``), truncates to
+    ``cfg.recent_evidence_max_chars_per_kind`` chars (reviewer / test:
+    tail-only because the verdict + reasoning sit at the bottom;
+    developer: head + tail per v0.38.0 HK2 because diffs + tool
+    transcripts often place the failing call site near the top),
+    and renders labelled blocks under ``REVIEWER_RAW:``, ``TEST_RAW:``,
+    ``DEVELOPER_RAW:``.
 
     Returns the legacy one-liner verbatim when the feature is disabled
     (per-kind cap = 0 OR include_kinds = []). Tolerates missing /
@@ -309,11 +315,27 @@ async def _build_recent_evidence_block(
         blob = getattr(ev, "raw_response", None) or getattr(ev, "output_text", "") or ""
         if not blob:
             continue
-        tail = blob[-cap:]
+        # v0.38.0 HK2: developer raw_response tails truncate by both
+        # head and tail. Reviewer / test bodies are verdict-first
+        # (tail-biased) so tail-only stays correct; developer diffs +
+        # tool transcripts often place the failing tool-call near the
+        # top with the final error near the bottom, so seeing only the
+        # tail loses the call site that matters for refinement.
+        if len(blob) <= cap:
+            truncated = blob
+        elif label_kind == "developer":
+            half = cap // 2
+            truncated = (
+                f"{blob[:half]}"
+                f"\n[...truncated {len(blob) - cap} bytes...]\n"
+                f"{blob[-half:]}"
+            )
+        else:
+            truncated = blob[-cap:]
         section_label = _RECENT_EVIDENCE_KIND_TO_LABEL.get(
             label_kind, label_kind.upper() + "_RAW"
         )
-        blocks.append(f"{section_label}:\n{tail}")
+        blocks.append(f"{section_label}:\n{truncated}")
         populated_kinds.append(label_kind)
 
     if not blocks:
@@ -884,6 +906,65 @@ async def _escalate_stuck_to_architect(
     return _parse_architect_resolution(result.text or "")
 
 
+def _dump_architect_consult_envelope(
+    orch: "Orchestrator",
+    task: Task,
+    *,
+    reason: str,
+    prior_attempts: list[str] | None,
+    recent_evidence: str,
+) -> None:
+    """v0.38.0 HK3: dump the ARCHITECT_CONSULT envelope to ``.autodev/debug/``.
+
+    Mirrors :meth:`adapters.claude_code.ClaudeCodeAdapter._dump_empty_result`
+    and :func:`orchestrator.plan_phase._persist_failed_architect_plan`
+    so post-mortems can reconstruct what the architect was asked to
+    consult on without tailing the orchestrator stdout. Filename:
+    ``architect_consult-{task_id}-{unix_ms}.json`` — pass-num-orderable
+    and grep-friendly.
+
+    Gated on :attr:`AutodevConfig.dump_architect_consult_envelopes`
+    (default True). Tolerates I/O / serialization errors silently —
+    forensics is observability, not correctness.
+    """
+    if not bool(getattr(orch.cfg, "dump_architect_consult_envelopes", True)):
+        return
+    try:
+        import json
+        import time
+
+        from state.paths import debug_dir
+
+        target_dir = debug_dir(orch.cwd)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        ts_ms = int(time.time() * 1000)
+        safe_id = task.id.replace("/", "_").replace(" ", "_")
+        target = target_dir / f"architect_consult-{safe_id}-{ts_ms}.json"
+        iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        payload = {
+            "note": (
+                "ARCHITECT_CONSULT envelope dispatched to architect_b "
+                "via _dispatch_architect_consult; replay-only forensics"
+            ),
+            "task_id": task.id,
+            "phase_id": task.phase_id,
+            "reason": reason,
+            "prior_attempts": list(prior_attempts or []),
+            "recent_evidence": recent_evidence,
+            "timestamp": iso,
+        }
+        target.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive: never mask consult
+        logger.warning(
+            "execute_phase.architect_consult_dump_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+
+
 async def _dispatch_architect_consult(
     orch: "Orchestrator",
     task: Task,
@@ -923,17 +1004,28 @@ async def _dispatch_architect_consult(
     await orch.plan_manager.increment_architect_consult(task.id)
 
     # 2) Invoke the architect in consult mode.
-    # v0.37.0 H1: fold reviewer/test/coder raw_response bodies into the
-    # evidence block so the architect can refine on substance, not just
-    # the verdict token.
+    # v0.37.0 H1: fold reviewer/test/developer raw_response bodies into
+    # the evidence block so the architect can refine on substance, not
+    # just the verdict token.
+    recent_evidence = await _build_recent_evidence_block(
+        orch, task, reason, web_context_block
+    )
+    # v0.38.0 HK3: snapshot the consult envelope to .autodev/debug/ so
+    # post-mortems can reconstruct the architect's input without
+    # re-running the orchestrator.
+    _dump_architect_consult_envelope(
+        orch,
+        task,
+        reason=reason,
+        prior_attempts=prior_attempts,
+        recent_evidence=recent_evidence,
+    )
     arch_resolution = await _escalate_stuck_to_architect(
         orch,
         task,
         stuck_state=stuck_state,
         ladder_step="ARCHITECT_CONSULT",
-        recent_evidence=await _build_recent_evidence_block(
-            orch, task, reason, web_context_block
-        ),
+        recent_evidence=recent_evidence,
         prior_attempts=prior_attempts,
     )
 

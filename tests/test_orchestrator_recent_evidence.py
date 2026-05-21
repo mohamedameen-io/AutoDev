@@ -1,7 +1,7 @@
-"""v0.37.0 H1: tests for ``_build_recent_evidence_block``.
+"""v0.37.0 H1 / v0.38.0 HK1+HK2: tests for ``_build_recent_evidence_block``.
 
-The helper threads reviewer / test / coder ``raw_response`` bodies into
-the ``recent_evidence`` block sent to stuck-recovery prompts so the
+The helper threads reviewer / test / developer ``raw_response`` bodies
+into the ``recent_evidence`` block sent to stuck-recovery prompts so the
 architect-consult and sounding-board agents can refine on substance, not
 just the verdict token.
 
@@ -10,7 +10,8 @@ Covered scenarios:
   2. Review evidence missing → falls back to legacy one-liner.
   3. Test evidence present but ``raw_response`` and ``output_text`` both
      empty → kind skipped silently.
-  4. Per-kind cap enforcement → returned blob is the LAST ``cap`` chars.
+  4. Per-kind cap enforcement → reviewer/test = LAST ``cap`` chars;
+     developer (HK2) = head + tail with explicit truncation marker.
   5. ``include_kinds=["test"]`` → only the test block appears.
   6. ``recent_evidence_max_chars_per_kind=0`` → legacy one-liner returned
      even when evidence files exist on disk.
@@ -35,7 +36,7 @@ class _FakeCfg:
 
     def __post_init__(self) -> None:
         if self.recent_evidence_include_kinds is None:
-            self.recent_evidence_include_kinds = ["review", "test", "coder"]
+            self.recent_evidence_include_kinds = ["review", "test", "developer"]
 
 
 @dataclass
@@ -102,7 +103,7 @@ async def test_review_missing_falls_back_to_legacy_one_liner(
     assert rendered == "WEB_CONTEXT: foo\nreviewer NEEDS_CHANGES"
     assert "REVIEWER_RAW:" not in rendered
     assert "TEST_RAW:" not in rendered
-    assert "CODER_RAW:" not in rendered
+    assert "DEVELOPER_RAW:" not in rendered
 
 
 @pytest.mark.asyncio
@@ -237,7 +238,7 @@ async def test_include_kinds_filter_emits_only_requested_section(
     assert "TEST_RAW:" in rendered
     assert "test body" in rendered
     assert "REVIEWER_RAW:" not in rendered
-    assert "CODER_RAW:" not in rendered
+    assert "DEVELOPER_RAW:" not in rendered
 
 
 @pytest.mark.asyncio
@@ -269,3 +270,137 @@ async def test_cap_zero_returns_legacy_one_liner_ignoring_evidence(
     assert rendered == "reviewer REJECTED"
     assert "REVIEWER_RAW:" not in rendered
     assert "this body" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# v0.38.0 HK2: developer body truncates head + tail
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_developer_body_truncates_head_and_tail_with_marker(
+    tmp_path: Path,
+) -> None:
+    """v0.38.0 HK2: developer ``raw_response`` exceeding the per-kind
+    cap is truncated to ``head[:cap//2] + marker + tail[-cap//2:]`` so
+    the architect sees both the failing call site (typically near the
+    top of a long tool transcript) AND the final error (near the bottom).
+    Reviewer / test bodies still tail-only.
+    """
+    task = _make_task()
+    head_payload = "H" * 500
+    middle_payload = "M" * 800
+    tail_payload = "T" * 500
+    big = head_payload + middle_payload + tail_payload  # 1800 chars total
+
+    await write_evidence(
+        tmp_path,
+        task.id,
+        CoderEvidence(
+            task_id=task.id,
+            output_text=big,
+            raw_response=big,
+        ),
+    )
+    cap = 200  # → half = 100
+    orch = _FakeOrch(
+        cwd=tmp_path,
+        cfg=_FakeCfg(
+            recent_evidence_max_chars_per_kind=cap,
+            recent_evidence_include_kinds=["developer"],
+        ),
+    )
+    rendered = await _build_recent_evidence_block(
+        orch,  # type: ignore[arg-type]
+        task,
+        reason="developer failed",
+    )
+    assert "DEVELOPER_RAW:" in rendered
+    # head: first 100 H chars survive (the call site).
+    assert "H" * 100 in rendered
+    # tail: last 100 T chars survive (the final error).
+    assert "T" * 100 in rendered
+    # middle (the 800 'M' chars) is dropped.
+    assert "M" * 100 not in rendered
+    # truncation marker present with byte count = 1800 - 200 = 1600.
+    assert "[...truncated 1600 bytes...]" in rendered
+
+
+@pytest.mark.asyncio
+async def test_review_tail_only_truncation_unchanged_by_hk2(
+    tmp_path: Path,
+) -> None:
+    """v0.38.0 HK2 regression-guard: reviewer body still tail-only —
+    head + tail is developer-specific. Same body length, same cap,
+    different label_kind path."""
+    task = _make_task()
+    head_payload = "H" * 500
+    middle_payload = "M" * 800
+    tail_payload = "T" * 500
+    big = head_payload + middle_payload + tail_payload
+
+    await write_evidence(
+        tmp_path,
+        task.id,
+        ReviewEvidence(
+            task_id=task.id,
+            verdict="REJECTED",
+            output_text=big,
+            raw_response=big,
+        ),
+    )
+    cap = 200
+    orch = _FakeOrch(
+        cwd=tmp_path,
+        cfg=_FakeCfg(
+            recent_evidence_max_chars_per_kind=cap,
+            recent_evidence_include_kinds=["review"],
+        ),
+    )
+    rendered = await _build_recent_evidence_block(
+        orch,  # type: ignore[arg-type]
+        task,
+        reason="reviewer REJECTED",
+    )
+    assert "REVIEWER_RAW:" in rendered
+    # Reviewer = tail-only. Head H chars dropped, marker NOT present.
+    assert "H" * 100 not in rendered
+    # Last 200 T chars survive.
+    assert "T" * 200 in rendered
+    assert "[...truncated" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_developer_body_under_cap_emits_no_marker(
+    tmp_path: Path,
+) -> None:
+    """v0.38.0 HK2: when the body fits within the cap, no truncation
+    marker should appear — the head+tail branch is reserved for
+    over-cap bodies."""
+    task = _make_task()
+    small_body = "small developer body — fits within cap easily"
+
+    await write_evidence(
+        tmp_path,
+        task.id,
+        CoderEvidence(
+            task_id=task.id,
+            output_text=small_body,
+            raw_response=small_body,
+        ),
+    )
+    orch = _FakeOrch(
+        cwd=tmp_path,
+        cfg=_FakeCfg(
+            recent_evidence_max_chars_per_kind=4000,
+            recent_evidence_include_kinds=["developer"],
+        ),
+    )
+    rendered = await _build_recent_evidence_block(
+        orch,  # type: ignore[arg-type]
+        task,
+        reason="developer failed",
+    )
+    assert "DEVELOPER_RAW:" in rendered
+    assert small_body in rendered
+    assert "[...truncated" not in rendered

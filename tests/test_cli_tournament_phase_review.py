@@ -86,7 +86,8 @@ def patch_runner(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     async def fake_get_adapter(platform, **_kwargs):
         from stub_adapter import StubAdapter, ok
 
-        return StubAdapter({"explorer": ok("ok")})
+        # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+        return StubAdapter({"explorer": ok("ok")}), {"platform": "claude_code"}
 
     monkeypatch.setattr(
         "orchestrator.phase_review_runner.run_phase_review_tournament",

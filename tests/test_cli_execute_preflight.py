@@ -47,7 +47,7 @@ def test_execute_aborts_with_actionable_message_on_auth_failed(
         with (
             patch(
                 "cli.commands.execute.get_adapter",
-                AsyncMock(return_value=mock_adapter),
+                AsyncMock(return_value=(mock_adapter, {"platform": "claude_code"})),
             ),
             patch("cli.commands.execute.Orchestrator") as mock_orch_cls,
         ):
@@ -86,7 +86,7 @@ def test_execute_proceeds_when_healthcheck_passes(tmp_path: Path) -> None:
         with (
             patch(
                 "cli.commands.execute.get_adapter",
-                AsyncMock(return_value=mock_adapter),
+                AsyncMock(return_value=(mock_adapter, {"platform": "claude_code"})),
             ),
             patch("cli.commands.execute.Orchestrator") as mock_orch_cls,
             patch("cli.commands.execute.build_registry"),

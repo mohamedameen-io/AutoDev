@@ -165,9 +165,10 @@ def plan(
         # by the schema validator; ``cfg.platform`` is always one of
         # {claude_code, cursor, auto} here.
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
-        adapter = await get_adapter(
+        adapter, selection_meta = await get_adapter(
             cast("Literal['claude_code', 'cursor', 'auto']", platform_pref),
             respect_trigger_context=cfg.adapter_respect_trigger_context,
+            cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
         )
         # v0.31.0 (Phase 5.4): emit a fitness telemetry line + warn on
         # poor adapter/codebase fit. Best-effort.
@@ -178,6 +179,16 @@ def plan(
         await _maybe_print_blocked_banner(console, cwd)
         registry = build_registry(cfg)
         orch = Orchestrator(cwd=cwd, cfg=cfg, adapter=adapter, registry=registry)
+        # v0.38.0 HK10: forensic breadcrumb so post-mortems can
+        # correlate "which selection arm fired this boot" with
+        # downstream behaviour. Best-effort — never block the planner
+        # on a ledger I/O error.
+        try:
+            await orch.plan_manager.ledger_append(
+                op="adapter_selected", payload=selection_meta
+            )
+        except Exception:  # noqa: BLE001 — forensics, not correctness
+            pass
         approved = await orch.plan(intent)
         _render_plan_summary(console, approved)
 

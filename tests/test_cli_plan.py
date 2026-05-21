@@ -117,10 +117,12 @@ def test_plan_success_renders_output(tmp_path: Path) -> None:
             patch("cli.commands.plan.Orchestrator") as mock_orch_cls,
         ):
             mock_adapter = MagicMock()
-            mock_get_adapter.return_value = mock_adapter
+            # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
 
             mock_orch = MagicMock()
             mock_orch.plan = AsyncMock(return_value=mock_plan)
+            mock_orch.plan_manager.ledger_append = AsyncMock(return_value=None)
             mock_orch_cls.return_value = mock_orch
 
             result = runner.invoke(
@@ -144,12 +146,14 @@ def test_plan_autodev_error_exits_2(tmp_path: Path) -> None:
             patch("cli.commands.plan.Orchestrator") as mock_orch_cls,
         ):
             mock_adapter = MagicMock()
-            mock_get_adapter.return_value = mock_adapter
+            # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
 
             mock_orch = MagicMock()
             mock_orch.plan = AsyncMock(
                 side_effect=AutodevError("planning failed: no spec")
             )
+            mock_orch.plan_manager.ledger_append = AsyncMock(return_value=None)
             mock_orch_cls.return_value = mock_orch
 
             result = runner.invoke(cli, ["plan", "build a widget", "--skip-spec-validation"])
@@ -273,12 +277,14 @@ def test_plan_complexity_flag_overrides_config(tmp_path: Path) -> None:
             patch("cli.commands.plan.Orchestrator") as mock_orch_cls,
         ):
             mock_adapter = MagicMock()
-            mock_get_adapter.return_value = mock_adapter
+            # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
 
             def _capture(*args, **kwargs):  # type: ignore[no-untyped-def]
                 captured["cfg"] = kwargs.get("cfg")
                 mock_orch = MagicMock()
                 mock_orch.plan = AsyncMock(return_value=mock_plan)
+                mock_orch.plan_manager.ledger_append = AsyncMock(return_value=None)
                 return mock_orch
 
             mock_orch_cls.side_effect = _capture
@@ -310,12 +316,14 @@ def test_plan_complexity_flag_omitted_uses_config_value(tmp_path: Path) -> None:
             patch("cli.commands.plan.Orchestrator") as mock_orch_cls,
         ):
             mock_adapter = MagicMock()
-            mock_get_adapter.return_value = mock_adapter
+            # v0.38.0 HK10: get_adapter returns (adapter, selection_meta).
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
 
             def _capture(*args, **kwargs):  # type: ignore[no-untyped-def]
                 captured["cfg"] = kwargs.get("cfg")
                 mock_orch = MagicMock()
                 mock_orch.plan = AsyncMock(return_value=mock_plan)
+                mock_orch.plan_manager.ledger_append = AsyncMock(return_value=None)
                 return mock_orch
 
             mock_orch_cls.side_effect = _capture

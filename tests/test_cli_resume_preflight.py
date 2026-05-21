@@ -48,7 +48,10 @@ def test_resume_aborts_with_actionable_message_on_auth_failed(
         )
 
         with (
-            patch("cli.commands.resume.get_adapter", AsyncMock(return_value=mock_adapter)),
+            patch(
+                "cli.commands.resume.get_adapter",
+                AsyncMock(return_value=(mock_adapter, {"platform": "claude_code"})),
+            ),
             patch("cli.commands.resume.Orchestrator") as mock_orch_cls,
         ):
             result = runner.invoke(cli, ["resume"])
@@ -85,7 +88,10 @@ def test_resume_proceeds_when_healthcheck_passes(tmp_path: Path) -> None:
         ]
 
         with (
-            patch("cli.commands.resume.get_adapter", AsyncMock(return_value=mock_adapter)),
+            patch(
+                "cli.commands.resume.get_adapter",
+                AsyncMock(return_value=(mock_adapter, {"platform": "claude_code"})),
+            ),
             patch("cli.commands.resume.Orchestrator") as mock_orch_cls,
         ):
             mock_orch = MagicMock()

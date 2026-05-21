@@ -121,9 +121,10 @@ def execute(
         # path remains.
         nonlocal preflight_failure
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
-        adapter = await get_adapter(
+        adapter, selection_meta = await get_adapter(
             cast("Literal['claude_code', 'cursor', 'auto']", platform_pref),
             respect_trigger_context=cfg.adapter_respect_trigger_context,
+            cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
         )
 
         # v0.31.0 (Phase 5.4): emit a fitness telemetry line + warn on
@@ -151,6 +152,13 @@ def execute(
             registry=registry,
             disable_impl_tournament=no_impl_tournament,
         )
+        # v0.38.0 HK10: see plan.py for rationale. Best-effort breadcrumb.
+        try:
+            await orch.plan_manager.ledger_append(
+                op="adapter_selected", payload=selection_meta
+            )
+        except Exception:  # noqa: BLE001 — forensics, not correctness
+            pass
         tasks = await orch.execute(task_id=task_id)
         _render_execute_summary(console, tasks)
 
