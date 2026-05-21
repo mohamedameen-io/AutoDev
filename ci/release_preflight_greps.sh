@@ -67,15 +67,35 @@ preflight_v036() {
   check "v0.36 D3 helper"             src/orchestrator/plan_phase_recovery.py      "should_change_model_for_class"
 }
 
+preflight_v037() {
+  check "v0.37 H1 helper"             src/orchestrator/execute_phase.py            "_build_recent_evidence_block"
+  check "v0.37 H1 header"             src/orchestrator/execute_phase.py            "REVIEWER_RAW:"
+  check "v0.37 H1 config"             src/config/schema.py                         "recent_evidence_max_chars_per_kind"
+  check "v0.37 H2 parser cap"         src/orchestrator/corrective_parser.py        "max_tasks"
+  check "v0.37 H2 ledger op"          src/state/ledger.py                          "corrective_cap_reached"
+  check "v0.37 H2 config"             src/config/schema.py                         "max_corrective_tasks_per_phase"
+  check "v0.37 H2 status literal"     src/state/schemas.py                         "\"capped\""
+  check "v0.37 H3 method"             src/orchestrator/circuit_breaker.py          "record_test_diagnosis"
+  check "v0.37 H3 reset_adapter"      src/orchestrator/circuit_breaker.py          "reset_adapter"
+  check "v0.37 H3 config"             src/config/schema.py                         "test_diag_breaker_threshold"
+  check "v0.37 H4 helper"             src/adapters/detect.py                       "_detect_trigger_context"
+  check "v0.37 H4 config"             src/config/schema.py                         "adapter_respect_trigger_context"
+  check "v0.37 H5 module"             src/orchestrator/repo_size.py                "def is_huge_repo"
+  check "v0.37 H5 resolver"           src/orchestrator/huge_repo_overrides.py      "resolve_huge_repo_value"
+  check "v0.37 H5 hallucination"      src/qa/hallucination_guard.py                "huge_repo_cpp_paths_included"
+  check "v0.37 H5 master switch"      src/config/schema.py                         "huge_repo_overrides_disabled"
+}
+
 case "$target" in
   v0.32) preflight_v032 ;;
   v0.33) preflight_v033 ;;
   v0.34) preflight_v034 ;;
   v0.35) preflight_v035 ;;
   v0.36) preflight_v036 ;;
-  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ;;
+  v0.37) preflight_v037 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ;;
   *)
-    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | all)" >&2
+    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | all)" >&2
     exit 2
     ;;
 esac

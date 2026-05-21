@@ -2,6 +2,98 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-05-21
+
+Cascading-failure closure (Tier H). The compounding pattern observed
+in real-world enterprise runs — blind stuck-recovery → bad refines →
+unbounded correction-task fanout → infrastructure failures hiding as
+per-task blocks — is closed at the source. Five phases land together
+because they reinforce each other: H1 makes refinement informed; H2
+caps the corrective-task explosion; H3 escalates repeated test-runner
+infrastructure failures to a run halt; H4 routes the adapter to the
+host that invoked autodev (claude_code from Claude Code, cursor from
+Cursor); H5 auto-scales the new H1/H2/H3 caps and the hallucination-
+guard skip-list on huge repos.
+
+### Added
+- `_build_recent_evidence_block` helper threads the freshest reviewer
+  / test / coder `raw_response` bodies into `recent_evidence` for both
+  architect-consult and stuck-critic prompts. Sounding-board agents
+  can now refine on substance instead of coin-flipping on a verdict
+  token. Per-kind tail cap default 4000 chars; `REVIEWER_RAW:` /
+  `TEST_RAW:` / `CODER_RAW:` section headers (#H1).
+- Per-phase correction-task cap with `corrective_cap_reached` ledger
+  op and a new `Phase.review_status="capped"` literal. Cap is
+  cumulative across architect-refine and phase-review-tournament
+  rounds; default 8 corrections per phase. On exhaustion the
+  originating task soft-blocks with a `user_decision_required`
+  recovery hint listing `autodev requeue` / `autodev rewind`
+  next-actions (#H2).
+- Test-diagnosis cross-task circuit breaker. `InfraFailureCircuitBreaker`
+  now carries a second deque keyed off `record_test_diagnosis(task_id,
+  diagnosis, ts)`; `capture_failed` defaults are 3 events in 600 s.
+  Trip raises the existing `InfrastructureCircuitOpenError` so the
+  v0.29.0 quarantine catch sites handle it identically to adapter-class
+  trips. Configurable diagnoses set (`runtime_crash` and
+  `collection_failed` are opt-in) (#H3).
+- Adapter trigger-context routing. `_detect_trigger_context` reads
+  `CLAUDECODE` / `CLAUDE_PROJECT_DIR` (claude_code) and
+  `TERM_PROGRAM=Cursor` / `CURSOR_*` (cursor) and picks the matching
+  adapter when `preferred="auto"`. Precedence: explicit `--platform X`
+  > trigger context > `AUTODEV_PLATFORM` env > language-weighted
+  fitness > fallback. Every `detect_platform.selected` log line now
+  carries `source=preferred|trigger_context|env|fitness|fallback` (#H4).
+- `is_huge_repo(cwd)` (new module `orchestrator/repo_size.py`) and
+  `orchestrator/huge_repo_overrides.py` knob-keyed resolver. H1/H2/H3
+  caps auto-scale on huge repos using the existing
+  `huge_repo_multiplier_applied` telemetry op shape. Hallucination
+  guard auto-unions `**/PrecompiledHeaders/**`, `**/Generated/**`,
+  `**/Intermediate/**`, `**/Engine/**`, `**/build/**`,
+  `**/cmake-build-*/**` when the repo is huge AND C/C++ ≥ 80% of the
+  language profile. `AUTODEV_LANG_WEIGHT` default lifts to 0.5 on
+  huge repos so fitness scoring engages by default (#H5).
+
+### Changed
+- `parse_corrective_direction` accepts `max_tasks` for the H2 budget.
+- `InfraFailureCircuitBreaker.reset()` clears both deques;
+  `reset_adapter()` (new) clears only the adapter-class stream so the
+  test-diagnosis deque accumulates across intervening healthy adapter
+  calls.
+- `Phase.review_status` Literal gains `"capped"`.
+- `task_overrides.huge_repo_multipliers` default extended with H1/H2/H3
+  keys (the existing `max_duration_s_per_task` / `max_diff_bytes`
+  defaults are preserved).
+- Task-state transitions widened so `coded` / `auto_gated` / `reviewed`
+  / `tested` can move to `quarantined` (lets the H3 mid-test-slot trip
+  stamp the offending task as resumable).
+
+### Telemetry
+- New ops: `corrective_cap_reached`,
+  `execute_phase.recent_evidence_built` (forensics),
+  `execute_phase.test_diag_breaker_trip`,
+  `detect_platform.trigger_context_detected`,
+  `detect_platform.trigger_context_unhealthy`,
+  `hallucination_guard.huge_repo_cpp_paths_included`.
+
+### Config
+- `recent_evidence_max_chars_per_kind: int = 4000`
+- `recent_evidence_include_kinds: list[str] = ["review","test","coder"]`
+- `max_corrective_tasks_per_phase: int = 8`
+- `corrective_cap_action: Literal = "soft_block_phase"`
+- `test_diag_breaker_threshold: int = 3`
+- `test_diag_breaker_window_s: float = 600.0`
+- `test_diag_breaker_diagnoses: list[str] = ["capture_failed"]`
+- `adapter_respect_trigger_context: bool = True`
+- `huge_repo_overrides_disabled: bool = False` (top-level master escape
+  hatch; coexists with the existing per-tournament-phase field)
+
+### Behaviour change
+H4 trigger-context detection beats `AUTODEV_PLATFORM` env when
+`preferred="auto"`. Operators who relied on `AUTODEV_PLATFORM` to
+override their shell's host detection can set
+`adapter_respect_trigger_context=False` to restore pre-v0.37.0
+precedence. Explicit `--platform X` continues to win unconditionally.
+
 ## [0.36.0] - 2026-05-16
 
 Retries, budgets, forensics, spec hygiene (Tiers D + E + F + G from
