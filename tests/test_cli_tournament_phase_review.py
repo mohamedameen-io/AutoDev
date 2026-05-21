@@ -83,7 +83,7 @@ def patch_runner(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             history=[],
         )
 
-    async def fake_get_adapter(platform):
+    async def fake_get_adapter(platform, **_kwargs):
         from stub_adapter import StubAdapter, ok
 
         return StubAdapter({"explorer": ok("ok")})
