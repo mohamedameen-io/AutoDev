@@ -443,3 +443,194 @@ def test_requeue_unknown_task_id_exits_1(tmp_path: Path) -> None:
         assert _read_ledger_ops(cwd) == baseline_ops
         reloaded = _load_plan(cwd)
         assert reloaded.phases[0].tasks[0].status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# v0.38.0 I2 (HK4) — --capped-phases bulk-recovery selector.
+# ---------------------------------------------------------------------------
+
+
+def _mk_capped_plan() -> Plan:
+    """Two-phase plan, both phases at ``review_status="capped"``, each
+    with a mix of blocked + complete tasks. Used by the I2 tests for
+    the ``--capped-phases`` selector."""
+    return Plan(
+        plan_id="p-capped",
+        spec_hash="0123456789abcdef",
+        phases=[
+            Phase(
+                id="1",
+                title="Phase 1",
+                review_status="capped",
+                tasks=[
+                    Task(
+                        id="1.1",
+                        phase_id="1",
+                        title="done",
+                        description="d1",
+                        status="complete",
+                    ),
+                    Task(
+                        id="1.2",
+                        phase_id="1",
+                        title="stuck",
+                        description="d2",
+                        status="blocked",
+                        blocked_reason="qa_gate_timeout",
+                        retry_count=3,
+                    ),
+                ],
+            ),
+            Phase(
+                id="2",
+                title="Phase 2",
+                review_status="capped",
+                tasks=[
+                    Task(
+                        id="2.1",
+                        phase_id="2",
+                        title="stuck-2",
+                        description="d3",
+                        status="blocked",
+                        blocked_reason="verdict: rejected",
+                        retry_count=2,
+                    ),
+                ],
+            ),
+            Phase(
+                id="3",
+                title="Phase 3",
+                review_status="accepted",
+                tasks=[
+                    Task(
+                        id="3.1",
+                        phase_id="3",
+                        title="uncapped-stuck",
+                        description="d4",
+                        status="blocked",
+                        blocked_reason="some other thing",
+                        retry_count=1,
+                    ),
+                ],
+            ),
+        ],
+        created_at=_iso(),
+        updated_at=_iso(),
+    )
+
+
+def test_requeue_capped_phases_unions_blocked_tasks(tmp_path: Path) -> None:
+    """``--capped-phases`` unions every blocked task across phases sitting
+    at ``review_status='capped'`` — and leaves the unrelated phase
+    (``review_status='accepted'``) untouched."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config(cwd)
+        _seed_plan(cwd, _mk_capped_plan())
+
+        result = runner.invoke(cli, ["requeue", "--capped-phases", "--yes"])
+
+        assert result.exit_code == 0, result.output
+        reloaded = _load_plan(cwd)
+        statuses = {t.id: t.status for p in reloaded.phases for t in p.tasks}
+        assert statuses == {
+            "1.1": "complete",  # untouched (was not blocked)
+            "1.2": "pending",  # capped phase + blocked → requeued
+            "2.1": "pending",  # capped phase + blocked → requeued
+            "3.1": "blocked",  # uncapped phase → untouched
+        }
+        # Capped phases get their review_status reset so the tournament
+        # re-fires on the next pass (mirrors the existing --phase reset).
+        review = {p.id: p.review_status for p in reloaded.phases}
+        assert review["1"] is None
+        assert review["2"] is None
+        assert review["3"] == "accepted"
+
+
+def test_requeue_capped_phases_emits_audit_op(tmp_path: Path) -> None:
+    """``--capped-phases`` emits ``requeue.capped_phases_selected``
+    with the correct payload (phase ids + post-idempotency task count)
+    BEFORE the per-task ``update_task_status`` ops."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config(cwd)
+        _seed_plan(cwd, _mk_capped_plan())
+
+        result = runner.invoke(cli, ["requeue", "--capped-phases", "--yes"])
+
+        assert result.exit_code == 0, result.output
+        # Parse full ledger and find the audit op.
+        lp = cwd / ".autodev" / "plan-ledger.jsonl"
+        entries = []
+        for raw in lp.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+        audit = [
+            e for e in entries
+            if e["op"] == "requeue.capped_phases_selected"
+        ]
+        assert len(audit) == 1
+        payload = audit[0]["payload"]
+        assert set(payload["phases"]) == {"1", "2"}
+        assert payload["task_count"] == 2  # 1.2 + 2.1
+
+        # The audit op must precede the per-task transitions so a
+        # partial-crash forensics view sees "operator-intent" first.
+        audit_seq = audit[0]["seq"]
+        per_task_seqs = [
+            e["seq"] for e in entries
+            if e["op"] == "update_task_status"
+            and e["payload"].get("status") == "pending"
+        ]
+        assert all(audit_seq < seq for seq in per_task_seqs)
+
+
+def test_requeue_capped_phases_composes_with_task(tmp_path: Path) -> None:
+    """``--capped-phases`` + ``--task X`` unions both selectors (the
+    explicit task from the uncapped phase is included)."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config(cwd)
+        _seed_plan(cwd, _mk_capped_plan())
+
+        result = runner.invoke(
+            cli,
+            [
+                "requeue",
+                "--capped-phases",
+                "--task",
+                "3.1",  # blocked task in the uncapped phase
+                "--yes",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        reloaded = _load_plan(cwd)
+        statuses = {t.id: t.status for p in reloaded.phases for t in p.tasks}
+        assert statuses["1.2"] == "pending"  # capped union
+        assert statuses["2.1"] == "pending"  # capped union
+        assert statuses["3.1"] == "pending"  # explicit --task
+
+
+def test_requeue_capped_phases_no_capped_returns_nothing(tmp_path: Path) -> None:
+    """``--capped-phases`` on a plan with zero capped phases is a
+    no-op: exit 0, "nothing to requeue." message, no new ledger ops."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config(cwd)
+        # Plan with a blocked task but no capped phases.
+        _seed_plan(cwd, _mk_blocked_plan())
+        baseline_ops = _read_ledger_ops(cwd)
+
+        result = runner.invoke(cli, ["requeue", "--capped-phases", "--yes"])
+
+        assert result.exit_code == 0, result.output
+        assert "nothing to requeue" in result.output.lower()
+        # No mutation, no audit op.
+        assert _read_ledger_ops(cwd) == baseline_ops

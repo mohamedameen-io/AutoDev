@@ -162,6 +162,88 @@ def _collect_recovery_outcomes(ledger_pth: Path) -> list[dict]:
     return rows
 
 
+def _count_ops_by_name(ledger_pth: Path, op_name: str) -> dict[str, int]:
+    """v0.38.0 I2 (HK4): per-``phase_id`` count of a specific ledger op.
+
+    Walks the plan ledger JSONL the same best-effort way as
+    :func:`_collect_recovery_outcomes` (missing file → ``{}``; malformed
+    lines silently skipped — status is a forensic view that must render
+    even on a partially-corrupted ledger). Only counts entries that
+    carry a ``phase_id`` field in the payload; ops without it are
+    skipped so the dict key is always a valid phase id.
+
+    Returns a ``dict[phase_id, count]``. Caller may sort however it
+    likes; the function does not sort the result itself.
+    """
+    counts: dict[str, int] = {}
+    if not ledger_pth.exists():
+        return counts
+    try:
+        with ledger_pth.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("op") != op_name:
+                    continue
+                payload = obj.get("payload") or {}
+                phase_id = payload.get("phase_id")
+                if not isinstance(phase_id, str) or not phase_id:
+                    continue
+                counts[phase_id] = counts.get(phase_id, 0) + 1
+    except OSError:
+        return {}
+    return counts
+
+
+def _collect_corrective_cap_scope_by_phase(
+    ledger_pth: Path,
+) -> dict[str, str]:
+    """v0.38.0 I2 (HK4): most-recent ``scope`` per phase for the
+    ``corrective_cap_reached`` op.
+
+    Same best-effort JSONL walk as :func:`_count_ops_by_name`. The
+    last-seen ``scope`` value per ``phase_id`` wins, so the status
+    panel reflects the most recent cap regime in force (operators
+    normally see one ceiling fire at a time; the most recent firing is
+    the actionable one). Returns ``{}`` on missing file or full read
+    failure; missing/empty ``scope`` defaults to ``"phase"`` so callers
+    rendering pre-I3 ledgers see legacy semantics.
+    """
+    scope_by_phase: dict[str, str] = {}
+    if not ledger_pth.exists():
+        return scope_by_phase
+    try:
+        with ledger_pth.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("op") != "corrective_cap_reached":
+                    continue
+                payload = obj.get("payload") or {}
+                phase_id = payload.get("phase_id")
+                if not isinstance(phase_id, str) or not phase_id:
+                    continue
+                scope = payload.get("scope")
+                # Pre-I3 ledgers omit ``scope``; fall back to "phase"
+                # so the panel still renders something meaningful.
+                if scope not in ("phase", "plan"):
+                    scope = "phase"
+                scope_by_phase[phase_id] = scope
+    except OSError:
+        return {}
+    return scope_by_phase
+
+
 def _find_architect_dumps(autodev_dir: Path) -> list[Path]:
     """v0.36.0 F3: list ``.autodev/debug/architect-failed-*.md`` paths.
 
@@ -248,6 +330,75 @@ def _render_recovery_outcomes(
             )
 
 
+def _render_capped_phases_panel(
+    console: Console,
+    capped_phases: list,
+    *,
+    cwd: Path,
+) -> None:
+    """v0.38.0 I2 (HK4): top-of-blocked-surface summary for phases
+    whose ``review_status == "capped"`` (H2 per-phase cap or I3 plan-
+    scope cap fired).
+
+    Shows: total capped count + scope breakdown (phase vs plan), per-
+    phase ``corrective_cap_reached`` op count + scope, and the bulk
+    recovery command. ``capped_phases`` is the pre-filtered list of
+    :class:`state.schemas.Phase` objects so the panel does not re-walk
+    plan structure; ``cwd`` is required for the ledger walk that
+    populates per-phase counts.
+    """
+    lp = ledger_path(cwd)
+    try:
+        cap_counts = _count_ops_by_name(lp, "corrective_cap_reached")
+    except Exception:  # noqa: BLE001 - status must render even on a bad ledger
+        cap_counts = {}
+    try:
+        scope_by_phase = _collect_corrective_cap_scope_by_phase(lp)
+    except Exception:  # noqa: BLE001
+        scope_by_phase = {}
+
+    # Scope tally — drives the headline "N phases capped (X phase-scope,
+    # Y plan-scope)" line.
+    phase_scope = sum(
+        1 for p in capped_phases if scope_by_phase.get(p.id, "phase") == "phase"
+    )
+    plan_scope = sum(
+        1 for p in capped_phases if scope_by_phase.get(p.id, "phase") == "plan"
+    )
+
+    header = (
+        f"{len(capped_phases)} phase(s) capped "
+        f"({phase_scope} phase-scope, {plan_scope} plan-scope)"
+    )
+
+    table = Table(title="Capped Phases", show_lines=False)
+    table.add_column("Phase", style="cyan")
+    table.add_column("Title")
+    table.add_column("Scope")
+    table.add_column("Cap fires", justify="right")
+    # Sort by ledger cap-fire count descending so the most-pressed
+    # phase renders first (operators triage by fire-rate).
+    rows = sorted(
+        capped_phases,
+        key=lambda p: cap_counts.get(p.id, 0),
+        reverse=True,
+    )
+    for phase in rows:
+        table.add_row(
+            phase.id,
+            phase.title or "",
+            scope_by_phase.get(phase.id, "phase"),
+            str(cap_counts.get(phase.id, 0)),
+        )
+
+    body = (
+        f"[bold yellow]{header}[/bold yellow]\n\n"
+        "Run: [bold]autodev requeue --capped-phases[/bold] to bulk-recover."
+    )
+    console.print(Panel(body, title="Capped phases", border_style="red"))
+    console.print(table)
+
+
 def _render_blocked_section(
     console: Console,
     plan: Plan,
@@ -271,6 +422,16 @@ def _render_blocked_section(
     *something* actionable; the helper degrades gracefully rather than
     silently dropping the row.
     """
+    # v0.38.0 I2 (HK4): surface capped phases at the TOP of the blocked
+    # surface even when zero tasks are blocked — a phase can sit at
+    # ``review_status="capped"`` after H2/I3 fired with the cap-action
+    # regime configured to ``skip_corrective_round`` (no task soft-block),
+    # in which case the operator's actionable view is "which phases are
+    # capped + the bulk recovery command", not the per-task panel.
+    capped_phases = [p for p in plan.phases if p.review_status == "capped"]
+    if capped_phases and cwd is not None:
+        _render_capped_phases_panel(console, capped_phases, cwd=cwd)
+
     blocked_tasks: list[Task] = [
         t for phase in plan.phases for t in phase.tasks if t.status == "blocked"
     ]

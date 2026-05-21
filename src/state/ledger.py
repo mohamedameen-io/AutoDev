@@ -496,6 +496,18 @@ LedgerOp = Literal[
     # mutated by this op; the counter itself flows through the regular
     # ``update_phase_meta`` op.
     "skip_corrective_loop_detected",
+    # v0.38.0 I2 (HK4): ``autodev requeue --capped-phases`` was invoked.
+    # Audit-only breadcrumb mirroring the existing ``requeue`` op
+    # rationale — the per-task ``status: blocked → pending`` transitions
+    # flow through the regular ``update_task_status`` ops emitted
+    # alongside by :meth:`PlanManager.requeue_tasks`. Payload shape:
+    # ``{phases: list[str], task_count: int}`` where ``phases`` is the
+    # set of phase ids whose ``review_status == "capped"`` matched the
+    # selector and ``task_count`` is the number of blocked tasks
+    # actually queued for the requeue (post-idempotency-filter, may
+    # be 0 on a no-op re-run). Forensics goal: correlate H2/I3 cap-fires
+    # with operator-triggered bulk recovery without scraping CLI logs.
+    "requeue.capped_phases_selected",
 ]
 
 
@@ -1029,6 +1041,12 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # ``update_phase_meta`` op emitted alongside (the
         # ``Phase.metadata["skip_corrective_count"]`` delta).
         "skip_corrective_loop_detected",
+        # v0.38.0 I2 (HK4): ``autodev requeue --capped-phases`` audit
+        # breadcrumb. Replay is a no-op — the per-task transitions live
+        # in the ``update_task_status`` ops emitted alongside (one per
+        # requeued task) and the phase ``review_status`` reset flows
+        # through the regular ``update_phase_meta`` op.
+        "requeue.capped_phases_selected",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

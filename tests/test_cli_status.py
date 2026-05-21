@@ -327,6 +327,139 @@ def test_status_blocked_lists_dump_paths(tmp_path: Path) -> None:
     assert "architect-failed-" in rendered
 
 
+# ---------------------------------------------------------------------------
+# v0.38.0 I2 (HK4): capped-phases panel on `status --blocked`.
+# ---------------------------------------------------------------------------
+
+
+def _make_capped_plan() -> Plan:
+    """Plan with two capped phases (one phase-scope, one plan-scope)
+    plus one accepted phase. No blocked tasks — exercises the case
+    where the capped-phases panel renders standalone."""
+    import datetime as _dt
+
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    return Plan(
+        plan_id="p-capped-status",
+        spec_hash="h" * 16,
+        metadata={"title": "capped status plan"},
+        edit_scope=[],
+        phases=[
+            Phase(
+                id="1",
+                title="Phase one",
+                review_status="capped",
+                tasks=[
+                    Task(
+                        id="1.1",
+                        phase_id="1",
+                        title="t1",
+                        description="x",
+                        status="complete",
+                    ),
+                ],
+            ),
+            Phase(
+                id="2",
+                title="Phase two",
+                review_status="capped",
+                tasks=[
+                    Task(
+                        id="2.1",
+                        phase_id="2",
+                        title="t2",
+                        description="x",
+                        status="blocked",
+                        blocked_reason="qa fail",
+                    ),
+                ],
+            ),
+            Phase(
+                id="3",
+                title="Phase three",
+                review_status="accepted",
+                tasks=[
+                    Task(
+                        id="3.1",
+                        phase_id="3",
+                        title="t3",
+                        description="x",
+                        status="complete",
+                    ),
+                ],
+            ),
+        ],
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def test_status_blocked_renders_capped_phases_panel(tmp_path: Path) -> None:
+    """When the plan has phases at ``review_status='capped'`` and the
+    ledger carries ``corrective_cap_reached`` ops, the blocked surface
+    renders a "Capped phases" panel with per-phase scope + fire counts
+    + the bulk recovery command."""
+    from io import StringIO
+    import json as _json
+
+    from cli.commands.status import _render_blocked_section
+
+    (tmp_path / ".autodev").mkdir(parents=True)
+    ledger = tmp_path / ".autodev" / "plan-ledger.jsonl"
+    # Phase 1: two phase-scope cap fires; Phase 2: one plan-scope.
+    rows = [
+        {"op": "corrective_cap_reached",
+         "payload": {"phase_id": "1", "scope": "phase", "cap": 8, "dropped": 2}},
+        {"op": "corrective_cap_reached",
+         "payload": {"phase_id": "1", "scope": "phase", "cap": 8, "dropped": 1}},
+        {"op": "corrective_cap_reached",
+         "payload": {"phase_id": "2", "scope": "plan", "cap": 24, "dropped": 3}},
+    ]
+    with ledger.open("w") as fh:
+        for r in rows:
+            fh.write(_json.dumps(r) + "\n")
+
+    plan = _make_capped_plan()
+    out = StringIO()
+    console = Console(file=out, force_terminal=False, width=140)
+    _render_blocked_section(console, plan, cwd=tmp_path)
+    rendered = out.getvalue()
+
+    # Headline: count + scope breakdown.
+    assert "Capped phases" in rendered
+    assert "2 phase(s) capped" in rendered
+    assert "phase-scope" in rendered and "plan-scope" in rendered
+    # Bulk recovery suggested command appears verbatim.
+    assert "autodev requeue --capped-phases" in rendered
+    # Per-phase rows: ids + fire counts + scope labels.
+    assert "Phase one" in rendered
+    assert "Phase two" in rendered
+    # Phase 1 has 2 cap fires; phase 2 has 1. Sort by count desc → 1
+    # appears before 2 in the table body.
+    p1_idx = rendered.find("Phase one")
+    p2_idx = rendered.find("Phase two")
+    assert 0 < p1_idx < p2_idx
+
+
+def test_status_blocked_no_capped_phases_no_panel(tmp_path: Path) -> None:
+    """Back-compat: plans without capped phases do not render the new
+    panel — neither the "Capped phases" title nor the bulk recovery
+    command appear in the output."""
+    from io import StringIO
+
+    from cli.commands.status import _render_blocked_section
+
+    (tmp_path / ".autodev").mkdir(parents=True)
+    plan = _make_blocked_plan()  # blocked task, no capped phases
+    out = StringIO()
+    console = Console(file=out, force_terminal=False, width=140)
+    _render_blocked_section(console, plan, cwd=tmp_path)
+    rendered = out.getvalue()
+
+    assert "Capped phases" not in rendered
+    assert "autodev requeue --capped-phases" not in rendered
+
+
 def test_status_blocked_shows_design_class_action(tmp_path: Path) -> None:
     from io import StringIO
     import json as _json

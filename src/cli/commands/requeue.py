@@ -68,15 +68,28 @@ def _select_task_ids(
     phases: tuple[str, ...],
     infrastructure: bool,
     all_blocked: bool,
-) -> tuple[list[str], list[str]]:
+    capped_phases: bool = False,
+) -> tuple[list[str], list[str], list[str]]:
     """Resolve the CLI selectors against ``plan``.
 
-    Returns ``(task_ids_to_requeue, unknown_explicit_ids)``. The
-    second tuple is non-empty when the operator typo-ed an explicit
-    ``--task`` id; the caller surfaces it as exit-1 user-error.
+    Returns ``(task_ids_to_requeue, unknown_explicit_ids,
+    matched_capped_phase_ids)``. The second tuple is non-empty when the
+    operator typo-ed an explicit ``--task`` id; the caller surfaces it
+    as exit-1 user-error. The third tuple lists every phase whose
+    ``review_status == "capped"`` actually fed into the selection — the
+    requeue CLI uses it as the payload for the
+    ``requeue.capped_phases_selected`` audit op (always populated when
+    ``capped_phases=True``, even if zero blocked tasks rolled up; an
+    empty list when ``capped_phases=False``).
 
     Tasks already at ``status="pending"`` are filtered OUT here (the
     requeue is idempotent — a no-op call writes zero ledger entries).
+
+    v0.38.0 I2 (HK4): ``capped_phases=True`` is the bulk-recovery
+    selector that unions every blocked task across phases sitting at
+    ``review_status="capped"`` (set by H2's per-phase / I3's plan-scope
+    corrective cap). Composes with the other selectors via OR; the
+    idempotency filter at the bottom still applies.
     """
     by_id: dict[str, Task] = {}
     blocked_in_phase: dict[str, list[Task]] = {}
@@ -114,9 +127,25 @@ def _select_task_ids(
             for task in tasks:
                 selected[task.id] = task
 
+    # v0.38.0 I2 (HK4): roll up every blocked task across phases whose
+    # ``review_status == "capped"`` (H2 per-phase cap and/or I3 plan-
+    # scope cap). The matched phase-id list is returned alongside so
+    # the caller can stamp the ``requeue.capped_phases_selected`` audit
+    # op with the exact phase set the operator's flag matched — even
+    # when zero blocked tasks ultimately fed into the selection (the
+    # phase may be capped with all tasks already pending after a prior
+    # requeue, in which case the op records a no-op recovery attempt).
+    matched_capped_phases: list[str] = []
+    if capped_phases:
+        for phase in plan.phases:
+            if phase.review_status == "capped":
+                matched_capped_phases.append(phase.id)
+                for task in blocked_in_phase.get(phase.id, []):
+                    selected[task.id] = task
+
     # Idempotency filter: drop tasks that are already pending.
     runnable = [tid for tid, task in selected.items() if task.status != "pending"]
-    return runnable, unknown
+    return runnable, unknown, matched_capped_phases
 
 
 def _affected_phase_ids(plan: Plan, task_ids: list[str]) -> list[str]:
@@ -164,10 +193,20 @@ def _resolve_source_label(
     phases: tuple[str, ...],
     infrastructure: bool,
     all_blocked: bool,
+    capped_phases: bool = False,
 ) -> str:
-    """Return a short flag-name for the ledger ``source`` field."""
+    """Return a short flag-name for the ledger ``source`` field.
+
+    v0.38.0 I2: ``--capped-phases`` slots between ``--all-blocked`` and
+    ``--infrastructure`` in the precedence chain. It is broader than
+    ``--phase`` / ``--task`` (potentially many phases) but narrower than
+    ``--all-blocked`` (skips uncapped phases), so the label reflects
+    that it's the bulk-recovery selector for the H2/I3 cap-fire surface.
+    """
     if all_blocked:
         return "--all-blocked"
+    if capped_phases:
+        return "--capped-phases"
     if infrastructure:
         return "--infrastructure"
     if phases:
@@ -206,6 +245,17 @@ def _resolve_source_label(
     help="Requeue every blocked task in the plan (asks confirmation).",
 )
 @click.option(
+    "--capped-phases",
+    "capped_phases",
+    is_flag=True,
+    default=False,
+    help=(
+        "Requeue all blocked tasks in phases with review_status='capped' "
+        "(set by H2 per-phase / I3 plan-scope corrective-cap fires). "
+        "Composes with other selectors via OR."
+    ),
+)
+@click.option(
     "--yes",
     "yes",
     is_flag=True,
@@ -222,6 +272,7 @@ def requeue(
     phases: tuple[str, ...],
     infrastructure: bool,
     all_blocked: bool,
+    capped_phases: bool,
     yes: bool,
     dry_run: bool,
 ) -> None:
@@ -251,12 +302,13 @@ def requeue(
             )
             return
 
-        task_ids, unknown = _select_task_ids(
+        task_ids, unknown, matched_capped_phases = _select_task_ids(
             plan,
             explicit_tasks=tasks,
             phases=phases,
             infrastructure=infrastructure,
             all_blocked=all_blocked,
+            capped_phases=capped_phases,
         )
         if unknown:
             joined = ", ".join(sorted(unknown))
@@ -296,7 +348,24 @@ def requeue(
             phases=phases,
             infrastructure=infrastructure,
             all_blocked=all_blocked,
+            capped_phases=capped_phases,
         )
+        # v0.38.0 I2 (HK4): emit the bulk-recovery audit breadcrumb BEFORE
+        # the requeue mutations land so the forensic order of operations
+        # reads "operator picked --capped-phases → N tasks requeued"
+        # straight off the ledger. Audit-only — the per-task transitions
+        # flow through the regular ``update_task_status`` ops emitted
+        # inside ``requeue_tasks``. Uses ``pm.ledger_append`` (takes its
+        # own lock) so the call is safe against the second lock acquire
+        # inside :meth:`PlanManager.requeue_tasks` below.
+        if capped_phases:
+            await pm.ledger_append(
+                op="requeue.capped_phases_selected",
+                payload={
+                    "phases": list(matched_capped_phases),
+                    "task_count": len(task_ids),
+                },
+            )
         result = await pm.requeue_tasks(
             task_ids,
             reset_phase_review=True,
