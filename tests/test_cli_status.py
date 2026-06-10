@@ -320,7 +320,7 @@ def test_status_blocked_lists_dump_paths(tmp_path: Path) -> None:
 
     plan = _make_blocked_plan()
     out = StringIO()
-    console = Console(file=out, force_terminal=False)
+    console = Console(file=out, force_terminal=False, width=200)
     _render_blocked_section(console, plan, cwd=tmp_path)
     rendered = out.getvalue()
     assert "Archived Rejected Plans" in rendered
