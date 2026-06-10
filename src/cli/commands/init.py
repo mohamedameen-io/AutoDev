@@ -203,6 +203,10 @@ def init(platform: str, force: bool, inline: bool, rebuild_index: bool) -> None:
                     str(cwd),
                     "--db",
                     str(db_path),
+                    "--workers",
+                    str(cfg.index_build_workers),
+                    "--batch-size",
+                    str(cfg.index_build_batch_size),
                 ]
                 subprocess.Popen(  # noqa: S603 - executable is sys.executable
                     cmd,
@@ -221,7 +225,12 @@ def init(platform: str, force: bool, inline: bool, rebuild_index: bool) -> None:
                 )
             else:
                 with console.status("Building file/symbol index..."):
-                    stats = IndexBuilder.build_full(cwd, db_path)
+                    stats = IndexBuilder.build_full(
+                        cwd,
+                        db_path,
+                        workers=cfg.index_build_workers,
+                        batch_size=cfg.index_build_batch_size,
+                    )
                 index_summary = (
                     f"{stats.file_count} files, {stats.symbol_count} symbols "
                     f"({stats.duration_ms} ms)"

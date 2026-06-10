@@ -144,12 +144,24 @@ def test_init_async_for_huge_repo(tmp_path: Path) -> None:
         return_value=_FakeCapacity(is_huge=True)
     )
 
+    # The async escape hatch is opt-in (default flipped to sync in the
+    # parallel-build work). Enable it explicitly to exercise the spawn path.
+    from config.defaults import default_config as _real_default_config
+
+    def _async_enabled_config():
+        cfg = _real_default_config()
+        cfg.index_huge_repo_async_init = True
+        return cfg
+
     with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
         with mock.patch.dict(
             "sys.modules", {"state.file_index": fake_index_module}
         ), mock.patch(
             "runtime.repo_probe.probe_repo",
             fake_probe_module.probe_repo,
+        ), mock.patch(
+            "cli.commands.init.default_config",
+            _async_enabled_config,
         ), mock.patch(
             "subprocess.Popen"
         ) as mock_popen:

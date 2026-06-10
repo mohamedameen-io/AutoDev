@@ -39,12 +39,13 @@ import datetime as _dt
 import hashlib
 import json
 import logging
+import multiprocessing as mp
 import os
 import re
 import sqlite3
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -435,6 +436,156 @@ def _content_hash(text: bytes) -> str:
     return hashlib.sha256(text).hexdigest()[:16]
 
 
+# ---------------------------------------------------------------------------
+# Parallel parse (CPU-bound, GIL-bound → processes, not threads)
+# ---------------------------------------------------------------------------
+#
+# The parse stage (read bytes → hash → stat → decode → extractor.extract())
+# is CPU- and GIL-bound, so we fan it out across worker *processes*. The
+# write stage stays single-threaded in the parent (sqlite single-writer).
+# Serial and parallel paths feed the SAME writer (``_bulk_write`` /
+# ``_index_parsed_serial``) → parity by construction.
+#
+# macOS defaults to the ``spawn`` start method, so the worker function and
+# its arguments must be top-level + picklable. We reuse the ``forkserver``
+# context (mirrors ``qa/sandbox.py``). Workers re-import this module; the
+# extractors are module-level singletons that re-init idempotently, so the
+# worker just calls ``lookup_extractor(suffix)``. Workers do NO sqlite I/O.
+
+
+@dataclass(frozen=True)
+class _ParsedFile:
+    """Result of parsing one file in a worker process (picklable).
+
+    ``symbols`` is a tuple of ``(name, kind, signature, line, col)`` tuples
+    so the dataclass is trivially picklable. ``rel`` is the repo-relative
+    POSIX path used as the ``files.path`` primary key.
+    """
+
+    rel: str
+    content_hash: str
+    mtime_ns: int
+    size_bytes: int
+    lang: str
+    symbols: tuple[tuple[str, str, str, int, int], ...]
+
+
+# Set by the pool initializer in each worker (picklable string arg). Workers
+# need the repo root to compute the repo-relative path.
+_WORKER_CWD: str | None = None
+
+
+def _init_worker(cwd: str) -> None:
+    """Pool initializer: stash the repo root in a module global."""
+    global _WORKER_CWD
+    _WORKER_CWD = cwd
+
+
+def _parse_one(abs_path: Path, cwd: Path) -> _ParsedFile | None:
+    """Parse a single file into a :class:`_ParsedFile` (no DB access).
+
+    Best-effort parity with :func:`_index_one_file`: read/decode/extract
+    failures yield an empty symbol list; a path outside *cwd* or an
+    unreadable/vanished file yields ``None`` (skipped).
+    """
+    try:
+        rel = abs_path.relative_to(cwd).as_posix()
+    except ValueError:
+        return None
+    try:
+        raw = abs_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        st = abs_path.stat()
+    except OSError:
+        return None
+    chash = _content_hash(raw)
+    extractor = lookup_extractor(abs_path.suffix.lower())
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", errors="replace")
+    try:
+        extracted = extractor.extract(text)
+    except Exception as exc:  # noqa: BLE001 — never let one file kill the build
+        _log.debug("file_index.extract_failed path=%s err=%s", rel, str(exc))
+        extracted = []
+    symbols = tuple(
+        (
+            sym["name"],
+            sym["kind"],
+            sym["signature"],
+            int(sym["line"]),
+            int(sym["col"]),
+        )
+        for sym in extracted
+    )
+    return _ParsedFile(
+        rel=rel,
+        content_hash=chash,
+        mtime_ns=st.st_mtime_ns,
+        size_bytes=st.st_size,
+        lang=extractor.lang_tag,
+        symbols=symbols,
+    )
+
+
+def _parse_file_worker(abs_str: str) -> _ParsedFile | None:
+    """Top-level, picklable worker entrypoint for the process pool.
+
+    Uses the pool-initialized ``_WORKER_CWD`` to resolve repo-relative
+    paths. Returns ``None`` for files that should be skipped.
+    """
+    if _WORKER_CWD is None:  # pragma: no cover — initializer always runs first
+        return None
+    return _parse_one(Path(abs_str), Path(_WORKER_CWD))
+
+
+def _iter_parsed(
+    files: list[Path],
+    cwd: Path,
+    workers: int,
+) -> Iterator[_ParsedFile]:
+    """Yield :class:`_ParsedFile` for each file, parallel when ``workers>1``.
+
+    Parallel path: a ``forkserver`` ``Pool`` runs :func:`_parse_file_worker`
+    via ``imap_unordered``. On any pool-construction failure we fall back to
+    the serial path so a build never hard-fails on a multiprocessing quirk.
+    Serial path (``workers<=1`` or fallback): parse in-process. ``None``
+    results (skipped files) are filtered out in both paths.
+    """
+    if workers > 1 and files:
+        try:
+            ctx = mp.get_context("forkserver")
+            with ctx.Pool(
+                processes=workers,
+                initializer=_init_worker,
+                initargs=(str(cwd),),
+            ) as pool:
+                for parsed in pool.imap_unordered(
+                    _parse_file_worker,
+                    [str(p) for p in files],
+                    chunksize=64,
+                ):
+                    if parsed is not None:
+                        yield parsed
+            return
+        except Exception as exc:  # noqa: BLE001 — fall back to serial
+            _log.warning(
+                "file_index.pool_init_failed workers=%d err=%s; "
+                "falling back to serial parse",
+                workers,
+                str(exc),
+            )
+
+    # Serial fallback (workers<=1, empty file list, or pool failure).
+    for abs_path in files:
+        parsed = _parse_one(abs_path, cwd)
+        if parsed is not None:
+            yield parsed
+
+
 def _index_one_file(
     conn: sqlite3.Connection,
     cwd: Path,
@@ -518,6 +669,161 @@ def _delete_file_row(conn: sqlite3.Connection, rel: str) -> None:
     conn.execute("DELETE FROM files_fts WHERE path=?", (rel,))
 
 
+# ---------------------------------------------------------------------------
+# Bulk-loading writer (Step 2) — single-threaded, batched, FTS rebuild
+# ---------------------------------------------------------------------------
+
+
+def _drop_symbols_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Drop the per-row external-content FTS sync triggers.
+
+    During a bulk load we populate ``symbols_fts`` once via the
+    ``('rebuild')`` command instead of firing ``symbols_ai`` on every
+    INSERT (orders of magnitude faster on huge repos).
+    """
+    conn.execute("DROP TRIGGER IF EXISTS symbols_ai")
+    conn.execute("DROP TRIGGER IF EXISTS symbols_ad")
+
+
+# The AI/AD trigger bodies, factored out so the bulk path can re-create the
+# exact same triggers it dropped (keeping ``build_incremental`` per-file
+# inserts populating the external-content FTS).
+_SYMBOLS_FTS_TRIGGERS_DDL = """
+CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
+    INSERT INTO symbols_fts(rowid, name, file_path, signature)
+    VALUES (new.id, new.name, new.file_path, new.signature);
+END;
+CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, file_path, signature)
+    VALUES('delete', old.id, old.name, old.file_path, old.signature);
+END;
+"""
+
+
+def _recreate_symbols_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Re-create the ``symbols_ai`` / ``symbols_ad`` sync triggers."""
+    conn.executescript(_SYMBOLS_FTS_TRIGGERS_DDL)
+
+
+def _bulk_write(
+    conn: sqlite3.Connection,
+    parsed_iter: Iterable[_ParsedFile],
+    indexed_at: int,
+    batch_size: int,
+    progress_cb: Callable[[int, int], None] | None,
+    total: int,
+    start: float,
+) -> tuple[int, int]:
+    """Bulk-load parsed files into a freshly-wiped index.
+
+    Assumes the db was just created (``build_full`` wipes first), so there
+    are no pre-existing rows to skip/delete. The ``symbols_fts``
+    external-content sync triggers are dropped for the duration; FTS is
+    repopulated once at the end via ``INSERT INTO
+    symbols_fts(symbols_fts) VALUES('rebuild')``, then the triggers are
+    re-created so ``build_incremental`` per-file inserts keep working.
+
+    Commits every *batch_size* files to bound the WAL (no 600 MB
+    single-transaction blob). Returns ``(file_count, symbol_count)``.
+
+    Note: ``files_fts`` is a *standalone* trigram FTS (no triggers), so we
+    insert its ``path`` rows directly alongside the ``files`` rows.
+    """
+    _drop_symbols_fts_triggers(conn)
+
+    file_count = 0
+    symbol_count = 0
+    files_batch: list[tuple] = []
+    files_fts_batch: list[tuple] = []
+    symbols_batch: list[tuple] = []
+
+    def _flush() -> None:
+        if files_batch:
+            conn.executemany(
+                "INSERT INTO files(path, content_hash, mtime_ns, size_bytes, "
+                "lang, indexed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                files_batch,
+            )
+            conn.executemany(
+                "INSERT INTO files_fts(path) VALUES (?)", files_fts_batch
+            )
+        if symbols_batch:
+            conn.executemany(
+                "INSERT INTO symbols(file_path, name, kind, signature, line, "
+                "col) VALUES (?, ?, ?, ?, ?, ?)",
+                symbols_batch,
+            )
+        files_batch.clear()
+        files_fts_batch.clear()
+        symbols_batch.clear()
+
+    conn.execute("BEGIN")
+    in_txn = True
+    try:
+        for parsed in parsed_iter:
+            files_batch.append(
+                (
+                    parsed.rel,
+                    parsed.content_hash,
+                    parsed.mtime_ns,
+                    parsed.size_bytes,
+                    parsed.lang,
+                    indexed_at,
+                )
+            )
+            files_fts_batch.append((parsed.rel,))
+            for sym in parsed.symbols:
+                symbols_batch.append(
+                    (parsed.rel, sym[0], sym[1], sym[2], sym[3], sym[4])
+                )
+            file_count += 1
+            symbol_count += len(parsed.symbols)
+
+            if progress_cb is not None and (
+                file_count % 1000 == 0 or file_count == total
+            ):
+                try:
+                    progress_cb(file_count, total)
+                except Exception:  # noqa: BLE001
+                    pass
+            if file_count % 5000 == 0:
+                _log.info(
+                    "file_index.build_progress files_done=%d files_total=%d "
+                    "elapsed_ms=%d",
+                    file_count,
+                    total,
+                    int((time.monotonic() - start) * 1000),
+                )
+
+            # Commit per batch to bound the WAL.
+            if len(files_batch) >= batch_size:
+                _flush()
+                conn.execute("COMMIT")
+                conn.execute("BEGIN")
+        # Final partial batch.
+        _flush()
+        conn.execute("COMMIT")
+        in_txn = False
+
+        # One-shot external-content FTS rebuild → identical to the
+        # trigger-populated index.
+        conn.execute("INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')")
+        # Restore the per-row sync triggers for build_incremental.
+        _recreate_symbols_fts_triggers(conn)
+    except Exception:
+        if in_txn:
+            conn.execute("ROLLBACK")
+        # Best-effort: leave the schema with triggers re-created so a
+        # subsequent incremental isn't left without FTS sync.
+        try:
+            _recreate_symbols_fts_triggers(conn)
+        except sqlite3.DatabaseError:
+            pass
+        raise
+
+    return file_count, symbol_count
+
+
 def _set_meta(conn: sqlite3.Connection, **kv: str | int) -> None:
     for k, v in kv.items():
         conn.execute(
@@ -596,8 +902,15 @@ class IndexBuilder:
         db_path: Path,
         languages: list[str] | None = None,
         progress_cb: Callable[[int, int], None] | None = None,
+        workers: int = 0,
+        batch_size: int = 1000,
     ) -> IndexStats:
         """Rebuild the index from scratch over every tracked file.
+
+        The parse stage (read + decode + symbol extraction) is fanned out
+        across worker *processes* and feeds a single bulk-loading sqlite
+        writer in the parent. Serial (``workers<=1``) and parallel paths
+        share the same writer, so the produced index is identical.
 
         Args:
             cwd: Repo root.
@@ -608,6 +921,11 @@ class IndexBuilder:
             progress_cb: Optional ``(files_done, files_total)`` callback.
                 Called once per ~1000 files to give the operator
                 liveness on huge repos.
+            workers: Number of parse worker processes. ``0`` (default)
+                means ``os.cpu_count() or 1``. ``1`` forces the serial
+                in-process parse path.
+            batch_size: Number of files per write transaction. Bounds the
+                WAL so a huge repo doesn't accumulate one giant commit.
 
         Returns:
             :class:`IndexStats` summarizing the run.
@@ -660,57 +978,49 @@ class IndexBuilder:
                 )
 
                 indexed_at = int(time.time())
-                file_count = 0
-                symbol_count = 0
+                resolved_workers = workers if workers > 0 else (
+                    os.cpu_count() or 1
+                )
                 files = list(iter_repo_files(cwd))
                 total = len(files)
-                conn.execute("BEGIN")
-                try:
-                    for idx, abs_path in enumerate(files, start=1):
-                        if languages is not None:
-                            ext = lookup_extractor(abs_path.suffix.lower())
-                            if ext.lang_tag not in languages:
-                                continue
-                        changed, syms = _index_one_file(
-                            conn, cwd, abs_path, indexed_at
-                        )
-                        if changed:
-                            file_count += 1
-                            symbol_count += syms
-                        if progress_cb is not None and (
-                            idx % 1000 == 0 or idx == total
-                        ):
-                            try:
-                                progress_cb(idx, total)
-                            except Exception:  # noqa: BLE001
-                                pass
-                        if idx % 5000 == 0:
-                            _log.info(
-                                "file_index.build_progress files_done=%d files_total=%d elapsed_ms=%d",
-                                idx,
-                                total,
-                                int((time.monotonic() - start) * 1000),
-                            )
-                    sha = _current_git_sha(cwd)
-                    duration_ms = int((time.monotonic() - start) * 1000)
-                    final_file_count = conn.execute(
-                        "SELECT COUNT(*) FROM files"
-                    ).fetchone()[0]
-                    final_symbol_count = conn.execute(
-                        "SELECT COUNT(*) FROM symbols"
-                    ).fetchone()[0]
-                    _set_meta(
-                        conn,
-                        last_indexed_sha=sha or "",
-                        last_indexed_at=indexed_at,
-                        file_count=final_file_count,
-                        symbol_count=final_symbol_count,
-                        build_duration_ms=duration_ms,
+
+                # Parse stage (parallel via forkserver, else serial). The
+                # ``files_fts`` rows + symbols are written serially in the
+                # parent by ``_bulk_write``, which shares the parse output
+                # with the serial path → parity by construction.
+                parsed_iter = _iter_parsed(files, cwd, resolved_workers)
+                if languages is not None:
+                    allow = set(languages)
+                    parsed_iter = (
+                        p for p in parsed_iter if p.lang in allow
                     )
-                    conn.execute("COMMIT")
-                except Exception:
-                    conn.execute("ROLLBACK")
-                    raise
+
+                file_count, symbol_count = _bulk_write(
+                    conn,
+                    parsed_iter,
+                    indexed_at,
+                    batch_size,
+                    progress_cb,
+                    total,
+                    start,
+                )
+
+                sha = _current_git_sha(cwd)
+                duration_ms = int((time.monotonic() - start) * 1000)
+                final_file_count = conn.execute(
+                    "SELECT COUNT(*) FROM files"
+                ).fetchone()[0]
+                final_symbol_count = conn.execute(
+                    "SELECT COUNT(*) FROM symbols"
+                ).fetchone()[0]
+                _set_meta(
+                    conn,
+                    last_indexed_sha=sha or "",
+                    last_indexed_at=indexed_at,
+                    file_count=final_file_count,
+                    symbol_count=final_symbol_count,
+                    build_duration_ms=duration_ms,
+                )
             finally:
                 conn.close()
 
@@ -743,6 +1053,8 @@ class IndexBuilder:
         db_path: Path,
         since_sha: str | None,
         full_rebuild_threshold: int = _DEFAULT_FULL_REBUILD_THRESHOLD,
+        workers: int = 0,
+        batch_size: int = 1000,
     ) -> IndexStats:
         """Incrementally update the index.
 
@@ -758,6 +1070,10 @@ class IndexBuilder:
         mtime-vs-row-mtime check across the full file inventory (still
         cheap because :func:`_index_one_file` skips unchanged rows).
 
+        ``workers`` / ``batch_size`` are forwarded only to the
+        :meth:`build_full` delegations (the targeted-changed path stays
+        serial — change-sets are small).
+
         Idempotent: holds ``.autodev/index.db.lock`` for the duration;
         on lock-held returns a no-op :class:`IndexStats`.
         """
@@ -765,7 +1081,9 @@ class IndexBuilder:
         start = time.monotonic()
 
         if not db_path.exists():
-            return IndexBuilder.build_full(cwd, db_path)
+            return IndexBuilder.build_full(
+                cwd, db_path, workers=workers, batch_size=batch_size
+            )
 
         # Schema-version check (cheap migration trigger).
         try:
@@ -785,7 +1103,9 @@ class IndexBuilder:
                 stored_version,
                 INDEX_SCHEMA_VERSION,
             )
-            return IndexBuilder.build_full(cwd, db_path)
+            return IndexBuilder.build_full(
+                cwd, db_path, workers=workers, batch_size=batch_size
+            )
 
         # If git diff is available + since_sha is set, peek at the
         # changed-set BEFORE acquiring the lock so we can route to
@@ -802,7 +1122,9 @@ class IndexBuilder:
                     len(peeked_changed),
                     full_rebuild_threshold,
                 )
-                return IndexBuilder.build_full(cwd, db_path)
+                return IndexBuilder.build_full(
+                    cwd, db_path, workers=workers, batch_size=batch_size
+                )
 
         with _builder_lock(db_path) as held:
             if not held:
@@ -1279,3 +1601,45 @@ __all__ = [
     "SymbolHit",
     "_last_indexed_sha",
 ]
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for the opt-in async (subprocess) full build.
+
+    ``autodev init`` spawns ``python -m state.file_index build-full
+    --cwd <repo> --db <db> [--workers N] [--batch-size N]`` for huge-repo
+    async builds. Prior to this entrypoint the module had no ``__main__``
+    block, so the subprocess loaded the module and exited doing nothing —
+    the async path never indexed. This restores it.
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="state.file_index")
+    sub = ap.add_subparsers(dest="command", required=True)
+    bf = sub.add_parser("build-full", help="Full rebuild of the index.")
+    bf.add_argument("--cwd", type=Path, required=True)
+    bf.add_argument("--db", type=Path, required=True)
+    bf.add_argument("--workers", type=int, default=0)
+    bf.add_argument("--batch-size", type=int, default=1000)
+    args = ap.parse_args(argv)
+
+    if args.command == "build-full":
+        logging.basicConfig(level=logging.INFO)
+        stats = IndexBuilder.build_full(
+            args.cwd,
+            args.db,
+            workers=args.workers,
+            batch_size=args.batch_size,
+        )
+        _log.info(
+            "file_index.build_full_done files=%d symbols=%d duration_ms=%d",
+            stats.file_count,
+            stats.symbol_count,
+            stats.duration_ms,
+        )
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
