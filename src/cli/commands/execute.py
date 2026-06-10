@@ -48,14 +48,22 @@ def _maybe_refresh_index(cwd: Path, cfg) -> None:
     if building_marker.exists():
         logger.info("index.skip_async_build_in_progress")
         return
+    workers = getattr(cfg, "index_build_workers", 0)
+    batch_size = getattr(cfg, "index_build_batch_size", 1000)
     try:
         from state.file_index import IndexBuilder, _last_indexed_sha
 
         if not db_path.exists():
-            IndexBuilder.build_full(cwd, db_path)
+            IndexBuilder.build_full(
+                cwd, db_path, workers=workers, batch_size=batch_size
+            )
         else:
             IndexBuilder.build_incremental(
-                cwd, db_path, since_sha=_last_indexed_sha(db_path)
+                cwd,
+                db_path,
+                since_sha=_last_indexed_sha(db_path),
+                workers=workers,
+                batch_size=batch_size,
             )
     except Exception as exc:  # noqa: BLE001 - never block on index failure
         logger.warning("index.refresh_failed", err=str(exc))

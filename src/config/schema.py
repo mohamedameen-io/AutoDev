@@ -1030,13 +1030,26 @@ class AutodevConfig(BaseModel):
     index_full_rebuild_threshold_files: int = Field(
         default=5000, ge=100, le=100_000
     )
-    # On huge repos (``RepoCapacity.is_huge``) the initial full build can
-    # take minutes. When True (default), ``autodev init`` spawns the
-    # builder in a background subprocess and returns immediately; the
-    # ``.autodev/index.db.building`` marker file signals to the per-trigger
-    # incremental hook that it should skip until the build completes.
-    # Set False to force synchronous initial build even on huge repos.
-    index_huge_repo_async_init: bool = True
+    # Number of worker processes used by ``IndexBuilder.build_full`` to
+    # parse files in parallel (the parse stage is CPU- and GIL-bound, so
+    # processes, not threads). ``0`` (default) = ``os.cpu_count() or 1``;
+    # ``1`` forces the serial in-process parse. Workers feed a single
+    # bulk-loading sqlite writer in the parent.
+    index_build_workers: int = Field(default=0, ge=0)
+    # Files per write transaction during a full bulk build. Bounds the WAL
+    # so a huge repo doesn't accumulate one giant single-transaction blob
+    # (the pre-parallel builder produced a ~600 MB WAL that only flushed at
+    # the end). Lower it on memory-constrained hosts.
+    index_build_batch_size: int = Field(default=1000, ge=1)
+    # On huge repos (``RepoCapacity.is_huge``) the initial full build used
+    # to take minutes, so it was spawned in a background subprocess. Now
+    # that the build is parallel + bulk-loaded it is fast enough to run
+    # synchronously, so the default is False (sync). Set True to restore
+    # the opt-in async escape hatch: ``autodev init`` spawns the builder in
+    # a background subprocess and returns immediately; the
+    # ``.autodev/index.db.building`` marker signals the per-trigger
+    # incremental hook to skip until the build completes.
+    index_huge_repo_async_init: bool = False
 
     # v0.30.0 Bug 5: cross-task infrastructure-failure circuit breaker.
     # Counts adapter failures whose ``subtype`` is in
