@@ -213,3 +213,83 @@ async def test_circuit_breaker_threshold_configurable_via_config(
     assert reason is not None
     assert "5" in reason
     assert "120" in reason
+
+
+# ---------------------------------------------------------------------------
+# v0.39.0 B4: circuit-breaker window auto-scales on huge repos.
+# ---------------------------------------------------------------------------
+
+
+def _force_huge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch ``orchestrator.repo_size.is_huge_repo`` → True (honoring the
+    escape hatch). The huge-repo resolver imports the helper locally, so
+    we patch the canonical source symbol."""
+    import orchestrator.repo_size as size_mod
+    from orchestrator.repo_size import clear_cache
+
+    clear_cache()
+
+    def _force_true(cwd: Path, threshold: int | None = None, *, cfg: Any = None) -> bool:  # noqa: ARG001
+        if cfg is not None and getattr(cfg, "huge_repo_overrides_disabled", False):
+            return False
+        return True
+
+    monkeypatch.setattr(size_mod, "is_huge_repo", _force_true)
+
+
+def test_circuit_breaker_window_scales_on_huge_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a huge repo, ``circuit_breaker_window_s`` auto-scales 60 → 120
+    (mult 2.0) and ``circuit_breaker_threshold`` 3 → 6 — both via the
+    pre-populated ``huge_repo_multipliers`` dict, with zero operator
+    config edits.
+    """
+    _force_huge(monkeypatch)
+
+    cfg = default_config()
+    cfg.tournaments.auto_disable_for_models = []
+    cfg.tournaments.impl.enabled = False
+    cfg.tournaments.plan.enabled = False
+    # Defaults: threshold 3, window 60.0.
+    registry = build_registry(cfg)
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = Orchestrator(
+        cwd=tmp_path,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id="sess-test-cb-huge",
+    )
+
+    assert isinstance(orch._circuit_breaker, InfraFailureCircuitBreaker)
+    # window 60 × 2.0 = 120; threshold 3 × 2.0 = 6 (already-scaled in v0.37.0).
+    assert orch._circuit_breaker.window_s == 120.0
+    assert orch._circuit_breaker.threshold == 6
+
+
+def test_circuit_breaker_window_unscaled_on_small_repo(
+    tmp_path: Path,
+) -> None:
+    """On a small repo (is_huge_repo False via real probe over an empty
+    tmp_path) the window stays the raw 60.0 and threshold the raw 3."""
+    from orchestrator.repo_size import clear_cache
+
+    clear_cache()
+
+    cfg = default_config()
+    cfg.tournaments.auto_disable_for_models = []
+    cfg.tournaments.impl.enabled = False
+    cfg.tournaments.plan.enabled = False
+    registry = build_registry(cfg)
+    adapter = StubAdapter({"explorer": ok("ok")})
+    orch = Orchestrator(
+        cwd=tmp_path,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id="sess-test-cb-small",
+    )
+
+    assert orch._circuit_breaker.window_s == 60.0
+    assert orch._circuit_breaker.threshold == 3

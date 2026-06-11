@@ -102,8 +102,10 @@ def resume(platform: str | None) -> None:
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
         adapter_pair = await get_adapter(
             cast("Literal['claude_code', 'cursor', 'auto']", platform_pref),
+            cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
+            cfg=cfg,
         )
         adapter: PlatformAdapter = adapter_pair[0]
         selection_meta = adapter_pair[1]

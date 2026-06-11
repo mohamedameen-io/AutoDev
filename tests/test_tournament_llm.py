@@ -398,6 +398,62 @@ async def test_exhausts_retries_raises_transient(
     assert len(adapter.calls) == 3
 
 
+# ── v0.39.0 B4: jitter on the retry backoff ───────────────────────────────
+
+
+def _capture_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Capture (but skip) every ``asyncio.sleep`` duration tenacity asks
+    for, so we can introspect the computed wait per attempt without
+    actually sleeping. Unlike ``_patch_no_sleep`` this does NOT stub out
+    ``wait_exponential`` — the real (jittered) wait strategy runs."""
+    captured: list[float] = []
+
+    async def _record(s: float) -> None:
+        captured.append(s)
+
+    monkeypatch.setattr("asyncio.sleep", _record)
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_is_jittered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The configured ``wait`` is a combined exponential + 0-2s random
+    jitter (not a bare exponential). Two independent retry sequences for
+    the SAME attempt index must not produce identical backoff durations,
+    proving the ``wait_random`` term is live. Attempt-count semantics are
+    unchanged (the existing count tests still pass).
+    """
+    import random
+
+    sleeps_a = _capture_sleeps(monkeypatch)
+    random.seed(1)
+    adapter_a = StubAdapter([TransientError("429") for _ in range(5)])
+    client_a = AdapterLLMClient(adapter_a, cwd=tmp_path, max_attempts=4)
+    with pytest.raises(TransientError):
+        await client_a.call(system="s", user="u", role="critic_t")
+
+    sleeps_b = _capture_sleeps(monkeypatch)
+    random.seed(2)
+    adapter_b = StubAdapter([TransientError("429") for _ in range(5)])
+    client_b = AdapterLLMClient(adapter_b, cwd=tmp_path, max_attempts=4)
+    with pytest.raises(TransientError):
+        await client_b.call(system="s", user="u", role="critic_t")
+
+    # Each sequence sleeps between attempts (4 attempts → 3 sleeps).
+    assert len(sleeps_a) >= 1
+    assert len(sleeps_b) >= 1
+    # A bare exponential would give identical, deterministic durations for
+    # the same attempt index across the two runs. The 0-2s jitter breaks
+    # that determinism: the first inter-attempt sleeps must differ.
+    assert sleeps_a[0] != sleeps_b[0]
+    # Sanity: jitter rides ON TOP of the exponential floor (min=2), so the
+    # first sleep is >= 2.0 and within the exponential+jitter envelope.
+    assert sleeps_a[0] >= 2.0
+    assert sleeps_a[0] <= 4.0 + 1e-6  # first exp term (~2) + max jitter (2)
+
+
 # ── Non-transient errors do NOT retry ─────────────────────────────────────
 
 @pytest.mark.asyncio

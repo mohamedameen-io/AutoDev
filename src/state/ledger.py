@@ -508,6 +508,39 @@ LedgerOp = Literal[
     # be 0 on a no-op re-run). Forensics goal: correlate H2/I3 cap-fires
     # with operator-triggered bulk recovery without scraping CLI logs.
     "requeue.capped_phases_selected",
+    # v0.39.0 (Cluster A2b): runtime auto-soft-pass fallback fired. After
+    # >=2 consecutive test-runner ``capture_failed`` diagnoses on a huge
+    # repo, the orchestrator auto-enables
+    # ``treat_unrunnable_tests_as_no_tests`` in-memory for the rest of the
+    # session. Audit-only — the flag lives only on the in-memory cfg (the
+    # profile is never written to ``.autodev/config.json``), so replay
+    # treats this op as a forensic no-op. Payload shape:
+    # ``{task_id: str, reason: str, consecutive_capture_failed: int}``.
+    "auto_soft_pass_enabled",
+    # v0.39.0 (Cluster C2): a ``complex`` task on a huge repo looks
+    # under-decomposed (too many files / one very large file), or it
+    # exhausted its scaled budget with ``error_max_turns``. Audit-only —
+    # the orchestrator never mutates or rejects the plan in response; the
+    # op is a forensic breadcrumb that lets retrospectives correlate
+    # huge-repo brute-force failures with the tasks that should have been
+    # split. Emitted from two sites: the planner advisory in
+    # ``plan_phase._advise_task_decomposition`` (``source="planner_advisory"``,
+    # post-parse, before ``init_plan``) and the runtime developer-failure
+    # block in ``execute_phase`` (``source="runtime"``, on the first one or
+    # two ``error_max_turns`` retries). Payload shape:
+    # ``{task_id: str, source: str, attempt: int, file_count: int,
+    # files: list[str], complexity: str}``. Replay treats it as a no-op.
+    "task_under_decomposed",
+    # Phase 0 (cost/time telemetry): per-invocation cost breadcrumb. Emitted
+    # once for EVERY adapter round-trip — the main delegate path AND every
+    # tournament invocation (judges + developers/test_engineers), which
+    # otherwise bypass ``GuardrailEnforcer.post_invocation`` and so are
+    # invisible to the in-memory ``plan_cost_usd`` accumulator. The
+    # per-run total is recovered by summing these ops' ``cost_usd`` over
+    # the run window. Audit-only — no plan-state mutation, so replay is a
+    # forensic no-op. Payload shape:
+    # ``{role: str, task_id: str | None, cost_usd: float, duration_s: float}``.
+    "invocation_cost",
 ]
 
 
@@ -1047,6 +1080,21 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # requeued task) and the phase ``review_status`` reset flows
         # through the regular ``update_phase_meta`` op.
         "requeue.capped_phases_selected",
+        # v0.39.0 (Cluster A2b): runtime auto-soft-pass fallback fired.
+        # Audit-only — the ``treat_unrunnable_tests_as_no_tests`` flip is
+        # in-memory on the session cfg only and never persisted, so replay
+        # is a no-op forensic breadcrumb.
+        "auto_soft_pass_enabled",
+        # v0.39.0 (Cluster C2): under-decomposed huge-repo task breadcrumb.
+        # Audit-only — the orchestrator never mutates/rejects the plan in
+        # response (the planner advisory and runtime telemetry are purely
+        # observational), so replay is a no-op forensic breadcrumb.
+        "task_under_decomposed",
+        # Phase 0 (cost/time telemetry): per-invocation cost breadcrumb.
+        # Audit-only — purely observational (the per-run cost summary is
+        # computed by summing these ops over the run window); replay is a
+        # forensic no-op.
+        "invocation_cost",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

@@ -623,8 +623,10 @@ def phase_review_subcommand(
 
         adapter, selection_meta = await get_adapter(
             cfg.platform,
+            cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
+            cfg=cfg,
         )
         registry = build_registry(cfg)
         orch = Orchestrator(
@@ -770,8 +772,10 @@ async def _run_plan_tournament_cli(
         # standalone ledger plumbing exists.
         adapter, _selection_meta = await get_adapter(
             cfg.platform,
+            cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
+            cfg=cfg,
         )
         # Pass the loaded plan markdown so _cli_role_overrides can extract
         # the architect's COMPLEXITY: classification and resolve per-role
@@ -895,8 +899,10 @@ async def _run_impl_tournament_cli(
         # skip rationale (no Orchestrator on this CLI path).
         adapter, _selection_meta = await get_adapter(
             cfg.platform,
+            cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
+            cfg=cfg,
         )
         rmt, rat, rts, ref = _cli_role_overrides(cfg)
         client = AdapterLLMClient(

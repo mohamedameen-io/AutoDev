@@ -382,6 +382,7 @@ async def get_adapter(
     platform_hint: Literal["claude_code", "cursor"] | None = None,
     respect_trigger_context: bool = True,
     cursor_trigger_env_extra: Iterable[str] = (),
+    cfg: object | None = None,
 ) -> tuple[PlatformAdapter, dict[str, object]]:
     """Resolve a PlatformAdapter instance for the given preference.
 
@@ -404,6 +405,17 @@ async def get_adapter(
     "healthcheck_ok"}``. CLI callers append this to the ledger as the
     ``adapter_selected`` op so post-mortems can correlate "which
     selection arm fired this session" with downstream behaviour.
+
+    huge-repo (Cluster B0): ``cfg`` is the loaded
+    :class:`config.schema.AutodevConfig`. When provided and the built
+    adapter exposes ``bind_adapters_cfg``, this binds ``cfg.adapters``
+    (probe retry / timeout knobs) plus the full ``cfg`` and ``cwd`` so
+    the mandatory post-``get_adapter`` re-probe in the CLI commands
+    picks up the configured / huge-repo-scaled probe timeout. The
+    detect-time probe inside :func:`detect_platform` stays unbound (it
+    runs on a throwaway adapter at the 10s default — a fast "is the CLI
+    alive?" check). Backward-compatible: ``cfg=None`` (the default)
+    skips binding entirely.
     """
     name = await detect_platform(
         platform,
@@ -417,6 +429,15 @@ async def get_adapter(
         cursor_trigger_env_extra=cursor_trigger_env_extra,
     )
     adapter = _make_adapter(name, cwd=cwd, platform_hint=platform_hint)
+    # huge-repo (Cluster B0): bind the loaded config onto the adapter so
+    # the existing probe knobs (``probe_retry_attempts`` /
+    # ``probe_backoff_initial_s``) and the new ``probe_timeout_s``
+    # (+ huge-repo scaling) actually reach the mandatory re-probe. Before
+    # this, ``bind_adapters_cfg`` was never called in production and the
+    # knobs silently fell back to defaults.
+    if cfg is not None and hasattr(adapter, "bind_adapters_cfg"):
+        adapters_cfg = getattr(cfg, "adapters", None)
+        adapter.bind_adapters_cfg(adapters_cfg, root_cfg=cfg, probe_cwd=cwd)
     selection_meta: dict[str, object] = {
         "platform": name,
         "source": source,

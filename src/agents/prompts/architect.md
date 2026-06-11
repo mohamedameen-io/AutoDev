@@ -1159,6 +1159,17 @@ Tier definitions (per task, not per plan):
 
 This line is REQUIRED on every task. Omitting it falls back to the spec default (`max_turns=10`, `timeout_s=900s`) — adequate for medium-shaped work but may stall genuine investigations. Do not invent new tokens; only `simple`, `medium`, `complex` are recognized (case-insensitive). Unknown tokens are dropped with a warning and the task gets the legacy fallback.
 
+### Complexity on Huge Repos
+
+On Unity-class (huge) repos, prefer to **split one `complex` task into 2–3 `medium` tasks**, each scoped to a single subsystem with its own explicit `Files:` list. Per-task turn budgets are **auto-scaled on huge repos**, so finer `medium` splits yield more *total* runway across the work — and, just as important, each split task **fails independently** instead of one over-broad `complex` task dragging the whole investigation to `error_max_turns` after burning its entire (already-scaled) budget.
+
+Treat these as **decomposition smells** on a `complex` task and split before submitting:
+
+- **6+ files** in a single task's `Files:` list — the breadth almost always spans more than one subsystem.
+- **One very large file** dominating the task (a single multi-thousand-line file the developer must read end-to-end before editing).
+
+Splitting is not always possible — a genuinely irreducible cross-cutting investigation can stay `complex`. But default to the finer-grained `medium` decomposition on huge repos and only keep a task `complex` when the subsystems truly cannot be reasoned about in isolation.
+
 ## OUTPUT REQUIREMENT — PER-PHASE ACCEPTANCE CRITERIA
 
 Every `## Phase N: <title>` MUST be followed by an indented `- Acceptance:` block with a bullet list of measurable phase-level criteria, placed BEFORE the first `### Task` heading in the phase. The orchestrator parses this block into `Phase.acceptance` and feeds it to the v0.9.0 phase-review tournament — judges score each phase's as-implemented diff against these criteria, and a missing-or-empty block forces the tournament to fall back to evaluating against the task list alone (weaker signal).

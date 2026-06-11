@@ -679,7 +679,10 @@ class TaskOverridesConfig(BaseModel):
             # v0.39.0 alongside the recent_evidence_include_kinds shim.
             "coder": 2.0,
             "developer": 2.0,
-            "reviewer": 1.5,
+            # v0.39.0 C1: bumped 1.5 → 2.5 so non-task reviewer turns scale
+            # enough on huge repos (base 5 × 2.5 ≈ 13 ≥ the empirically-
+            # needed 12). Small-repo reviewer stays at the base 5.
+            "reviewer": 2.5,
             "domain_expert": 1.5,
             "test_engineer": 1.5,
             # v0.37.0 H5: knob-keyed. The :mod:`orchestrator.huge_repo_overrides`
@@ -704,6 +707,31 @@ class TaskOverridesConfig(BaseModel):
             # event, not by total runtime.
             "test_diag_backoff_total_budget_s": 2.0,
             "test_diag_auto_reset_window_s": 2.0,
+            # v0.39.0 huge-repo-native tier. The resolver looks these up by
+            # name and applies the multiplier to the operator's base value.
+            #   * probe_timeout_s (B2): 10s → 15s so the PONG preflight
+            #     probe beats the ~7-10s cold start on huge repos. Base
+            #     lives on ``cfg.adapters.probe_timeout_s`` (not a top-level
+            #     attr), so it is scaled at the adapter, not via
+            #     ``resolve_all_h5_knobs``.
+            #   * parallelism_multiplier (B3): <1.0 by design — halves the
+            #     auto-picked subprocess count (e.g. 12 → 6) to cut 429/529
+            #     rate-limit pressure. Consumed by
+            #     ``resolve_huge_repo_parallelism``, which clamps to a
+            #     ceiling and treats operator pins as an escape hatch.
+            #   * circuit_breaker_window_s (B4): widens the infra-failure
+            #     window 60s → 120s so a slow huge-repo burst doesn't trip
+            #     the breaker prematurely. ``circuit_breaker_threshold`` is
+            #     already scaled elsewhere; this scales the RAW window at
+            #     the breaker construction site.
+            #   * max_turns_ceiling (A3): lifts the budget-escalation turns
+            #     ceiling 250 → 375. Base lives on nested
+            #     ``cfg.budget_escalation`` (not a top-level attr), scaled
+            #     at the consume site, not via ``resolve_all_h5_knobs``.
+            "probe_timeout_s": 1.5,
+            "parallelism_multiplier": 0.5,
+            "circuit_breaker_window_s": 2.0,
+            "max_turns_ceiling": 1.5,
         }
     )
     # v0.36.0 E2: multiplier applied to the resolved ``max_turns`` on
@@ -711,6 +739,29 @@ class TaskOverridesConfig(BaseModel):
     # cascade of retries can't push the per-task budget to infinity.
     retry_budget_multiplier: float = 2.0
     retry_budget_cap_turns: int = 200
+
+
+class BudgetEscalationConfig(BaseModel):
+    """v0.39.0 A3: ceilings for the per-task budget-escalation ladder.
+
+    The escalation ladder in :mod:`orchestrator.budget_escalation` bumps a
+    task's ``max_turns`` / ``timeout_s`` on successive retry attempts. These
+    two ceilings cap that ladder so a cascade of retries can't push the
+    per-task budget to infinity.
+
+    Defaults mirror the module constants ``DEFAULT_MAX_TURNS_CEILING=250`` /
+    ``DEFAULT_TIMEOUT_S_CEILING=3600`` in
+    :mod:`orchestrator.budget_escalation` (``budget_escalation.py:62-66``),
+    so behaviour is byte-identical to today until huge-repo scaling kicks
+    in (the ``"max_turns_ceiling"`` key in
+    ``task_overrides.huge_repo_multipliers`` lifts the turns ceiling 1.5×
+    on huge repos; the timeout ceiling is left un-scaled).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_turns_ceiling: int = Field(default=250, ge=1)
+    timeout_s_ceiling: int = Field(default=3600, ge=1)
 
 
 class AdaptersConfig(BaseModel):
@@ -727,6 +778,24 @@ class AdaptersConfig(BaseModel):
 
     probe_retry_attempts: int = Field(default=3, ge=1, le=10)
     probe_backoff_initial_s: float = Field(default=1.0, gt=0.0)
+    # v0.39.0 B2: per-attempt PONG preflight-probe timeout in seconds.
+    # The default 10.0 preserves the legacy fail-fast "is the CLI alive?"
+    # behaviour; huge repos scale it 1.5× (→ 15s) via the
+    # ``"probe_timeout_s"`` key in ``task_overrides.huge_repo_multipliers``
+    # so the probe survives the slower cold start without operator tuning.
+    probe_timeout_s: float = Field(default=10.0, ge=5.0, le=60.0)
+    # v0.39.0 B1: spawn-agent isolation. When True, spawned headless
+    # ``claude -p`` agents are isolated from the *target* repo's
+    # project/local settings (SessionStart hooks) and MCP servers via
+    # ``--setting-sources user --strict-mcp-config --mcp-config
+    # '{"mcpServers":{}}'`` — the target's ``CLAUDE.md`` still loads (it is
+    # not a settings source), so agents keep following repo conventions.
+    # These are AutoDev's own single-shot workers (instructions via
+    # ``--prompt``, tools via ``--allowed-tools``); they don't need the
+    # target's interactive tooling, and isolating them removes the
+    # cold-start latency that otherwise blows the probe timeout. Operators
+    # who *want* the target's hooks/MCP in spawned agents can set False.
+    suppress_target_repo_config: bool = Field(default=True)
 
 
 class HiveConfig(BaseModel):
@@ -876,6 +945,16 @@ class AutodevConfig(BaseModel):
     # ``huge_repo_multipliers=None`` — the resolver uses the baked-in
     # curve (simple 3.0×, medium 2.0×, complex 1.5×).
     task_overrides: TaskOverridesConfig = Field(default_factory=TaskOverridesConfig)
+    # v0.39.0 A3: ceilings for the per-task budget-escalation ladder. The
+    # ``| None`` annotation matches an existing defensive
+    # ``getattr(orch.cfg, "budget_escalation", None)`` read in
+    # ``execute_phase.py``; the ``default_factory`` makes the model live in
+    # practice (defaults mirror the ``budget_escalation.py`` module
+    # constants → byte-identical to today until huge-repo scaling applies
+    # the ``"max_turns_ceiling"`` multiplier).
+    budget_escalation: BudgetEscalationConfig | None = Field(
+        default_factory=BudgetEscalationConfig
+    )
     # v0.37.0 H5: master escape hatch for all H5 large-codebase auto-
     # defaults (multiplier scaling of H1/H2/H3 caps, hallucination-guard
     # skip-list extension on huge C/C++ repos, ``AUTODEV_LANG_WEIGHT``

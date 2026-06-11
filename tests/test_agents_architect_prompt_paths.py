@@ -63,3 +63,22 @@ def test_architect_prompt_has_edit_scope_validation_note() -> None:
             "architect prompt — use positive guidance only (per "
             "v0.26.2 Phase 4 /critic finding)."
         )
+
+
+def test_architect_prompt_documents_huge_repo_complexity_section() -> None:
+    """v0.39.0 (Cluster C2a): the architect prompt must carry a
+    ``Complexity on Huge Repos`` subsection steering the architect toward
+    splitting one ``complex`` task into 2–3 ``medium`` tasks, noting that
+    budgets are auto-scaled and flagging 6+ files / one very large file as
+    a decomposition smell.
+    """
+    body = _read()
+    # Section marker.
+    assert "Complexity on Huge Repos" in body
+    # Splitting guidance + the medium target.
+    assert "split" in body.lower()
+    assert "medium" in body
+    # The auto-scaling rationale.
+    assert "auto-scaled" in body
+    # The decomposition smell thresholds.
+    assert "6+ files" in body or "6+" in body

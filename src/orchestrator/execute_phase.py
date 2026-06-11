@@ -168,6 +168,131 @@ _GuardrailClassToHintClass: dict[
 }
 
 
+def maybe_enable_auto_soft_pass(orch: "Orchestrator", diagnosis: str) -> bool:
+    """Track consecutive ``capture_failed``; auto-enable soft-pass on a huge repo.
+
+    After >=2 consecutive test-runner ``capture_failed`` diagnoses on a
+    **huge** repo, auto-enable ``treat_unrunnable_tests_as_no_tests``
+    in-memory (idempotent) so the current task — and the rest of the
+    session — can soft-pass an infra-class capture failure instead of
+    churning the test-diagnosis breaker.
+
+    No-op (returns ``False``) when:
+
+    * the ``huge_repo_overrides_disabled`` escape hatch is set;
+    * the repo is not huge (honors the tier invariant — small repos keep
+      strict gating);
+    * the flag is already enabled (the idempotency guard).
+
+    A clean ``ok`` / ``no_tests_found`` diagnosis resets the counter.
+
+    Returns ``True`` iff this call just flipped the flag.
+    """
+    # Escape hatch wins — restore pre-tier behaviour on huge repos.
+    if getattr(orch.cfg, "huge_repo_overrides_disabled", False):
+        return False
+    # Small repos never auto-soft-pass: honors the tier invariant. Use the
+    # capacity signal so this mirrors the task-role huge-scaling path.
+    if not getattr(getattr(orch, "_repo_capacity", None), "is_huge", False):
+        return False
+
+    if diagnosis == "capture_failed":
+        orch._consecutive_capture_failed = (
+            getattr(orch, "_consecutive_capture_failed", 0) + 1
+        )
+    elif diagnosis in ("ok", "no_tests_found"):
+        orch._consecutive_capture_failed = 0
+        return False
+    # Any other diagnosis (collection_failed / runtime_crash / ...) neither
+    # increments nor resets — only a clean run clears the streak.
+
+    if getattr(orch, "_consecutive_capture_failed", 0) < 2:
+        return False
+    if getattr(orch.cfg, "treat_unrunnable_tests_as_no_tests", False):
+        # Already enabled — idempotent no-op.
+        return False
+
+    # Flip in-memory only — the profile is never written to disk.
+    orch.cfg.treat_unrunnable_tests_as_no_tests = True
+    logger.warning(
+        "execute_phase.auto_soft_pass_enabled",
+        reason="consecutive_capture_failed",
+        consecutive_capture_failed=orch._consecutive_capture_failed,
+    )
+    # Best-effort forensic ledger op (fire-and-forget). Guarded so test
+    # stubs without a plan_manager / running loop never raise.
+    if getattr(orch, "plan_manager", None) is not None:
+        try:
+            asyncio.ensure_future(
+                orch.plan_manager.ledger_append(
+                    op="auto_soft_pass_enabled",
+                    payload={
+                        "reason": "consecutive_capture_failed",
+                        "consecutive_capture_failed": (
+                            orch._consecutive_capture_failed
+                        ),
+                    },
+                )
+            )
+        except Exception:  # noqa: BLE001 — telemetry never blocks
+            pass
+    return True
+
+
+async def maybe_emit_under_decomposed_runtime(
+    orch: "Orchestrator",
+    task: "Task",
+    developer_result: "AgentResult",
+) -> bool:
+    """v0.39.0 (Cluster C2c): emit ``task_under_decomposed`` on a budget-bust.
+
+    When a developer task burns its (already huge-scaled) ``max_turns`` budget
+    with ``subtype="error_max_turns"`` on a **huge** repo, on its first one or
+    two attempts (``retry_count in (0, 1)``), that is a strong signal the
+    architect should have split it into smaller ``medium`` tasks. Emit a
+    best-effort, ``plan_manager``-guarded ``task_under_decomposed`` breadcrumb
+    (``source="runtime"``) for offline retrospectives.
+
+    Purely observational: returns ``True`` iff it just emitted, but the caller
+    ignores the return — control flow is unchanged either way. No-op when:
+
+    * the failure subtype is not ``error_max_turns``;
+    * ``retry_count >= 2`` (later attempts; the early signal is what matters);
+    * the repo is not huge (honors the tier invariant);
+    * there is no ``plan_manager`` (test stubs / pre-init).
+
+    Never raises — any ledger error is swallowed with a warning.
+    """
+    if developer_result.subtype != "error_max_turns":
+        return False
+    if task.retry_count not in (0, 1):
+        return False
+    if not getattr(getattr(orch, "_repo_capacity", None), "is_huge", False):
+        return False
+    if getattr(orch, "plan_manager", None) is None:
+        return False
+    try:
+        await orch.plan_manager.ledger_append(
+            op="task_under_decomposed",
+            payload={
+                "task_id": task.id,
+                "source": "runtime",
+                "attempt": int(task.retry_count),
+                "file_count": len(task.files),
+                "files": task.files[:10],
+                "complexity": task.complexity,
+            },
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — telemetry never blocks
+        logger.warning(
+            "execute_phase.ledger_append_failed",
+            op="task_under_decomposed",
+            err=str(exc),
+        )
+        return False
+
+
 def _build_recovery_hint(
     *,
     task_id: str,
@@ -2303,15 +2428,24 @@ def _resolve_execute_parallelism(orch: "Orchestrator") -> int:
     ceiling) when no explicit cap is configured — the dispatcher polls
     greedily, so this just sets the upper bound.
     """
+    from orchestrator.huge_repo_overrides import resolve_huge_repo_parallelism
     from runtime.resource_probe import probe_host, resolve_parallelism
 
     configured = orch.cfg.tournaments.execute_max_parallel_tasks
     capacity = probe_host()
-    return resolve_parallelism(
+    base = resolve_parallelism(
         configured=configured,
         capacity=capacity,
         role_mix="execute",
         num_judges=configured if configured is not None else 16,
+    )
+    # v0.39.0 B3: halve auto-resolved parallelism on huge repos (operator
+    # pin bypasses; no-op on small repos / when the escape hatch is set).
+    return resolve_huge_repo_parallelism(
+        base=base,
+        configured=configured,
+        cwd=orch.cwd,
+        cfg=orch.cfg,
     )
 
 
@@ -3837,6 +3971,13 @@ async def _execute_one(
                     task_id=task.id,
                     err=developer_result.error,
                 )
+                # v0.39.0 (Cluster C2c): runtime under-decomposition
+                # telemetry. Best-effort, purely observational — never
+                # changes control flow (falls through to the existing
+                # retry/escalate path below unchanged).
+                await maybe_emit_under_decomposed_runtime(
+                    orch, task, developer_result
+                )
                 # v0.20.0 C3: dynamic scope expansion on missing-file
                 # error. Inspect the adapter output for paths that look
                 # like sparse-checkout misses; if any are covered by the
@@ -4136,6 +4277,14 @@ async def _execute_one(
                 runner_stderr_tail=stderr_tail or None,
             )
             await write_evidence(orch.cwd, task.id, test_ev)
+
+            # v0.39.0 (Cluster A2b): runtime auto-soft-pass fallback. Track
+            # consecutive ``capture_failed`` on a huge repo and, after >=2
+            # in a row, flip ``treat_unrunnable_tests_as_no_tests`` in-memory
+            # so the CURRENT task can benefit — the gate below reads the
+            # flag live via getattr. No-op on small repos / escape hatch /
+            # when already enabled.
+            maybe_enable_auto_soft_pass(orch, diagnosis)
 
             if diagnosis == "no_tests_found" or (
                 diagnosis in ("capture_failed", "collection_failed", "runtime_crash")
@@ -5502,7 +5651,57 @@ async def delegate(
         if timeout_s is None:
             timeout_s = _DEFAULT_DEVELOPER_TIMEOUT_S
     else:
+        # v0.39.0 (Cluster C1): non-task roles (reviewer, test_engineer,
+        # domain_expert, critics, …) previously bypassed huge-repo scaling
+        # entirely — ``max_turns`` was pinned to ``spec_max_turns`` no matter
+        # how large the repo was, which is why the reviewer needed a manual
+        # ``reviewer.max_turns=12`` override to survive Unity-class runs.
+        # We now scale these roles by the same role-keyed
+        # ``huge_repo_multipliers`` dict the task branch consults, gated on
+        # the identical ``_repo_capacity.is_huge`` signal (NOT
+        # ``is_huge_repo(cwd)``) so both arms of this ``delegate`` agree.
+        # No-op when capacity is None / not huge / role absent / mult ≤ 1.0
+        # / cfg lacks ``task_overrides``. Idempotent — always recomputes
+        # from ``spec_max_turns``.
+        repo_capacity = getattr(orch, "_repo_capacity", None)
+        _task_overrides_cfg = getattr(orch.cfg, "task_overrides", None)
+        huge_mult_overrides = (
+            getattr(_task_overrides_cfg, "huge_repo_multipliers", None)
+            if _task_overrides_cfg is not None
+            else None
+        )
         max_turns = spec_max_turns
+        if (
+            repo_capacity is not None
+            and getattr(repo_capacity, "is_huge", False)
+            and isinstance(huge_mult_overrides, dict)
+            and role in huge_mult_overrides
+            and huge_mult_overrides[role] > 1.0
+        ):
+            _role_mult = float(huge_mult_overrides[role])
+            # Round half *up* (not banker's ``round``): the documented C1
+            # outcomes require reviewer 5×2.5→13 and domain_expert 3×1.5→5,
+            # i.e. .5 cases round toward more runway. ``int(x + 0.5)`` gives
+            # 13 / 8 / 5 where ``int(round(x))`` would give 12 / 8 / 4.
+            max_turns = int(spec_max_turns * _role_mult + 0.5)
+            # v0.36.0 E1 telemetry (reused): record the role-keyed scaling
+            # for forensics. Best-effort, ``plan_manager``-guarded.
+            if getattr(orch, "plan_manager", None) is not None:
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="huge_repo_multiplier_applied",
+                        payload={
+                            "role": role,
+                            "base": int(spec_max_turns),
+                            "multiplier": _role_mult,
+                            "effective": int(max_turns),
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.huge_repo_nontask_ledger_failed",
+                        err=str(exc),
+                    )
         timeout_s = None  # adapter applies its own default (600s in claude_code)
 
     # v0.31.0 (Phase 3): per-(task_id, role) budget escalation on
@@ -5525,6 +5724,11 @@ async def delegate(
 
         # Read tunable ceilings off the cfg if present (operator
         # override surface), else fall back to the module defaults.
+        from orchestrator.budget_escalation import (
+            DEFAULT_MAX_TURNS_CEILING,
+        )
+        from orchestrator.huge_repo_overrides import resolve_huge_repo_value
+
         _ceiling_cfg = getattr(orch.cfg, "budget_escalation", None)
         _max_turns_ceiling = (
             getattr(_ceiling_cfg, "max_turns_ceiling", None)
@@ -5536,9 +5740,24 @@ async def delegate(
             if _ceiling_cfg is not None
             else None
         )
+        # v0.39.0 (Cluster A3): lift the turns ceiling on huge repos
+        # (1.5× → 375 from the 250 default) so a long task can climb the
+        # escalation ladder without prematurely hard-failing. The resolver
+        # is identity on small repos / escape hatch, so small-repo
+        # behaviour is byte-identical. ``timeout_s_ceiling`` stays un-scaled.
+        _base_ceiling = (
+            _max_turns_ceiling
+            if _max_turns_ceiling is not None
+            else DEFAULT_MAX_TURNS_CEILING
+        )
+        _ceiling_eff, _ = resolve_huge_repo_value(
+            key="max_turns_ceiling",
+            base_value=float(_base_ceiling),
+            cwd=orch.cwd,
+            cfg=orch.cfg,
+        )
         _kwargs: dict[str, int] = {}
-        if _max_turns_ceiling is not None:
-            _kwargs["max_turns_ceiling"] = int(_max_turns_ceiling)
+        _kwargs["max_turns_ceiling"] = int(round(_ceiling_eff))
         if _timeout_s_ceiling is not None:
             _kwargs["timeout_s_ceiling"] = int(_timeout_s_ceiling)
 

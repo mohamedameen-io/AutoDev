@@ -153,6 +153,40 @@ def test_resolver_scales_test_diag_window(
     assert mult == 2.0
 
 
+def test_resolver_scales_max_turns_ceiling_huge(
+    _force_huge_repo: None, tmp_path: Path
+) -> None:
+    """v0.39.0 (Cluster A3): the budget-escalation turns ceiling lifts 1.5×
+    on huge repos (250 → 375). Uses the real default multiplier dict so the
+    test pins the shipped 1.5 multiplier."""
+    from orchestrator.huge_repo_overrides import resolve_huge_repo_value
+
+    cfg = _FakeAutodevCfg()  # default multipliers (carry max_turns_ceiling)
+    eff, mult = resolve_huge_repo_value(
+        key="max_turns_ceiling",
+        base_value=250.0,
+        cwd=tmp_path,
+        cfg=cfg,
+    )
+    assert int(round(eff)) == 375
+    assert mult == 1.5
+
+
+def test_resolver_max_turns_ceiling_identity_small_repo(tmp_path: Path) -> None:
+    """On a small (non-huge) repo the ceiling resolver is identity → 250."""
+    from orchestrator.huge_repo_overrides import resolve_huge_repo_value
+
+    cfg = _FakeAutodevCfg(threshold=10**9)  # never huge
+    eff, mult = resolve_huge_repo_value(
+        key="max_turns_ceiling",
+        base_value=250.0,
+        cwd=tmp_path,
+        cfg=cfg,
+    )
+    assert int(round(eff)) == 250
+    assert mult is None
+
+
 # ---------------------------------------------------------------------------
 # Escape hatch: huge_repo_overrides_disabled.
 # ---------------------------------------------------------------------------

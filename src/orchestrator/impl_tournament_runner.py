@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 from autologging import get_logger
 from errors import TournamentError
 from orchestrator.delegation_envelope import DelegationEnvelope
+from orchestrator.huge_repo_overrides import resolve_huge_repo_parallelism
 from orchestrator.worktree import WorktreeManager
 from runtime.resource_probe import probe_host, resolve_parallelism
 from state.evidence import write_evidence
@@ -384,6 +385,14 @@ async def run_impl_tournament(
         capacity=probe_host(),
         role_mix="impl",
         num_judges=cfg.num_judges,
+    )
+    # v0.39.0 B3: halve auto-resolved parallelism on huge repos (operator
+    # pin bypasses; no-op on small repos / when the escape hatch is set).
+    resolved_parallelism = resolve_huge_repo_parallelism(
+        base=resolved_parallelism,
+        configured=orch.cfg.tournaments.max_parallel_subprocesses,
+        cwd=orch.cwd,
+        cfg=orch.cfg,
     )
     # v0.18.0 C3: when veto-mode is active, use specialist judge roles by
     # default. Operators can override via ``cfg.tournaments.impl.judge_roles``

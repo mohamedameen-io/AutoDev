@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Literal
 
 from adapters.git_utils import _git_diff_range, extract_files_from_diff
 from autologging import get_logger
+from orchestrator.huge_repo_overrides import resolve_huge_repo_parallelism
 from runtime.resource_probe import probe_host, resolve_parallelism
 from state.evidence import write_evidence
 from state.paths import autodev_root
@@ -324,6 +325,14 @@ async def run_phase_review_tournament(
         capacity=probe_host(),
         role_mix="phase_review",
         num_judges=cfg.num_judges,
+    )
+    # v0.39.0 B3: halve auto-resolved parallelism on huge repos (operator
+    # pin bypasses; no-op on small repos / when the escape hatch is set).
+    resolved_parallelism = resolve_huge_repo_parallelism(
+        base=resolved_parallelism,
+        configured=orch.cfg.tournaments.max_parallel_subprocesses,
+        cwd=orch.cwd,
+        cfg=orch.cfg,
     )
     tcfg = TournamentConfig(
         num_judges=cfg.num_judges,

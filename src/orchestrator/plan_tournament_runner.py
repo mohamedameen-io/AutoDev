@@ -22,6 +22,7 @@ import random
 from typing import TYPE_CHECKING
 
 from autologging import get_logger
+from orchestrator.huge_repo_overrides import resolve_huge_repo_parallelism
 from orchestrator.plan_parser import extract_complexity
 from runtime.resource_probe import probe_host, resolve_parallelism
 from state.knowledge import TournamentEvent
@@ -314,6 +315,14 @@ async def run_plan_tournament(
         capacity=probe_host(),
         role_mix="plan",
         num_judges=effective_num_judges,
+    )
+    # v0.39.0 B3: halve auto-resolved parallelism on huge repos (operator
+    # pin bypasses; no-op on small repos / when the escape hatch is set).
+    resolved_parallelism = resolve_huge_repo_parallelism(
+        base=resolved_parallelism,
+        configured=orch.cfg.tournaments.max_parallel_subprocesses,
+        cwd=orch.cwd,
+        cfg=orch.cfg,
     )
     tcfg = TournamentConfig(
         num_judges=effective_num_judges,

@@ -2,6 +2,92 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Huge-repo-native tier (slated for v0.39.0). Folds the manual environment
+workarounds that an unbuildable 358k-file engine repo required —
+disabling the target's MCP servers, bumping probe retries, hand-capping
+parallelism, forcing the unrunnable-tests soft-pass, and raising
+reviewer/ceiling turn budgets — into auto-applied, capacity-aware
+behaviour so a huge/unbuildable repo runs with zero `.autodev/config.json`
+edits and zero env vars. Every change is additive, idempotent, a no-op on
+small repos, and gated by the existing `huge_repo_overrides_disabled`
+escape hatch.
+
+Two root-cause fixes underpin the tier: (1) `ClaudeCodeAdapter.bind_adapters_cfg`
+was never called in production, so the `probe_retry_attempts` /
+`probe_backoff_initial_s` knobs silently fell back to defaults — `get_adapter`
+now binds the adapter config before the preflight probe; (2) spawned headless
+agents inherited the target repo's `SessionStart` hooks + MCP servers,
+inflating every cold start past the 10s probe timeout — they are now isolated.
+
+### Soft breaking changes
+
+- **`adapters.suppress_target_repo_config` defaults to `True`.** Spawned
+  headless `claude -p` agents now run with `--setting-sources user
+  --strict-mcp-config --mcp-config '{"mcpServers":{}}'`, so they no longer
+  load the target repo's project/local settings (including `SessionStart`
+  hooks) or MCP servers. The target's `CLAUDE.md` still loads, so repo
+  conventions are preserved. This removes seconds of per-spawn cold-start
+  latency (and the need to disable MCP by hand). Operators who genuinely
+  rely on a target-repo `SessionStart` hook during AutoDev runs can set
+  `suppress_target_repo_config: false`.
+
+### Added
+- **Auto-applied huge-repo profile** (`orchestrator/huge_repo_profile.py`):
+  `apply_huge_repo_profile(cfg, cwd)` produces an *effective* config on huge
+  repos at orchestrator construction. Runtime/ephemeral — computed on a deep
+  copy, **never written to `.autodev/config.json`**. Today its one live
+  effect is auto-enabling `treat_unrunnable_tests_as_no_tests` on a huge
+  **and** unbuildable repo (other huge-repo knobs were already auto-scaled
+  elsewhere).
+- **Unbuildable-repo detection**: `qa.detect.detect_language` now detects
+  C/C++ (`CMakeLists.txt`, `*.sln`, `*.vcxproj` → `"cpp"`, lowest precedence);
+  new `is_repo_unbuildable(cwd)` (language unknown or outside
+  `RUNNABLE_TEST_LANGUAGES`). Runtime fallback also auto-enables the
+  test soft-pass after ≥2 consecutive `capture_failed` on a huge repo
+  (`auto_soft_pass_enabled` ledger op).
+- **Configurable + huge-scaled preflight probe timeout**:
+  `adapters.probe_timeout_s` (default 10.0, range 5–60), scaled ×1.5 on
+  huge repos via `huge_repo_multipliers`.
+- **Conservative parallelism on huge repos**: `huge_repo_multipliers.parallelism_multiplier`
+  (0.5) + a huge-repo ceiling, applied via `resolve_huge_repo_parallelism`
+  at the four tournament/execute parallelism sites. Operator pins
+  (`max_parallel_subprocesses` / `execute_max_parallel_tasks`) are never
+  silently scaled.
+- **Configurable turn ceilings**: new `budget_escalation` config
+  (`max_turns_ceiling` 250, `timeout_s_ceiling` 3600); `max_turns_ceiling`
+  scaled ×1.5 on huge repos.
+- **Non-task-role turn scaling**: reviewer / test_engineer / domain_expert
+  `max_turns` now scale on huge repos via the existing
+  `huge_repo_multipliers` role keys (reviewer bumped to 2.5×). Removes the
+  manual reviewer turn-budget bump.
+- **Task-decomposition guidance + telemetry**: architect-prompt subsection on
+  splitting `complex` tasks on huge repos; a non-blocking planner advisory and
+  a runtime `task_under_decomposed` ledger breadcrumb when a `complex` task is
+  over-broad or exhausts its turn budget.
+- **Retry resilience**: full jitter on the tournament retry backoff
+  (anti-thundering-herd); empty CLI results are now retryable **only** when an
+  infra status (429/5xx) accompanied them; `circuit_breaker_window_s` scaled
+  ×2 on huge repos.
+- **Run cost + wall-time telemetry**: every adapter invocation (main path **and**
+  tournament judges/developers) now records an audit-only `invocation_cost`
+  ledger op via a transparent `CostRecordingAdapter` wrapper on the shared
+  adapter; `autodev plan` / `autodev execute` append a
+  `{phase, cost_usd, elapsed_s, tasks, ts}` row to `.autodev/run-summary.jsonl`
+  and print a `Run cost: $X · wall Ns` summary line. (Note: the in-memory
+  `GuardrailEnforcer.plan_cost_usd` budget cap only sees main-path invocations,
+  so it under-counts tournament spend — the new ledger-based total is
+  authoritative; tightening the cap itself is a follow-up.)
+
+### Fixed
+- **Adapter config binding gap**: `get_adapter(cfg=...)` now binds the adapter
+  config (and probe cwd) before the preflight probe, so `probe_retry_attempts`,
+  `probe_backoff_initial_s`, and the new `probe_timeout_s` actually take effect
+  in production instead of silently using defaults.
+- Corrected the stale `test_default_ceilings_are_sane` assertion (the v0.38.0
+  turn-ceiling bump to 250 had left it asserting the old 100).
+
 ## [0.38.0] - 2026-05-21
 
 Convergence polish (Tier I). Closes the four named "next layer of

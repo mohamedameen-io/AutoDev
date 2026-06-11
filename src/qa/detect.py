@@ -22,6 +22,8 @@ def detect_language(cwd: Path) -> str | None:
     * ``*.csproj`` → ``"dotnet"``
     * ``Gemfile`` → ``"ruby"``
     * ``*.swift`` → ``"swift"``
+    * ``*.sln`` / ``*.vcxproj`` → ``"cpp"`` (lowest precedence)
+    * ``CMakeLists.txt`` → ``"cpp"`` (lowest precedence)
 
     Returns ``None`` when no manifest is found.
     """
@@ -41,6 +43,14 @@ def detect_language(cwd: Path) -> str | None:
         return "ruby"
     if list(cwd.glob("*.swift")):
         return "swift"
+    # v0.39.0 (Cluster A2): C++/CMake at the LOWEST precedence. A .NET
+    # solution also carries a ``*.sln``, and Python/Node repos may sit
+    # alongside a CMake tree — both must keep winning, so these checks
+    # come last, just before the final ``return None``.
+    if list(cwd.glob("*.sln")) or list(cwd.glob("*.vcxproj")):
+        return "cpp"
+    if (cwd / "CMakeLists.txt").exists():
+        return "cpp"
     return None
 
 
@@ -79,4 +89,38 @@ def detect_toolchain(cwd: Path) -> str | None:
     return _toolchain_map.get(language)
 
 
-__all__ = ["detect_language", "detect_toolchain"]
+# v0.39.0 (Cluster A2): languages whose tests AutoDev can actually build
+# and run in-environment. A *detected* language outside this set (e.g.
+# ``"cpp"``, which requires a configured native toolchain we don't drive)
+# means "tests are not runnable here" → the huge-repo profile / runtime
+# fallback can soft-pass an infra-class capture failure rather than treat
+# it as a code defect. Kept deliberately separate from ``detect_language``
+# so ``"cpp"`` stays useful for indexing / sparse logic.
+RUNNABLE_TEST_LANGUAGES = {
+    "python",
+    "nodejs",
+    "rust",
+    "go",
+    "java",
+    "dotnet",
+    "ruby",
+    "swift",
+}
+
+
+def is_repo_unbuildable(cwd: Path) -> bool:
+    """True when AutoDev cannot build/run this repo's tests in-environment.
+
+    Returns ``True`` when there is no detected language, or the detected
+    language is outside :data:`RUNNABLE_TEST_LANGUAGES` (e.g. ``"cpp"``).
+    """
+    lang = detect_language(cwd)
+    return lang is None or lang not in RUNNABLE_TEST_LANGUAGES
+
+
+__all__ = [
+    "RUNNABLE_TEST_LANGUAGES",
+    "detect_language",
+    "detect_toolchain",
+    "is_repo_unbuildable",
+]
