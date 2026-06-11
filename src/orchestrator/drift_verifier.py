@@ -38,12 +38,21 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-# Conservative parser. Matches the prompt's documented output format:
-# ``VERDICT: APPROVED`` or ``VERDICT: NEEDS_REVISION``. Case-insensitive
-# because some critic responses lowercase the verdict word.
+# Conservative parser. Matches any VERDICT: line, including the prompt's
+# documented ``VERDICT: APPROVED`` / ``VERDICT: NEEDS_REVISION`` format, and
+# also bold markdown (``**VERDICT: ...**``) and non-standard forms that
+# critics occasionally emit (e.g., ``**VERDICT: TASK 3.1 — NOT IMPLEMENTED**``).
+# Capturing everything after ``VERDICT:`` lets the caller classify the value.
+# Case-insensitive because some critic responses lowercase the verdict word.
 _VERDICT_RE = re.compile(
-    r"^\s*(?:#+\s*)?VERDICT\s*:\s*(APPROVED|NEEDS_REVISION)\s*$",
+    r"^\s*(?:#+\s*)?(?:\*+\s*)?VERDICT\s*:\s*(.+?)(?:\s*\*+)?\s*$",
     re.IGNORECASE | re.MULTILINE,
+)
+# Matches "TASK {id} — " prefixes that critics insert before the verdict word
+# when per-task format bleeds into the phase verdict line.
+_VERDICT_TASK_PREFIX_RE = re.compile(
+    r"^TASK\s+[\w.\-]+\s*[—\-]+\s*",
+    re.IGNORECASE,
 )
 # Per-task line: ``TASK 2.1: VERIFIED|MISSING|DRIFTED``. Used for
 # extracting drift findings out of the structured response.
@@ -214,8 +223,22 @@ def _parse_drift_response(text: str) -> tuple[bool, list[str]]:
         )
         return False, findings
 
-    verdict = verdict_match.group(1).upper()
-    passed = (verdict == "APPROVED") and not findings
+    raw_verdict_text = verdict_match.group(1).strip()
+    # Strip a "TASK {id} — " prefix that critics occasionally prepend when
+    # per-task format bleeds into the phase verdict line.
+    normalized = _VERDICT_TASK_PREFIX_RE.sub("", raw_verdict_text).upper()
+    is_approved = bool(re.match(r"APPROVED\b", normalized))
+    is_standard = is_approved or bool(re.match(r"NEEDS_REVISION\b", normalized))
+    if not is_standard:
+        # Non-standard verdict word (e.g., "NOT IMPLEMENTED", "DRIFTED",
+        # "TASK 3.1 — NOT IMPLEMENTED") — treat as NEEDS_REVISION so the
+        # structured verdict path is taken rather than the skeptical
+        # "missing VERDICT line" fallback. The phase still fails correctly.
+        findings.insert(
+            0,
+            f"drift_verifier: non-standard verdict '{raw_verdict_text}' treated as NEEDS_REVISION",
+        )
+    passed = is_approved and not findings
     return passed, findings
 
 

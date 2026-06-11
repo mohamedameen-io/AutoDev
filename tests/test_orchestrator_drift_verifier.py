@@ -258,3 +258,68 @@ async def test_drift_verifier_uses_phase_id_to_key_evidence(
     )
     # Slash sanitized for filesystem safety.
     assert "/" not in verdict.evidence_path.name
+
+
+@pytest.mark.asyncio
+async def test_drift_verifier_bold_verdict_non_standard_fails_without_missing_line_finding(
+    tmp_path: Path,
+) -> None:
+    """A bold-formatted VERDICT line with a non-standard word is recognized and
+    treated as NEEDS_REVISION — NOT as a missing VERDICT line.
+
+    Regression test: the old strict regex (APPROVED|NEEDS_REVISION only) caused
+    critics emitting ``**VERDICT: TASK 3.1 — NOT IMPLEMENTED**`` to trigger the
+    skeptical "response missing VERDICT line" fallback, hiding the real finding.
+    """
+    from orchestrator.drift_verifier import run_drift_verifier
+
+    adapter = StubAdapter(
+        {
+            "critic_drift_verifier": ok(
+                "The task is a manual on-device step.\n\n"
+                "**VERDICT: TASK 3.1 — NOT IMPLEMENTED (expected; manual human step)**\n\n"
+                "No autonomous action was taken.\n"
+            )
+        }
+    )
+    orch = _OrchStub(adapter, tmp_path)
+    verdict = await run_drift_verifier(
+        orch=orch,
+        phase=_phase(),
+        evidence_dir=tmp_path / ".autodev" / "evidence",
+        diff_text="",
+    )
+    assert verdict.passed is False
+    # Must NOT fall back to the "missing VERDICT line" finding — the line exists.
+    assert not any(
+        "missing VERDICT line" in f for f in verdict.drift_findings
+    ), f"unexpected fallback finding in: {verdict.drift_findings}"
+    # Must surface a non-standard-verdict finding instead.
+    assert any(
+        "non-standard verdict" in f for f in verdict.drift_findings
+    ), f"expected non-standard verdict finding in: {verdict.drift_findings}"
+
+
+@pytest.mark.asyncio
+async def test_drift_verifier_bold_approved_verdict_passes(
+    tmp_path: Path,
+) -> None:
+    """A bold-formatted ``**VERDICT: APPROVED**`` is accepted the same as plain."""
+    from orchestrator.drift_verifier import run_drift_verifier
+
+    adapter = StubAdapter(
+        {
+            "critic_drift_verifier": ok(
+                "Everything looks good.\n\n**VERDICT: APPROVED**\n"
+            )
+        }
+    )
+    orch = _OrchStub(adapter, tmp_path)
+    verdict = await run_drift_verifier(
+        orch=orch,
+        phase=_phase(),
+        evidence_dir=tmp_path / ".autodev" / "evidence",
+        diff_text="",
+    )
+    assert verdict.passed is True
+    assert verdict.drift_findings == []
