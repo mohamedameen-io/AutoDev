@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 # agent that legitimately exhausts every escalation tier should not be
 # able to acquire unbounded turns — this caps the ladder regardless of
 # the configured base.
-DEFAULT_MAX_TURNS_CEILING: int = 100
+DEFAULT_MAX_TURNS_CEILING: int = 250
 
 # Hard ceiling on the per-call escalated ``timeout_s`` (1 hour). Mirrors
 # the ``max_turns`` ceiling rationale.

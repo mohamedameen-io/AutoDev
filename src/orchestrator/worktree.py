@@ -117,6 +117,7 @@ def subprocess_run_ls_files(git_root: Path, pathspec: str) -> str:
         ["git", "-C", str(git_root), "ls-files", pathspec],
         capture_output=True,
         text=True,
+        errors="replace",
         check=False,
     )
     if completed.returncode != 0:
@@ -783,8 +784,8 @@ class WorktreeManager:
                         f"resolved edit_scope = {edit_scope!r}"
                     )
 
-        check_args = ["apply", "--check"]
-        apply_args = ["apply"]
+        check_args = ["apply", "--check", "--whitespace=fix"]
+        apply_args = ["apply", "--whitespace=fix"]
         if three_way:
             check_args.append("--3way")
             apply_args.append("--3way")
@@ -793,6 +794,20 @@ class WorktreeManager:
             # captures exactly the diff's hunks (no risk of sweeping
             # unrelated dirty state via a later ``git add -A``).
             apply_args.append("--index")
+
+        # Robust integration: drop any leftover uncommitted dirt on the
+        # files this patch targets (e.g. partial hunks staged by a prior
+        # whitespace-rejected apply) so the pre-flight check sees a clean
+        # base for them. Scoped to the diff's target files only — never a
+        # blanket reset — so unrelated working-tree state is untouched.
+        # ``checkout --`` restores each target to HEAD, which already
+        # includes any earlier task committed via commit-per-task.
+        from adapters.git_utils import extract_files_from_diff as _xf_targets
+
+        _targets = _xf_targets(diff_text)
+        if _targets:
+            await _run_git(self._main, ["reset", "--quiet", "--", *_targets])
+            await _run_git(self._main, ["checkout", "--", *_targets])
 
         # Pre-flight: ``git apply --check`` so we fail fast on conflicts.
         check_rc, _, check_err = await _run_git(

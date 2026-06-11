@@ -4137,16 +4137,25 @@ async def _execute_one(
             )
             await write_evidence(orch.cwd, task.id, test_ev)
 
-            if diagnosis == "no_tests_found":
-                # Legitimate: no tests exist for the changed code.
-                # Proceed to the next step rather than soft-blocking
-                # on phantom failures. The persistent record is on
-                # ``TestEvidence.diagnosis`` (already written above)
-                # — downstream consumers (e.g. ``autodev status``)
-                # read the evidence JSON, not the in-memory task.
+            if diagnosis == "no_tests_found" or (
+                diagnosis in ("capture_failed", "collection_failed", "runtime_crash")
+                and getattr(
+                    orch.cfg, "treat_unrunnable_tests_as_no_tests", False
+                )
+            ):
+                # Legitimate: no tests exist for the changed code — OR
+                # (``treat_unrunnable_tests_as_no_tests``) the target repo
+                # cannot be built/tested in this environment, so an
+                # infra-class capture failure is not a code defect.
+                # Soft-pass to the next step rather than hard-failing.
+                # The real diagnosis is preserved on
+                # ``TestEvidence.diagnosis`` (already written above) —
+                # downstream consumers (e.g. ``autodev status``) read the
+                # evidence JSON, not the in-memory task.
                 logger.info(
                     "execute_phase.tests_no_tests_found",
                     task_id=task.id,
+                    diagnosis=diagnosis,
                 )
                 task = await orch.plan_manager.update_task_status(
                     task.id, "tested"

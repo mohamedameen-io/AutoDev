@@ -1101,6 +1101,16 @@ class AutodevConfig(BaseModel):
     always recommended; ``runtime_crash`` and ``collection_failed`` are
     opt-in because they can be legitimate per-task issues."""
 
+    treat_unrunnable_tests_as_no_tests: bool = Field(default=False)
+    """When True, infrastructure-class test diagnoses (``capture_failed``,
+    ``collection_failed``, ``runtime_crash``) are soft-passed like
+    ``no_tests_found`` instead of triggering the per-task hard-fail. For
+    environments that cannot build/run the target repo's test suite (e.g.
+    an external engine repo with no local build/device), where an empty
+    test capture is not a code defect. The real diagnosis is still
+    recorded on ``TestEvidence.diagnosis`` for forensics. Default False
+    preserves the strict behaviour."""
+
     # v0.38.0 I4: exponential backoff + auto-reset for the test-diag
     # stream. Threshold-crossing no longer hard-halts immediately —
     # the orchestrator first sleeps ``initial * (multiplier ** n)``

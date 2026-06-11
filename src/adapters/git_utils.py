@@ -49,6 +49,7 @@ def _git_porcelain_set(cwd: Path) -> set[str] | None:
             cwd=str(cwd_path),
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=5,
             check=False,
         )
@@ -94,6 +95,7 @@ def _git_diff(cwd: Path) -> str | None:
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=10,
             check=False,
         )
@@ -120,6 +122,7 @@ def _list_untracked(cwd: Path) -> list[str]:
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=5,
             check=False,
         )
@@ -159,6 +162,7 @@ def _git_diff_with_untracked(cwd: Path) -> str | None:
                 cwd=str(cwd),
                 capture_output=True,
                 text=True,
+            errors="replace",
                 timeout=10,
                 check=False,
             )
@@ -192,6 +196,7 @@ def _git_diff_range(cwd: Path, from_sha: str, to_sha: str) -> str | None:
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=15,
             check=False,
         )
@@ -296,6 +301,7 @@ def _git_rev_parse_head(cwd: Path) -> str | None:
             cwd=str(cwd_path),
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=5,
             check=False,
         )
