@@ -784,6 +784,15 @@ class AdaptersConfig(BaseModel):
     # ``"probe_timeout_s"`` key in ``task_overrides.huge_repo_multipliers``
     # so the probe survives the slower cold start without operator tuning.
     probe_timeout_s: float = Field(default=10.0, ge=5.0, le=60.0)
+    # v0.39.0 (huge-repo follow-up): model used for the PONG preflight
+    # probe. The probe is a trivial "is the CLI alive + authed?" round-trip
+    # — it does NOT need the heavy default model, whose cold start (~9-11s)
+    # straddles the 10s probe timeout on a busy huge-repo startup. A fast
+    # model ("haiku") cuts the cold start to ~7-8s, comfortably under the
+    # timeout. Passed as ``--model <probe_model>`` in the probe command.
+    # Empty string → flag omitted (CLI inherits its default model — the
+    # legacy pre-fast-model behaviour).
+    probe_model: str = "haiku"
     # v0.39.0 B1: spawn-agent isolation. When True, spawned headless
     # ``claude -p`` agents are isolated from the *target* repo's
     # project/local settings (SessionStart hooks) and MCP servers via

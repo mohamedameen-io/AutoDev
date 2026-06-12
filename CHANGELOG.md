@@ -79,6 +79,22 @@ inflating every cold start past the 10s probe timeout — they are now isolated.
   `GuardrailEnforcer.plan_cost_usd` budget cap only sees main-path invocations,
   so it under-counts tournament spend — the new ledger-based total is
   authoritative; tightening the cap itself is a follow-up.)
+- **Huge-repo worktrees are now sparse by default.** `apply_huge_repo_profile`
+  auto-enables `worktree_sparse_checkout_enabled` on huge repos, the
+  execute-phase worktree path now honours `worktree_huge_create_timeout_s`
+  (was using the 60 s default), and the sparse cone falls back to the task's
+  own `files`/`extended_scope` when the plan declares no `edit_scope`. Fixes a
+  live failure on a 358 k-file Git-LFS repo where full (non-sparse) worktree
+  checkouts produced ~62 MB phantom diffs that tripped the diff-size guardrail
+  and blocked every task, plus 60 s `git worktree add` timeouts.
+- **Preflight probe robustness on slow cold-starts.** New
+  `adapters.probe_model` (default `"haiku"`) makes the PONG healthcheck use a
+  fast model (~7-8 s vs ~9-11 s on the heavy default, which straddled the 10 s
+  timeout), and the *unbound* detect-time probe timeout default is raised
+  10 s → 20 s (a bound `probe_timeout_s` and its huge-scaling still win for the
+  post-bind re-probe). Fixes `plan`/`execute`/`resume` intermittently failing
+  the preflight probe on huge repos when the startup index refresh contends
+  for resources.
 
 ### Fixed
 - **Adapter config binding gap**: `get_adapter(cfg=...)` now binds the adapter

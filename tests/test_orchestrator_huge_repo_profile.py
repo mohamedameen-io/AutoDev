@@ -101,6 +101,57 @@ def test_huge_buildable_flag_stays_false(
     assert eff.treat_unrunnable_tests_as_no_tests is False
 
 
+def test_huge_repo_auto_enables_sparse_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Huge repo → ``worktree_sparse_checkout_enabled`` flips True.
+
+    This is the gap-1 fix: huge-repo worktrees must come up sparse so
+    they don't materialize the full tree (LFS phantom diffs). Fires
+    regardless of buildability.
+    """
+    _patch_huge(monkeypatch, huge=True)
+    _patch_unbuildable(monkeypatch, unbuildable=False)
+    cfg = default_config()
+    assert cfg.worktree_sparse_checkout_enabled is False
+
+    eff = apply_huge_repo_profile(cfg, tmp_path)
+
+    assert eff.worktree_sparse_checkout_enabled is True
+    # Non-destructive: input untouched.
+    assert cfg.worktree_sparse_checkout_enabled is False
+
+
+def test_small_repo_does_not_enable_sparse_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Small repo → no-op; sparse stays at its default (False)."""
+    _patch_huge(monkeypatch, huge=False)
+    _patch_unbuildable(monkeypatch, unbuildable=False)
+    cfg = default_config()
+    eff = apply_huge_repo_profile(cfg, tmp_path)
+    # Identity on a small repo → flag unchanged.
+    assert eff is cfg
+    assert eff.worktree_sparse_checkout_enabled is False
+
+
+def test_sparse_already_enabled_not_clobbered_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+) -> None:
+    """Operator opt-in (sparse already True) → no churn, no extra log line."""
+    _patch_huge(monkeypatch, huge=True)
+    _patch_unbuildable(monkeypatch, unbuildable=False)
+    cfg = default_config()
+    cfg.worktree_sparse_checkout_enabled = True
+
+    eff = apply_huge_repo_profile(cfg, tmp_path)
+    assert eff.worktree_sparse_checkout_enabled is True
+    # Nothing was "applied" for sparse (it was already on) AND the repo is
+    # buildable, so there is no profile-applied log line at all.
+    out = capsys.readouterr().out
+    assert "worktree_sparse_checkout_enabled" not in out
+
+
 def test_idempotent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

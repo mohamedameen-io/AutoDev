@@ -413,9 +413,11 @@ async def get_adapter(
     the mandatory post-``get_adapter`` re-probe in the CLI commands
     picks up the configured / huge-repo-scaled probe timeout. The
     detect-time probe inside :func:`detect_platform` stays unbound (it
-    runs on a throwaway adapter at the 10s default — a fast "is the CLI
-    alive?" check). Backward-compatible: ``cfg=None`` (the default)
-    skips binding entirely.
+    runs on a throwaway adapter at the 20s unbound default — a fast "is
+    the CLI alive?" check that, post-v0.39.0, pins the fast probe model
+    and gets 20s of headroom so a slow huge-repo cold start doesn't fail
+    it). Backward-compatible: ``cfg=None`` (the default) skips binding
+    entirely.
     """
     name = await detect_platform(
         platform,

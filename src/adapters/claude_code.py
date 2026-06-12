@@ -120,6 +120,27 @@ def _isolation_flags(adapters_cfg: Any | None) -> list[str]:
     return []
 
 
+# v0.39.0 (huge-repo follow-up): default model for the PONG preflight
+# probe when no config is bound. Matches ``AdaptersConfig.probe_model``'s
+# default so the UNBOUND detect-time probe — which is exactly where the
+# slow cold start blows the timeout on huge repos — gets the fast model
+# too. The agent commands already use "haiku" for the explorer role, so
+# it is a known-valid ``--model`` value for the installed CLI.
+_DEFAULT_PROBE_MODEL: str = "haiku"
+
+
+def _probe_model(adapters_cfg: Any | None) -> str:
+    """Return the model to pin on the PONG probe, or ``""`` to omit ``--model``.
+
+    Reads ``adapters_cfg.probe_model`` (default ``"haiku"``). The default
+    holds **even when ``adapters_cfg`` is ``None``** (unbound) so the
+    detect-time probe also pins the fast model. An explicit empty string
+    omits the flag entirely (CLI inherits its default model).
+    """
+    model = getattr(adapters_cfg, "probe_model", _DEFAULT_PROBE_MODEL)
+    return str(model) if model else ""
+
+
 # Observed `claude -p --output-format json` shape (claude 2.1.92):
 #   {"type":"result","subtype":"success","is_error":false,"duration_ms":...,
 #    "num_turns":...,"result":"...","stop_reason":"end_turn",
@@ -657,7 +678,8 @@ class ClaudeCodeAdapter(PlatformAdapter):
         """Two-stage probe: cheap ``--version``, then live PONG round-trip.
 
         Stage 1 (``claude --version``) catches "CLI missing / broken install".
-        Stage 2 (``echo PONG | claude -p --max-turns 1``, 10s timeout) catches
+        Stage 2 (``echo PONG | claude -p --max-turns 1``, fast model + 20s
+        unbound timeout) catches
         bad auth and network failures that stage 1 cannot see — a perfectly
         installed CLI with an expired token still returns 0 from
         ``--version`` but fails the live call with HTTP 401/403.
@@ -668,8 +690,8 @@ class ClaudeCodeAdapter(PlatformAdapter):
           * ``"claude --version timed out"``  — Stage 1 hang (5s).
           * ``"auth_failed: ..."``            — Stage 2 ``is_error=true`` with
                                                 401/403 in the message.
-          * ``"network: ..."``                — Stage 2 timeout (10s) or other
-                                                non-auth ``is_error=true``.
+          * ``"network: ..."``                — Stage 2 timeout (20s unbound)
+                                                or other non-auth ``is_error=true``.
         """
         # Stage 1: cheap CLI presence + version probe.
         try:
@@ -712,9 +734,12 @@ class ClaudeCodeAdapter(PlatformAdapter):
     async def _pong_probe(self, version_str: str) -> tuple[bool, str]:
         """Run ``echo PONG | claude -p --max-turns 1`` and classify the result.
 
-        10s per-attempt timeout is intentional: this runs at every
-        ``autodev resume`` / ``execute`` startup; a longer wait would
-        defeat fail-fast semantics.
+        The per-attempt timeout is bounded: a bound cfg supplies
+        ``probe_timeout_s`` (default 10s, huge-scaled to 15s); the UNBOUND
+        detect-time probe uses the 20s default (v0.39.0 — see the
+        ``timeout_s`` note below). This runs at every ``autodev resume`` /
+        ``execute`` startup, so the ceiling stays tight enough to preserve
+        fail-fast semantics while surviving a slow huge-repo cold start.
 
         v0.36.0 F2: retry on transient network failures with exponential
         backoff (1s, 3s, 9s by default). Auth failures short-circuit
@@ -752,10 +777,23 @@ class ClaudeCodeAdapter(PlatformAdapter):
         # falls back to the base on ANY error — the probe must NEVER
         # crash (it runs before the orchestrator exists, at every
         # startup).
+        # v0.39.0 (huge-repo follow-up): the UNBOUND default is 20.0, not
+        # 10.0. The detect-time probe (``detect_platform`` →
+        # ``adapter.healthcheck()``) runs on a throwaway adapter BEFORE
+        # ``get_adapter`` binds ``cfg.adapters``, so the configured /
+        # huge-scaled ``probe_timeout_s`` (15s) cannot reach it. On a busy
+        # huge-repo cold start the default-model probe (and even the
+        # fast-model probe under concurrent index-refresh contention) can
+        # take 9-11s — straddling the legacy 10s ceiling and failing all
+        # retries. 20s gives that cold start headroom while still being a
+        # hard fail-fast ceiling (the fast-model happy path completes in
+        # ~7-8s, so this only bites a genuinely hung/contended CLI). A
+        # bound cfg's ``probe_timeout_s`` (and its huge-repo scaling
+        # below) still wins for the mandatory post-bind re-probe.
         timeout_s = float(
-            getattr(_adapters_cfg, "probe_timeout_s", 10.0)
+            getattr(_adapters_cfg, "probe_timeout_s", 20.0)
             if _adapters_cfg is not None
-            else 10.0
+            else 20.0
         )
         if self._root_cfg is not None and self._probe_cwd is not None:
             try:
@@ -818,18 +856,29 @@ class ClaudeCodeAdapter(PlatformAdapter):
         )
 
     async def _pong_probe_once(
-        self, version_str: str, *, timeout_s: float = 10.0
+        self, version_str: str, *, timeout_s: float = 20.0
     ) -> tuple[bool, str]:
         """Single PONG round-trip without retry/backoff.
 
-        ``timeout_s`` defaults to 10.0 (the historical hardcoded value);
+        ``timeout_s`` defaults to 20.0 (v0.39.0: raised from the legacy
+        10.0 so the UNBOUND detect-time probe survives the slow huge-repo
+        cold start — see the note in :meth:`_pong_probe`);
         :meth:`_pong_probe` resolves a configured / huge-repo-scaled
         value and passes it explicitly. huge-repo (Cluster B1): the
         probe command carries the same isolation flags as the agent
         command (``_isolation_flags``) — this is the highest-leverage
         cold-start fix, since the original workaround disabled MCP
         precisely to speed up the probe.
+
+        v0.39.0 (huge-repo follow-up): the probe also pins a fast model
+        via ``--model <probe_model>`` (``cfg.adapters.probe_model``,
+        default ``"haiku"``). The probe is a trivial liveness/auth
+        round-trip; the heavy default model's ~9-11s cold start straddles
+        the 10s probe timeout on a busy huge-repo startup, while "haiku"
+        lands at ~7-8s. Empty ``probe_model`` (or no cfg bound) → flag
+        omitted, restoring the legacy default-model behaviour.
         """
+        probe_model = _probe_model(self._adapters_cfg)
         probe_cmd: list[str] = [
             self.binary,
             "-p",
@@ -838,8 +887,10 @@ class ClaudeCodeAdapter(PlatformAdapter):
             "1",
             "--output-format",
             "json",
-            *_isolation_flags(self._adapters_cfg),
         ]
+        if probe_model:
+            probe_cmd += ["--model", probe_model]
+        probe_cmd += [*_isolation_flags(self._adapters_cfg)]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *probe_cmd,

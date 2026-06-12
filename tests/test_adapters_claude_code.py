@@ -189,8 +189,13 @@ def _capture_timeout_probe_once(captured: list[float]):
 
 
 @pytest.mark.asyncio
-async def test_probe_timeout_default_10s_when_unbound() -> None:
-    """No cfg bound → probe uses the 10s default."""
+async def test_probe_timeout_default_20s_when_unbound() -> None:
+    """No cfg bound → probe uses the 20s unbound default (v0.39.0).
+
+    Raised from the legacy 10s so the detect-time probe (which runs on a
+    throwaway, unbound adapter before ``get_adapter`` binds the cfg)
+    survives a slow huge-repo cold start.
+    """
     adapter = ClaudeCodeAdapter()
     captured: list[float] = []
     with patch.object(
@@ -200,7 +205,7 @@ async def test_probe_timeout_default_10s_when_unbound() -> None:
     ):
         ok, _ = await adapter._pong_probe(version_str="v1.0")
     assert ok is True
-    assert captured == [10.0]
+    assert captured == [20.0]
 
 
 @pytest.mark.asyncio
@@ -427,6 +432,9 @@ def test_probe_command_omits_isolation_flags_when_suppress_false() -> None:
             await adapter._pong_probe_once("v1.0")
 
     _asyncio.run(_run())
+    # ``probe_model`` is independent of ``suppress_target_repo_config``:
+    # the stub omits it, so the default "haiku" still pins ``--model``.
+    # The isolation flags ARE absent (suppress=False).
     assert captured_cmds == [
         [
             "claude",
@@ -436,8 +444,105 @@ def test_probe_command_omits_isolation_flags_when_suppress_false() -> None:
             "1",
             "--output-format",
             "json",
+            "--model",
+            "haiku",
         ]
     ]
+
+
+# ---------------------------------------------------------------------------
+# huge-repo follow-up: PONG probe pins a fast model.
+# ---------------------------------------------------------------------------
+
+
+def _capture_probe_cmd() -> tuple[list[list[str]], "callable"]:
+    captured: list[list[str]] = []
+
+    def _fake_exec(*cmd, **_kw):
+        captured.append(list(cmd))
+        return _ok_proc()
+
+    return captured, _fake_exec
+
+
+def test_probe_command_includes_default_haiku_model_when_unbound() -> None:
+    """Unbound adapter → probe pins ``--model haiku`` (the default).
+
+    The detect-time probe runs unbound, so the default MUST hold even
+    without a cfg — that is exactly where the slow cold start hurts.
+    """
+    captured, _fake_exec = _capture_probe_cmd()
+    adapter = ClaudeCodeAdapter()  # unbound
+
+    import asyncio as _asyncio
+
+    async def _run():
+        with patch(
+            "adapters.claude_code.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=_fake_exec),
+        ):
+            await adapter._pong_probe_once("v1.0")
+
+    _asyncio.run(_run())
+    assert len(captured) == 1
+    cmd = captured[0]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "haiku"
+
+
+def test_probe_command_respects_configured_probe_model() -> None:
+    """``probe_model`` from the bound cfg overrides the default."""
+    captured, _fake_exec = _capture_probe_cmd()
+
+    class _ModelCfg:
+        probe_model = "sonnet"
+
+    adapter = ClaudeCodeAdapter()
+    adapter.bind_adapters_cfg(_ModelCfg())
+
+    import asyncio as _asyncio
+
+    async def _run():
+        with patch(
+            "adapters.claude_code.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=_fake_exec),
+        ):
+            await adapter._pong_probe_once("v1.0")
+
+    _asyncio.run(_run())
+    cmd = captured[0]
+    assert cmd[cmd.index("--model") + 1] == "sonnet"
+
+
+def test_probe_command_omits_model_when_probe_model_empty() -> None:
+    """Empty ``probe_model`` → ``--model`` flag omitted (legacy default)."""
+    captured, _fake_exec = _capture_probe_cmd()
+
+    class _EmptyModelCfg:
+        probe_model = ""
+
+    adapter = ClaudeCodeAdapter()
+    adapter.bind_adapters_cfg(_EmptyModelCfg())
+
+    import asyncio as _asyncio
+
+    async def _run():
+        with patch(
+            "adapters.claude_code.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=_fake_exec),
+        ):
+            await adapter._pong_probe_once("v1.0")
+
+    _asyncio.run(_run())
+    assert "--model" not in captured[0]
+
+
+def test_default_probe_model_matches_schema_default() -> None:
+    """The unbound-default probe model matches ``AdaptersConfig.probe_model``."""
+    from adapters.claude_code import _DEFAULT_PROBE_MODEL
+    from config.schema import AdaptersConfig
+
+    assert _DEFAULT_PROBE_MODEL == AdaptersConfig().probe_model == "haiku"
 
 
 # ---------------------------------------------------------------------------

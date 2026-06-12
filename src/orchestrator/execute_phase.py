@@ -3829,6 +3829,41 @@ async def _execute_one(
                     _resolved = list(_plan_for_scope.edit_scope)
                 if _resolved:
                     sparse_paths = _resolved
+            # huge-repo follow-up: when sparse is enabled (huge repo) but
+            # NO edit_scope is declared (the common case — architects don't
+            # always emit a plan/phase edit_scope), fall back to the task's
+            # OWN claimed files (+ extended_scope) as the sparse cone.
+            # Without this, ``sparse_paths`` stays None →
+            # ``create_per_task`` does a FULL checkout, which on a huge LFS
+            # repo materializes the entire tree and produces a ~62 MB
+            # checkout/LFS "phantom diff" that trips the diff-size guardrail
+            # and blocks the task. The cone must contain the files the
+            # developer needs to read/edit; ``create_per_task`` additionally
+            # folds in their sibling headers. Empty → leave None (legacy
+            # full checkout) so a task that genuinely claims no files is
+            # unaffected.
+            if not sparse_paths:
+                _task_cone = [
+                    p
+                    for p in (
+                        list(getattr(task, "files", []) or [])
+                        + list(getattr(task, "extended_scope", []) or [])
+                    )
+                    if isinstance(p, str) and p.strip()
+                ]
+                if _task_cone:
+                    # Deduplicate while preserving first-seen order.
+                    _seen: set[str] = set()
+                    sparse_paths = [
+                        p
+                        for p in _task_cone
+                        if not (p in _seen or _seen.add(p))
+                    ]
+                    logger.info(
+                        "execute_phase.sparse_cone_from_task_files",
+                        task_id=task.id,
+                        paths=sparse_paths,
+                    )
         try:
             worktree = await worktree_mgr.create_per_task(
                 task.id,

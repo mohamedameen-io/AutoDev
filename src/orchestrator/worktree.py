@@ -338,6 +338,13 @@ class WorktreeManager:
         v0.17.0 S6: ``sparse_paths`` is forwarded into the same
         sparse-checkout machinery used by :meth:`create`. ``None`` (or
         an empty list) preserves legacy full-checkout behavior.
+
+        v0.39.0 (huge-repo follow-up): both the sparse ``--no-checkout``
+        and the non-sparse fallback ``git worktree add`` now pass
+        ``timeout_s=self._create_timeout_s()`` — they previously used the
+        ``_run_git`` 60s default, so the execute-phase worktree path
+        ignored ``huge_create_timeout_s`` (600s) and timed out at 60s on
+        Unity-scale repos even though :meth:`create` already honored it.
         """
         wt = self._dir / "tasks" / task_id
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -364,6 +371,7 @@ class WorktreeManager:
             rc, out, err = await _run_git(
                 self._main,
                 ["worktree", "add", "--no-checkout", "--detach", str(wt), base_ref],
+                timeout_s=self._create_timeout_s(),
             )
             if rc != 0:
                 raise WorktreeError(
@@ -433,6 +441,7 @@ class WorktreeManager:
         rc, out, err = await _run_git(
             self._main,
             ["worktree", "add", "--detach", str(wt), base_ref],
+            timeout_s=self._create_timeout_s(),
         )
         if rc != 0:
             raise WorktreeError(
