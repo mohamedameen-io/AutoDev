@@ -86,7 +86,13 @@ inflating every cold start past the 10s probe timeout — they are now isolated.
   own `files`/`extended_scope` when the plan declares no `edit_scope`. Fixes a
   live failure on a 358 k-file Git-LFS repo where full (non-sparse) worktree
   checkouts produced ~62 MB phantom diffs that tripped the diff-size guardrail
-  and blocked every task, plus 60 s `git worktree add` timeouts.
+  and blocked every task, plus 60 s `git worktree add` timeouts. The
+  **impl-tournament** worktree path now shares the same sparse + huge-timeout
+  creation (it previously built its `WorktreeManager` non-huge and passed no
+  cone), and `apply_patch_to_main` defensively clears a **stale
+  `.git/index.lock`** (only when unowned + aged) before `git apply` — a killed
+  60 s worktree-add had been leaving a lock that cascaded into `rc=128` apply
+  failures. (Pooled worktrees, `worktree_pool_enabled`, remain a follow-up.)
 - **Preflight probe robustness on slow cold-starts.** New
   `adapters.probe_model` (default `"haiku"`) makes the PONG healthcheck use a
   fast model (~7-8 s vs ~9-11 s on the heavy default, which straddled the 10 s

@@ -25,8 +25,156 @@ __all__ = [
     "_git_diff_with_untracked",
     "_git_diff_range",
     "_git_rev_parse_head",
+    "clear_stale_index_lock",
     "extract_files_from_diff",
 ]
+
+
+# v0.40.0 (huge-repo Gap 3): how old an ``index.lock`` must be before we
+# consider it abandoned. A live ``git`` op refreshes/holds the lock for the
+# duration of the index write; on a healthy host that completes in well
+# under a second, so 30 s is comfortably beyond any legitimate in-flight
+# index mutation while still clearing the residue a killed ``git worktree
+# add`` (timed out on a huge LFS repo) leaves behind.
+_STALE_INDEX_LOCK_AGE_S = 30.0
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Return ``True`` if a process with *pid* currently exists.
+
+    Uses ``os.kill(pid, 0)`` which sends no signal but raises
+    :class:`ProcessLookupError` when no such process exists (and
+    :class:`PermissionError` when the process exists but is owned by
+    another user — still "alive" for our purposes). Any other ``OSError``
+    is treated conservatively as "alive" so we never clear a lock we're
+    unsure about.
+    """
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _read_lock_owner_pid(lock_path: Path) -> int | None:
+    """Best-effort read of the PID written inside an ``index.lock``.
+
+    Modern git writes the locking process's PID (and other metadata) into
+    the lock file. When present and parseable we use it to check liveness
+    directly. Returns ``None`` when the file is empty, unreadable, or the
+    contents don't start with an integer (older git, or a partially
+    written lock) — the caller then falls back to the mtime heuristic.
+    """
+    try:
+        raw = lock_path.read_text(errors="replace").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    first = raw.splitlines()[0].strip()
+    # git's lock payload may be ``<pid> <hostname> ...``; take the leading
+    # token only.
+    token = first.split()[0] if first.split() else first
+    try:
+        pid = int(token)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def clear_stale_index_lock(
+    git_dir: Path,
+    *,
+    max_age_s: float = _STALE_INDEX_LOCK_AGE_S,
+) -> bool:
+    """Remove a STALE ``<git_dir>/index.lock``; refuse a fresh/live one.
+
+    v0.40.0 (huge-repo Gap 3): a ``git worktree add`` that is killed after
+    timing out on a huge LFS repo can leave a stale ``index.lock`` in the
+    MAIN repo's git dir. The very next main-repo index mutation (the
+    ``git apply`` patch-integration step) then fails with::
+
+        fatal: Unable to create '.../.git/index.lock': File exists.
+
+    cascading the single timeout into every subsequent apply. This helper
+    is the belt-and-suspenders cleanup: it removes the lock ONLY when it is
+    safe to do so, so a genuinely concurrent git op is never disturbed.
+
+    A lock is removed when BOTH hold:
+
+    * No live owner — if the lock file records a PID and that process is
+      still alive, we refuse (a real git op holds it). When no parseable
+      PID is present we fall back to the age check alone.
+    * Stale by age — the file's mtime is older than ``max_age_s`` (default
+      30 s). A fresh lock (a real op mid-write) is always kept.
+
+    Idempotent and safe to call before every main-repo index mutation:
+    when no lock exists it is a no-op returning ``False``.
+
+    Args:
+        git_dir: the repository's git directory (``<repo>/.git``). The
+            lock checked is ``git_dir / "index.lock"``.
+        max_age_s: minimum mtime age before a PID-less lock is cleared.
+
+    Returns:
+        ``True`` if a stale lock was removed; ``False`` otherwise (no lock,
+        or the lock was deemed fresh / owned by a live process).
+    """
+    import time
+
+    try:
+        gd = Path(git_dir)
+    except TypeError:
+        return False
+    lock_path = gd / "index.lock"
+    try:
+        st = lock_path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return False
+
+    # 1. Refuse if a live owner is recorded in the lock payload.
+    owner_pid = _read_lock_owner_pid(lock_path)
+    if owner_pid is not None and _pid_is_alive(owner_pid):
+        _log.warning(
+            "git.index_lock.live_owner",
+            extra={"lock": str(lock_path), "pid": owner_pid},
+        )
+        return False
+
+    # 2. Refuse a fresh lock regardless of recorded PID — a real op may be
+    #    mid-write before stamping its PID. ``time.time`` and mtime share a
+    #    clock; clamp negatives (clock skew) to "fresh" to stay safe.
+    age_s = time.time() - st.st_mtime
+    if age_s < max_age_s:
+        return False
+
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        # Raced with another cleaner / the owning op finishing. Either way
+        # the lock is gone now — treat as success-ish but report no removal
+        # since we didn't do it.
+        return False
+    except OSError as exc:
+        _log.warning(
+            "git.index_lock.unlink_failed",
+            extra={"lock": str(lock_path), "err": str(exc)},
+        )
+        return False
+
+    _log.warning(
+        "git.index_lock.stale_cleared",
+        extra={"lock": str(lock_path), "age_s": round(age_s, 1)},
+    )
+    return True
 
 
 def _git_porcelain_set(cwd: Path) -> set[str] | None:

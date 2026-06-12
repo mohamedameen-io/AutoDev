@@ -71,6 +71,49 @@ def _resolve_tournament_model(orch: "Orchestrator") -> str | None:
     return None
 
 
+def _resolve_wm_huge_mode(orch: "Orchestrator") -> bool:
+    """Resolve the WorktreeManager ``huge_mode`` flag for *orch*.
+
+    v0.40.0 (huge-repo Gap 3): mirrors the resolution the execute-phase
+    dispatcher does inline (``worktree_huge_repo_mode`` ``on``/``off``/
+    ``auto``, where ``auto`` keys off ``RepoCapacity.is_huge``). Centralized
+    here so the impl-tournament worktree path makes the SAME huge-mode
+    decision as the execute path rather than defaulting to ``False`` (the
+    bug: the tournament ``WorktreeManager`` was built with no ``huge_mode``,
+    so ``git worktree add`` kept the 60 s timeout and was killed on the
+    Unity LFS repo).
+    """
+    mode = getattr(orch.cfg, "worktree_huge_repo_mode", "auto")
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    # "auto"
+    return bool(getattr(getattr(orch, "_repo_capacity", None), "is_huge", False))
+
+
+def _task_sparse_cone(task: "Task") -> list[str] | None:
+    """Repo-relative sparse cone from the task's own claimed files.
+
+    v0.40.0 (huge-repo Gap 3): the same task-cone fallback the execute path
+    uses (``execute_phase.sparse_cone_from_task_files``) — union the task's
+    ``files`` + ``extended_scope`` (deduped, order-preserving). Returned as
+    ``None`` when the task declares no files, so the tournament worktree
+    falls back to a full checkout exactly as before on a task with no
+    declared scope (and on small repos the manager ignores it anyway).
+    """
+    raw = list(getattr(task, "files", []) or []) + list(
+        getattr(task, "extended_scope", []) or []
+    )
+    seen: set[str] = set()
+    cone = [
+        p
+        for p in raw
+        if isinstance(p, str) and p.strip() and not (p in seen or seen.add(p))
+    ]
+    return cone or None
+
+
 def _is_auto_disabled(model: str | None, auto_disable: list[str]) -> bool:
     """Return ``True`` if ``model`` matches any auto-disable marker.
 
@@ -437,7 +480,43 @@ async def run_impl_tournament(
         ),
     )
 
-    wt_mgr = WorktreeManager(main_repo=orch.cwd, tournament_dir=worktree_dir)
+    # v0.40.0 (huge-repo Gap 3): build the tournament WorktreeManager
+    # huge-safe — same as the execute-phase path. Previously this manager
+    # was constructed with no ``huge_mode`` (→ 60 s ``git worktree add``
+    # timeout) and the engine called ``create(nonce, base_ref="HEAD")`` with
+    # no scope (→ full checkout). On the Unity LFS repo that timed out at
+    # 60 s, the killed git op left a stale ``.git/index.lock``, and every
+    # subsequent ``git apply`` failed. Now: extended timeout on huge repos
+    # + a default sparse cone from the task's files so the engine's
+    # scope-less ``create`` narrows the checkout via the same machinery the
+    # ``create_per_task`` path uses.
+    _wm_huge_mode = _resolve_wm_huge_mode(orch)
+    _wm_huge_timeout_s = float(
+        getattr(orch.cfg, "worktree_huge_create_timeout_s", 600)
+    )
+    # Sparse becomes the default on huge repos (mirrors the execute path's
+    # ``worktree_huge_repo_mode``-driven flip); the legacy
+    # ``worktree_sparse_checkout_enabled`` flag is an explicit opt-in for
+    # non-huge repos. Only compute the cone when sparse is in effect so
+    # small-repo tournaments stay full-checkout (no behavior change).
+    _sparse_enabled = bool(
+        getattr(orch.cfg, "worktree_sparse_checkout_enabled", False)
+    ) or _wm_huge_mode
+    _default_cone = _task_sparse_cone(task) if _sparse_enabled else None
+    if _default_cone:
+        logger.info(
+            "impl_tournament.sparse_cone_from_task_files",
+            task_id=task.id,
+            paths=_default_cone,
+        )
+    wt_mgr = WorktreeManager(
+        main_repo=orch.cwd,
+        tournament_dir=worktree_dir,
+        huge_mode=_wm_huge_mode,
+        huge_create_timeout_s=_wm_huge_timeout_s,
+        autodev_root=autodev_root(orch.cwd),
+        default_sparse_paths=_default_cone,
+    )
     coder_runner = _CoderRunner(orch)
 
     judge_plugins = (
@@ -820,7 +899,24 @@ async def _impl_meta_merge_via_diff_synthesis(
         / f"multi-impl-{task.id}-meta"
     )
     worktree_dir = artifact_dir / "worktrees"
-    wt_mgr = WorktreeManager(main_repo=orch.cwd, tournament_dir=worktree_dir)
+    # v0.40.0 (huge-repo Gap 3): the meta-merge worktree is the same
+    # scope-less ``create("meta")`` shape, so make it huge-safe too.
+    _mm_huge_mode = _resolve_wm_huge_mode(orch)
+    _mm_huge_timeout_s = float(
+        getattr(orch.cfg, "worktree_huge_create_timeout_s", 600)
+    )
+    _mm_sparse_enabled = bool(
+        getattr(orch.cfg, "worktree_sparse_checkout_enabled", False)
+    ) or _mm_huge_mode
+    _mm_default_cone = _task_sparse_cone(task) if _mm_sparse_enabled else None
+    wt_mgr = WorktreeManager(
+        main_repo=orch.cwd,
+        tournament_dir=worktree_dir,
+        huge_mode=_mm_huge_mode,
+        huge_create_timeout_s=_mm_huge_timeout_s,
+        autodev_root=autodev_root(orch.cwd),
+        default_sparse_paths=_mm_default_cone,
+    )
     coder_runner = _CoderRunner(orch)
 
     try:
