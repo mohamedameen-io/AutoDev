@@ -113,6 +113,26 @@ preflight_v038() {
   check "v0.38 I5 selection source"   src/adapters/detect.py                       "_classify_selection_source"
 }
 
+preflight_v039() {
+  check "v0.39 J1 cost recorder"      src/orchestrator/cost_recorder.py            "class CostRecordingAdapter"
+  check "v0.39 J1 run summary"        src/state/run_summary.py                     "def append_run_summary"
+  check "v0.39 J1 invocation op"      src/state/ledger.py                          "invocation_cost"
+  check "v0.39 J2 profile module"     src/orchestrator/huge_repo_profile.py        "def apply_huge_repo_profile"
+  check "v0.39 J2 profile sparse"     src/orchestrator/huge_repo_profile.py        "worktree_sparse_checkout_enabled"
+  check "v0.39 J2 unbuildable"        src/qa/detect.py                             "def is_repo_unbuildable"
+  check "v0.39 J2 probe model"        src/config/schema.py                         "probe_model"
+  check "v0.39 J2 suppress cfg"       src/config/schema.py                         "suppress_target_repo_config"
+  check "v0.39 J2 budget ceilings"    src/config/schema.py                         "class BudgetEscalationConfig"
+  check "v0.39 J3 parallelism"        src/orchestrator/huge_repo_overrides.py      "def resolve_huge_repo_parallelism"
+  check "v0.39 J3 worktree cone"      src/orchestrator/worktree.py                 "default_sparse_paths"
+  check "v0.39 J3 stale lock"         src/adapters/git_utils.py                    "def clear_stale_index_lock"
+  check "v0.39 J4 accept helper"      src/orchestrator/execute_phase.py            "_maybe_accept_approved_on_exhaustion"
+  check "v0.39 J4 accept op"          src/state/ledger.py                          "accepted_approved_on_exhaustion"
+  check "v0.39 J5 containment"        src/orchestrator/execute_phase.py            "_diff_confined_to_autodev"
+  check "v0.39 J5 containment op"     src/state/ledger.py                          "containment_violation_autodev_paths"
+  check "v0.39 J6 drift partition"    src/orchestrator/drift_verifier.py           "def partition_drift_findings"
+}
+
 case "$target" in
   v0.32) preflight_v032 ;;
   v0.33) preflight_v033 ;;
@@ -121,9 +141,10 @@ case "$target" in
   v0.36) preflight_v036 ;;
   v0.37) preflight_v037 ;;
   v0.38) preflight_v038 ;;
-  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ;;
+  v0.39) preflight_v039 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ;;
   *)
-    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | all)" >&2
+    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | all)" >&2
     exit 2
     ;;
 esac
