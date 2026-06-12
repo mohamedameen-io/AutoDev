@@ -115,6 +115,21 @@ inflating every cold start past the 10s probe timeout — they are now isolated.
   reach `complete`). New `containment_violation_autodev_paths` audit ledger op.
   (Scoping AutoDev's own run-mechanics out of corrective-generation prompts —
   the upstream trigger — is noted as a follow-up.)
+- **Phase-review correctives no longer leak AutoDev's own internals.** When the
+  `drift_verifier` critic's response is malformed *for AutoDev's parser*, its
+  diagnostics (`"drift_verifier: response missing VERDICT line"`, `"...non-standard
+  verdict 'PASS'..."`) were recorded as drift *findings* and fed verbatim into
+  corrective generation — so the phase-review spawned correctives to "fix
+  AutoDev's drift_verifier" instead of the target repo, churning forever.
+  `phase_review_runner` now partitions findings (`partition_drift_findings`):
+  correctives are built from **substantive target-repo findings only**
+  (`task X: MISSING|DRIFTED`, `drift report: …`); AutoDev-meta findings
+  (`drift_verifier:` / `drift_convergence_failure:` prefixes) are filtered out.
+  If only meta findings remain, no corrective is injected (phase review →
+  non-blocking `skipped`). The verdict still drives control flow
+  (`accept_phase=False` unchanged) — only the leaked text is filtered.
+  Fail-open: unknown-prefix findings count as substantive (never suppresses a
+  real corrective).
 - **Preflight probe robustness on slow cold-starts.** New
   `adapters.probe_model` (default `"haiku"`) makes the PONG healthcheck use a
   fast model (~7-8 s vs ~9-11 s on the heavy default, which straddled the 10 s

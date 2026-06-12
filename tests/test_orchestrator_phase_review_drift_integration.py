@@ -184,6 +184,77 @@ async def test_phase_review_with_drift_detected_overrides_to_corrective_required
 
 
 @pytest.mark.asyncio
+async def test_phase_review_meta_only_verdict_produces_no_corrective(
+    tmp_path: Path, capture_tournament: None
+) -> None:
+    """Gap 6 (UUM-136411): a malformed-for-parser verdict (non-standard
+    verdict word / missing VERDICT line) yields ONLY AutoDev-internal
+    ``drift_verifier:`` meta findings. The phase must still be rejected
+    (control flow), but NO corrective_direction may be built from the
+    meta plumbing text — otherwise the developer loops trying to "fix"
+    AutoDev's own verdict parser in the target repo (tasks 0.c2/0.c3)."""
+    pm = PlanManager(tmp_path, session_id="sess-init")
+    await pm.init_plan(_mk_plan())
+    adapter = StubAdapter(
+        {
+            "critic_drift_verifier": ok(
+                "| AC1 | PASS |\n"
+                "**VERDICT: PARTIAL PASS — 11 of 12 criteria fully confirmed.**\n"
+            )
+        }
+    )
+    orch = _make_orch(tmp_path, adapter)
+    plan = await orch.plan_manager.load()
+    phase = plan.phases[0]  # type: ignore[union-attr]
+
+    outcome = await prr.run_phase_review_tournament(
+        orch, phase, "aaaa1111", "bbbb2222", spec_md="my spec"
+    )
+
+    # Phase still fails verification (control flow preserved) ...
+    assert outcome.accept_phase is False
+    # ... but the contaminated meta text never becomes a corrective.
+    assert outcome.corrective_direction is None
+
+
+@pytest.mark.asyncio
+async def test_phase_review_mixed_findings_keeps_substantive_drops_meta(
+    tmp_path: Path, capture_tournament: None
+) -> None:
+    """A response that BOTH drifts a real task AND trips the non-standard
+    verdict path: the corrective must keep the real ``task 1.1`` finding
+    but must not carry the ``drift_verifier:`` meta string."""
+    pm = PlanManager(tmp_path, session_id="sess-init")
+    await pm.init_plan(_mk_plan())
+    adapter = StubAdapter(
+        {
+            "critic_drift_verifier": ok(
+                "PHASE VERIFICATION:\n"
+                "TASK 1.1: DRIFTED\n"
+                "  - Spec Alignment: DRIFTED — implemented Y not X\n"
+                "## PHASE VERDICT\nVERDICT: PASS\n"  # non-standard -> meta finding
+                "  - DRIFTED tasks: 1.1\n"
+            )
+        }
+    )
+    orch = _make_orch(tmp_path, adapter)
+    plan = await orch.plan_manager.load()
+    phase = plan.phases[0]  # type: ignore[union-attr]
+
+    outcome = await prr.run_phase_review_tournament(
+        orch, phase, "aaaa1111", "bbbb2222", spec_md="my spec"
+    )
+
+    assert outcome.accept_phase is False
+    assert outcome.corrective_direction is not None
+    # Substantive target-repo finding survives ...
+    assert "1.1" in outcome.corrective_direction
+    # ... AutoDev's own plumbing diagnostic does not leak in.
+    assert "drift_verifier:" not in outcome.corrective_direction
+    assert "non-standard verdict" not in outcome.corrective_direction
+
+
+@pytest.mark.asyncio
 async def test_phase_review_b_winner_skips_drift_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

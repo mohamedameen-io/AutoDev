@@ -410,6 +410,7 @@ async def run_phase_review_tournament(
         try:
             from orchestrator.drift_verifier import (
                 _CONVERGENCE_SIMILARITY_THRESHOLD,
+                partition_drift_findings,
                 run_drift_verifier,
             )
 
@@ -449,18 +450,46 @@ async def run_phase_review_tournament(
             drift_verdict = None
 
         if drift_verdict is not None and not drift_verdict.passed:
+            # The verdict ALWAYS drives control flow: a non-passing drift
+            # verdict rejects the phase regardless of finding shape.
             accept_phase = False
-            findings_text = "\n".join(
-                f"- {f}" for f in drift_verdict.drift_findings
-            ) or "- drift detected (no specific findings parsed)"
-            corrective_direction = (
-                "Drift verifier detected divergence between the phase spec "
-                "and the as-implemented diff:\n" + findings_text
+            # v0.39.0 J (Gap 6): scope AutoDev-INTERNAL run-mechanics findings
+            # (verdict-parsing plumbing, convergence aborts, unregistered
+            # agent — all prefixed ``drift_verifier:`` /
+            # ``drift_convergence_failure:``) OUT of the corrective-generation
+            # text. On the 358k-file Unity run (UUM-136411) a malformed-for-
+            # parser critic verdict produced ONLY these meta findings, which
+            # were spliced verbatim into ``corrective_direction`` and parsed
+            # into corrective tasks (0.c2/0.c3) about AutoDev's own
+            # drift_verifier — the developer then looped trying to "fix"
+            # AutoDev's verdict parser in the target repo instead of the GLES
+            # bug. SUBSTANTIVE findings (``task {id}: MISSING|DRIFTED``, the
+            # critic's ``drift report: ...`` body) are KEPT so legitimate
+            # target-repo drift still produces correctives.
+            substantive_findings, meta_findings = partition_drift_findings(
+                list(drift_verdict.drift_findings)
             )
+            if substantive_findings:
+                findings_text = "\n".join(f"- {f}" for f in substantive_findings)
+                corrective_direction = (
+                    "Drift verifier detected divergence between the phase spec "
+                    "and the as-implemented diff:\n" + findings_text
+                )
+            else:
+                # Only AutoDev-internal plumbing diagnostics remain — there is
+                # nothing about the target repo to correct. Emit no corrective
+                # direction; the orchestrator records the phase as
+                # ``review_status="skipped"`` (a terminal, non-blocking state)
+                # rather than injecting a contaminated corrective task that
+                # would churn against AutoDev's own internals.
+                corrective_direction = None
             logger.info(
                 "drift_verifier.override_to_corrective",
                 phase_id=phase.id,
                 n_findings=len(drift_verdict.drift_findings),
+                n_substantive=len(substantive_findings),
+                n_meta_excluded=len(meta_findings),
+                corrective_emitted=corrective_direction is not None,
             )
             # v0.34.0 B3: convergence-failure ledger breadcrumb so
             # operators can see when the corrective loop self-aborted
