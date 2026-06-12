@@ -2,9 +2,9 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.39.0] - 2026-06-13
 
-Huge-repo-native tier (slated for v0.39.0). Folds the manual environment
+Huge-repo-native tier (Tier J). Folds the manual environment
 workarounds that an unbuildable 358k-file engine repo required —
 disabling the target's MCP servers, bumping probe retries, hand-capping
 parallelism, forcing the unrunnable-tests soft-pass, and raising
