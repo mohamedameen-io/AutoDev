@@ -51,8 +51,17 @@ class Orchestrator:
         plugin_registry: PluginRegistry | None = None,
     ) -> None:
         self._cwd = Path(cwd)
+        # v0.39.0 (Cluster A1): rebind ``cfg`` to its huge-repo-profiled
+        # equivalent BEFORE storing it and before any downstream
+        # construction (GuardrailEnforcer ctor below, H5 resolver calls
+        # later in __init__). Non-destructive deep copy on a huge repo;
+        # identity (same object) on a small repo / escape hatch. The only
+        # NEW live effect is auto-enabling
+        # ``treat_unrunnable_tests_as_no_tests`` on a huge+unbuildable repo.
+        from orchestrator.huge_repo_profile import apply_huge_repo_profile
+
+        cfg = apply_huge_repo_profile(cfg, self._cwd)
         self._cfg = cfg
-        self._adapter = adapter
         self._registry = registry
         self._session_id = session_id or f"sess-{uuid.uuid4().hex[:12]}"
         # v0.25.2: open .autodev/sessions/<sid>/events.jsonl for the
@@ -63,6 +72,19 @@ class Orchestrator:
         self._plan_manager = PlanManager(
             self._cwd, self._session_id, lock_timeout_s=lock_timeout_s
         )
+        # Phase 0 (cost/time telemetry): wrap the shared adapter in a
+        # transparent cost-recording decorator. EVERY invocation surface
+        # (main delegate AND every tournament — judges + developers +
+        # test_engineers) goes through this one shared instance, so the
+        # wrapper is the single chokepoint that captures all spend,
+        # including the tournament invocations that otherwise bypass
+        # ``GuardrailEnforcer.post_invocation``. It emits one audit-only
+        # ``invocation_cost`` ledger op per call against THIS repo / session
+        # (not ``inv.cwd``, which is a throw-away tournament worktree).
+        # Best-effort — a telemetry failure never breaks an invocation.
+        from orchestrator.cost_recorder import CostRecordingAdapter
+
+        self._adapter = CostRecordingAdapter(adapter, self._plan_manager)
         self._knowledge = KnowledgeStore(
             self._cwd, cfg=cfg, session_id=self._session_id
         )
@@ -118,6 +140,13 @@ class Orchestrator:
         # persisted — a fresh orchestrator starts both at ``None``.
         self._last_adapter_subtype: str | None = None
         self._last_adapter_api_error_status: int | None = None
+        # v0.39.0 (Cluster A2b): consecutive test-runner ``capture_failed``
+        # diagnoses on a huge repo. After >=2 in a row the runtime fallback
+        # (:func:`execute_phase.maybe_enable_auto_soft_pass`) auto-enables
+        # ``treat_unrunnable_tests_as_no_tests`` in-memory so the current
+        # task can soft-pass instead of churning the test-diagnosis breaker.
+        # Reset to 0 on a clean ``ok`` / ``no_tests_found``. In-memory only.
+        self._consecutive_capture_failed = 0
 
         # v0.30.0 Bug 5: cross-task infrastructure-failure circuit breaker.
         # Counts adapter failures with infra-class subtypes
@@ -145,6 +174,15 @@ class Orchestrator:
         _cb_threshold_eff, _ = resolve_huge_repo_value(
             key="circuit_breaker_threshold",
             base_value=float(cfg.circuit_breaker_threshold),
+            cwd=self._cwd,
+            cfg=cfg,
+        )
+        # v0.39.0 B4: widen the infra-failure rolling window on huge
+        # repos (default 60 → 120 at mult 2.0) so the breaker tolerates
+        # the longer cold-start / 429 backoff spacing without tripping.
+        _cb_window_eff, _ = resolve_huge_repo_value(
+            key="circuit_breaker_window_s",
+            base_value=float(cfg.circuit_breaker_window_s),
             cwd=self._cwd,
             cfg=cfg,
         )
@@ -186,7 +224,7 @@ class Orchestrator:
         # per-task backoff loop.
         self._circuit_breaker = InfraFailureCircuitBreaker(
             threshold=int(round(_cb_threshold_eff)),
-            window_s=cfg.circuit_breaker_window_s,
+            window_s=float(_cb_window_eff),
             test_diag_threshold=int(round(_td_threshold_eff)),
             test_diag_window_s=_td_window_eff,
             test_diag_diagnoses=frozenset(cfg.test_diag_breaker_diagnoses),

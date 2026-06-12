@@ -25,6 +25,54 @@ from typing import Any, Awaitable, Callable
 _log = logging.getLogger(__name__)
 
 
+# v0.39.0 B3: absolute ceiling for auto-resolved parallelism on huge
+# repos. Mirrors ``resource_probe._PARALLELISM_CEILING`` (16) but lower —
+# huge repos drive more 429/529 overload per worker, so we cap the
+# auto-halved count harder. Operator pins bypass this (see
+# :func:`resolve_huge_repo_parallelism`).
+_HUGE_REPO_PARALLELISM_CEILING = 6
+
+
+def resolve_huge_repo_parallelism(
+    *,
+    base: int,
+    configured: int | None,
+    cwd,
+    cfg,
+) -> int:
+    """Halve auto-resolved parallelism on huge repos to avoid 429/529 overload.
+
+    Operator pin (``configured is not None``) is the escape hatch — never
+    silently scaled. On small repos / when the escape hatch is set the
+    ``parallelism_multiplier`` key resolves to ``None`` and *base* is
+    returned unchanged.
+
+    Args:
+        base: The host-resolved parallelism (output of
+            :func:`runtime.resource_probe.resolve_parallelism`).
+        configured: The operator-supplied pin (``None`` = auto-resolved).
+            When set, *base* is returned verbatim.
+        cwd: Repository root.
+        cfg: :class:`config.schema.AutodevConfig` instance.
+
+    Returns:
+        ``base`` when pinned / small repo / disabled; otherwise the
+        halved value floored at 1 and capped at
+        ``_HUGE_REPO_PARALLELISM_CEILING``.
+    """
+    if configured is not None:
+        return base
+    eff, mult = resolve_huge_repo_value(
+        key="parallelism_multiplier",
+        base_value=float(base),
+        cwd=cwd,
+        cfg=cfg,
+    )
+    if mult is None:  # small repo / huge_repo_overrides_disabled
+        return base
+    return min(max(1, int(eff)), _HUGE_REPO_PARALLELISM_CEILING)
+
+
 def resolve_huge_repo_value(
     *,
     key: str,
@@ -184,5 +232,6 @@ def resolve_all_h5_knobs(
 __all__ = [
     "apply_and_log_huge_repo_value",
     "resolve_all_h5_knobs",
+    "resolve_huge_repo_parallelism",
     "resolve_huge_repo_value",
 ]

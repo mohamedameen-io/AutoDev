@@ -68,6 +68,53 @@ def test_every_ledger_op_has_apply_handler(op: str) -> None:
         pass
 
 
+def test_task_under_decomposed_replays_as_noop() -> None:
+    """v0.39.0 (Cluster C2d): ``task_under_decomposed`` is audit-only.
+
+    It must round-trip through ``_apply_op`` as a no-op (return the plan
+    unchanged), NOT raise ``LedgerCorruptError("unknown op")``. This guards
+    the regression where adding the op to the ``LedgerOp`` Literal without
+    a matching dispatch branch makes any ledger containing it un-replayable.
+    """
+    plan = make_minimal_plan()
+    entry = make_entry(
+        "task_under_decomposed",
+        {
+            "task_id": "1.1",
+            "source": "planner_advisory",
+            "attempt": 0,
+            "file_count": 8,
+            "files": ["a.py", "b.py"],
+            "complexity": "complex",
+        },
+    )
+    result = _apply_op(plan, entry)
+    assert result is plan
+
+
+def test_invocation_cost_replays_as_noop() -> None:
+    """Phase 0 (cost/time telemetry): ``invocation_cost`` is audit-only.
+
+    It must round-trip through ``_apply_op`` as a no-op (return the plan
+    unchanged), NOT raise ``LedgerCorruptError("unknown op")``. Mirrors the
+    ``task_under_decomposed`` guard: adding the op to the ``LedgerOp``
+    Literal without a matching dispatch branch would make any ledger
+    containing it un-replayable.
+    """
+    plan = make_minimal_plan()
+    entry = make_entry(
+        "invocation_cost",
+        {
+            "role": "developer",
+            "task_id": "1.1",
+            "cost_usd": 0.0123,
+            "duration_s": 4.5,
+        },
+    )
+    result = _apply_op(plan, entry)
+    assert result is plan
+
+
 def test_apply_op_unknown_label_still_raises() -> None:
     """Sanity: an op string NOT in the Literal still triggers the
     fall-through raise. Confirms the exhaustiveness check above will

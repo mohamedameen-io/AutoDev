@@ -492,6 +492,6 @@ async def test_escalation_respects_ceiling(tmp_path: Path) -> None:
 
 
 def test_default_ceilings_are_sane() -> None:
-    """Module-level defaults are tuned for production: 100 turns / 1h."""
-    assert DEFAULT_MAX_TURNS_CEILING == 100
+    """Module-level defaults are tuned for production: 250 turns / 1h."""
+    assert DEFAULT_MAX_TURNS_CEILING == 250
     assert DEFAULT_TIMEOUT_S_CEILING == 3600

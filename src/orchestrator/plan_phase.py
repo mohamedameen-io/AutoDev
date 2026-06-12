@@ -16,6 +16,7 @@ Flow:
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -526,6 +527,95 @@ async def _emit_granular_drop_ops(
         await orch.plan_manager.ledger_append(
             op="task_extended_scope_entry_dropped",
             payload={**base, "task_id": task_id},
+        )
+
+
+# v0.39.0 (Cluster C2b): a ``complex`` task touching this many or more
+# files on a huge repo is treated as a decomposition smell — the architect
+# should likely have split it into 2–3 ``medium`` tasks scoped to one
+# subsystem each. Advisory only; never gates the plan.
+_SCOPE_BREADTH_THRESHOLD: int = 6
+# v0.39.0 (Cluster C2b): a single literal file larger than this byte count
+# is also a decomposition smell (one mega-file dominating a complex task).
+_LARGE_FILE_BYTES: int = 100_000
+
+
+async def _advise_task_decomposition(
+    orch: "Orchestrator", plan: Plan, cwd: Path
+) -> None:
+    """v0.39.0 (Cluster C2b): post-parse decomposition advisory for huge repos.
+
+    On Unity-class repos, ``complex`` tasks that touch many files (or one
+    very large file) tend to exhaust even their auto-scaled turn budget and
+    fail with ``error_max_turns`` — they should have been split into finer
+    ``medium`` tasks scoped to a single subsystem (each of which gets its
+    own scaled budget and fails independently). This helper logs a warning
+    and emits a best-effort ``task_under_decomposed`` ledger breadcrumb
+    (``source="planner_advisory"``) for each such task so retrospectives can
+    correlate the failure with the plan shape.
+
+    Purely observational: it NEVER mutates or rejects the plan, NEVER changes
+    control flow, and NEVER raises (the entire body is wrapped defensively).
+    No-op on small repos (gated on ``_repo_capacity.is_huge``).
+    """
+    try:
+        if not getattr(
+            getattr(orch, "_repo_capacity", None), "is_huge", False
+        ):
+            return
+        for phase in plan.phases:
+            for task in getattr(phase, "tasks", []) or []:
+                if task.complexity != "complex":
+                    continue
+                files = task.files or []
+                breadth_smell = len(files) >= _SCOPE_BREADTH_THRESHOLD
+                large_file_smell = False
+                if not breadth_smell:
+                    # Cheap large-file check on literal (non-glob) paths
+                    # only — globs / patterns are skipped (os.stat would
+                    # raise on them and we don't want to expand). The whole
+                    # check is best-effort; OSError (missing / permission)
+                    # is swallowed.
+                    for rel in files:
+                        if not rel or any(c in rel for c in "*?[]"):
+                            continue
+                        try:
+                            if os.stat(cwd / rel).st_size > _LARGE_FILE_BYTES:
+                                large_file_smell = True
+                                break
+                        except OSError:
+                            continue
+                if not (breadth_smell or large_file_smell):
+                    continue
+                logger.warning(
+                    "plan_phase.task_under_decomposed_advisory",
+                    task_id=task.id,
+                    complexity="complex",
+                    file_count=len(files),
+                    files=files[:10],
+                )
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="task_under_decomposed",
+                        payload={
+                            "task_id": task.id,
+                            "source": "planner_advisory",
+                            "attempt": 0,
+                            "file_count": len(files),
+                            "files": files[:10],
+                            "complexity": task.complexity,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "plan_phase.ledger_append_failed",
+                        op="task_under_decomposed",
+                        err=str(exc),
+                    )
+    except Exception as exc:  # noqa: BLE001
+        # Advisory must never break the plan phase.
+        logger.warning(
+            "plan_phase.task_decomposition_advisory_failed", err=str(exc)
         )
 
 
@@ -1195,6 +1285,10 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
             else:
                 logger.info("plan_phase.tournament_no_change")
 
+        # v0.39.0 (Cluster C2b): post-parse decomposition advisory. Runs on
+        # the final approved plan, just before it's committed to the ledger.
+        # Advisory only — never mutates/rejects the plan or raises.
+        await _advise_task_decomposition(orch, plan, cwd)
         await orch.plan_manager.init_plan(plan)
         logger.info(
             "plan_phase.approved",

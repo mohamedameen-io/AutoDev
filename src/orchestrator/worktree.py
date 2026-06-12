@@ -145,6 +145,7 @@ class WorktreeManager:
         huge_mode: bool = False,
         huge_create_timeout_s: float = 600.0,
         autodev_root: Path | None = None,
+        default_sparse_paths: list[str] | None = None,
     ) -> None:
         """Initialize a worktree manager.
 
@@ -154,11 +155,27 @@ class WorktreeManager:
         (358K files, 3 GB) full-checkout worktree creation can take
         80-180 s; the legacy 60 s ceiling killed it. Full sparse-by-default
         lands in v0.23.0 C1.
+
+        v0.40.0 (huge-repo Gap 3): ``default_sparse_paths`` is an optional
+        repo-relative cone applied by :meth:`create` when the caller does
+        NOT pass an explicit ``sparse_paths``. The impl-tournament engine
+        (:class:`tournament.ImplTournament`) calls ``create(nonce,
+        base_ref="HEAD")`` with no scope of its own — it has no access to
+        the task's files — so it would otherwise do a FULL checkout that
+        times out (and materializes a multi-GB phantom) on a huge LFS repo,
+        even though the execute-phase ``create_per_task`` path is already
+        sparse. The runner now threads the task's files/extended_scope in
+        here so all worktree-creation paths share one huge-safe cone.
+        ``None`` (the default) preserves legacy full-checkout behavior for
+        small repos and any caller that doesn't opt in.
         """
         self._main = Path(main_repo)
         self._dir = Path(tournament_dir)
         self._huge_mode = bool(huge_mode)
         self._huge_create_timeout_s = float(huge_create_timeout_s)
+        self._default_sparse_paths = (
+            list(default_sparse_paths) if default_sparse_paths else None
+        )
         # v0.31.0 (Phase 5.2): root for the worktree-state manifest.
         # When None we infer ``<main_repo>/.autodev/`` so legacy callers
         # continue recording state without an explicit override. Tests
@@ -238,6 +255,15 @@ class WorktreeManager:
             raise WorktreeError(
                 f"worktree path {wt} already exists; call remove() first"
             )
+
+        # v0.40.0 (huge-repo Gap 3): fall back to the instance-level
+        # ``default_sparse_paths`` cone when the caller passed no explicit
+        # scope. The impl-tournament engine calls ``create(nonce,
+        # base_ref="HEAD")`` with ``sparse_paths=None``; without this the
+        # tournament worktree would full-checkout and time out on a huge
+        # LFS repo. ``None`` on both → legacy full checkout (small repos).
+        if sparse_paths is None and self._default_sparse_paths:
+            sparse_paths = list(self._default_sparse_paths)
 
         # v0.17.0 S6: sparse-checkout pre-flight.
         # Empty list is treated as None (defensive — callers may forward
@@ -338,6 +364,13 @@ class WorktreeManager:
         v0.17.0 S6: ``sparse_paths`` is forwarded into the same
         sparse-checkout machinery used by :meth:`create`. ``None`` (or
         an empty list) preserves legacy full-checkout behavior.
+
+        v0.39.0 (huge-repo follow-up): both the sparse ``--no-checkout``
+        and the non-sparse fallback ``git worktree add`` now pass
+        ``timeout_s=self._create_timeout_s()`` — they previously used the
+        ``_run_git`` 60s default, so the execute-phase worktree path
+        ignored ``huge_create_timeout_s`` (600s) and timed out at 60s on
+        Unity-scale repos even though :meth:`create` already honored it.
         """
         wt = self._dir / "tasks" / task_id
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -364,6 +397,7 @@ class WorktreeManager:
             rc, out, err = await _run_git(
                 self._main,
                 ["worktree", "add", "--no-checkout", "--detach", str(wt), base_ref],
+                timeout_s=self._create_timeout_s(),
             )
             if rc != 0:
                 raise WorktreeError(
@@ -433,6 +467,7 @@ class WorktreeManager:
         rc, out, err = await _run_git(
             self._main,
             ["worktree", "add", "--detach", str(wt), base_ref],
+            timeout_s=self._create_timeout_s(),
         )
         if rc != 0:
             raise WorktreeError(
@@ -794,6 +829,23 @@ class WorktreeManager:
             # captures exactly the diff's hunks (no risk of sweeping
             # unrelated dirty state via a later ``git add -A``).
             apply_args.append("--index")
+
+        # v0.40.0 (huge-repo Gap 3): belt-and-suspenders stale-lock cleanup
+        # before ANY main-repo index mutation. A ``git worktree add`` killed
+        # after timing out on a huge LFS repo can leave a stale
+        # ``.git/index.lock`` behind; the reset/checkout/apply below would
+        # then fail with "Unable to create '.../index.lock': File exists",
+        # cascading one timeout into every subsequent apply. The helper only
+        # removes a lock that is BOTH old and not held by a live process, so
+        # a genuinely concurrent git op is never disturbed (no-op when no
+        # lock exists → safe on small repos).
+        from adapters.git_utils import clear_stale_index_lock
+
+        if clear_stale_index_lock(self._main / ".git"):
+            self._log.warning(
+                "worktree.stale_index_lock_cleared",
+                git_dir=str(self._main / ".git"),
+            )
 
         # Robust integration: drop any leftover uncommitted dirt on the
         # files this patch targets (e.g. partial hunks staged by a prior

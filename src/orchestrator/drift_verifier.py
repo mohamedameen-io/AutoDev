@@ -242,6 +242,60 @@ def _parse_drift_response(text: str) -> tuple[bool, list[str]]:
     return passed, findings
 
 
+# v0.39.0 J (Gap 6): prefixes that mark a drift finding as AutoDev-INTERNAL
+# run-mechanics (verdict-parsing plumbing, convergence aborts, unregistered
+# agent) rather than a SUBSTANTIVE finding about the target repo's code.
+#
+# Every meta finding produced by this module is constructed with one of these
+# prefixes (see ``_parse_drift_response`` lines emitting "drift_verifier: ..."
+# and ``run_drift_verifier``'s "drift_convergence_failure: ..." /
+# unregistered-agent paths). Substantive findings are the per-task results
+# (``task {id}: MISSING|DRIFTED``) and the critic's own ``drift report: ...``
+# body — neither carries these prefixes.
+#
+# These are SCOPED OUT of the ``corrective_direction`` text fed to corrective
+# generation (in ``phase_review_runner``) so the developer is never asked to
+# "fix" AutoDev's own verdict parser in the target repo. The drift verdict's
+# ``passed`` flag is unaffected — control flow (accept/reject the phase) still
+# uses the full finding list; only the prompt TEXT is filtered.
+_META_FINDING_PREFIXES: tuple[str, ...] = (
+    "drift_verifier:",
+    "drift_convergence_failure:",
+)
+
+
+def _is_meta_finding(finding: str) -> bool:
+    """``True`` iff ``finding`` is an AutoDev-internal run-mechanics diagnostic.
+
+    Meta findings describe AutoDev's own plumbing (e.g. "the critic's response
+    was missing a VERDICT line", "non-standard verdict 'PASS' treated as
+    NEEDS_REVISION", "corrective patch ≥90% identical to prior") — never a
+    problem in the target repo's code. They must not leak into the
+    corrective-generation prompt. Case-insensitive; leading whitespace is
+    ignored.
+    """
+    lowered = (finding or "").lstrip().lower()
+    return any(lowered.startswith(p) for p in _META_FINDING_PREFIXES)
+
+
+def partition_drift_findings(
+    findings: list[str],
+) -> tuple[list[str], list[str]]:
+    """Split ``findings`` into ``(substantive, meta)`` preserving order.
+
+    ``substantive`` are findings about the target repo's code (per-task
+    MISSING/DRIFTED results, the critic's drift-report body) that are safe to
+    feed into corrective generation. ``meta`` are AutoDev-internal
+    run-mechanics diagnostics (see :func:`_is_meta_finding`) that must be
+    scoped OUT of the corrective prompt.
+    """
+    substantive: list[str] = []
+    meta: list[str] = []
+    for f in findings:
+        (meta if _is_meta_finding(f) else substantive).append(f)
+    return substantive, meta
+
+
 def _safe_phase_id(phase_id: str) -> str:
     """Sanitize a phase id for use as a filename."""
     return phase_id.replace("/", "_").replace(" ", "_")
@@ -395,5 +449,6 @@ async def run_drift_verifier(
 
 __all__ = [
     "DriftVerdict",
+    "partition_drift_findings",
     "run_drift_verifier",
 ]

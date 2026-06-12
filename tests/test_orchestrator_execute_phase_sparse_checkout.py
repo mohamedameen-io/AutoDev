@@ -174,6 +174,79 @@ async def test_sparse_paths_none_when_disabled(
 
 
 @pytest.mark.asyncio
+async def test_sparse_falls_back_to_task_files_when_no_edit_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gap-1 fix: sparse enabled + NO edit_scope → cone from task.files.
+
+    This is the bug that produced the 62 MB LFS phantom diff: when sparse
+    is on (huge repo) but the plan declares no edit_scope, the worktree
+    must still be narrowed — to the task's own claimed files — instead of
+    falling through to a full (non-sparse) checkout.
+    """
+    plan = _build_plan(edit_scope=[])  # NO plan/phase edit_scope
+    captured: dict[str, Any] = {}
+
+    async def fake_create_per_task(
+        self, task_id: str, base_ref: str = "HEAD",
+        sparse_paths: list[str] | None = None,
+        **_kw: object,
+    ) -> Path:
+        captured["sparse_paths"] = sparse_paths
+        return tmp_path / "fake_wt"
+
+    monkeypatch.setattr(
+        WorktreeManager, "create_per_task", fake_create_per_task
+    )
+
+    # Sparse explicitly enabled (mirrors what apply_huge_repo_profile does
+    # on a huge repo).
+    cfg = default_config().model_copy(
+        update={"worktree_sparse_checkout_enabled": True}
+    )
+
+    class _FakePM:
+        async def load(self) -> Plan:
+            return plan
+
+        async def update_task_status(self, *a, **kw):  # noqa: ANN001
+            return plan.phases[0].tasks[0]
+
+    class _FakeGuard:
+        def start_task(self, *a, **kw): ...
+        def end_task(self, *a, **kw): ...
+
+    class _FakeOrch:
+        pass
+
+    fake_orch = _FakeOrch()
+    fake_orch.cfg = cfg  # type: ignore[attr-defined]
+    fake_orch.cwd = tmp_path  # type: ignore[attr-defined]
+    fake_orch.plan_manager = _FakePM()  # type: ignore[attr-defined]
+    fake_orch.guardrails = _FakeGuard()  # type: ignore[attr-defined]
+
+    from orchestrator import execute_phase as ep
+
+    class _Sentinel(Exception):
+        pass
+
+    async def fake_delegate(*a, **kw):  # noqa: ANN001
+        raise _Sentinel("stop")
+
+    monkeypatch.setattr(ep, "delegate", fake_delegate)
+
+    wt_mgr = WorktreeManager(tmp_path, tmp_path / "wts")
+    task = plan.phases[0].tasks[0]
+    assert task.files == ["src/qa/foo.py"]
+
+    with pytest.raises(_Sentinel):
+        await ep._execute_one(fake_orch, task, worktree_mgr=wt_mgr)
+
+    # Cone falls back to the task's own files → NOT None (no full checkout).
+    assert captured["sparse_paths"] == ["src/qa/foo.py"]
+
+
+@pytest.mark.asyncio
 async def test_phase_scope_overrides_plan_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

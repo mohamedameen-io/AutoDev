@@ -48,7 +48,7 @@ from qa import (
     run_tests,
 )
 from qa.code_size import run_code_size
-from state.paths import autodev_root
+from state.paths import AUTODEV_DIR, autodev_root
 from state.schemas import (
     CoderEvidence,
     CriticEvidence,
@@ -166,6 +166,131 @@ _GuardrailClassToHintClass: dict[
     "infrastructure": "network_transient",
     "cap": "model_capacity_exhausted",
 }
+
+
+def maybe_enable_auto_soft_pass(orch: "Orchestrator", diagnosis: str) -> bool:
+    """Track consecutive ``capture_failed``; auto-enable soft-pass on a huge repo.
+
+    After >=2 consecutive test-runner ``capture_failed`` diagnoses on a
+    **huge** repo, auto-enable ``treat_unrunnable_tests_as_no_tests``
+    in-memory (idempotent) so the current task — and the rest of the
+    session — can soft-pass an infra-class capture failure instead of
+    churning the test-diagnosis breaker.
+
+    No-op (returns ``False``) when:
+
+    * the ``huge_repo_overrides_disabled`` escape hatch is set;
+    * the repo is not huge (honors the tier invariant — small repos keep
+      strict gating);
+    * the flag is already enabled (the idempotency guard).
+
+    A clean ``ok`` / ``no_tests_found`` diagnosis resets the counter.
+
+    Returns ``True`` iff this call just flipped the flag.
+    """
+    # Escape hatch wins — restore pre-tier behaviour on huge repos.
+    if getattr(orch.cfg, "huge_repo_overrides_disabled", False):
+        return False
+    # Small repos never auto-soft-pass: honors the tier invariant. Use the
+    # capacity signal so this mirrors the task-role huge-scaling path.
+    if not getattr(getattr(orch, "_repo_capacity", None), "is_huge", False):
+        return False
+
+    if diagnosis == "capture_failed":
+        orch._consecutive_capture_failed = (
+            getattr(orch, "_consecutive_capture_failed", 0) + 1
+        )
+    elif diagnosis in ("ok", "no_tests_found"):
+        orch._consecutive_capture_failed = 0
+        return False
+    # Any other diagnosis (collection_failed / runtime_crash / ...) neither
+    # increments nor resets — only a clean run clears the streak.
+
+    if getattr(orch, "_consecutive_capture_failed", 0) < 2:
+        return False
+    if getattr(orch.cfg, "treat_unrunnable_tests_as_no_tests", False):
+        # Already enabled — idempotent no-op.
+        return False
+
+    # Flip in-memory only — the profile is never written to disk.
+    orch.cfg.treat_unrunnable_tests_as_no_tests = True
+    logger.warning(
+        "execute_phase.auto_soft_pass_enabled",
+        reason="consecutive_capture_failed",
+        consecutive_capture_failed=orch._consecutive_capture_failed,
+    )
+    # Best-effort forensic ledger op (fire-and-forget). Guarded so test
+    # stubs without a plan_manager / running loop never raise.
+    if getattr(orch, "plan_manager", None) is not None:
+        try:
+            asyncio.ensure_future(
+                orch.plan_manager.ledger_append(
+                    op="auto_soft_pass_enabled",
+                    payload={
+                        "reason": "consecutive_capture_failed",
+                        "consecutive_capture_failed": (
+                            orch._consecutive_capture_failed
+                        ),
+                    },
+                )
+            )
+        except Exception:  # noqa: BLE001 — telemetry never blocks
+            pass
+    return True
+
+
+async def maybe_emit_under_decomposed_runtime(
+    orch: "Orchestrator",
+    task: "Task",
+    developer_result: "AgentResult",
+) -> bool:
+    """v0.39.0 (Cluster C2c): emit ``task_under_decomposed`` on a budget-bust.
+
+    When a developer task burns its (already huge-scaled) ``max_turns`` budget
+    with ``subtype="error_max_turns"`` on a **huge** repo, on its first one or
+    two attempts (``retry_count in (0, 1)``), that is a strong signal the
+    architect should have split it into smaller ``medium`` tasks. Emit a
+    best-effort, ``plan_manager``-guarded ``task_under_decomposed`` breadcrumb
+    (``source="runtime"``) for offline retrospectives.
+
+    Purely observational: returns ``True`` iff it just emitted, but the caller
+    ignores the return — control flow is unchanged either way. No-op when:
+
+    * the failure subtype is not ``error_max_turns``;
+    * ``retry_count >= 2`` (later attempts; the early signal is what matters);
+    * the repo is not huge (honors the tier invariant);
+    * there is no ``plan_manager`` (test stubs / pre-init).
+
+    Never raises — any ledger error is swallowed with a warning.
+    """
+    if developer_result.subtype != "error_max_turns":
+        return False
+    if task.retry_count not in (0, 1):
+        return False
+    if not getattr(getattr(orch, "_repo_capacity", None), "is_huge", False):
+        return False
+    if getattr(orch, "plan_manager", None) is None:
+        return False
+    try:
+        await orch.plan_manager.ledger_append(
+            op="task_under_decomposed",
+            payload={
+                "task_id": task.id,
+                "source": "runtime",
+                "attempt": int(task.retry_count),
+                "file_count": len(task.files),
+                "files": task.files[:10],
+                "complexity": task.complexity,
+            },
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — telemetry never blocks
+        logger.warning(
+            "execute_phase.ledger_append_failed",
+            op="task_under_decomposed",
+            err=str(exc),
+        )
+        return False
 
 
 def _build_recovery_hint(
@@ -2303,15 +2428,24 @@ def _resolve_execute_parallelism(orch: "Orchestrator") -> int:
     ceiling) when no explicit cap is configured — the dispatcher polls
     greedily, so this just sets the upper bound.
     """
+    from orchestrator.huge_repo_overrides import resolve_huge_repo_parallelism
     from runtime.resource_probe import probe_host, resolve_parallelism
 
     configured = orch.cfg.tournaments.execute_max_parallel_tasks
     capacity = probe_host()
-    return resolve_parallelism(
+    base = resolve_parallelism(
         configured=configured,
         capacity=capacity,
         role_mix="execute",
         num_judges=configured if configured is not None else 16,
+    )
+    # v0.39.0 B3: halve auto-resolved parallelism on huge repos (operator
+    # pin bypasses; no-op on small repos / when the escape hatch is set).
+    return resolve_huge_repo_parallelism(
+        base=base,
+        configured=configured,
+        cwd=orch.cwd,
+        cfg=orch.cfg,
     )
 
 
@@ -3695,6 +3829,41 @@ async def _execute_one(
                     _resolved = list(_plan_for_scope.edit_scope)
                 if _resolved:
                     sparse_paths = _resolved
+            # huge-repo follow-up: when sparse is enabled (huge repo) but
+            # NO edit_scope is declared (the common case — architects don't
+            # always emit a plan/phase edit_scope), fall back to the task's
+            # OWN claimed files (+ extended_scope) as the sparse cone.
+            # Without this, ``sparse_paths`` stays None →
+            # ``create_per_task`` does a FULL checkout, which on a huge LFS
+            # repo materializes the entire tree and produces a ~62 MB
+            # checkout/LFS "phantom diff" that trips the diff-size guardrail
+            # and blocks the task. The cone must contain the files the
+            # developer needs to read/edit; ``create_per_task`` additionally
+            # folds in their sibling headers. Empty → leave None (legacy
+            # full checkout) so a task that genuinely claims no files is
+            # unaffected.
+            if not sparse_paths:
+                _task_cone = [
+                    p
+                    for p in (
+                        list(getattr(task, "files", []) or [])
+                        + list(getattr(task, "extended_scope", []) or [])
+                    )
+                    if isinstance(p, str) and p.strip()
+                ]
+                if _task_cone:
+                    # Deduplicate while preserving first-seen order.
+                    _seen: set[str] = set()
+                    sparse_paths = [
+                        p
+                        for p in _task_cone
+                        if not (p in _seen or _seen.add(p))
+                    ]
+                    logger.info(
+                        "execute_phase.sparse_cone_from_task_files",
+                        task_id=task.id,
+                        paths=sparse_paths,
+                    )
         try:
             worktree = await worktree_mgr.create_per_task(
                 task.id,
@@ -3837,6 +4006,27 @@ async def _execute_one(
                     task_id=task.id,
                     err=developer_result.error,
                 )
+                # Tier J (huge-repo): accept an APPROVED-but-turn-exhausted
+                # task instead of losing the approved (empty-diff) result to
+                # a ``user_decision_required`` soft-block. Strictly gated —
+                # fires ONLY when the failure is pure turn-exhaustion AND a
+                # reviewer ``APPROVED`` verdict is already on record for an
+                # empty diff (see ``_maybe_accept_approved_on_exhaustion``).
+                # Returns ``None`` (no-op) on a genuine semantic failure /
+                # non-approved / non-empty-diff task, so this never masks a
+                # real failure.
+                _accepted = await _maybe_accept_approved_on_exhaustion(
+                    orch, task, developer_result
+                )
+                if _accepted is not None:
+                    return _accepted
+                # v0.39.0 (Cluster C2c): runtime under-decomposition
+                # telemetry. Best-effort, purely observational — never
+                # changes control flow (falls through to the existing
+                # retry/escalate path below unchanged).
+                await maybe_emit_under_decomposed_runtime(
+                    orch, task, developer_result
+                )
                 # v0.20.0 C3: dynamic scope expansion on missing-file
                 # error. Inspect the adapter output for paths that look
                 # like sparse-checkout misses; if any are covered by the
@@ -3875,6 +4065,54 @@ async def _execute_one(
                 if task.escalated:
                     return task
                 last_issues = [developer_result.error or "adapter failure"]
+                continue
+
+            # Gap 5 (containment): reject a developer diff confined ENTIRELY
+            # to AutoDev's own ``.autodev/`` directory. AutoDev owns that
+            # dir in the target repo (evidence / ledger / tournament / index
+            # state); a task agent editing only those files has perceived
+            # AutoDev's internals as the work to do, not the target code.
+            # That is never legitimate task output, so route it through the
+            # same retry/escalate path a QA-gate failure uses rather than
+            # letting it flow to the reviewer (where an APPROVED verdict on
+            # a no-op-to-the-target diff could carry it to ``complete``).
+            # No-op for empty diffs (research tasks) and for any diff that
+            # touches at least one path outside ``.autodev/``.
+            if _diff_confined_to_autodev(developer_result):
+                _autodev_files = extract_files_from_diff(
+                    developer_result.diff or "", strict=False
+                )
+                logger.warning(
+                    "execute_phase.containment_violation_autodev_paths",
+                    task_id=task.id,
+                    files=_autodev_files[:20],
+                )
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="containment_violation_autodev_paths",
+                        payload={
+                            "task_id": task.id,
+                            "files": _autodev_files[:20],
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort breadcrumb
+                    logger.warning(
+                        "execute_phase.ledger_append_failed",
+                        op="containment_violation_autodev_paths",
+                        err=str(exc),
+                    )
+                _containment_reason = (
+                    "containment_violation: developer diff is confined to "
+                    "AutoDev's own .autodev/ directory "
+                    f"({', '.join(_autodev_files[:5])}) — edit the TARGET "
+                    "repository's code, not AutoDev's internal run state"
+                )
+                task = await _try_retry_or_escalate(
+                    orch, task, retry_limit, reason=_containment_reason
+                )
+                if task.escalated:
+                    return task
+                last_issues = [_containment_reason]
                 continue
 
             task = await orch.plan_manager.update_task_status(task.id, "coded")
@@ -4136,6 +4374,14 @@ async def _execute_one(
                 runner_stderr_tail=stderr_tail or None,
             )
             await write_evidence(orch.cwd, task.id, test_ev)
+
+            # v0.39.0 (Cluster A2b): runtime auto-soft-pass fallback. Track
+            # consecutive ``capture_failed`` on a huge repo and, after >=2
+            # in a row, flip ``treat_unrunnable_tests_as_no_tests`` in-memory
+            # so the CURRENT task can benefit — the gate below reads the
+            # flag live via getattr. No-op on small repos / escape hatch /
+            # when already enabled.
+            maybe_enable_auto_soft_pass(orch, diagnosis)
 
             if diagnosis == "no_tests_found" or (
                 diagnosis in ("capture_failed", "collection_failed", "runtime_crash")
@@ -5502,7 +5748,57 @@ async def delegate(
         if timeout_s is None:
             timeout_s = _DEFAULT_DEVELOPER_TIMEOUT_S
     else:
+        # v0.39.0 (Cluster C1): non-task roles (reviewer, test_engineer,
+        # domain_expert, critics, …) previously bypassed huge-repo scaling
+        # entirely — ``max_turns`` was pinned to ``spec_max_turns`` no matter
+        # how large the repo was, which is why the reviewer needed a manual
+        # ``reviewer.max_turns=12`` override to survive Unity-class runs.
+        # We now scale these roles by the same role-keyed
+        # ``huge_repo_multipliers`` dict the task branch consults, gated on
+        # the identical ``_repo_capacity.is_huge`` signal (NOT
+        # ``is_huge_repo(cwd)``) so both arms of this ``delegate`` agree.
+        # No-op when capacity is None / not huge / role absent / mult ≤ 1.0
+        # / cfg lacks ``task_overrides``. Idempotent — always recomputes
+        # from ``spec_max_turns``.
+        repo_capacity = getattr(orch, "_repo_capacity", None)
+        _task_overrides_cfg = getattr(orch.cfg, "task_overrides", None)
+        huge_mult_overrides = (
+            getattr(_task_overrides_cfg, "huge_repo_multipliers", None)
+            if _task_overrides_cfg is not None
+            else None
+        )
         max_turns = spec_max_turns
+        if (
+            repo_capacity is not None
+            and getattr(repo_capacity, "is_huge", False)
+            and isinstance(huge_mult_overrides, dict)
+            and role in huge_mult_overrides
+            and huge_mult_overrides[role] > 1.0
+        ):
+            _role_mult = float(huge_mult_overrides[role])
+            # Round half *up* (not banker's ``round``): the documented C1
+            # outcomes require reviewer 5×2.5→13 and domain_expert 3×1.5→5,
+            # i.e. .5 cases round toward more runway. ``int(x + 0.5)`` gives
+            # 13 / 8 / 5 where ``int(round(x))`` would give 12 / 8 / 4.
+            max_turns = int(spec_max_turns * _role_mult + 0.5)
+            # v0.36.0 E1 telemetry (reused): record the role-keyed scaling
+            # for forensics. Best-effort, ``plan_manager``-guarded.
+            if getattr(orch, "plan_manager", None) is not None:
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="huge_repo_multiplier_applied",
+                        payload={
+                            "role": role,
+                            "base": int(spec_max_turns),
+                            "multiplier": _role_mult,
+                            "effective": int(max_turns),
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "execute_phase.huge_repo_nontask_ledger_failed",
+                        err=str(exc),
+                    )
         timeout_s = None  # adapter applies its own default (600s in claude_code)
 
     # v0.31.0 (Phase 3): per-(task_id, role) budget escalation on
@@ -5525,6 +5821,11 @@ async def delegate(
 
         # Read tunable ceilings off the cfg if present (operator
         # override surface), else fall back to the module defaults.
+        from orchestrator.budget_escalation import (
+            DEFAULT_MAX_TURNS_CEILING,
+        )
+        from orchestrator.huge_repo_overrides import resolve_huge_repo_value
+
         _ceiling_cfg = getattr(orch.cfg, "budget_escalation", None)
         _max_turns_ceiling = (
             getattr(_ceiling_cfg, "max_turns_ceiling", None)
@@ -5536,9 +5837,24 @@ async def delegate(
             if _ceiling_cfg is not None
             else None
         )
+        # v0.39.0 (Cluster A3): lift the turns ceiling on huge repos
+        # (1.5× → 375 from the 250 default) so a long task can climb the
+        # escalation ladder without prematurely hard-failing. The resolver
+        # is identity on small repos / escape hatch, so small-repo
+        # behaviour is byte-identical. ``timeout_s_ceiling`` stays un-scaled.
+        _base_ceiling = (
+            _max_turns_ceiling
+            if _max_turns_ceiling is not None
+            else DEFAULT_MAX_TURNS_CEILING
+        )
+        _ceiling_eff, _ = resolve_huge_repo_value(
+            key="max_turns_ceiling",
+            base_value=float(_base_ceiling),
+            cwd=orch.cwd,
+            cfg=orch.cfg,
+        )
         _kwargs: dict[str, int] = {}
-        if _max_turns_ceiling is not None:
-            _kwargs["max_turns_ceiling"] = int(_max_turns_ceiling)
+        _kwargs["max_turns_ceiling"] = int(round(_ceiling_eff))
         if _timeout_s_ceiling is not None:
             _kwargs["timeout_s_ceiling"] = int(_timeout_s_ceiling)
 
@@ -6117,6 +6433,148 @@ def _parse_test_counts(text: str) -> tuple[int, int, int]:
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
+# Turn-exhaustion failure subtypes that are purely infrastructural — the
+# agent ran out of turns on (huge-repo) exploration, NOT a semantic defect.
+# ``error_max_turns`` is the per-attempt cap; ``error_max_turns_escalation_
+# exhausted`` is the synthetic subtype the budget-escalation tracker returns
+# once the per-(task, role) escalation ladder is spent. Both mean "more
+# runway would have helped", never "the work is wrong".
+_TURN_EXHAUSTION_SUBTYPES: frozenset[str] = frozenset(
+    {"error_max_turns", "error_max_turns_escalation_exhausted"}
+)
+
+
+async def _maybe_accept_approved_on_exhaustion(
+    orch: "Orchestrator",
+    task: "Task",
+    developer_result: "AgentResult",
+) -> "Task | None":
+    """Tier J: accept an APPROVED-but-turn-exhausted task instead of blocking.
+
+    Returns the completed ``Task`` when the approved artifact is accepted,
+    or ``None`` (no-op) when the strict gate does not hold — in which case
+    the caller falls through to the unchanged retry/escalate path.
+
+    The gap (observed on a 358k-file repo): a Phase-0 research/confirmation
+    task whose correct output is an EMPTY diff already has a reviewer
+    ``APPROVED`` verdict on record (``{task_id}-review.json``), but the
+    developer keeps hitting ``error_max_turns`` on broad codebase
+    exploration. The discard/escalation ladder eventually soft-blocks the
+    task as ``user_decision_required`` — *losing* the already-approved
+    result. The failure is purely infrastructural turn-exhaustion, not a
+    semantic verdict.
+
+    Gate STRICTLY (all must hold):
+
+    1. The developer result's ``subtype`` is a turn-exhaustion subtype
+       (:data:`_TURN_EXHAUSTION_SUBTYPES`). A semantic NEEDS_CHANGES /
+       REJECTED retry, a parse error, an auth/transport failure, etc. is
+       NOT accepted — those must still block.
+    2. A reviewer verdict of ``APPROVED`` is on record for this task's
+       artifact (``{task_id}-review.json``). Any other verdict (or no
+       review evidence at all) is NOT accepted.
+    3. The current (turn-exhausted) developer attempt produced no diff —
+       ``developer_result.diff`` is empty / whitespace-only. This is the
+       reliable signal: a turn-exhausted attempt emits no patch, and an
+       empty diff integrates as a no-op so completion is safe without an
+       apply step. A non-empty in-hand diff is deliberately NOT auto-
+       accepted here (applying an un-reviewed partial diff would be
+       unsafe); it falls through to the unchanged path.
+
+    Idempotent: marking the task ``complete`` is the terminal transition,
+    so a re-entry (e.g. resume) re-reads the same APPROVED evidence and
+    re-completes deterministically; the caller returns immediately on a
+    non-None result, so the developer is never re-dispatched. Best-effort
+    ledger / stuck-state side effects never mask the completion.
+    """
+    subtype = developer_result.subtype
+    if subtype not in _TURN_EXHAUSTION_SUBTYPES:
+        return None
+
+    from state.evidence import read_evidence  # noqa: PLC0415 — break cycle
+
+    try:
+        review_ev = await read_evidence(orch.cwd, task.id, "review")
+    except Exception as exc:  # noqa: BLE001 — defensive: never block the path
+        logger.warning(
+            "execute_phase.accept_approved_review_read_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return None
+    # Only an APPROVED verdict sticks. NEEDS_CHANGES / REJECTED / MALFORMED
+    # (or no review evidence) → no-op, fall through to retry/escalate.
+    if review_ev is None or getattr(review_ev, "verdict", None) != "APPROVED":
+        return None
+
+    # The current (turn-exhausted) attempt must carry no diff — an empty
+    # diff integrates as a no-op, so completion is safe without an apply
+    # step. A turn-exhausted attempt reliably emits no patch; a non-empty
+    # in-hand diff is out of scope (applying an un-reviewed partial diff
+    # would be unsafe) and falls through to the unchanged path.
+    in_hand_diff = developer_result.diff
+    if in_hand_diff is not None and in_hand_diff.strip():
+        return None
+
+    logger.warning(
+        "execute_phase.accepted_approved_on_exhaustion",
+        task_id=task.id,
+        subtype=subtype,
+        verdict="APPROVED",
+        diff_empty=True,
+    )
+    # Audit-only ledger breadcrumb. Best-effort — a ledger failure here
+    # MUST NOT mask the completion the operator needs.
+    if getattr(orch, "plan_manager", None) is not None:
+        try:
+            await orch.plan_manager.ledger_append(
+                op="accepted_approved_on_exhaustion",
+                payload={
+                    "task_id": task.id,
+                    "verdict": "APPROVED",
+                    "subtype": subtype or "unknown",
+                    "diff_empty": True,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort breadcrumb
+            logger.warning(
+                "execute_phase.ledger_append_failed",
+                op="accepted_approved_on_exhaustion",
+                err=str(exc),
+            )
+
+    # Mark complete. An empty diff integrates as a no-op, so there is
+    # nothing to apply to main — the reviewer already certified the
+    # empty diff as structurally correct. The task is ``in_progress`` at
+    # this point (set at dispatch and reset on every retry), and the FSM
+    # forbids a direct ``in_progress -> complete`` edge, so walk the
+    # canonical happy-path pipeline states the approved artifact would
+    # have traversed had it not been pre-empted by turn-exhaustion. Each
+    # edge is legal per ``task_state.TASK_TRANSITIONS``; the final
+    # ``tournamented -> complete`` carries the evidence bundle.
+    completed = task
+    for _status in ("coded", "auto_gated", "reviewed", "tested", "tournamented"):
+        if completed.status == _status:
+            continue
+        completed = await orch.plan_manager.update_task_status(task.id, _status)
+    completed = await orch.plan_manager.update_task_status(
+        task.id,
+        "complete",
+        meta={"evidence_bundle": f".autodev/evidence/{task.id}-review.json"},
+    )
+    # Zero the stuck-state counters on success (mirrors the happy-path
+    # completion tail). Best-effort — never mask the completion.
+    try:
+        await orch.plan_manager.reset_stuck_state(task.id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.reset_stuck_state_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+    return completed
+
+
 def _build_adapter_failure_reason(
     developer_result: AgentResult | None,
 ) -> str:
@@ -6142,6 +6600,59 @@ def _build_adapter_failure_reason(
     raw_error = developer_result.error or "adapter failure"
     truncated = raw_error[:200]
     return f"{base} ({subtype}): {truncated}"
+
+
+# Gap 5 (containment): AutoDev owns the ``.autodev/`` directory in the
+# target repo (evidence, ledger, tournaments, index DB, debug dumps). A
+# task agent must never perceive AutoDev's own run-mechanics as the work
+# to do. The observed derailment (corrective task ``0.c2`` on a 358k-file
+# run) had a developer edit ``.autodev/evidence/0-drift-verifier.json``
+# instead of the target repo's code, and that ``.autodev/``-only diff was
+# accepted as legitimate task work. A diff confined ENTIRELY to
+# ``.autodev/`` is the reliable signal for this class of derailment: real
+# task work always touches at least one path outside AutoDev's own dir.
+_AUTODEV_PATH_PREFIX = f"{AUTODEV_DIR}/"
+
+
+def _path_is_autodev_owned(path: str) -> bool:
+    """True iff *path* (repo-relative) lives under AutoDev's ``.autodev/``.
+
+    Normalizes a leading ``./`` and matches both the directory itself
+    (``.autodev``) and anything beneath it (``.autodev/...``). Conservative:
+    a path that merely *starts with* the literal string but is a sibling
+    (e.g. ``.autodev-notes/x``) is NOT matched.
+    """
+    p = path.strip()
+    if p.startswith("./"):
+        p = p[2:]
+    return p == AUTODEV_DIR or p.startswith(_AUTODEV_PATH_PREFIX)
+
+
+def _diff_confined_to_autodev(
+    developer_result: AgentResult | None,
+) -> bool:
+    """Gap 5: True iff a NON-EMPTY developer diff touches ONLY ``.autodev/``.
+
+    Returns ``False`` for a missing result, an empty / whitespace-only
+    diff, or any diff that touches at least one path outside AutoDev's own
+    directory. Only when the diff parses to a non-empty file set AND every
+    one of those files is AutoDev-owned does this return ``True`` — the
+    signal that the agent edited AutoDev's internals instead of the target
+    repo.
+
+    Empty-diff cases return ``False`` so legitimate research tasks (which
+    correctly produce no diff and are gated separately on an APPROVED
+    verdict) are never affected by this guard.
+    """
+    if developer_result is None or not developer_result.diff:
+        return False
+    try:
+        files = extract_files_from_diff(developer_result.diff, strict=False)
+    except Exception:  # noqa: BLE001 — defensive: never block on a parse quirk
+        return False
+    if not files:
+        return False
+    return all(_path_is_autodev_owned(f) for f in files)
 
 
 def _files_changed_for_secretscan(

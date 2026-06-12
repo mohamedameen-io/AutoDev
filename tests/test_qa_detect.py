@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 
-from qa.detect import detect_language, detect_toolchain
+from qa.detect import (
+    RUNNABLE_TEST_LANGUAGES,
+    detect_language,
+    detect_toolchain,
+    is_repo_unbuildable,
+)
 
 
 def _touch(path: Path) -> None:
@@ -106,3 +111,66 @@ def test_toolchain_java_pom(tmp_path: Path) -> None:
 
 def test_toolchain_unknown(tmp_path: Path) -> None:
     assert detect_toolchain(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# v0.39.0 (Cluster A2): C++/CMake detection (lowest precedence) +
+# is_repo_unbuildable.
+# ---------------------------------------------------------------------------
+
+
+def test_detect_cpp_cmake(tmp_path: Path) -> None:
+    _touch(tmp_path / "CMakeLists.txt")
+    assert detect_language(tmp_path) == "cpp"
+
+
+def test_detect_cpp_sln(tmp_path: Path) -> None:
+    _touch(tmp_path / "Engine.sln")
+    assert detect_language(tmp_path) == "cpp"
+
+
+def test_detect_cpp_vcxproj(tmp_path: Path) -> None:
+    _touch(tmp_path / "Engine.vcxproj")
+    assert detect_language(tmp_path) == "cpp"
+
+
+def test_dotnet_wins_over_sln(tmp_path: Path) -> None:
+    """A .NET solution carries BOTH a ``.csproj`` and a ``.sln`` — the
+    ``.csproj`` (dotnet) check must win over the lower-precedence cpp
+    ``.sln`` check."""
+    _touch(tmp_path / "MyApp.csproj")
+    _touch(tmp_path / "MyApp.sln")
+    assert detect_language(tmp_path) == "dotnet"
+
+
+def test_python_wins_over_cmake(tmp_path: Path) -> None:
+    """A Python repo that happens to carry a CMake tree stays python —
+    cpp/CMake is lowest precedence."""
+    _touch(tmp_path / "pyproject.toml")
+    _touch(tmp_path / "CMakeLists.txt")
+    assert detect_language(tmp_path) == "python"
+
+
+def test_cpp_not_in_toolchain_map(tmp_path: Path) -> None:
+    """cpp drives no linter gate yet — detect_toolchain returns None."""
+    _touch(tmp_path / "CMakeLists.txt")
+    assert detect_language(tmp_path) == "cpp"
+    assert detect_toolchain(tmp_path) is None
+
+
+def test_is_repo_unbuildable_empty(tmp_path: Path) -> None:
+    """No detected language → unbuildable."""
+    assert is_repo_unbuildable(tmp_path) is True
+
+
+def test_is_repo_unbuildable_cpp(tmp_path: Path) -> None:
+    """cpp is detected but outside RUNNABLE_TEST_LANGUAGES → unbuildable."""
+    _touch(tmp_path / "CMakeLists.txt")
+    assert "cpp" not in RUNNABLE_TEST_LANGUAGES
+    assert is_repo_unbuildable(tmp_path) is True
+
+
+def test_is_repo_unbuildable_false_for_python(tmp_path: Path) -> None:
+    """A runnable language (python) → buildable."""
+    _touch(tmp_path / "pyproject.toml")
+    assert is_repo_unbuildable(tmp_path) is False

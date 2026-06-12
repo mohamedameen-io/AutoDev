@@ -23,6 +23,7 @@ from tenacity import (
     retry,
     retry_if_exception_type,
     wait_exponential,
+    wait_random,
 )
 
 from errors import AdapterError, TournamentError
@@ -400,7 +401,10 @@ class AdapterLLMClient:
 
         @retry(
             stop=_stop_dispatch,
-            wait=wait_exponential(multiplier=2, min=2, max=60),
+            # v0.39.0 B4: add 0-2s random jitter on top of the exponential
+            # backoff so parallel agents re-fire on de-synced clocks,
+            # breaking the thundering-herd that drives 429/529 storms.
+            wait=wait_exponential(multiplier=2, min=2, max=60) + wait_random(0, 2),
             retry=retry_if_exception_type(TransientError),
             reraise=True,
         )

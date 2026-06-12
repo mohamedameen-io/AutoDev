@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -175,8 +176,10 @@ def plan(
         platform_pref = platform or cfg.platform  # type: ignore[assignment]
         adapter, selection_meta = await get_adapter(
             cast("Literal['claude_code', 'cursor', 'auto']", platform_pref),
+            cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
+            cfg=cfg,
         )
         # v0.31.0 (Phase 5.4): emit a fitness telemetry line + warn on
         # poor adapter/codebase fit. Best-effort.
@@ -197,8 +200,36 @@ def plan(
             )
         except Exception:  # noqa: BLE001 — forensics, not correctness
             pass
+        # Phase 0 (cost/time telemetry): record a run-start watermark
+        # (ledger high-water seq) + monotonic clock so we can attribute
+        # exactly this run's ``invocation_cost`` ops + wall time afterward.
+        from state.run_summary import (
+            append_run_summary,
+            current_ledger_seq,
+            sum_invocation_cost,
+        )
+
+        run_t0 = time.monotonic()
+        start_seq = current_ledger_seq(cwd)
         approved = await orch.plan(intent)
         _render_plan_summary(console, approved)
+        # Best-effort run summary — a telemetry failure NEVER fails the run.
+        try:
+            elapsed_s = time.monotonic() - run_t0
+            cost_usd = sum_invocation_cost(cwd, after_seq=start_seq)
+            n_tasks = sum(len(p.tasks) for p in approved.phases)
+            append_run_summary(
+                cwd,
+                phase="plan",
+                cost_usd=cost_usd,
+                elapsed_s=elapsed_s,
+                tasks=n_tasks,
+            )
+            console.print(
+                f"[dim]Run cost: ${cost_usd:.4f} USD · wall {elapsed_s:.0f}s[/dim]"
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry only
+            logger.warning("plan.run_summary_failed", err=str(exc))
 
     try:
         asyncio.run(_run())
