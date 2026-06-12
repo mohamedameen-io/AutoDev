@@ -105,6 +105,16 @@ inflating every cold start past the 10s probe timeout — they are now isolated.
   the in-hand diff is empty — semantic `NEEDS_CHANGES`/`REJECTED`, non-turn
   failures, and non-empty/un-reviewed diffs still block (no masking of real
   failures). New `accepted_approved_on_exhaustion` audit ledger op.
+- **Containment: reject agent edits confined to AutoDev's own `.autodev/`.** A
+  corrective task derailed into editing `.autodev/evidence/*.json` (AutoDev's
+  own internal state) instead of the target repo — there was no scope
+  enforcement when a task declares no `edit_scope` (the common huge-repo case)
+  and no guard against an agent writing to AutoDev-owned paths. A developer
+  diff confined entirely to `.autodev/` is now rejected as invalid task output
+  *before* the reviewer runs and routed to retry/escalate (so it can never
+  reach `complete`). New `containment_violation_autodev_paths` audit ledger op.
+  (Scoping AutoDev's own run-mechanics out of corrective-generation prompts —
+  the upstream trigger — is noted as a follow-up.)
 - **Preflight probe robustness on slow cold-starts.** New
   `adapters.probe_model` (default `"haiku"`) makes the PONG healthcheck use a
   fast model (~7-8 s vs ~9-11 s on the heavy default, which straddled the 10 s

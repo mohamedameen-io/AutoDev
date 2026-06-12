@@ -553,6 +553,17 @@ LedgerOp = Literal[
     # breadcrumb. Payload shape:
     # ``{task_id: str, verdict: str, subtype: str, diff_empty: bool}``.
     "accepted_approved_on_exhaustion",
+    # Gap 5 (containment): a developer diff was confined ENTIRELY to
+    # AutoDev's own ``.autodev/`` directory (evidence / ledger / tournament
+    # / index state) instead of the target repository's code — the agent
+    # perceived AutoDev's internal run-mechanics as the task scope. The
+    # orchestrator rejects the diff as invalid task output and routes the
+    # task through the regular retry/escalate path. Audit-only — the actual
+    # task-status transition (retry / escalate / block) flows through the
+    # ``update_task_status`` ops emitted alongside; replay is a no-op
+    # forensic breadcrumb. Payload shape:
+    # ``{task_id: str, files: list[str]}`` (files capped at 20).
+    "containment_violation_autodev_paths",
 ]
 
 
@@ -1112,6 +1123,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # regular ``update_task_status`` op emitted alongside; replay is a
         # no-op forensic breadcrumb.
         "accepted_approved_on_exhaustion",
+        # Gap 5 (containment): developer diff confined to AutoDev's own
+        # ``.autodev/`` directory was rejected as invalid task output.
+        # Audit-only — the task-status transition (retry / escalate / block)
+        # flows through the regular ``update_task_status`` ops emitted
+        # alongside by the retry/escalation FSM; replay is a no-op
+        # forensic breadcrumb.
+        "containment_violation_autodev_paths",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

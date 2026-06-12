@@ -48,7 +48,7 @@ from qa import (
     run_tests,
 )
 from qa.code_size import run_code_size
-from state.paths import autodev_root
+from state.paths import AUTODEV_DIR, autodev_root
 from state.schemas import (
     CoderEvidence,
     CriticEvidence,
@@ -4067,6 +4067,54 @@ async def _execute_one(
                 last_issues = [developer_result.error or "adapter failure"]
                 continue
 
+            # Gap 5 (containment): reject a developer diff confined ENTIRELY
+            # to AutoDev's own ``.autodev/`` directory. AutoDev owns that
+            # dir in the target repo (evidence / ledger / tournament / index
+            # state); a task agent editing only those files has perceived
+            # AutoDev's internals as the work to do, not the target code.
+            # That is never legitimate task output, so route it through the
+            # same retry/escalate path a QA-gate failure uses rather than
+            # letting it flow to the reviewer (where an APPROVED verdict on
+            # a no-op-to-the-target diff could carry it to ``complete``).
+            # No-op for empty diffs (research tasks) and for any diff that
+            # touches at least one path outside ``.autodev/``.
+            if _diff_confined_to_autodev(developer_result):
+                _autodev_files = extract_files_from_diff(
+                    developer_result.diff or "", strict=False
+                )
+                logger.warning(
+                    "execute_phase.containment_violation_autodev_paths",
+                    task_id=task.id,
+                    files=_autodev_files[:20],
+                )
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="containment_violation_autodev_paths",
+                        payload={
+                            "task_id": task.id,
+                            "files": _autodev_files[:20],
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort breadcrumb
+                    logger.warning(
+                        "execute_phase.ledger_append_failed",
+                        op="containment_violation_autodev_paths",
+                        err=str(exc),
+                    )
+                _containment_reason = (
+                    "containment_violation: developer diff is confined to "
+                    "AutoDev's own .autodev/ directory "
+                    f"({', '.join(_autodev_files[:5])}) — edit the TARGET "
+                    "repository's code, not AutoDev's internal run state"
+                )
+                task = await _try_retry_or_escalate(
+                    orch, task, retry_limit, reason=_containment_reason
+                )
+                if task.escalated:
+                    return task
+                last_issues = [_containment_reason]
+                continue
+
             task = await orch.plan_manager.update_task_status(task.id, "coded")
 
             # Step 3: auto-gates (syntax/lint/build/test_runner/secretscan).
@@ -6552,6 +6600,59 @@ def _build_adapter_failure_reason(
     raw_error = developer_result.error or "adapter failure"
     truncated = raw_error[:200]
     return f"{base} ({subtype}): {truncated}"
+
+
+# Gap 5 (containment): AutoDev owns the ``.autodev/`` directory in the
+# target repo (evidence, ledger, tournaments, index DB, debug dumps). A
+# task agent must never perceive AutoDev's own run-mechanics as the work
+# to do. The observed derailment (corrective task ``0.c2`` on a 358k-file
+# run) had a developer edit ``.autodev/evidence/0-drift-verifier.json``
+# instead of the target repo's code, and that ``.autodev/``-only diff was
+# accepted as legitimate task work. A diff confined ENTIRELY to
+# ``.autodev/`` is the reliable signal for this class of derailment: real
+# task work always touches at least one path outside AutoDev's own dir.
+_AUTODEV_PATH_PREFIX = f"{AUTODEV_DIR}/"
+
+
+def _path_is_autodev_owned(path: str) -> bool:
+    """True iff *path* (repo-relative) lives under AutoDev's ``.autodev/``.
+
+    Normalizes a leading ``./`` and matches both the directory itself
+    (``.autodev``) and anything beneath it (``.autodev/...``). Conservative:
+    a path that merely *starts with* the literal string but is a sibling
+    (e.g. ``.autodev-notes/x``) is NOT matched.
+    """
+    p = path.strip()
+    if p.startswith("./"):
+        p = p[2:]
+    return p == AUTODEV_DIR or p.startswith(_AUTODEV_PATH_PREFIX)
+
+
+def _diff_confined_to_autodev(
+    developer_result: AgentResult | None,
+) -> bool:
+    """Gap 5: True iff a NON-EMPTY developer diff touches ONLY ``.autodev/``.
+
+    Returns ``False`` for a missing result, an empty / whitespace-only
+    diff, or any diff that touches at least one path outside AutoDev's own
+    directory. Only when the diff parses to a non-empty file set AND every
+    one of those files is AutoDev-owned does this return ``True`` — the
+    signal that the agent edited AutoDev's internals instead of the target
+    repo.
+
+    Empty-diff cases return ``False`` so legitimate research tasks (which
+    correctly produce no diff and are gated separately on an APPROVED
+    verdict) are never affected by this guard.
+    """
+    if developer_result is None or not developer_result.diff:
+        return False
+    try:
+        files = extract_files_from_diff(developer_result.diff, strict=False)
+    except Exception:  # noqa: BLE001 — defensive: never block on a parse quirk
+        return False
+    if not files:
+        return False
+    return all(_path_is_autodev_owned(f) for f in files)
 
 
 def _files_changed_for_secretscan(
