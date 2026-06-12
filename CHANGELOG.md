@@ -93,6 +93,18 @@ inflating every cold start past the 10s probe timeout — they are now isolated.
   `.git/index.lock`** (only when unowned + aged) before `git apply` — a killed
   60 s worktree-add had been leaving a lock that cascaded into `rc=128` apply
   failures. (Pooled worktrees, `worktree_pool_enabled`, remain a follow-up.)
+- **Accept approved-but-turn-exhausted research tasks.** On a huge repo, a
+  research/empty-diff task can have its reviewer **APPROVED** empty diff on
+  record yet keep getting discarded because the developer exhausts its turn
+  budget on broad codebase exploration before re-emitting an artifact —
+  escalating to `error_max_turns_escalation_exhausted` and a
+  `user_decision_required` soft-block that loses the approval. The execute loop
+  now, at the developer-failure chokepoint, accepts the approved artifact as
+  complete (an empty diff integrates as a no-op) **only** when the failure is
+  purely turn-exhaustion AND a review verdict of `APPROVED` is on record AND
+  the in-hand diff is empty — semantic `NEEDS_CHANGES`/`REJECTED`, non-turn
+  failures, and non-empty/un-reviewed diffs still block (no masking of real
+  failures). New `accepted_approved_on_exhaustion` audit ledger op.
 - **Preflight probe robustness on slow cold-starts.** New
   `adapters.probe_model` (default `"haiku"`) makes the PONG healthcheck use a
   fast model (~7-8 s vs ~9-11 s on the heavy default, which straddled the 10 s

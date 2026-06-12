@@ -541,6 +541,18 @@ LedgerOp = Literal[
     # forensic no-op. Payload shape:
     # ``{role: str, task_id: str | None, cost_usd: float, duration_s: float}``.
     "invocation_cost",
+    # Tier J (huge-repo): accept an APPROVED-but-turn-exhausted task as done.
+    # Emitted by ``execute_phase`` when a research/empty-diff task already has
+    # a reviewer ``APPROVED`` verdict on record but the developer keeps
+    # hitting ``error_max_turns`` / ``error_max_turns_escalation_exhausted``
+    # on broad huge-repo exploration. Rather than losing the approved result
+    # to a ``user_decision_required`` soft-block, the orchestrator accepts the
+    # approved (empty-diff) artifact and completes the task. Audit-only — the
+    # actual ``status="complete"`` transition flows through the regular
+    # ``update_task_status`` op emitted alongside; replay is a no-op forensic
+    # breadcrumb. Payload shape:
+    # ``{task_id: str, verdict: str, subtype: str, diff_empty: bool}``.
+    "accepted_approved_on_exhaustion",
 ]
 
 
@@ -1095,6 +1107,11 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # computed by summing these ops over the run window); replay is a
         # forensic no-op.
         "invocation_cost",
+        # Tier J (huge-repo): accept-approved-on-exhaustion breadcrumb.
+        # Audit-only — the ``status="complete"`` transition flows through the
+        # regular ``update_task_status`` op emitted alongside; replay is a
+        # no-op forensic breadcrumb.
+        "accepted_approved_on_exhaustion",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

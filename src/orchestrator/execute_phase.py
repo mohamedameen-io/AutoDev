@@ -4006,6 +4006,20 @@ async def _execute_one(
                     task_id=task.id,
                     err=developer_result.error,
                 )
+                # Tier J (huge-repo): accept an APPROVED-but-turn-exhausted
+                # task instead of losing the approved (empty-diff) result to
+                # a ``user_decision_required`` soft-block. Strictly gated —
+                # fires ONLY when the failure is pure turn-exhaustion AND a
+                # reviewer ``APPROVED`` verdict is already on record for an
+                # empty diff (see ``_maybe_accept_approved_on_exhaustion``).
+                # Returns ``None`` (no-op) on a genuine semantic failure /
+                # non-approved / non-empty-diff task, so this never masks a
+                # real failure.
+                _accepted = await _maybe_accept_approved_on_exhaustion(
+                    orch, task, developer_result
+                )
+                if _accepted is not None:
+                    return _accepted
                 # v0.39.0 (Cluster C2c): runtime under-decomposition
                 # telemetry. Best-effort, purely observational — never
                 # changes control flow (falls through to the existing
@@ -6369,6 +6383,148 @@ def _parse_test_counts(text: str) -> tuple[int, int, int]:
     if m is None:
         return 0, 0, 0
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+# Turn-exhaustion failure subtypes that are purely infrastructural — the
+# agent ran out of turns on (huge-repo) exploration, NOT a semantic defect.
+# ``error_max_turns`` is the per-attempt cap; ``error_max_turns_escalation_
+# exhausted`` is the synthetic subtype the budget-escalation tracker returns
+# once the per-(task, role) escalation ladder is spent. Both mean "more
+# runway would have helped", never "the work is wrong".
+_TURN_EXHAUSTION_SUBTYPES: frozenset[str] = frozenset(
+    {"error_max_turns", "error_max_turns_escalation_exhausted"}
+)
+
+
+async def _maybe_accept_approved_on_exhaustion(
+    orch: "Orchestrator",
+    task: "Task",
+    developer_result: "AgentResult",
+) -> "Task | None":
+    """Tier J: accept an APPROVED-but-turn-exhausted task instead of blocking.
+
+    Returns the completed ``Task`` when the approved artifact is accepted,
+    or ``None`` (no-op) when the strict gate does not hold — in which case
+    the caller falls through to the unchanged retry/escalate path.
+
+    The gap (observed on a 358k-file repo): a Phase-0 research/confirmation
+    task whose correct output is an EMPTY diff already has a reviewer
+    ``APPROVED`` verdict on record (``{task_id}-review.json``), but the
+    developer keeps hitting ``error_max_turns`` on broad codebase
+    exploration. The discard/escalation ladder eventually soft-blocks the
+    task as ``user_decision_required`` — *losing* the already-approved
+    result. The failure is purely infrastructural turn-exhaustion, not a
+    semantic verdict.
+
+    Gate STRICTLY (all must hold):
+
+    1. The developer result's ``subtype`` is a turn-exhaustion subtype
+       (:data:`_TURN_EXHAUSTION_SUBTYPES`). A semantic NEEDS_CHANGES /
+       REJECTED retry, a parse error, an auth/transport failure, etc. is
+       NOT accepted — those must still block.
+    2. A reviewer verdict of ``APPROVED`` is on record for this task's
+       artifact (``{task_id}-review.json``). Any other verdict (or no
+       review evidence at all) is NOT accepted.
+    3. The current (turn-exhausted) developer attempt produced no diff —
+       ``developer_result.diff`` is empty / whitespace-only. This is the
+       reliable signal: a turn-exhausted attempt emits no patch, and an
+       empty diff integrates as a no-op so completion is safe without an
+       apply step. A non-empty in-hand diff is deliberately NOT auto-
+       accepted here (applying an un-reviewed partial diff would be
+       unsafe); it falls through to the unchanged path.
+
+    Idempotent: marking the task ``complete`` is the terminal transition,
+    so a re-entry (e.g. resume) re-reads the same APPROVED evidence and
+    re-completes deterministically; the caller returns immediately on a
+    non-None result, so the developer is never re-dispatched. Best-effort
+    ledger / stuck-state side effects never mask the completion.
+    """
+    subtype = developer_result.subtype
+    if subtype not in _TURN_EXHAUSTION_SUBTYPES:
+        return None
+
+    from state.evidence import read_evidence  # noqa: PLC0415 — break cycle
+
+    try:
+        review_ev = await read_evidence(orch.cwd, task.id, "review")
+    except Exception as exc:  # noqa: BLE001 — defensive: never block the path
+        logger.warning(
+            "execute_phase.accept_approved_review_read_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return None
+    # Only an APPROVED verdict sticks. NEEDS_CHANGES / REJECTED / MALFORMED
+    # (or no review evidence) → no-op, fall through to retry/escalate.
+    if review_ev is None or getattr(review_ev, "verdict", None) != "APPROVED":
+        return None
+
+    # The current (turn-exhausted) attempt must carry no diff — an empty
+    # diff integrates as a no-op, so completion is safe without an apply
+    # step. A turn-exhausted attempt reliably emits no patch; a non-empty
+    # in-hand diff is out of scope (applying an un-reviewed partial diff
+    # would be unsafe) and falls through to the unchanged path.
+    in_hand_diff = developer_result.diff
+    if in_hand_diff is not None and in_hand_diff.strip():
+        return None
+
+    logger.warning(
+        "execute_phase.accepted_approved_on_exhaustion",
+        task_id=task.id,
+        subtype=subtype,
+        verdict="APPROVED",
+        diff_empty=True,
+    )
+    # Audit-only ledger breadcrumb. Best-effort — a ledger failure here
+    # MUST NOT mask the completion the operator needs.
+    if getattr(orch, "plan_manager", None) is not None:
+        try:
+            await orch.plan_manager.ledger_append(
+                op="accepted_approved_on_exhaustion",
+                payload={
+                    "task_id": task.id,
+                    "verdict": "APPROVED",
+                    "subtype": subtype or "unknown",
+                    "diff_empty": True,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort breadcrumb
+            logger.warning(
+                "execute_phase.ledger_append_failed",
+                op="accepted_approved_on_exhaustion",
+                err=str(exc),
+            )
+
+    # Mark complete. An empty diff integrates as a no-op, so there is
+    # nothing to apply to main — the reviewer already certified the
+    # empty diff as structurally correct. The task is ``in_progress`` at
+    # this point (set at dispatch and reset on every retry), and the FSM
+    # forbids a direct ``in_progress -> complete`` edge, so walk the
+    # canonical happy-path pipeline states the approved artifact would
+    # have traversed had it not been pre-empted by turn-exhaustion. Each
+    # edge is legal per ``task_state.TASK_TRANSITIONS``; the final
+    # ``tournamented -> complete`` carries the evidence bundle.
+    completed = task
+    for _status in ("coded", "auto_gated", "reviewed", "tested", "tournamented"):
+        if completed.status == _status:
+            continue
+        completed = await orch.plan_manager.update_task_status(task.id, _status)
+    completed = await orch.plan_manager.update_task_status(
+        task.id,
+        "complete",
+        meta={"evidence_bundle": f".autodev/evidence/{task.id}-review.json"},
+    )
+    # Zero the stuck-state counters on success (mirrors the happy-path
+    # completion tail). Best-effort — never mask the completion.
+    try:
+        await orch.plan_manager.reset_stuck_state(task.id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.reset_stuck_state_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+    return completed
 
 
 def _build_adapter_failure_reason(
