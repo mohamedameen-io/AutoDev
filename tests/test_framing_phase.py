@@ -582,3 +582,21 @@ async def test_framing_conservatism_corpus(tmp_path: Path, bug_path: Path) -> No
 def test_conservatism_corpus_is_non_empty() -> None:
     """Guard: the corpus must actually contain fixtures (else Gate 2 is vacuous)."""
     assert len(_CONSERVATISM_BUGS) >= 4
+
+
+def test_hypothesis_is_a_trim_word_boundaries() -> None:
+    """Lexical trim signal must use word boundaries, not naive substring match.
+
+    Regression: 'cut' matched as a substring of 'exeCUTing' on the real Synaptix
+    bug ('Error executing tooling task'), polluting signals_fired.
+    """
+    from orchestrator.framing_phase import _hypothesis_is_a_trim
+
+    # genuine trim/shrink language fires
+    assert _hypothesis_is_a_trim("trim the verbose tool observation")
+    assert _hypothesis_is_a_trim("cut the logging output")
+    assert _hypothesis_is_a_trim("reduce the payload size")
+    assert _hypothesis_is_a_trim("we should trimming down the context")  # suffix
+    # substring false-positives must NOT fire
+    assert not _hypothesis_is_a_trim("Error executing tooling task")  # cut in exeCUTing
+    assert not _hypothesis_is_a_trim("add retry with backoff")

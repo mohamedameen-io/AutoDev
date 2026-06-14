@@ -52,7 +52,13 @@ _CLASSIFICATION_RE = re.compile(
 _CONFIDENCE_RE = re.compile(r"CONFIDENCE:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
 
 # Lexical scrutiny-only signal — NEVER structural, can never alone flip the class.
-_TRIM_WORDS = ("trim", "shrink", "reduce", "remove", "delete", "strip", "cut", "drop")
+# Word-boundary anchored so it does not false-positive on substrings (e.g. "cut"
+# inside "exeCUTing"); the trailing ``\w*`` still catches suffixed forms (trimming,
+# reduces, removed).
+_TRIM_RE = re.compile(
+    r"\b(?:trim|shrink|reduce|remove|delete|strip|cut|drop)\w*",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -201,8 +207,7 @@ def _extract_line(text: str, label: str) -> str | None:
 
 
 def _hypothesis_is_a_trim(intent: str) -> bool:
-    low = intent.lower()
-    return any(word in low for word in _TRIM_WORDS)
+    return bool(_TRIM_RE.search(intent))
 
 
 def _format_signals(signals_fired: list[str]) -> str:
