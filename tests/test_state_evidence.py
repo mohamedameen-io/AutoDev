@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -16,8 +17,10 @@ from state.schemas import (
     CoderEvidence,
     CriticEvidence,
     ExploreEvidence,
+    FramingEvidence,
     ReviewEvidence,
     SMEEvidence,
+    SolutionApproach,
     TestEvidence,
 )
 
@@ -211,3 +214,48 @@ async def test_list_evidence_empty_dir(tmp_path: Path) -> None:
     """list_evidence when no evidence dir exists returns empty list."""
     items = await list_evidence(tmp_path, "anything")
     assert items == []
+
+
+@pytest.mark.asyncio
+async def test_framing_evidence_round_trip(tmp_path: Path) -> None:
+    sa = SolutionApproach(
+        name="separate-planes",
+        altitude="design_fix",
+        summary="separate control and data planes with opaque handles",
+        eliminates_failure_class=True,
+        primary_tradeoff="larger diff now, no recurrence later",
+        primary_risk="touches a cross-module contract",
+        integration_surface=["src/core.py"],
+        est_blast_radius="cross-module contract",
+    )
+    ev = FramingEvidence(
+        task_id="plan-framing",
+        classification="realized_design_failure",
+        confidence=0.82,
+        hypothesis_challenged="user said trim; it is the realized design failure",
+        signals_fired=["recurrence_at_seam"],
+        approaches=[sa],
+        chosen_approach_name="separate-planes",
+        altitude_rationale="eliminates the failure class",
+    )
+    path = await write_evidence(tmp_path, "plan-framing", ev)
+    assert path.name == "plan-framing-framing.json"
+    loaded = await read_evidence(tmp_path, "plan-framing", "framing")
+    assert isinstance(loaded, FramingEvidence)
+    assert loaded == ev
+    assert loaded.approaches[0].altitude == "design_fix"
+
+
+@pytest.mark.asyncio
+async def test_framing_evidence_byte_identical(tmp_path: Path) -> None:
+    ev = FramingEvidence(
+        task_id="plan-framing",
+        classification="local_defect",
+        confidence=0.0,
+        hypothesis_challenged="local",
+    )
+    p1 = await write_evidence(tmp_path, "plan-framing", ev)
+    raw1 = json.loads(p1.read_text(encoding="utf-8"))
+    p2 = await write_evidence(tmp_path, "plan-framing", ev)
+    raw2 = json.loads(p2.read_text(encoding="utf-8"))
+    assert raw1 == raw2

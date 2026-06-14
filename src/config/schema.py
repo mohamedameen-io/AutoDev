@@ -374,6 +374,41 @@ def _default_phase_review_cfg() -> "TournamentPhaseConfig":
     )
 
 
+class FramingPhaseConfig(BaseModel):
+    """Framing/altitude phase config (ADR-0044).
+
+    Mirrors :class:`TournamentPhaseConfig`'s ``extra="forbid"`` strictness.
+    ``enabled`` has no inline default — it is set by :func:`_default_framing_cfg`
+    so the ``default_factory`` on :attr:`AutodevConfig.framing` keeps legacy
+    on-disk configs (which omit the field) valid.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    design_smell_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    num_approaches: int = Field(default=3, ge=2, le=3)
+    require_structural_signal: bool = True
+    altitude_judge_panel_size: int = Field(default=3, ge=1, le=5)
+    classifier_model: str | None = None
+    altitude_judge_model: str | None = None
+
+
+def _default_framing_cfg() -> "FramingPhaseConfig":
+    """Default-on framing config used when an existing ``config.json`` omits the
+    new field (ADR-0044). On by default; the conservative classifier + fail-safe
+    degrade to ``local_defect`` are the offset."""
+    return FramingPhaseConfig(
+        enabled=True,
+        design_smell_threshold=0.7,
+        num_approaches=3,
+        require_structural_signal=True,
+        altitude_judge_panel_size=3,
+        classifier_model=None,
+        altitude_judge_model=None,
+    )
+
+
 class TournamentsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -889,6 +924,10 @@ class KnowledgeConfig(BaseModel):
             "critic_t",
             "architect_b",
             "synthesizer",
+            # ADR-0044 lever #5: keep anti_bloat_v1 seed lessons out of the
+            # framing / altitude_judge cohort (minimality suspended there).
+            "framing",
+            "altitude_judge",
         ]
     )
     # v0.18.0 B1: lane-aware lesson injection toggle. When True (default),
@@ -1000,6 +1039,10 @@ class AutodevConfig(BaseModel):
     )
     hive: HiveConfig
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
+    # ADR-0044: framing/altitude phase config. ``default_factory`` is mandatory
+    # so a legacy ``config.json`` lacking the field still validates under
+    # ``extra="forbid"`` (the factory defaults to ``enabled=True``).
+    framing: FramingPhaseConfig = Field(default_factory=_default_framing_cfg)
     # v0.16.0 hallucination-guard top-level toggle. Default True — the
     # guard ships on by default so projects benefit immediately. Skip
     # patterns: dynamic imports, third-party packages not installed in

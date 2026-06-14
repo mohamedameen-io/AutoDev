@@ -433,6 +433,29 @@ class Plan(BaseModel):
         return _validate_edit_scope_paths(v)
 
 
+class SolutionApproach(BaseModel):
+    """One altitude-distinct candidate strategy (ADR-0044).
+
+    Internal artifact — the orchestrator selects among these; there is no
+    user-facing presentation (unlike BRAINSTORM Phase 3). Standalone value
+    model: does NOT inherit ``_BaseEvidence`` and carries no ``task_id``/``kind``.
+    Pydantic v2 does not inherit ``model_config``, so ``extra="forbid"`` is stated.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    altitude: Literal["local_patch", "component_refactor", "design_fix"]
+    summary: str
+    # LOAD-BEARING: the altitude_judge rubric scores against this field —
+    # "does this eliminate the failure class or merely bound it?"
+    eliminates_failure_class: bool
+    primary_tradeoff: str
+    primary_risk: str
+    integration_surface: list[str] = Field(default_factory=list)
+    est_blast_radius: str  # qualitative: "single function" .. "cross-module contract"
+
+
 # ---------------------------------------------------------------------------
 # Evidence discriminated union (discriminator field: "kind")
 # ---------------------------------------------------------------------------
@@ -536,6 +559,26 @@ class SMEEvidence(_BaseEvidence):
     topic: str = ""
     findings: str
     confidence: Literal["HIGH", "MEDIUM", "LOW"] = "MEDIUM"
+
+
+class FramingEvidence(_BaseEvidence):
+    """Artifact produced by the ``framing`` phase (ADR-0044).
+
+    Persisted as evidence kind ``framing`` (file ``plan-framing-framing.json``) and
+    re-read on resume instead of re-invoking the classifier. Pydantic v2 does NOT
+    inherit ``model_config``, so ``extra="forbid"`` is restated explicitly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["framing"] = "framing"
+    classification: Literal["local_defect", "realized_design_failure"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    hypothesis_challenged: str
+    signals_fired: list[str] = Field(default_factory=list)
+    approaches: list[SolutionApproach] = Field(default_factory=list)
+    chosen_approach_name: str | None = None
+    altitude_rationale: str | None = None
 
 
 class CriticEvidence(_BaseEvidence):
@@ -679,6 +722,7 @@ Evidence = Annotated[
         TestEvidence,
         ExploreEvidence,
         SMEEvidence,
+        FramingEvidence,
         CriticEvidence,
         TournamentEvidence,
         ReviewTournamentEvidence,
@@ -697,6 +741,7 @@ __all__ = [
     "CriticEvidence",
     "Evidence",
     "ExploreEvidence",
+    "FramingEvidence",
     "Phase",
     "Plan",
     "RecoveryHint",
@@ -704,6 +749,7 @@ __all__ = [
     "ReviewEvidence",
     "ReviewTournamentEvidence",
     "SMEEvidence",
+    "SolutionApproach",
     "Task",
     "TaskStatus",
     "TestEvidence",

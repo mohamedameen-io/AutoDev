@@ -7,6 +7,7 @@ from pathlib import Path
 from config.schema import (
     AgentConfig,
     AutodevConfig,
+    FramingPhaseConfig,
     GuardrailsConfig,
     HiveConfig,
     QAGatesConfig,
@@ -30,6 +31,11 @@ _AGENT_MODEL_DEFAULTS: dict[str, str | None] = {
     "architect_b": None,
     "synthesizer": None,
     "judge": None,
+    # ADR-0044: unregistered specialist roles. NOT in REQUIRED_AGENT_ROLES (so
+    # absent from the registry), but cfg.agents needs an entry so the specialist
+    # dispatch (_invoke_framing_role) can read model/max-turns for the invocation.
+    "framing": None,
+    "altitude_judge": None,
 }
 
 _AGENT_MAX_TURNS: dict[str, int] = {
@@ -51,6 +57,8 @@ _AGENT_MAX_TURNS: dict[str, int] = {
     "architect_b": 5,
     "synthesizer": 1,
     "judge": 1,
+    "framing": 1,
+    "altitude_judge": 1,
 }
 
 
@@ -237,5 +245,14 @@ def default_config(platform: str = "auto") -> AutodevConfig:
         hive=HiveConfig(
             enabled=True,
             path=Path("~/.local/share/autodev/shared-learnings.jsonl"),
+        ),
+        framing=FramingPhaseConfig(
+            enabled=True,
+            design_smell_threshold=0.7,
+            num_approaches=3,
+            require_structural_signal=True,
+            altitude_judge_panel_size=3,
+            classifier_model=None,
+            altitude_judge_model=None,
         ),
     )
