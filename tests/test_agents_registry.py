@@ -225,3 +225,29 @@ def test_architect_prompt_contains_per_phase_acceptance_directive() -> None:
     # The directive must explicitly position the block before the first
     # ``### Task`` heading.
     assert "### Task" in architect_prompt
+
+
+# ── ADR-0044: framing-phase coupling + prompts ───────────────────────────
+
+
+def test_architect_coupling_note_present() -> None:
+    """The architect prompt must carry the FRAMING PHASE COUPLING note, or the
+    architect's own minimality conditioning silently shrinks a chosen design_fix
+    back to a local_patch (defeating the phase end-to-end)."""
+    assert "FRAMING PHASE COUPLING" in load_prompt("architect")
+
+
+def test_framing_prompt_loads() -> None:
+    body = load_prompt("framing")
+    assert not body.startswith("---")  # frontmatter stripped
+    assert body.strip()
+    # The frontmatter ``name: framing`` line was stripped; the body's approaches
+    # contract legitimately uses ``name: <slug>``, so we check the exact fm line.
+    assert "name: framing" not in body
+
+
+def test_altitude_judge_prompt_loads() -> None:
+    body = load_prompt("altitude_judge")
+    assert not body.startswith("---")
+    assert body.strip()
+    assert "name: altitude_judge" not in body

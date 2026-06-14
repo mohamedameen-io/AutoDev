@@ -876,6 +876,14 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # plan state.
         return plan
 
+    if op in ("framing_classified", "framing_strategy_chosen"):
+        # ADR-0044: audit-only breadcrumbs appended during the framing phase,
+        # BEFORE the plan is persisted via ``init_plan`` (framing runs ahead of
+        # the architect). Like ``plan_tournament_complete`` they may legitimately
+        # precede any plan-containing op on replay, so they MUST return early
+        # here — before the ``plan is None`` guard below — and never mutate plan.
+        return plan
+
     if op in ("mark_in_flight", "clear_in_flight"):
         # v0.11.0: audit-only breadcrumbs for the parallel dispatcher.
         # In-flight is in-memory on the PlanManager; resumes do NOT
@@ -1345,12 +1353,6 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
                     if block_reason_class is not None:
                         t.block_reason_class = block_reason_class
                     break
-        return plan
-
-    if op in ("framing_classified", "framing_strategy_chosen"):
-        # ADR-0044: audit-only breadcrumbs appended during the framing phase.
-        # They never mutate plan state; replay must resolve them to a no-op,
-        # not the unknown-op raise below.
         return plan
 
     # Unknown op — fail loudly rather than silently produce wrong state.
