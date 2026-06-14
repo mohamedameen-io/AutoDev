@@ -4,6 +4,8 @@ All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-06-14
+
 ### Added
 
 - **Framing/altitude phase (ADR-0044).** A new phase between exploration and planning
@@ -19,6 +21,12 @@ All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepa
   `plan-framing` evidence with zero extra LLM calls). Kill-switch via
   `framing.enabled=false` or `AUTODEV_FRAMING_DISABLED=1`. Common-case cost is one extra
   LLM call; the design-failure path adds four. Surfaced in `autodev status`.
+
+### Fixed
+
+- Framing's lexical `hypothesis_is_a_trim` scrutiny signal now matches on word
+  boundaries instead of substrings (e.g. "cut" no longer matches inside "exeCUTing").
+  The signal is scrutiny-only (never structural), so there is no gate-behavior change.
 
 ## [0.39.0] - 2026-06-13
 
