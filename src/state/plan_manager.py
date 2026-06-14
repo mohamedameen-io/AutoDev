@@ -1726,6 +1726,10 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
             phase.end_checkpoint_commit = val if isinstance(val, str) else None
         return plan
 
+    if op in ("framing_classified", "framing_strategy_chosen"):
+        # ADR-0044: audit-only breadcrumbs (see ledger._apply_op). No plan mutation.
+        return plan
+
     return plan
 
 

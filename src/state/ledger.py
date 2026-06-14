@@ -564,6 +564,12 @@ LedgerOp = Literal[
     # forensic breadcrumb. Payload shape:
     # ``{task_id: str, files: list[str]}`` (files capped at 20).
     "containment_violation_autodev_paths",
+    # ADR-0044: framing-phase audit breadcrumbs. They never mutate plan state
+    # (the architect / plan tournament record the plan); replay treats them as
+    # no-ops. Payloads: framing_classified={classification, confidence,
+    # signals_fired}; framing_strategy_chosen={chosen_approach_name, altitude}.
+    "framing_classified",
+    "framing_strategy_chosen",
 ]
 
 
@@ -1339,6 +1345,12 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
                     if block_reason_class is not None:
                         t.block_reason_class = block_reason_class
                     break
+        return plan
+
+    if op in ("framing_classified", "framing_strategy_chosen"):
+        # ADR-0044: audit-only breadcrumbs appended during the framing phase.
+        # They never mutate plan state; replay must resolve them to a no-op,
+        # not the unknown-op raise below.
         return plan
 
     # Unknown op — fail loudly rather than silently produce wrong state.
