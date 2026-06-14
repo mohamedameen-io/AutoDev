@@ -6,6 +6,7 @@ Filled incrementally across Phases 2-6.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -377,3 +378,140 @@ async def test_framing_call_count_design_path_is_one(
     orch = _make_orch(tmp_path, adapter)
     await run_framing_phase(orch, "trim it", "", "", None, "abc123")
     assert adapter.count("framing") == 1
+
+
+# --- Phase 4: altitude_judge Borda panel ------------------------------------
+
+
+def _design_text() -> str:
+    return _framing_text("realized_design_failure", 0.85) + _approaches_text(
+        _LOCAL_ITEM, _DESIGN_ITEM
+    )
+
+
+def _slots_in(prompt: str) -> dict[int, str]:
+    return {
+        int(m.group(1)): m.group(2)
+        for m in re.finditer(r"### Candidate (\d+)\naltitude: (\w+)", prompt)
+    }
+
+
+def _judge_ranks_design_first(inv):  # type: ignore[no-untyped-def]
+    slots = _slots_in(inv.prompt)
+    design_slot = next((s for s, alt in slots.items() if alt == "design_fix"), 1)
+    others = [s for s in sorted(slots) if s != design_slot]
+    ranking = " ".join(str(s) for s in [design_slot, *others])
+    return ok(f"```ranking\nRANKING: {ranking}\n```\n")
+
+
+def _judge_ranks_slot_order(inv):  # type: ignore[no-untyped-def]
+    slots = sorted(_slots_in(inv.prompt))
+    return ok("```ranking\nRANKING: " + " ".join(str(s) for s in slots) + "\n```\n")
+
+
+@pytest.mark.asyncio
+async def test_altitude_panel_selects_design_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bootstrap_repo(tmp_path)
+    _force_structural(monkeypatch)
+    adapter = StubAdapter(
+        {"framing": ok(_design_text()), "altitude_judge": _judge_ranks_design_first}
+    )
+    orch = _make_orch(tmp_path, adapter)
+    decision = await run_framing_phase(orch, "trim it", "", "", None, "abc123")
+    assert decision is not None
+    assert decision.classification == "realized_design_failure"
+    assert decision.chosen_approach.altitude == "design_fix"
+    assert adapter.count("altitude_judge") == 3
+
+
+@pytest.mark.asyncio
+async def test_altitude_panel_two_approaches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bootstrap_repo(tmp_path)
+    _force_structural(monkeypatch)
+    adapter = StubAdapter(
+        {"framing": ok(_design_text()), "altitude_judge": _judge_ranks_design_first}
+    )
+    orch = _make_orch(tmp_path, adapter)
+    orch.cfg.framing.num_approaches = 2  # valid_labels must become "12", not "123"
+    decision = await run_framing_phase(orch, "trim it", "", "", None, "abc123")
+    assert decision is not None
+    assert decision.classification == "realized_design_failure"
+    assert len(decision.approaches) == 2
+    assert decision.chosen_approach.altitude == "design_fix"
+
+
+@pytest.mark.asyncio
+async def test_altitude_panel_partial_judge_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bootstrap_repo(tmp_path)
+    _force_structural(monkeypatch)
+    state = {"n": 0}
+
+    def _judge(inv):  # type: ignore[no-untyped-def]
+        state["n"] += 1
+        if state["n"] == 1:
+            return ok("no ranking line here")
+        return _judge_ranks_design_first(inv)
+
+    adapter = StubAdapter({"framing": ok(_design_text()), "altitude_judge": _judge})
+    orch = _make_orch(tmp_path, adapter)
+    decision = await run_framing_phase(orch, "trim it", "", "", None, "abc123")
+    assert decision is not None
+    assert decision.chosen_approach.altitude == "design_fix"
+
+
+@pytest.mark.asyncio
+async def test_altitude_panel_all_fail_tiebreak_local_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bootstrap_repo(tmp_path)
+    _force_structural(monkeypatch)
+    adapter = StubAdapter(
+        {"framing": ok(_design_text()), "altitude_judge": ok("garbage no ranking line")}
+    )
+    orch = _make_orch(tmp_path, adapter)
+    decision = await run_framing_phase(orch, "trim it", "", "", None, "abc123")
+    assert decision is not None
+    assert decision.chosen_approach.altitude == "local_patch"
+
+
+def test_altitude_panel_order_inversion() -> None:
+    import random
+
+    from orchestrator.framing_phase import _shuffle_approaches
+
+    order = _shuffle_approaches(["x", "y", "z"], random.Random(123))
+    assert sorted(order) == [1, 2, 3]
+    assert sorted(order.values()) == ["x", "y", "z"]
+    slot_ranking = [3, 1, 2]
+    # inverse-map slot ranking -> canonical names via THIS judge's order map
+    assert [order[s] for s in slot_ranking] == [order[3], order[1], order[2]]
+    assert sorted(order[s] for s in slot_ranking) == ["x", "y", "z"]
+
+
+@pytest.mark.asyncio
+async def test_altitude_panel_deterministic_from_spec_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_structural(monkeypatch)
+
+    async def _run(d: Path):  # type: ignore[no-untyped-def]
+        d.mkdir()
+        _bootstrap_repo(d)
+        adapter = StubAdapter(
+            {"framing": ok(_design_text()), "altitude_judge": _judge_ranks_slot_order}
+        )
+        orch = _make_orch(d, adapter)
+        # rank-by-slot makes the winner depend on the shuffle, so equal winners
+        # across runs proves the spec_hash-seeded shuffle is deterministic.
+        return await run_framing_phase(orch, "trim it", "", "", None, "deadbeef")
+
+    dec1 = await _run(tmp_path / "a")
+    dec2 = await _run(tmp_path / "b")
+    assert dec1 is not None and dec2 is not None
+    assert dec1.chosen_approach.name == dec2.chosen_approach.name

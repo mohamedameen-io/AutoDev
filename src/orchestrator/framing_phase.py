@@ -17,7 +17,9 @@ therefore NOT in ``orch.registry``. They dispatch via the specialist path
 
 from __future__ import annotations
 
+import asyncio
 import os
+import random
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -34,6 +36,8 @@ from orchestrator.framing_signals import (
 from state.evidence import read_evidence, write_evidence
 from state.file_index import CandidateDigest
 from state.schemas import FramingEvidence, SolutionApproach
+from tournament.core import parse_ranking
+from tournament.voting import BordaAggregator
 
 if TYPE_CHECKING:
     from orchestrator import Orchestrator
@@ -287,6 +291,111 @@ def _decision_from_evidence(ev: FramingEvidence) -> AltitudeDecision:
     )
 
 
+def _shuffle_approaches(labels: list[str], rng: random.Random) -> dict[int, str]:
+    """Shuffle approach NAMES into a slot order; return ``{slot_1based: canonical_name}``.
+
+    Replaces ``randomize_for_judge`` (hardcoded A/B/AB, exactly 3) — this is N-generic.
+    """
+    shuffled = list(labels)
+    rng.shuffle(shuffled)
+    return {i + 1: name for i, name in enumerate(shuffled)}
+
+
+def _render_approaches_in_slot_order(
+    approaches: list[SolutionApproach], order: dict[int, str]
+) -> str:
+    by_name = {a.name: a for a in approaches}
+    blocks: list[str] = []
+    for slot in sorted(order):
+        a = by_name[order[slot]]
+        blocks.append(
+            f"### Candidate {slot}\n"
+            f"altitude: {a.altitude}\n"
+            f"summary: {a.summary}\n"
+            f"eliminates_failure_class: {a.eliminates_failure_class}\n"
+            f"primary_tradeoff: {a.primary_tradeoff}\n"
+            f"primary_risk: {a.primary_risk}\n"
+            f"est_blast_radius: {a.est_blast_radius}"
+        )
+    return "\n\n".join(blocks)
+
+
+async def _run_altitude_judge_panel(
+    orch: "Orchestrator",
+    approaches: list[SolutionApproach],
+    intent: str,
+    candidate_digest: CandidateDigest | None,
+    spec_hash: str,
+) -> tuple[SolutionApproach, str]:
+    """Single-pass N-judge Borda panel over altitude-diverse approaches (minimality
+    suspended, scoped to THIS step).
+
+    Suspension is by construction: dispatches ``altitude_judge`` ONLY (never
+    ``minimality_judge``/``judge``), uses its own prompt (never JUDGE_RANK_3 / the
+    length penalty), never demotes oversized winners, and relies on the denylist.
+    Deterministic: a single local ``random.Random(int(spec_hash, 16))`` is advanced per
+    judge. Borda aggregates over canonical NAMES — each judge's slot ranking is
+    inverse-mapped via THAT judge's order before aggregation.
+    """
+    labels = [a.name for a in approaches]
+    n = len(approaches)
+    # Derived from the ACTUAL count — NEVER the literal "123". ``parse_ranking`` rejects
+    # a ranking whose valid-digit count is below ``len(valid_labels)``, so a literal
+    # "123" would reject every N!=3 panel; N=2 is a real, gated branch (valid_labels="12").
+    valid_labels = "".join(str(i) for i in range(1, n + 1))
+    rng = random.Random(int(spec_hash, 16))  # seeded ONCE; advanced per judge
+    panel_size = orch.cfg.framing.altitude_judge_panel_size
+    orders = [_shuffle_approaches(labels, rng) for _ in range(panel_size)]
+
+    candidate_files = candidate_digest.render() if candidate_digest is not None else ""
+
+    async def _one_judge(order: dict[int, str]) -> str:
+        rendered = _render_approaches_in_slot_order(approaches, order)
+        return await _invoke_framing_role(
+            orch,
+            "altitude_judge",
+            {
+                "spec": intent,
+                "approaches": rendered,
+                "candidate_files": candidate_files,
+            },
+            action="rank",
+        )
+
+    results = await asyncio.gather(
+        *[_one_judge(order) for order in orders], return_exceptions=True
+    )
+
+    rankings: list[list[str] | None] = []
+    for order, res in zip(orders, results):
+        if not isinstance(res, str):
+            rankings.append(None)
+            continue
+        slot_ranking = parse_ranking(res, valid_labels)
+        if slot_ranking is None:
+            rankings.append(None)
+            continue
+        try:
+            rankings.append([order[int(s)] for s in slot_ranking])
+        except (KeyError, ValueError):
+            rankings.append(None)
+
+    # Conservative tiebreak: the local_patch approach (guaranteed present on the design
+    # path). Must be a canonical NAME for BordaAggregator's priority map to apply it.
+    local_patch_name = next(
+        (a.name for a in approaches if a.altitude == "local_patch"), labels[0]
+    )
+    winner_name, scores, n_valid = BordaAggregator().aggregate(
+        rankings, labels=labels, tiebreak_winner=local_patch_name
+    )
+    chosen = next(a for a in approaches if a.name == winner_name)
+    rationale = (
+        f"altitude_judge panel ({n_valid}/{panel_size} valid rankings) selected "
+        f"'{winner_name}' ({chosen.altitude}); scores={scores}"
+    )
+    return chosen, rationale
+
+
 async def run_framing_phase(
     orch: "Orchestrator",
     intent: str,
@@ -367,17 +476,16 @@ async def run_framing_phase(
             is_design = False
             logger.info("framing_phase.local_defect_path", reason="parse_degraded")
         else:
-            # Placeholder selection (Phase 3): first design_fix, else first approach.
-            # Replaced by the altitude_judge Borda panel in Phase 4.
-            chosen = next(
-                (a for a in approaches if a.altitude == "design_fix"), approaches[0]
+            # Real selection: altitude_judge Borda panel (minimality suspended).
+            chosen, rationale = await _run_altitude_judge_panel(
+                orch, approaches, intent, candidate_digest, spec_hash
             )
             final_classification = "realized_design_failure"
-            rationale = "placeholder selection (Phase 3): first design_fix"
             logger.info(
                 "framing_phase.design_failure_path",
                 confidence=confidence,
                 n_approaches=len(approaches),
+                chosen=chosen.name,
             )
     else:
         chosen = _local_patch_approach()
