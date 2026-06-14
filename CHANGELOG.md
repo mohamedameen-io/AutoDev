@@ -2,6 +2,10 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+<!-- Framing/altitude phase (ADR-0044). Entry finalized in Phase 6. -->
+
 ## [0.39.0] - 2026-06-13
 
 Huge-repo-native tier (Tier J). Folds the manual environment

@@ -387,6 +387,8 @@ autodev/                          # project root
 | [ADR-008](../src/design_decision/adr-008-deterministic-fsm-orchestration.md) | Deterministic FSM Orchestration |
 | [ADR-009](../src/design_decision/adr-009-pydantic-v2-strict-validation.md) | Pydantic v2 Strict Validation |
 | [ADR-010](../src/design_decision/adr-010-conservative-tiebreak-in-tournaments.md) | Conservative Tiebreak in Tournaments |
+| [0043](decisions/0043-huge-repo-mode.md) | Huge-Repo Mode (`worktree_huge_repo_mode` + cascading defaults) |
+| [0044](decisions/0044-framing-altitude-phase.md) | Framing/Altitude Phase for Autonomous Patch-vs-Architecture Decisions (Proposed) |
 
 ### Reference Documents (`docs/design_documentation/`)
 
