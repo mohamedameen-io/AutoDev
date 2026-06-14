@@ -133,6 +133,25 @@ preflight_v039() {
   check "v0.39 J6 drift partition"    src/orchestrator/drift_verifier.py           "def partition_drift_findings"
 }
 
+preflight_v040() {
+  check "v0.40 framing phase"         src/orchestrator/framing_phase.py     "async def run_framing_phase"
+  check "v0.40 specialist dispatch"   src/orchestrator/framing_phase.py     "_invoke_framing_role"
+  check "v0.40 altitude panel"        src/orchestrator/framing_phase.py     "_run_altitude_judge_panel"
+  check "v0.40 local shuffle"         src/orchestrator/framing_phase.py     "def _shuffle_approaches"
+  check "v0.40 recurrence signal"     src/orchestrator/framing_signals.py   "def compute_recurrence_at_seam"
+  check "v0.40 boundary signal"       src/orchestrator/framing_signals.py   "def compute_boundary_repeatedly_touched"
+  check "v0.40 evidence schema"       src/state/schemas.py                  "class FramingEvidence"
+  check "v0.40 approach schema"       src/state/schemas.py                  "class SolutionApproach"
+  check "v0.40 phase config"          src/config/schema.py                  "class FramingPhaseConfig"
+  check "v0.40 denylist role"         src/config/schema.py                  "altitude_judge"
+  check "v0.40 classified op"         src/state/ledger.py                   "framing_classified"
+  check "v0.40 strategy op"           src/state/ledger.py                   "framing_strategy_chosen"
+  check "v0.40 call site"             src/orchestrator/plan_phase.py        "run_framing_phase"
+  check "v0.40 architect coupling"    src/agents/prompts/architect.md       "FRAMING PHASE COUPLING"
+  check "v0.40 framing prompt"        src/agents/prompts/framing.md         "CLASSIFICATION:"
+  check "v0.40 judge prompt"          src/agents/prompts/altitude_judge.md  "RANKING:"
+}
+
 case "$target" in
   v0.32) preflight_v032 ;;
   v0.33) preflight_v033 ;;
@@ -142,9 +161,10 @@ case "$target" in
   v0.37) preflight_v037 ;;
   v0.38) preflight_v038 ;;
   v0.39) preflight_v039 ;;
-  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ;;
+  v0.40) preflight_v040 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ;;
   *)
-    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | all)" >&2
+    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | all)" >&2
     exit 2
     ;;
 esac
