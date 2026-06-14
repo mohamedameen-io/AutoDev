@@ -65,6 +65,39 @@ def _framing_text(
     )
 
 
+_LOCAL_ITEM = (
+    "- name: trim\n"
+    "  altitude: local_patch\n"
+    "  summary: trim the observation\n"
+    "  eliminates_failure_class: false\n"
+    "  primary_tradeoff: fast but only bounds\n"
+    "  primary_risk: recurs at the seam\n"
+    "  integration_surface: [src/foo.py]\n"
+    "  est_blast_radius: single function"
+)
+_DESIGN_ITEM = (
+    "- name: separate-planes\n"
+    "  altitude: design_fix\n"
+    "  summary: separate control and data planes\n"
+    "  eliminates_failure_class: true\n"
+    "  primary_tradeoff: larger diff now\n"
+    "  primary_risk: cross-module contract\n"
+    "  integration_surface: [src/core.py]\n"
+    "  est_blast_radius: cross-module contract"
+)
+
+
+def _approaches_text(*items: str) -> str:
+    return "```approaches\n" + "\n".join(items) + "\n```\n"
+
+
+def _force_structural(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _fake(cwd: object, candidate_digest: object, intent: str):
+        return ["recurrence_at_seam"], True
+
+    monkeypatch.setattr("orchestrator.framing_phase._compute_signals", _fake)
+
+
 # --- parser -----------------------------------------------------------------
 
 
@@ -235,3 +268,112 @@ async def test_framing_byte_identical_stub(tmp_path: Path) -> None:
         (d2 / ".autodev" / "evidence" / "plan-framing-framing.json").read_text()
     )
     assert raw1 == raw2
+
+
+# --- Phase 3: parse_approaches + design-path generation ---------------------
+
+
+def test_parse_approaches_empty() -> None:
+    from orchestrator.framing_phase import parse_approaches
+
+    approaches, failures = parse_approaches("")
+    assert approaches == []
+    assert any("empty response" in f for f in failures)
+
+
+def test_parse_approaches_valid_two() -> None:
+    from orchestrator.framing_phase import parse_approaches
+
+    approaches, failures = parse_approaches(_approaches_text(_LOCAL_ITEM, _DESIGN_ITEM))
+    assert len(approaches) == 2
+    assert failures == []
+    assert {a.altitude for a in approaches} == {"local_patch", "design_fix"}
+
+
+def test_parse_approaches_missing_eliminates_field() -> None:
+    from orchestrator.framing_phase import parse_approaches
+
+    bad = _LOCAL_ITEM.replace("  eliminates_failure_class: false\n", "")
+    approaches, failures = parse_approaches(_approaches_text(bad, _DESIGN_ITEM))
+    assert len(approaches) == 1
+    assert approaches[0].altitude == "design_fix"
+    assert any("malformed approach" in f for f in failures)
+
+
+def test_parse_approaches_unknown_field_skipped() -> None:
+    from orchestrator.framing_phase import parse_approaches
+
+    bad = _LOCAL_ITEM + "\n  bogus_field: x"
+    approaches, failures = parse_approaches(_approaches_text(bad, _DESIGN_ITEM))
+    assert len(approaches) == 1
+    assert approaches[0].altitude == "design_fix"
+    assert any("malformed approach" in f for f in failures)
+
+
+def test_parse_approaches_respects_num_approaches_cap() -> None:
+    from orchestrator.framing_phase import parse_approaches
+
+    items = [
+        _LOCAL_ITEM,
+        _DESIGN_ITEM,
+        _DESIGN_ITEM.replace("separate-planes", "p3"),
+        _DESIGN_ITEM.replace("separate-planes", "p4"),
+    ]
+    approaches, failures = parse_approaches(_approaches_text(*items), num_approaches=3)
+    assert len(approaches) == 3
+    assert any("truncated" in f for f in failures)
+
+
+@pytest.mark.asyncio
+async def test_design_path_generates_both_altitudes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bootstrap_repo(tmp_path)
+    _force_structural(monkeypatch)
+    text = _framing_text("realized_design_failure", 0.85) + _approaches_text(
+        _LOCAL_ITEM, _DESIGN_ITEM
+    )
+    adapter = StubAdapter({"framing": ok(text)})
+    orch = _make_orch(tmp_path, adapter)
+    decision = await run_framing_phase(orch, "trim it", "", "", None, "abc123")
+    assert decision is not None
+    assert decision.classification == "realized_design_failure"
+    altitudes = {a.altitude for a in decision.approaches}
+    assert "local_patch" in altitudes
+    assert "design_fix" in altitudes
+    ops = [e.op for e in read_entries(tmp_path)]
+    assert "framing_strategy_chosen" in ops
+
+
+@pytest.mark.asyncio
+async def test_design_path_degrades_when_only_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bootstrap_repo(tmp_path)
+    _force_structural(monkeypatch)
+    text = _framing_text("realized_design_failure", 0.85) + _approaches_text(_LOCAL_ITEM)
+    adapter = StubAdapter({"framing": ok(text)})
+    orch = _make_orch(tmp_path, adapter)
+    decision = await run_framing_phase(orch, "trim it", "", "", None, "abc123")
+    assert decision is not None
+    assert decision.classification == "local_defect"
+    assert len(decision.approaches) == 1
+    assert decision.approaches[0].altitude == "local_patch"
+    ev = await read_evidence(tmp_path, "plan-framing", "framing")
+    assert isinstance(ev, FramingEvidence)
+    assert "parse_degraded" in ev.signals_fired
+
+
+@pytest.mark.asyncio
+async def test_framing_call_count_design_path_is_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bootstrap_repo(tmp_path)
+    _force_structural(monkeypatch)
+    text = _framing_text("realized_design_failure", 0.85) + _approaches_text(
+        _LOCAL_ITEM, _DESIGN_ITEM
+    )
+    adapter = StubAdapter({"framing": ok(text)})
+    orch = _make_orch(tmp_path, adapter)
+    await run_framing_phase(orch, "trim it", "", "", None, "abc123")
+    assert adapter.count("framing") == 1

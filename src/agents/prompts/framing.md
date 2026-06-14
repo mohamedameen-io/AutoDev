@@ -58,11 +58,32 @@ That is always worse than your best-guess answer.
   concerns fused in one path (control / data-plane conflation)? Has this boundary been
   fixed repeatedly?
 
-## OUTPUT — emit EXACTLY this fenced block, nothing after it:
+## OUTPUT
+
+First, emit EXACTLY this fenced classification block:
 
 ```framing
 CLASSIFICATION: <local_defect | realized_design_failure>
 CONFIDENCE: <float 0.0-1.0>
 HYPOTHESIS_CHALLENGED: <one line: what the user assumed vs. what you found>
 SIGNALS_FIRED: <comma-separated names, or none>
+```
+
+If (and ONLY if) CLASSIFICATION is `realized_design_failure`, ALSO emit an
+`approaches` block immediately after the framing block. Generate exactly
+`num_approaches` (see CONTEXT) strategies, EACH at a DISTINCT altitude band — at
+least one `local_patch` and at least one `design_fix`. Approaches are INTERNAL
+artifacts you are generating for the altitude judge to score; do NOT present them to
+a user and do NOT recommend that someone pick one.
+
+```approaches
+- name: <unique slug>
+  altitude: <local_patch | component_refactor | design_fix>
+  summary: <one paragraph>
+  eliminates_failure_class: <true | false>   # true ONLY if it kills the class, not one instance
+  primary_tradeoff: <text>
+  primary_risk: <text>
+  integration_surface: [<file_or_contract>, ...]
+  est_blast_radius: <single function | component | cross-module contract>
+- name: ...
 ```

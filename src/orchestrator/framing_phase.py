@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from autologging import get_logger
+from pydantic import ValidationError
 
 from adapters.types import AgentInvocation
 from agents import load_prompt
@@ -79,18 +80,84 @@ def _local_patch_approach() -> SolutionApproach:
     )
 
 
-def _placeholder_design_approach() -> SolutionApproach:
-    """Phase-2 placeholder for the design path (replaced by real generation in Phase 3)."""
-    return SolutionApproach(
-        name="design_fix",
-        altitude="design_fix",
-        summary="(placeholder — real multi-approach generation lands in Phase 3)",
-        eliminates_failure_class=True,
-        primary_tradeoff="Larger blast radius now to eliminate the failure class.",
-        primary_risk="Touches a cross-module contract.",
-        integration_surface=[],
-        est_blast_radius="cross-module contract",
-    )
+_APPROACH_FIELD_RE = re.compile(r"^\s*([a-z_]+):\s*(.*)$")
+
+
+def _extract_fenced_block(text: str, lang: str) -> str | None:
+    m = re.search(rf"```{lang}\s*\n(.*?)```", text, re.DOTALL)
+    return m.group(1) if m else None
+
+
+def _split_approach_items(block: str) -> list[str]:
+    """Split a YAML-ish list into per-approach chunks on ``- `` boundaries."""
+    items: list[str] = []
+    current: list[str] | None = None
+    for line in block.splitlines():
+        if re.match(r"^\s*-\s+", line):
+            if current is not None:
+                items.append("\n".join(current))
+            current = [re.sub(r"^\s*-\s+", "", line)]
+        elif current is not None:
+            current.append(line)
+    if current is not None:
+        items.append("\n".join(current))
+    return items
+
+
+def _parse_list(value: str) -> list[str]:
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [x.strip().strip('"').strip("'") for x in inner.split(",") if x.strip()]
+    return [value] if value else []
+
+
+def _parse_approach_fields(item: str) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    for line in item.splitlines():
+        m = _APPROACH_FIELD_RE.match(line)
+        if m is None:
+            continue
+        key, value = m.group(1), m.group(2).strip()
+        if key == "eliminates_failure_class":
+            fields[key] = value.lower() in ("true", "yes", "1")
+        elif key == "integration_surface":
+            fields[key] = _parse_list(value)
+        else:
+            fields[key] = value
+    return fields
+
+
+def parse_approaches(
+    text: str, num_approaches: int = 3
+) -> tuple[list[SolutionApproach], list[str]]:
+    """Parse the ```approaches fenced block into SolutionApproaches (fail-safe).
+
+    Per-approach validation errors (a missing required field, or an extra field
+    under ``extra='forbid'``) skip that approach with a ``framing: malformed approach
+    <n>`` diagnostic — this NEVER raises. Over-count truncates to ``num_approaches``
+    with a ``framing: truncated approaches`` diagnostic. Empty / no block degrades to
+    ``([], [...])`` so the caller can fall back to ``local_defect`` (FR-4).
+    """
+    if not text or not text.strip():
+        return [], ["framing: empty response"]
+    block = _extract_fenced_block(text, "approaches")
+    if block is None:
+        return [], ["framing: no approaches block"]
+    approaches: list[SolutionApproach] = []
+    failures: list[str] = []
+    for idx, item in enumerate(_split_approach_items(block), 1):
+        fields = _parse_approach_fields(item)
+        try:
+            approaches.append(SolutionApproach(**fields))  # type: ignore[arg-type]
+        except ValidationError:
+            failures.append(f"framing: malformed approach {idx}")
+    if len(approaches) > num_approaches:
+        approaches = approaches[:num_approaches]
+        failures.append("framing: truncated approaches")
+    return approaches, failures
 
 
 def _extract_classification(text: str) -> tuple[str, float, list[str]]:
@@ -267,6 +334,7 @@ async def run_framing_phase(
                 candidate_digest.render() if candidate_digest is not None else ""
             ),
             "signals_summary": _format_signals(signals_fired),
+            "num_approaches": str(fr_cfg.num_approaches),
         },
         action="classify",
     )
@@ -282,17 +350,40 @@ async def run_framing_phase(
         and (not fr_cfg.require_structural_signal or structural_fired)
     )
 
+    rationale: str | None = None
     if is_design:
-        chosen = _placeholder_design_approach()
-        final_classification = "realized_design_failure"
-        rationale: str | None = "design-path placeholder (Phase 2)"
-        logger.info("framing_phase.design_failure_path", confidence=confidence)
+        approaches, parse_failures = parse_approaches(
+            raw, num_approaches=fr_cfg.num_approaches
+        )
+        if parse_failures:
+            logger.info("framing_phase.parse_failures", failures=parse_failures)
+        non_local = [a for a in approaches if a.altitude != "local_patch"]
+        if len(approaches) < 2 or not non_local:
+            # Fail-safe degrade: generation did not yield a usable design option.
+            signals_fired = signals_fired + ["parse_degraded"]
+            chosen = _local_patch_approach()
+            approaches = [chosen]
+            final_classification = "local_defect"
+            is_design = False
+            logger.info("framing_phase.local_defect_path", reason="parse_degraded")
+        else:
+            # Placeholder selection (Phase 3): first design_fix, else first approach.
+            # Replaced by the altitude_judge Borda panel in Phase 4.
+            chosen = next(
+                (a for a in approaches if a.altitude == "design_fix"), approaches[0]
+            )
+            final_classification = "realized_design_failure"
+            rationale = "placeholder selection (Phase 3): first design_fix"
+            logger.info(
+                "framing_phase.design_failure_path",
+                confidence=confidence,
+                n_approaches=len(approaches),
+            )
     else:
         chosen = _local_patch_approach()
+        approaches = [chosen]
         final_classification = "local_defect"
-        rationale = None
         logger.info("framing_phase.local_defect_path", confidence=confidence)
-    approaches = [chosen]
 
     # 7. Persist evidence BEFORE returning (crash-safety).
     ev = FramingEvidence(
