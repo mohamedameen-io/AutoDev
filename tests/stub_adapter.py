@@ -92,6 +92,30 @@ class StubAdapter(PlatformAdapter):
                     ),
                     duration_s=0.01,
                 )
+            # ADR-0044: framing defaults to a safe local_defect classification so
+            # tests that don't explicitly stub the role degrade conservatively
+            # (single local_patch, no panel) rather than crash the parser.
+            if inv.role == "framing":
+                return AgentResult(
+                    success=True,
+                    text=(
+                        "```framing\n"
+                        "CLASSIFICATION: local_defect\n"
+                        "CONFIDENCE: 0.0\n"
+                        "HYPOTHESIS_CHALLENGED: stub default\n"
+                        "SIGNALS_FIRED: none\n"
+                        "```\n"
+                    ),
+                    duration_s=0.01,
+                )
+            # ADR-0044: altitude_judge default ranking covers N=2 and N=3 (extra
+            # digits are filtered by parse_ranking against the dynamic valid_labels).
+            if inv.role == "altitude_judge":
+                return AgentResult(
+                    success=True,
+                    text="```ranking\nRANKING: 1 2 3\n```\n",
+                    duration_s=0.01,
+                )
             return AgentResult(
                 success=True,
                 text=f"[stub:{inv.role}] default-ok",

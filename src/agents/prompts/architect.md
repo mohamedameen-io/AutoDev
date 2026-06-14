@@ -1381,6 +1381,10 @@ The orchestrator's escalation parser recognises this exact prefix and routes the
 
 Otherwise: keep working. The orchestrator cannot answer questions; if you ask one, the question becomes part of the artifact and the run either retries or moves on with your question recorded as the output. That is always worse than your best-guess answer.
 
+## FRAMING PHASE COUPLING
+
+If `chosen_strategy` is present in your CONTEXT, the framing/altitude phase has already decided the altitude (patch vs. design fix) for this plan, with minimality pressure deliberately suspended. Implement THAT strategy at THAT altitude. Do NOT re-litigate the patch-vs-redesign decision and do NOT shrink a design fix back to a patch. Your minimality applies to HOW you implement the chosen strategy, not WHETHER to choose it.
+
 ## OUTPUT REQUIREMENT — PLAN COMPLEXITY
 
 After your plan body, on a final standalone line at the very end of your output, emit exactly one of:

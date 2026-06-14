@@ -2,6 +2,24 @@
 
 All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Framing/altitude phase (ADR-0044).** A new phase between exploration and planning
+  poses the patch-vs-architecture decision instead of defaulting to a localized patch.
+  A hybrid classifier (deterministic recurrence-at-seam / boundary-repeatedly-touched
+  signals + one conservative LLM call) classifies each defect as `local_defect` vs
+  `realized_design_failure`; on the design path it autonomously generates 2–3
+  altitude-diverse strategies and selects one via an `altitude_judge` Borda panel with
+  minimality pressure suspended, handing the winner to the architect (where minimality
+  resumes). On by default (`framing.enabled=True`), conservative (flip only at
+  `confidence >= 0.7` **and** a structural signal), fail-safe (degrades to a single
+  `local_patch`, never blocks planning), and deterministic-on-resume (re-reads
+  `plan-framing` evidence with zero extra LLM calls). Kill-switch via
+  `framing.enabled=false` or `AUTODEV_FRAMING_DISABLED=1`. Common-case cost is one extra
+  LLM call; the design-failure path adds four. Surfaced in `autodev status`.
+
 ## [0.39.0] - 2026-06-13
 
 Huge-repo-native tier (Tier J). Folds the manual environment

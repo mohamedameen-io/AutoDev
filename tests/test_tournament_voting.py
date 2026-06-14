@@ -212,3 +212,21 @@ def test_veto_all_none_falls_through_to_borda_tiebreak() -> None:
     assert winner == "A"
     assert valid == 0
     assert scores == {"A": 0, "B": 0, "AB": 0}
+
+
+def test_borda_aggregator_altitude_panel() -> None:
+    """ADR-0044: Borda over canonical approach names, one judge ranking None."""
+    labels = ["trim", "refactor", "redesign"]
+    rankings: list[list[str] | None] = [
+        ["redesign", "refactor", "trim"],
+        ["redesign", "trim", "refactor"],
+        None,
+    ]
+    winner, scores, n_valid = BordaAggregator().aggregate(
+        rankings, labels=labels, tiebreak_winner="trim"
+    )
+    assert winner == "redesign"
+    assert n_valid == 2
+    assert scores["redesign"] == 6
+    assert scores["refactor"] == 3
+    assert scores["trim"] == 3

@@ -15,11 +15,11 @@ from rich.table import Table
 
 from config.loader import load_config
 from errors import AutodevError
-from state.evidence import list_evidence
+from state.evidence import list_evidence, read_evidence
 from state.knowledge import KnowledgeStore
 from state.paths import autodev_root, config_path, ledger_path
 from state.plan_manager import PlanManager
-from state.schemas import Plan, Task
+from state.schemas import FramingEvidence, Plan, Task
 
 
 @click.command("status")
@@ -120,6 +120,7 @@ def status(blocked: bool) -> None:
             )
         _print_knowledge_summary(console, len(swarm_entries), len(hive_entries))
         _print_index_summary(console, cwd, cfg)
+        await _print_framing_summary(console, cwd)
 
     try:
         asyncio.run(_run())
@@ -562,4 +563,26 @@ def _print_index_summary(console: Console, cwd: Path, cfg) -> None:
     console.print(
         f"[cyan]Index:[/cyan] {file_count} files, {symbol_count} symbols "
         f"(last indexed {last_indexed})"
+    )
+
+
+async def _print_framing_summary(console: Console, cwd: Path) -> None:
+    """ADR-0044: surface the latest framing classification + chosen altitude.
+
+    Reads ``plan-framing-framing.json`` if present; silent no-op when absent
+    (status must render even before any framing has run).
+    """
+    try:
+        ev = await read_evidence(cwd, "plan-framing", "framing")
+    except Exception:  # pragma: no cover - display only, never fail status
+        return
+    if not isinstance(ev, FramingEvidence):
+        return
+    chosen = next(
+        (a for a in ev.approaches if a.name == ev.chosen_approach_name), None
+    )
+    altitude = chosen.altitude if chosen is not None else "unknown"
+    console.print(
+        f"[cyan]Framing:[/cyan] {ev.classification} "
+        f"(chosen altitude: {altitude})"
     )

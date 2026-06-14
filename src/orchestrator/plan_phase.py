@@ -27,6 +27,7 @@ from errors import AutodevError, TournamentError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
 from orchestrator.file_existence_validator import validate_files_exist
+from orchestrator.framing_phase import run_framing_phase
 from orchestrator.plan_parser import (
     PlanParseError,
     parse_plan_markdown,
@@ -57,6 +58,7 @@ from tournament.state import (
 
 if TYPE_CHECKING:
     from orchestrator import Orchestrator
+    from state.file_index import CandidateDigest
 
 
 logger = get_logger(__name__)
@@ -719,6 +721,10 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         # the architect prompt's "PREFER paths from this list" sentence
         # becomes a no-op (no broken behavior).
         candidate_digest_str = ""
+        # ADR-0044: keep the STRUCTURED digest object (not just the rendered
+        # string) so the framing signals can read .symbol_hits[].file_path /
+        # .file_hits[].path — a string has neither.
+        candidate_digest_obj: CandidateDigest | None = None
         if orch.cfg.index_enabled:
             db_path = orch.cwd / orch.cfg.index_path
             if db_path.exists():
@@ -728,11 +734,30 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                     digest = IndexQuery(db_path).get_candidates_for_spec(
                         spec_text=intent, limit=20
                     )
+                    candidate_digest_obj = digest
                     candidate_digest_str = digest.render(max_chars=2500)
                 except Exception as exc:  # noqa: BLE001 - never block plan
                     logger.warning(
                         "plan_phase.index_query_failed", err=str(exc)
                     )
+
+        # ADR-0044: framing/altitude phase — flag-guarded, fail-safe. Poses the
+        # patch-vs-architecture decision and threads the chosen altitude into the
+        # architect. run_framing_phase re-reads evidence on resume (zero LLM calls)
+        # and must NEVER block planning.
+        framing_decision = None
+        if orch.cfg.framing.enabled and not os.getenv("AUTODEV_FRAMING_DISABLED"):
+            try:
+                framing_decision = await run_framing_phase(
+                    orch=orch,
+                    intent=intent,
+                    explorer_findings=explorer_result.text[:4000],
+                    domain_expert_findings=domain_expert_result.text[:4000],
+                    candidate_digest=candidate_digest_obj,
+                    spec_hash=spec_hash,
+                )
+            except Exception as exc:  # noqa: BLE001 — framing must never block planning
+                logger.warning("plan_phase.framing_phase_failed", err=str(exc))
 
         architect_env = DelegationEnvelope(
             task_id="plan",
@@ -755,6 +780,20 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                 "explorer_findings": explorer_result.text[:4000],
                 "domain_expert_findings": domain_expert_result.text[:4000],
                 "candidate_files": candidate_digest_str,
+                # ADR-0044: the chosen altitude + classification. The architect
+                # implements THIS strategy at THIS altitude (see architect.md
+                # "FRAMING PHASE COUPLING"). Defaults keep behavior identical when
+                # framing is disabled or degrades to local_defect.
+                "chosen_strategy": (
+                    framing_decision.chosen_approach.name
+                    if framing_decision is not None
+                    else "local_patch"
+                ),
+                "framing_classification": (
+                    framing_decision.classification
+                    if framing_decision is not None
+                    else "local_defect"
+                ),
             },
         )
         # v0.26.2 Phase 3: bounded architect-retry loop with persistent-
