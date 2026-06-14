@@ -515,3 +515,70 @@ async def test_altitude_panel_deterministic_from_spec_hash(
     dec2 = await _run(tmp_path / "b")
     assert dec1 is not None and dec2 is not None
     assert dec1.chosen_approach.name == dec2.chosen_approach.name
+
+
+# --- Phase 6: merge gates ---------------------------------------------------
+
+_REGRESSION_DIR = Path(__file__).parent / "fixtures" / "regression"
+_CONSERVATISM_BUGS = sorted(
+    (Path(__file__).parent / "fixtures" / "conservatism_bugs").glob("*.md")
+)
+
+
+@pytest.mark.asyncio
+async def test_framing_phase_201_200(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 1 (decisive): the #201/#200 replay surfaces AND selects the design fix.
+
+    Replays the vendored synaptix_core_bug.md through run_framing_phase with a
+    StubAdapter returning a realized_design_failure framing + both altitudes; the
+    panel selects the design_fix.
+    """
+    bug = (_REGRESSION_DIR / "synaptix_core_bug.md").read_text(encoding="utf-8")
+    assert "429" in bug and "rate_limited" in bug  # vendored real content
+    _bootstrap_repo(tmp_path)
+    _force_structural(monkeypatch)
+    framing_text = _framing_text("realized_design_failure", 0.85) + _approaches_text(
+        _LOCAL_ITEM, _DESIGN_ITEM
+    )
+    adapter = StubAdapter(
+        {"framing": ok(framing_text), "altitude_judge": _judge_ranks_design_first}
+    )
+    orch = _make_orch(tmp_path, adapter)
+    decision = await run_framing_phase(orch, bug, "", "", None, "feedface")
+    assert decision is not None
+    assert decision.classification == "realized_design_failure"
+    assert decision.confidence >= 0.7
+    altitudes = {a.altitude for a in decision.approaches}
+    assert "local_patch" in altitudes
+    assert "design_fix" in altitudes
+    assert decision.chosen_approach.altitude == "design_fix"
+    ops = [e.op for e in read_entries(tmp_path)]
+    assert "framing_strategy_chosen" in ops
+
+
+@pytest.mark.parametrize(
+    "bug_path", _CONSERVATISM_BUGS, ids=lambda p: p.name
+)
+@pytest.mark.asyncio
+async def test_framing_conservatism_corpus(tmp_path: Path, bug_path: Path) -> None:
+    """Gate 2 (false-positive gate): every known-local bug stays local_defect,
+    yields a single local_patch, and fires ZERO altitude_judge calls."""
+    bug = bug_path.read_text(encoding="utf-8")
+    _bootstrap_repo(tmp_path)
+    # The conservative classifier classifies these local; no structural signal
+    # fires (candidate_digest=None), so the gate keeps them local_defect.
+    adapter = StubAdapter({"framing": ok(_framing_text("local_defect", 0.3))})
+    orch = _make_orch(tmp_path, adapter)
+    decision = await run_framing_phase(orch, bug, "", "", None, "abc123")
+    assert decision is not None
+    assert decision.classification == "local_defect"
+    assert len(decision.approaches) == 1
+    assert decision.approaches[0].altitude == "local_patch"
+    assert adapter.count("altitude_judge") == 0
+
+
+def test_conservatism_corpus_is_non_empty() -> None:
+    """Guard: the corpus must actually contain fixtures (else Gate 2 is vacuous)."""
+    assert len(_CONSERVATISM_BUGS) >= 4

@@ -1,6 +1,6 @@
 # 0044 — Framing/Altitude Phase for Autonomous Patch-vs-Architecture Decisions
 
-* **Status:** Proposed
+* **Status:** Accepted
 * **Date:** 2026-06-14
 * **Deciders:** Mohamed Ameen
 * **Tags:** orchestrator, planning, tournament, agents
@@ -193,3 +193,4 @@ The encouraging part: the expert machinery largely **already exists but is gated
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-06-14 | Mohamed Ameen | Initial ADR created (Proposed). |
+| 2026-06-14 | Mohamed Ameen | Implemented end-to-end (Phases 0–6) on `feat/framing-altitude-phase`; on by default with the conservative classifier + fail-safe degrade. Status Proposed → Accepted. |
