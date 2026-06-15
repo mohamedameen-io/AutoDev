@@ -4,6 +4,60 @@ All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-06-15
+
+### Added
+
+- **Intake & Clarification phase (ADR-0045).** A new on-by-default phase at the front of the
+  plan pipeline (after exploration/domain-expert, before framing) that *resolves*
+  under-specified specs instead of rejecting them: it **assesses** gaps (the upgraded
+  `spec_validator.assess` → `SpecGaps`), **gathers** cited facts from the repo (reusing the
+  explorer evidence), referenced GitHub issues/PRs (`gh` / `WebFetch`), Jira (MCP), and prior
+  sessions, **enriches** the spec with inline provenance, asks ≤4 **constraint-only**
+  clarifying questions (never solution strategies — the ADR-0044 boundary), then **locks** the
+  enriched spec and threads it downstream. Headless-first: `on_unanswered=assume_defaults`
+  applies recommended answers so CI/cron never hangs. Fail-safe (degrades to the raw intent,
+  never blocks planning) and deterministic-on-resume (re-reads `plan-intake` evidence, zero
+  extra LLM calls). New `autodev intake` subcommand + `autodev plan --no-intake` /
+  `--assume-defaults`. Kill-switch: `intake.enabled=false` or `AUTODEV_INTAKE_DISABLED=1`.
+- **Diagnosis phase (ADR-0046).** A new on-by-default, bug-gated phase (after intake, before
+  framing) that **reproduces the bug before planning the fix**, adapted from Matt Pocock's
+  `diagnose` discipline: it builds a **sandbox-ordered feedback loop** (failing-test →
+  replay-trace → throwaway-harness → … → cli-snapshot; live methods become a *delivered
+  artifact*, never the autonomous loop), reproduces the captured symptom, emits 3–5 ranked
+  falsifiable hypotheses, confirms a root cause, and produces a **seam verdict** that feeds
+  framing as an additive structural signal (`no_correct_seam` biases toward a design-altitude
+  classification without overriding the classifier). Honest `loop_fidelity` (never reports
+  `live` on a network-less run). Two new QA gates wire into execute: a **reproduce-gate** (the
+  persisted loop must fail pre-fix and pass post-fix) and a **debug-tag gate** (blocks leftover
+  `[DEBUG-...]` instrumentation). `developer` / `test_engineer` now write the failing
+  regression test before the fix. Fail-safe + deterministic-on-resume. Kill-switch:
+  `diagnosis.enabled=false` or `AUTODEV_DIAGNOSIS_DISABLED=1`.
+
+### Fixed
+
+- **Reviewer turn-exhaustion no longer discards a correct developer diff.** When the reviewer
+  agent itself ran out of turns, its truncated output parsed as `MALFORMED` and was routed as a
+  developer discard+retry — looping until the task was blocked even though the diff was correct.
+  The caller now disambiguates reviewer turn-exhaustion (infra) from a genuinely malformed diff
+  (developer): it retries the reviewer with an escalated budget and, if it still exhausts,
+  **soft-passes** the review and accepts the diff (stamped on the review evidence). Reviewer
+  base `max_turns` raised 5 → 8.
+- **Plan task dependencies are now emitted and inferred.** The architect prompt now REQUIRES
+  `Depends:` edges for tasks that consume another task's output, and a post-parse
+  dependency-inference pass adds an implicit dependency when a later same-phase task's files
+  overlap a file an earlier task creates (the Run-3 parallel-worktree incoherence: task 1.1
+  creates a serializer, 1.2 routes through it, no dependency). A plan-gate warning fires on
+  unordered same-phase file sharers; the scheduler already serializes on `depends_on`.
+- **Failed 3-way merges no longer corrupt the main tree.** On a 3-way apply failure the
+  conflict-escalation path now calls `WorktreeManager.abort_failed_apply` (`git merge --abort`,
+  else `git reset --hard` + scoped `git clean`) to guarantee a clean tree before marking the
+  task blocked, so conflict markers / partial applies can't poison subsequent tasks.
+- **Text-only tournament roles can't exhaust their budget on a stray read.** `critic_t` and
+  `synthesizer` (which review inlined content) no longer receive the `Read` tool, so a single
+  speculative read can't trip `error_max_turns` and kill a tournament branch; their turn
+  budgets were also raised to 6.
+
 ## [0.40.0] - 2026-06-14
 
 ### Added

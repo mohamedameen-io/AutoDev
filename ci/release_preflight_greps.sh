@@ -152,6 +152,40 @@ preflight_v040() {
   check "v0.40 judge prompt"          src/agents/prompts/altitude_judge.md  "RANKING:"
 }
 
+preflight_v041() {
+  # A1 — reviewer turn-exhaustion soft-pass (not a developer discard)
+  check "v0.41 A1 reviewer infra"     src/orchestrator/execute_phase.py            "_reviewer_exhausted_turns"
+  check "v0.41 A1 softpass marker"    src/orchestrator/execute_phase.py            "reviewer_infra_softpass"
+  # A2 — depends_on emission + inference + plan-gate warning
+  check "v0.41 A2 inference"          src/orchestrator/dependency_inference.py     "def infer_plan_dependencies"
+  check "v0.41 A2 dag warning"        src/orchestrator/dag.py                      "def warn_unordered_file_sharers"
+  check "v0.41 A2 architect rule"     src/agents/prompts/architect.md              "TASK DEPENDENCIES"
+  # A3 — merge-rollback on failed 3-way
+  check "v0.41 A3 abort helper"       src/orchestrator/worktree.py                 "def abort_failed_apply"
+  # A4 — text-only tournament roles drop Read
+  check "v0.41 A4 no-tool roles"      src/tournament/llm.py                        "_TEXT_ONLY_NO_TOOL_ROLES"
+  # Intake phase (ADR-0045)
+  check "v0.41 intake phase"          src/orchestrator/intake_phase.py             "async def run_intake_phase"
+  check "v0.41 intake gather"         src/orchestrator/intake_sources/__init__.py  "async def gather_facts"
+  check "v0.41 intake assess"         src/orchestrator/spec_validator.py           "def assess"
+  check "v0.41 intake config"         src/config/schema.py                         "class IntakePhaseConfig"
+  check "v0.41 intake evidence"       src/state/schemas.py                         "class IntakeEvidence"
+  check "v0.41 intake ledger op"      src/state/ledger.py                          "spec_locked"
+  check "v0.41 intake enricher"       src/agents/prompts/intake_enricher.md        "INTAKE ENRICHER"
+  check "v0.41 intake clarifier"      src/agents/prompts/intake_clarifier.md       "CONSTRAINTS, NOT SOLUTIONS"
+  check "v0.41 intake call site"      src/orchestrator/plan_phase.py               "run_intake_phase"
+  # Diagnosis phase (ADR-0046)
+  check "v0.41 diagnosis phase"       src/orchestrator/diagnosis_phase.py          "async def run_diagnosis_phase"
+  check "v0.41 diagnosis prompt"      src/agents/prompts/diagnostician.md          "SANDBOX"
+  check "v0.41 diagnosis config"      src/config/schema.py                         "class DiagnosisPhaseConfig"
+  check "v0.41 diagnosis evidence"    src/state/schemas.py                         "class DiagnosisEvidence"
+  check "v0.41 diagnosis ledger op"   src/state/ledger.py                          "seam_finding"
+  check "v0.41 reproduce gate"        src/qa/reproduce_gate.py                     "async def run_reproduce_gate"
+  check "v0.41 debug-tag gate"        src/qa/debug_tag_gate.py                     "async def run_debug_tag_gate"
+  check "v0.41 diagnosis call site"   src/orchestrator/plan_phase.py               "run_diagnosis_phase"
+  check "v0.41 framing diag signal"   src/orchestrator/framing_phase.py            "diagnosis_signals"
+}
+
 case "$target" in
   v0.32) preflight_v032 ;;
   v0.33) preflight_v033 ;;
@@ -162,9 +196,10 @@ case "$target" in
   v0.38) preflight_v038 ;;
   v0.39) preflight_v039 ;;
   v0.40) preflight_v040 ;;
-  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ;;
+  v0.41) preflight_v041 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ; preflight_v041 ;;
   *)
-    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | all)" >&2
+    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | v0.41 | all)" >&2
     exit 2
     ;;
 esac

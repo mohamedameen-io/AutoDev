@@ -389,6 +389,8 @@ autodev/                          # project root
 | [ADR-010](../src/design_decision/adr-010-conservative-tiebreak-in-tournaments.md) | Conservative Tiebreak in Tournaments |
 | [0043](decisions/0043-huge-repo-mode.md) | Huge-Repo Mode (`worktree_huge_repo_mode` + cascading defaults) |
 | [0044](decisions/0044-framing-altitude-phase.md) | Framing/Altitude Phase for Autonomous Patch-vs-Architecture Decisions (Proposed) |
+| [0045](decisions/0045-intake-clarification-phase.md) | Intake & Clarification Phase: gather, enrich, and clarify under-specified specs before autonomous planning (Accepted) |
+| [0046](decisions/0046-diagnosis-phase-reproduce-first.md) | Diagnosis Phase: a reproduce-first bug-fix workflow (feedback loop before plan), adapted from Matt Pocock's `diagnose` skill (Accepted) |
 
 ### Reference Documents (`docs/design_documentation/`)
 
