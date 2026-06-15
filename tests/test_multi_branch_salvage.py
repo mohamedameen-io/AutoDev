@@ -61,6 +61,11 @@ def _make_orch(tmp_path: Path) -> Orchestrator:
     cfg.tournaments.plan.num_branches = 3  # multi-branch
     cfg.tournaments.impl.enabled = False
     cfg.tournaments.auto_disable_for_models = []
+    # v0.41.0: these tests pre-seed incumbents under the raw-intent spec_hash.
+    # Intake (on by default) would lock an enriched spec and rebind spec_hash,
+    # moving the tournament dir away from the seeded one. Salvage is tested in
+    # isolation here, so intake is scoped off (phase-presence shift, not a regression).
+    cfg.intake.enabled = False
     registry = build_registry(cfg)
     adapter = StubAdapter(
         {

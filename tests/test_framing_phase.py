@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -780,3 +781,113 @@ def test_hypothesis_is_a_trim_word_boundaries() -> None:
     # substring false-positives must NOT fire
     assert not _hypothesis_is_a_trim("Error executing tooling task")  # cut in exeCUTing
     assert not _hypothesis_is_a_trim("add retry with backoff")
+
+
+# --- ADR-0046: additive diagnosis biasing ----------------------------------
+
+
+@dataclass
+class _StubDiagnosis:
+    """Duck-typed DiagnosisOutcome stand-in (matches the attrs framing reads)."""
+
+    seam: str = "unknown"
+    confirmed_cause: str | None = None
+    no_correct_seam: bool = False
+    reason: str = "ok"
+
+    @property
+    def ran(self) -> bool:
+        return self.reason not in ("disabled", "not_bug_fix")
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_seam_none_adds_signal_and_enables_design(
+    tmp_path: Path,
+) -> None:
+    """seam=='none' appends ``diagnosis_no_correct_seam`` to signals_fired AND
+    sets ``structural_fired`` — letting the conservatism gate ALLOW a design
+    classification the classifier ALSO agrees with (require_structural_signal)."""
+    _bootstrap_repo(tmp_path)
+    adapter = StubAdapter(
+        {
+            "framing": ok(_framing_text("realized_design_failure", 0.95, "none")),
+            "altitude_judge": ok("RANKING: separate-planes"),
+        }
+    )
+    orch = _make_orch(tmp_path, adapter)
+    # The classifier deliberately reports NO structural signal of its own, so
+    # without diagnosis the gate would refuse (require_structural_signal). The
+    # diagnosis no-correct-seam signal is what flips structural_fired.
+    dx = _StubDiagnosis(seam="none", confirmed_cause="no seam owns this")
+    await run_framing_phase(
+        orch, "x", "", "", None, "abc123", diagnosis_signals=dx
+    )
+    ev = await read_evidence(tmp_path, "plan-framing", "framing")
+    assert isinstance(ev, FramingEvidence)
+    assert "diagnosis_no_correct_seam" in ev.signals_fired
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_seam_correct_adds_informational_signal(
+    tmp_path: Path,
+) -> None:
+    """seam=='correct' adds ``diagnosis_correct_seam`` (informational); the
+    conservative local_defect default is unchanged."""
+    _bootstrap_repo(tmp_path)
+    adapter = StubAdapter({"framing": ok(_framing_text("local_defect", 0.1))})
+    orch = _make_orch(tmp_path, adapter)
+    dx = _StubDiagnosis(seam="correct", confirmed_cause="bug in foo()")
+    decision = await run_framing_phase(
+        orch, "x", "", "", None, "abc123", diagnosis_signals=dx
+    )
+    ev = await read_evidence(tmp_path, "plan-framing", "framing")
+    assert isinstance(ev, FramingEvidence)
+    assert "diagnosis_correct_seam" in ev.signals_fired
+    assert "diagnosis_no_correct_seam" not in ev.signals_fired
+    assert decision is not None
+    assert decision.classification == "local_defect"
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_no_correct_seam_flag_also_fires(tmp_path: Path) -> None:
+    """The ``no_correct_seam`` boolean (not just seam=='none') also triggers the
+    structural signal — e.g. seam=='shallow' with no_correct_seam=True."""
+    _bootstrap_repo(tmp_path)
+    adapter = StubAdapter({"framing": ok(_framing_text("local_defect", 0.1))})
+    orch = _make_orch(tmp_path, adapter)
+    dx = _StubDiagnosis(seam="shallow", no_correct_seam=True)
+    await run_framing_phase(
+        orch, "x", "", "", None, "abc123", diagnosis_signals=dx
+    )
+    ev = await read_evidence(tmp_path, "plan-framing", "framing")
+    assert isinstance(ev, FramingEvidence)
+    assert "diagnosis_no_correct_seam" in ev.signals_fired
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_none_is_noop_backcompat(tmp_path: Path) -> None:
+    """diagnosis_signals=None (the default) is a pure no-op — no diagnosis
+    signals appear and the call behaves exactly as pre-ADR-0046."""
+    _bootstrap_repo(tmp_path)
+    adapter = StubAdapter({"framing": ok(_framing_text("local_defect", 0.1))})
+    orch = _make_orch(tmp_path, adapter)
+    await run_framing_phase(orch, "x", "", "", None, "abc123")
+    ev = await read_evidence(tmp_path, "plan-framing", "framing")
+    assert isinstance(ev, FramingEvidence)
+    assert not any("diagnosis" in s for s in ev.signals_fired)
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_not_ran_is_noop(tmp_path: Path) -> None:
+    """A diagnosis outcome that did NOT run (reason='not_bug_fix' → .ran False)
+    adds no signal even when seam=='none'."""
+    _bootstrap_repo(tmp_path)
+    adapter = StubAdapter({"framing": ok(_framing_text("local_defect", 0.1))})
+    orch = _make_orch(tmp_path, adapter)
+    dx = _StubDiagnosis(seam="none", reason="not_bug_fix")
+    await run_framing_phase(
+        orch, "x", "", "", None, "abc123", diagnosis_signals=dx
+    )
+    ev = await read_evidence(tmp_path, "plan-framing", "framing")
+    assert isinstance(ev, FramingEvidence)
+    assert not any("diagnosis" in s for s in ev.signals_fired)

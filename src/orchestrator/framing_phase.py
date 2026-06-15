@@ -443,12 +443,23 @@ async def run_framing_phase(
     domain_expert_findings: str,
     candidate_digest: CandidateDigest | None,
     spec_hash: str,
+    diagnosis_signals: object | None = None,
 ) -> AltitudeDecision | None:
     """Classify the defect and select an altitude (ADR-0044).
 
     Returns ``None`` when disabled (kill-switch / config). Otherwise returns an
     :class:`AltitudeDecision`. Deterministic-on-resume: re-reads ``plan-framing``
     evidence FIRST and skips the classifier with zero LLM calls.
+
+    ADR-0046 integration: ``diagnosis_signals`` is an optional
+    :class:`orchestrator.diagnosis_phase.DiagnosisOutcome` (typed loosely as
+    ``object | None`` to avoid a circular import; duck-typed below). When the
+    diagnosis phase ran and found NO correct seam, an additive structural
+    signal (``diagnosis_no_correct_seam``) is appended and ``structural_fired``
+    is set — this lets the conservatism gate ALLOW a design classification when
+    the classifier ALSO says ``realized_design_failure``; it never FORCES one.
+    A ``correct`` seam adds an informational ``diagnosis_correct_seam`` signal
+    (local_defect remains the conservative default). ``None`` is a no-op.
     """
     cwd = orch.cwd
     fr_cfg = orch.cfg.framing
@@ -471,6 +482,28 @@ async def run_framing_phase(
         cwd, candidate_digest, intent
     )
 
+    # 3b. ADR-0046: additive diagnosis biasing. Duck-typed (no import of
+    # DiagnosisOutcome to keep this module import-light). Only fires when the
+    # diagnosis phase actually ran (``.ran``). This is structural-signal
+    # biasing ONLY — it never touches the classifier's own logic, the
+    # threshold, or the existing signals; the bias flows through the persisted
+    # ``signals_fired`` and (for no-correct-seam) ``structural_fired``.
+    diagnosis_summary = ""
+    if diagnosis_signals is not None and getattr(diagnosis_signals, "ran", False):
+        dx_seam = getattr(diagnosis_signals, "seam", "unknown")
+        dx_cause = getattr(diagnosis_signals, "confirmed_cause", None)
+        diagnosis_summary = f"confirmed_cause={dx_cause}; seam={dx_seam}"
+        if dx_seam == "none" or getattr(
+            diagnosis_signals, "no_correct_seam", False
+        ):
+            # No correct seam: let the conservatism gate ALLOW a design class
+            # (does NOT force it — the classifier must still agree).
+            signals_fired = signals_fired + ["diagnosis_no_correct_seam"]
+            structural_fired = True
+        elif dx_seam == "correct":
+            # Informational only — local_defect stays the conservative default.
+            signals_fired = signals_fired + ["diagnosis_correct_seam"]
+
     # 4. One conservative classifier call (specialist dispatch — never _delegate).
     raw = await _invoke_framing_role(
         orch,
@@ -483,6 +516,7 @@ async def run_framing_phase(
                 candidate_digest.render() if candidate_digest is not None else ""
             ),
             "signals_summary": _format_signals(signals_fired),
+            "diagnosis_summary": diagnosis_summary,
             "num_approaches": str(fr_cfg.num_approaches),
         },
         action="classify",

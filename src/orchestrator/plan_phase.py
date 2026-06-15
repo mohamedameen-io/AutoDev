@@ -26,8 +26,10 @@ from adapters.types import AgentInvocation, AgentResult
 from errors import AutodevError, TournamentError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
+from orchestrator.diagnosis_phase import run_diagnosis_phase
 from orchestrator.file_existence_validator import validate_files_exist
 from orchestrator.framing_phase import run_framing_phase
+from orchestrator.intake_phase import run_intake_phase
 from orchestrator.plan_parser import (
     PlanParseError,
     parse_plan_markdown,
@@ -714,6 +716,39 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         )
         await write_evidence(cwd, "plan-domain_expert", sme_ev)
 
+        # ADR-0045: intake & clarification phase — flag-guarded, fail-safe
+        # (mirrors the framing guard below). On success we REBIND the local
+        # ``intent`` to the LOCKED ENRICHED SPEC and ``spec_hash`` to its hash
+        # so EVERY downstream consumer (candidate_digest query, framing,
+        # architect ``context["spec"]``) uses the enriched spec, not the raw
+        # intent (intake design §2.3/§5.6). run_intake_phase is itself fail-safe
+        # and flag-guards internally; the outer guard avoids the read-evidence
+        # round-trip when intake is off. On degrade ``spec == raw intent`` so
+        # the rebind is harmless. Intake must NEVER block planning.
+        if orch.cfg.intake.enabled and not os.getenv("AUTODEV_INTAKE_DISABLED"):
+            try:
+                intake_outcome = await run_intake_phase(orch, intent)
+                intent = intake_outcome.spec
+                spec_hash = intake_outcome.spec_hash
+            except Exception as exc:  # noqa: BLE001 — intake must never block planning
+                logger.warning("plan_phase.intake_phase_failed", err=str(exc))
+
+        # ADR-0046: diagnosis (reproduce-first) phase — flag-guarded, fail-safe.
+        # run_diagnosis_phase internally gates on is-bug-fix + cfg.bug_only and
+        # is fail-safe, so we do NOT pre-gate; the outer guard only avoids the
+        # read-evidence round-trip when diagnosis is off. ``intent`` is now the
+        # enriched spec. Diagnosis must NEVER block planning.
+        diagnosis_outcome = None
+        if orch.cfg.diagnosis.enabled and not os.getenv(
+            "AUTODEV_DIAGNOSIS_DISABLED"
+        ):
+            try:
+                diagnosis_outcome = await run_diagnosis_phase(
+                    orch, intent, explorer_result.text[:4000]
+                )
+            except Exception as exc:  # noqa: BLE001 — diagnosis must never block planning
+                logger.warning("plan_phase.diagnosis_phase_failed", err=str(exc))
+
         # v0.25.0: query the file/symbol index for candidate paths/symbols
         # relevant to the spec text. The architect's prompt has a CANDIDATE
         # FILES section instructing it to prefer these paths over inventing
@@ -755,6 +790,7 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                     domain_expert_findings=domain_expert_result.text[:4000],
                     candidate_digest=candidate_digest_obj,
                     spec_hash=spec_hash,
+                    diagnosis_signals=diagnosis_outcome,
                 )
             except Exception as exc:  # noqa: BLE001 — framing must never block planning
                 logger.warning("plan_phase.framing_phase_failed", err=str(exc))
@@ -793,6 +829,19 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                     framing_decision.classification
                     if framing_decision is not None
                     else "local_defect"
+                ),
+                # ADR-0046: additive diagnosis context (harmless if architect.md
+                # does not consume them yet). Empty / "unknown" when diagnosis
+                # did not run (disabled, not-a-bug, or degraded).
+                "diagnosed_cause": (
+                    (diagnosis_outcome.confirmed_cause or "")
+                    if diagnosis_outcome is not None and diagnosis_outcome.ran
+                    else ""
+                ),
+                "diagnosis_seam": (
+                    diagnosis_outcome.seam
+                    if diagnosis_outcome is not None and diagnosis_outcome.ran
+                    else "unknown"
                 ),
             },
         )

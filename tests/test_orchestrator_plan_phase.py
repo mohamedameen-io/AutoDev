@@ -233,6 +233,10 @@ async def test_plan_phase_persists_via_ledger(tmp_path: Path) -> None:
         }
     )
     orch = _make_orch(tmp_path, adapter)
+    # ADR-0045: intake (on by default) would lock an enriched spec from the
+    # stub enricher, overwriting spec.md. This test asserts the RAW intent is
+    # persisted, so keep intake out of scope (its own suite covers enrichment).
+    orch.cfg.intake.enabled = False
     await orch.plan("Add subtract")
     from state.plan_manager import PlanManager
 
@@ -297,6 +301,11 @@ async def test_plan_phase_falls_back_to_latest_incumbent_on_tournament_error(
     cfg.tournaments.plan.enabled = True
     cfg.tournaments.plan.num_branches = 1  # legacy single-branch path
     cfg.tournaments.impl.enabled = False
+    # ADR-0045: intake (on by default) rebinds ``spec_hash`` to the enriched
+    # spec's hash, which would move the tournament dir away from the
+    # raw-intent hash this test pre-seeds. Keep intake out of scope — this
+    # test exercises tournament-error salvage, not enrichment.
+    cfg.intake.enabled = False
     registry = build_registry(cfg)
     orch = Orchestrator(
         cwd=tmp_path,
