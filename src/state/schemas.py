@@ -542,6 +542,17 @@ class TestEvidence(_BaseEvidence):
         ]
         | None
     ) = None
+    # v0.41.0 (P1-F): bounded soft-pass marker. Set ``True`` when the test
+    # step advanced the task despite an uncapturable result (``capture_failed``
+    # that genuinely produced no captured failures) after the bounded retry
+    # budget was spent — see :func:`orchestrator.execute_phase`. Distinct from
+    # the ``treat_unrunnable_tests_as_no_tests`` soft-pass (which routes through
+    # the ``no_tests_found`` branch and leaves this ``None``). A real RED test
+    # (captured ``failed > 0``) is NEVER soft-passed, so this stays ``None``
+    # for genuine failures. Optional with a ``None`` default for backward
+    # compatibility with evidence files written before this field existed.
+    soft_passed: bool | None = None
+    soft_pass_reason: str | None = None
 
 
 class ExploreEvidence(_BaseEvidence):
@@ -579,6 +590,11 @@ class FramingEvidence(_BaseEvidence):
     approaches: list[SolutionApproach] = Field(default_factory=list)
     chosen_approach_name: str | None = None
     altitude_rationale: str | None = None
+    # v0.40.0: preserve the framing classifier's raw response text so parse
+    # failures (e.g. shattered ``approaches`` blocks degrading to ``parse_degraded``)
+    # are diagnosable after the fact. Mirrors ``CoderEvidence.raw_response``;
+    # optional for backward compat with evidence files written before this field.
+    raw_response: str | None = None
 
 
 class CriticEvidence(_BaseEvidence):

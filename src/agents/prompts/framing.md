@@ -76,11 +76,15 @@ least one `local_patch` and at least one `design_fix`. Approaches are INTERNAL
 artifacts you are generating for the altitude judge to score; do NOT present them to
 a user and do NOT recommend that someone pick one.
 
+Set `eliminates_failure_class` to `true` ONLY if the approach kills the failure
+class, not a single instance of it. Do NOT append an inline `#` comment to that
+line (or any field line) — write only the value.
+
 ```approaches
 - name: <unique slug>
   altitude: <local_patch | component_refactor | design_fix>
   summary: <one paragraph>
-  eliminates_failure_class: <true | false>   # true ONLY if it kills the class, not one instance
+  eliminates_failure_class: <true | false>
   primary_tradeoff: <text>
   primary_risk: <text>
   integration_surface: [<file_or_contract>, ...]

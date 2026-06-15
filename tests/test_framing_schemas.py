@@ -69,6 +69,30 @@ def test_framing_evidence_confidence_bounds() -> None:
         _framing_ev(confidence=-0.1)
 
 
+def test_framing_evidence_raw_response_round_trips() -> None:
+    """v0.40.0: the raw classifier text is persisted so parse failures are diagnosable."""
+    raw = "```framing\nCLASSIFICATION: local_defect\n```\nsome trailing prose"
+    ev = _framing_ev(classification="local_defect", confidence=0.0, raw_response=raw)
+    assert ev.raw_response == raw
+    dumped = ev.model_dump(mode="json")
+    assert dumped["raw_response"] == raw
+    ev2 = FramingEvidence.model_validate(dumped)
+    assert ev2.raw_response == raw
+
+
+def test_framing_evidence_raw_response_defaults_none_backcompat() -> None:
+    """Backward compat: evidence files written before raw_response existed still load."""
+    payload = {
+        "kind": "framing",
+        "task_id": "plan-framing",
+        "classification": "local_defect",
+        "confidence": 0.0,
+        "hypothesis_challenged": "h",
+    }
+    ev = FramingEvidence.model_validate(payload)
+    assert ev.raw_response is None
+
+
 def test_framing_evidence_discriminator_routing() -> None:
     payload = {
         "kind": "framing",

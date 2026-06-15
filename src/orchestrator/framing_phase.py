@@ -90,7 +90,23 @@ def _local_patch_approach() -> SolutionApproach:
     )
 
 
-_APPROACH_FIELD_RE = re.compile(r"^\s*([a-z_]+):\s*(.*)$")
+# Tolerant of an optional leading ``-`` bullet (flat one-dash-per-field and nested
+# sub-bullet renderings) and optional ``**`` bold markers around the key, so all of
+# ``foo:`` / ``- foo:`` / ``**foo**:`` / ``- **foo**:`` parse to the same ``(key, value)``.
+_APPROACH_FIELD_RE = re.compile(r"^\s*-?\s*\*{0,2}([a-z_]+)\*{0,2}:\s*(.*)$")
+
+
+def _strip_inline_comment(value: str) -> str:
+    """Strip a trailing `` # ...`` comment from a field value.
+
+    The prompt example renders e.g. ``eliminates_failure_class: <true|false>  # ...``,
+    so a model that echoes the inline comment would otherwise make ``true`` parse as
+    the literal ``"true # ..."``. Only a ``#`` that follows whitespace (or starts the
+    value) is treated as a comment, so ``#`` inside a value (rare, but e.g. an anchor
+    like ``foo#bar``) is preserved.
+    """
+    m = re.search(r"(?:^|\s)#", value)
+    return value[: m.start()].rstrip() if m else value
 
 
 def _extract_fenced_block(text: str, lang: str) -> str | None:
@@ -98,15 +114,30 @@ def _extract_fenced_block(text: str, lang: str) -> str | None:
     return m.group(1) if m else None
 
 
+# A field line, with leading whitespace + optional ``-`` bullet + optional ``**`` bold
+# already stripped, that starts a NEW approach. Anchored on the ``name:`` key so
+# segmentation is driven by the record boundary — NOT by every ``-`` (which shatters
+# indented sub-bullets and flat one-dash-per-field renderings into one fragment each).
+_APPROACH_START_RE = re.compile(r"^\s*-?\s*\*{0,2}name\*{0,2}:\s*", re.IGNORECASE)
+
+
 def _split_approach_items(block: str) -> list[str]:
-    """Split a YAML-ish list into per-approach chunks on ``- `` boundaries."""
+    """Split a YAML-ish approaches list into per-approach chunks.
+
+    Segments on the ``name:`` field (the record boundary) rather than on ``- ``, so
+    every dash/indent/bold rendering of the same approaches collapses to one chunk
+    each: canonical two-space continuations, nested ``  - field:`` sub-bullets, flat
+    one-dash-per-field, and ``**bold**`` keys. Lines before the first ``name:`` (e.g.
+    a stray header) are ignored. Field-regex tolerance (see ``_APPROACH_FIELD_RE``)
+    means a chunk's raw lines parse regardless of their bullet/bold decoration.
+    """
     items: list[str] = []
     current: list[str] | None = None
     for line in block.splitlines():
-        if re.match(r"^\s*-\s+", line):
+        if _APPROACH_START_RE.match(line):
             if current is not None:
                 items.append("\n".join(current))
-            current = [re.sub(r"^\s*-\s+", "", line)]
+            current = [line]
         elif current is not None:
             current.append(line)
     if current is not None:
@@ -130,7 +161,11 @@ def _parse_approach_fields(item: str) -> dict[str, object]:
         m = _APPROACH_FIELD_RE.match(line)
         if m is None:
             continue
-        key, value = m.group(1), m.group(2).strip()
+        key = m.group(1)
+        # Strip a trailing `` # ...`` comment from EVERY value before interpreting it
+        # — the prompt example renders the boolean with an inline comment, so an
+        # echoed comment must not poison the truthy check (or any other field).
+        value = _strip_inline_comment(m.group(2).strip()).strip()
         if key == "eliminates_failure_class":
             fields[key] = value.lower() in ("true", "yes", "1")
         elif key == "integration_surface":
@@ -508,6 +543,8 @@ async def run_framing_phase(
         approaches=approaches,
         chosen_approach_name=chosen.name,
         altitude_rationale=rationale,
+        # Preserve the classifier's raw text so a later parse_degraded is diagnosable.
+        raw_response=raw,
     )
     await write_evidence(cwd, _EVIDENCE_TASK_ID, ev)
     logger.info(

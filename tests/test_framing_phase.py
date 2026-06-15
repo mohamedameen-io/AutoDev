@@ -291,6 +291,186 @@ def test_parse_approaches_valid_two() -> None:
     assert {a.altitude for a in approaches} == {"local_patch", "design_fix"}
 
 
+# --- v0.40.0: robust approach segmentation across dash/indent/bold renderings ----
+#
+# The SAME two approaches (one local_patch, one design_fix) rendered four ways. Each
+# must parse to TWO complete SolutionApproach objects with all required fields — the
+# parser segments on the ``name:`` record boundary, not on every ``-`` (which used to
+# shatter sub-bullets / flat fields into one fragment each -> all rejected ->
+# parse_degraded). Variant (a) is the canonical format already covered above; it is
+# repeated here in the matrix as an explicit no-regression anchor.
+
+# (a) canonical: ``- name:`` then two-space-indented continuation lines.
+_VARIANT_A = (
+    "- name: trim-obs\n"
+    "  altitude: local_patch\n"
+    "  summary: trim the observation\n"
+    "  eliminates_failure_class: false\n"
+    "  primary_tradeoff: fast but only bounds\n"
+    "  primary_risk: recurs at the seam\n"
+    "  integration_surface: [src/foo.py]\n"
+    "  est_blast_radius: single function\n"
+    "- name: split-planes\n"
+    "  altitude: design_fix\n"
+    "  summary: separate control and data planes\n"
+    "  eliminates_failure_class: true\n"
+    "  primary_tradeoff: larger diff now\n"
+    "  primary_risk: cross-module contract\n"
+    "  integration_surface: [src/core.py]\n"
+    "  est_blast_radius: cross-module contract"
+)
+
+# (b) nested sub-bullets: ``- name:`` then ``  - field:`` indented dashes.
+_VARIANT_B = (
+    "- name: trim-obs\n"
+    "  - altitude: local_patch\n"
+    "  - summary: trim the observation\n"
+    "  - eliminates_failure_class: false\n"
+    "  - primary_tradeoff: fast but only bounds\n"
+    "  - primary_risk: recurs at the seam\n"
+    "  - integration_surface: [src/foo.py]\n"
+    "  - est_blast_radius: single function\n"
+    "- name: split-planes\n"
+    "  - altitude: design_fix\n"
+    "  - summary: separate control and data planes\n"
+    "  - eliminates_failure_class: true\n"
+    "  - primary_tradeoff: larger diff now\n"
+    "  - primary_risk: cross-module contract\n"
+    "  - integration_surface: [src/core.py]\n"
+    "  - est_blast_radius: cross-module contract"
+)
+
+# (c) flat one-dash-per-field: every field is its own top-level ``- field:``.
+_VARIANT_C = (
+    "- name: trim-obs\n"
+    "- altitude: local_patch\n"
+    "- summary: trim the observation\n"
+    "- eliminates_failure_class: false\n"
+    "- primary_tradeoff: fast but only bounds\n"
+    "- primary_risk: recurs at the seam\n"
+    "- integration_surface: [src/foo.py]\n"
+    "- est_blast_radius: single function\n"
+    "- name: split-planes\n"
+    "- altitude: design_fix\n"
+    "- summary: separate control and data planes\n"
+    "- eliminates_failure_class: true\n"
+    "- primary_tradeoff: larger diff now\n"
+    "- primary_risk: cross-module contract\n"
+    "- integration_surface: [src/core.py]\n"
+    "- est_blast_radius: cross-module contract"
+)
+
+# (d) bold keys: ``- **name**:`` / ``  **field**:``.
+_VARIANT_D = (
+    "- **name**: trim-obs\n"
+    "  **altitude**: local_patch\n"
+    "  **summary**: trim the observation\n"
+    "  **eliminates_failure_class**: false\n"
+    "  **primary_tradeoff**: fast but only bounds\n"
+    "  **primary_risk**: recurs at the seam\n"
+    "  **integration_surface**: [src/foo.py]\n"
+    "  **est_blast_radius**: single function\n"
+    "- **name**: split-planes\n"
+    "  **altitude**: design_fix\n"
+    "  **summary**: separate control and data planes\n"
+    "  **eliminates_failure_class**: true\n"
+    "  **primary_tradeoff**: larger diff now\n"
+    "  **primary_risk**: cross-module contract\n"
+    "  **integration_surface**: [src/core.py]\n"
+    "  **est_blast_radius**: cross-module contract"
+)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [_VARIANT_A, _VARIANT_B, _VARIANT_C, _VARIANT_D],
+    ids=["a_canonical", "b_nested_subbullets", "c_flat_one_dash", "d_bold_keys"],
+)
+def test_parse_approaches_robust_renderings(variant: str) -> None:
+    from orchestrator.framing_phase import parse_approaches
+
+    approaches, failures = parse_approaches(_approaches_text(variant))
+    assert failures == [], f"unexpected parse failures: {failures}"
+    assert len(approaches) == 2
+    # both records fully reconstructed
+    assert {a.name for a in approaches} == {"trim-obs", "split-planes"}
+    assert {a.altitude for a in approaches} == {"local_patch", "design_fix"}
+    by_name = {a.name: a for a in approaches}
+    # required fields populated (not blank) on BOTH approaches
+    for a in approaches:
+        assert a.summary and a.primary_tradeoff and a.primary_risk
+        assert a.est_blast_radius
+    # the design approach's boolean parsed True; the local one False
+    assert by_name["split-planes"].eliminates_failure_class is True
+    assert by_name["trim-obs"].eliminates_failure_class is False
+    # list field parsed on both
+    assert by_name["trim-obs"].integration_surface == ["src/foo.py"]
+    assert by_name["split-planes"].integration_surface == ["src/core.py"]
+
+
+def test_parse_approaches_eliminates_field_inline_comment_true() -> None:
+    """An echoed inline ``# ...`` comment on the boolean must not poison the truthy
+    check — ``true # comment`` parses True (regression: it parsed False)."""
+    from orchestrator.framing_phase import parse_approaches
+
+    item = (
+        "- name: split-planes\n"
+        "  altitude: design_fix\n"
+        "  summary: separate control and data planes\n"
+        "  eliminates_failure_class: true   # true ONLY if it kills the class\n"
+        "  primary_tradeoff: larger diff now\n"
+        "  primary_risk: cross-module contract\n"
+        "  integration_surface: [src/core.py]\n"
+        "  est_blast_radius: cross-module contract"
+    )
+    approaches, failures = parse_approaches(_approaches_text(item))
+    assert failures == []
+    assert len(approaches) == 1
+    assert approaches[0].eliminates_failure_class is True
+    # the comment must not have leaked into a value field either
+    assert "#" not in approaches[0].summary
+
+
+def test_parse_approach_fields_strips_inline_comment_on_all_values() -> None:
+    """Inline-comment stripping applies to every value, not just the boolean."""
+    from orchestrator.framing_phase import _parse_approach_fields
+
+    fields = _parse_approach_fields(
+        "summary: separate planes  # rationale here\n"
+        "est_blast_radius: component   # not single function"
+    )
+    assert fields["summary"] == "separate planes"
+    assert fields["est_blast_radius"] == "component"
+
+
+def test_split_approach_items_before_after_fragmentation_repro() -> None:
+    """Concrete repro of the v0.40.0 failure: a 2-approach design block whose fields
+    are indented sub-bullets (variant b).
+
+    BEFORE the fix, segmentation on every ``- `` produced 16 fragments (2 ``name:``
+    lines + 7 ``  - field:`` sub-bullets per approach * 2 approaches), nearly all of
+    which failed SolutionApproach validation -> ``parse_degraded``. AFTER, the
+    ``name:``-anchored segmentation yields exactly 2 chunks -> 2 valid approaches."""
+    from orchestrator.framing_phase import _split_approach_items, parse_approaches
+
+    block = _VARIANT_B
+    # AFTER: name-anchored segmentation -> exactly 2 chunks.
+    chunks = _split_approach_items(block)
+    assert len(chunks) == 2
+
+    # The old dash-anchored rule would have started a new item on EVERY ``^\s*-\s+``
+    # line (the 2 names AND each ``  - field:`` sub-bullet). Count those to show the
+    # fragmentation the fix eliminates.
+    old_style_fragments = sum(1 for ln in block.splitlines() if re.match(r"^\s*-\s+", ln))
+    assert old_style_fragments == 16  # 2 names + 7 sub-bullets * 2 approaches
+    assert old_style_fragments > len(chunks)
+
+    # AFTER: both approaches parse cleanly, zero failures.
+    approaches, failures = parse_approaches(_approaches_text(block))
+    assert len(approaches) == 2
+    assert failures == []
+
+
 def test_parse_approaches_missing_eliminates_field() -> None:
     from orchestrator.framing_phase import parse_approaches
 
