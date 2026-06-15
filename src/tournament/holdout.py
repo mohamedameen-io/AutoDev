@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from qa.env import resolve_tool
+
 logger = logging.getLogger(__name__)
 
 
@@ -162,7 +164,11 @@ async def run_holdout_tests(
             failure_summary="no baseline tests survive at HEAD",
         )
 
-    args = ["python", "-m", "pytest", "-q", "--no-header", *sorted(extant)]
+    # Run the target repo's own pytest (its .venv/bin/pytest → uv run → poetry
+    # run → bare pytest) rather than a bare `python -m pytest` that may resolve
+    # to an interpreter without pytest installed.
+    base = resolve_tool(cwd, "pytest")
+    args = [*base, "-q", "--no-header", *sorted(extant)]
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
