@@ -50,6 +50,7 @@ async def test_code_size_gate_dispatched_when_enabled(
 ) -> None:
     """When ``cfg.qa_gates.code_size`` is True, the gate runs, surfaces a
     warn on the verbose fixture, and the dispatcher returns None (no halt)."""
+    pytest.importorskip("radon")  # warn severity depends on radon loc metrics
     from orchestrator import execute_phase as ep
 
     cwd, diff = repo_with_verbose_diff

@@ -102,6 +102,7 @@ def test_range_with_python_commits_metrics_match(
     tmp_git_repo: Path, tmp_path: Path
 ) -> None:
     """(b) Two commits each touching a known Python file with known LOC."""
+    pytest.importorskip("radon")  # loc_executable assertions need radon
     base = _head_sha(tmp_git_repo)
     # Commit 1: 3 executable LOC (one function, two statements).
     sha1 = _make_commit(

@@ -11,7 +11,7 @@
 .PHONY: test test-stability mutate-parser
 
 test:
-	uv run pytest tests/ -v
+	uv run --all-extras pytest tests/ -v
 
 test-stability:
 	uv run pytest -q \

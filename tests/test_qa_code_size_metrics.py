@@ -25,6 +25,11 @@ from qa.code_size_metrics import (
     compute_metrics_for_file,
 )
 
+# The metrics below (loc_executable, defensive_ratio, ...) are radon-backed and
+# only meaningful when the optional `code-size` extra is installed. Skip cleanly
+# when radon is absent rather than failing on degraded (all-zero) metrics.
+pytest.importorskip("radon")
+
 
 _FIXTURES_DIR = Path(__file__).parent / "fixtures" / "anti_bloat"
 

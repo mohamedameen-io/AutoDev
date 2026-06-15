@@ -19,6 +19,10 @@ import pytest
 
 from qa.code_size import run_code_size
 
+# warn-severity behavior depends on radon-backed metrics (the optional
+# `code-size` extra). Skip cleanly when radon isn't installed.
+pytest.importorskip("radon")
+
 
 _FIXTURES_DIR = Path(__file__).parent / "fixtures" / "anti_bloat"
 
