@@ -9,6 +9,7 @@ import pytest
 
 from errors import TournamentError
 from tournament.llm import (
+    _TEXT_ONLY_NO_TOOL_ROLES,
     AdapterLLMClient,
     ExpensiveTransientError,
     StubLLMClient,
@@ -163,6 +164,98 @@ async def test_invocation_no_role_dicts_keeps_defaults(tmp_path: Path) -> None:
     assert adapter.calls[0].max_turns == 1
     assert adapter.calls[0].allowed_tools is None
     assert adapter.calls[0].effort is None
+
+
+# ── v0.41.0 A4: text-only roles drop Read (no error_max_turns) ────────────
+
+
+def test_text_only_no_tool_roles_set_membership() -> None:
+    """The text-only-no-tool set is exactly ``{critic_t, synthesizer}``.
+
+    architect_b is deliberately EXCLUDED — it may legitimately need Read for
+    richer revisions, so it keeps the benign ``["Read"]`` sentinel.
+    """
+    assert _TEXT_ONLY_NO_TOOL_ROLES == frozenset({"critic_t", "synthesizer"})
+    assert "architect_b" not in _TEXT_ONLY_NO_TOOL_ROLES
+    assert "judge" not in _TEXT_ONLY_NO_TOOL_ROLES
+
+
+@pytest.mark.parametrize("role", ["critic_t", "synthesizer"])
+def test_text_only_role_resolves_to_empty_tools_over_empty_sentinel(
+    tmp_path: Path, role: str
+) -> None:
+    """critic_t / synthesizer resolve to an EMPTY tool list even when the
+    override map configured ``[]`` — the empty→["Read"] sentinel is NOT
+    re-applied for these roles. With Read dropped + inline content the role
+    can never burn its only turn on a speculative read.
+    """
+    adapter = StubAdapter([_Result(text="A")])
+    client = AdapterLLMClient(
+        adapter,
+        cwd=tmp_path,
+        # Same shape the phase_review_runner builds for a text-only role.
+        role_allowed_tools={role: []},
+    )
+    # The internal resolver returns [] (not ["Read"]).
+    assert client._resolve_allowed_tools(role) == []
+
+
+@pytest.mark.parametrize("role", ["critic_t", "synthesizer"])
+def test_text_only_role_unconfigured_keeps_legacy_none(
+    tmp_path: Path, role: str
+) -> None:
+    """Back-compat: the A4 suppression fires only for CONFIGURED text-only
+    roles (the tournament runners always configure them with ``[]``). A
+    caller that never opted into per-role tool restriction — no map, or this
+    role absent — keeps the legacy ``None`` (adapter omits the flag). This
+    prevents the A4 fix from silently restricting un-opted-in callers."""
+    # No role map at all → legacy None.
+    client_none = AdapterLLMClient(StubAdapter([_Result()]), cwd=tmp_path)
+    assert client_none._resolve_allowed_tools(role) is None
+    # Map present but THIS role absent → legacy None.
+    client_other = AdapterLLMClient(
+        StubAdapter([_Result()]),
+        cwd=tmp_path,
+        role_allowed_tools={"architect_b": []},
+    )
+    assert client_other._resolve_allowed_tools(role) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["critic_t", "synthesizer"])
+async def test_text_only_invocation_has_no_read_tool(
+    tmp_path: Path, role: str
+) -> None:
+    """A critic_t / synthesizer invocation built by the client carries an
+    EMPTY ``allowed_tools`` list — Read is never granted. The call completes
+    (StubAdapter returns inline-derived text) with no error_max_turns path.
+    """
+    adapter = StubAdapter([_Result(text="REVIEW-FROM-INLINE-CONTENT")])
+    client = AdapterLLMClient(
+        adapter,
+        cwd=tmp_path,
+        role_allowed_tools={role: []},
+        role_max_turns={role: 6},
+    )
+    out = await client.call(system="s", user="inline content here", role=role)
+    assert out == "REVIEW-FROM-INLINE-CONTENT"
+    assert adapter.calls[0].role == role
+    assert adapter.calls[0].allowed_tools == []
+    assert adapter.calls[0].allowed_tools != ["Read"]
+
+
+def test_architect_b_still_gets_read_sentinel_for_empty_list(
+    tmp_path: Path,
+) -> None:
+    """Regression guard: architect_b (NOT in the text-only set) keeps the
+    legacy empty→["Read"] normalization so genuinely Read-needing roles are
+    undisturbed by the A4 fix."""
+    client = AdapterLLMClient(
+        StubAdapter([_Result()]),
+        cwd=tmp_path,
+        role_allowed_tools={"architect_b": []},
+    )
+    assert client._resolve_allowed_tools("architect_b") == ["Read"]
 
 
 # ── Step 3: per-role effort plumbing ──────────────────────────────────────

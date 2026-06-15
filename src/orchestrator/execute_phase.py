@@ -48,6 +48,8 @@ from qa import (
     run_tests,
 )
 from qa.code_size import run_code_size
+from qa.debug_tag_gate import run_debug_tag_gate
+from qa.reproduce_gate import run_reproduce_gate
 from state.paths import AUTODEV_DIR, autodev_root
 from state.schemas import (
     CoderEvidence,
@@ -1778,6 +1780,16 @@ async def _apply_with_conflict_escalation(
                         "execute_phase.conflict_3way_failed",
                         task_id=task.id,
                         err=str(exc2),
+                    )
+                    # v0.41.0 (A3): a failed 3-way apply can leave the main
+                    # working tree in a merge-in-progress or partially-applied
+                    # state (conflict markers / staged hunks). Restore a clean
+                    # tree BEFORE marking the task blocked so those artifacts
+                    # don't bleed into the next task's per-task worktree
+                    # (created at HEAD of the main repo). Best-effort and
+                    # idempotent — never masks the underlying conflict.
+                    await worktree_mgr.abort_failed_apply(
+                        targets=list(task.files)
                     )
                     await orch.plan_manager.update_task_status(
                         task.id,
@@ -4154,6 +4166,12 @@ async def _execute_one(
             #   * the empty-result dump path is still inside ``delegate``.
             review_env = _review_envelope(task, coder_ev.diff or "")
             review_result_text: str = ""
+            # v0.41.0 (A1): hold the reviewer adapter result so the MALFORMED
+            # branch below can distinguish "reviewer ran out of turns" (infra)
+            # from "developer produced a bad diff" (genuine MALFORMED). Only
+            # the non-tournament path populates this directly; the tournament
+            # path falls back to ``orch._last_adapter_subtype``.
+            review_result: AgentResult | None = None
             review_tournament_outcome: (
                 "ReviewTournamentResult | None"
             ) = None
@@ -4275,17 +4293,122 @@ async def _execute_one(
                 raw_response=review_result_text,
             )
             await write_evidence(orch.cwd, task.id, review_ev)
-            # v0.31.0 (Phase 1.3): treat MALFORMED as a machinery failure
-            # rather than a content signal. For now (intermediate
-            # behaviour deferred from full orchestrator-side handling)
-            # we route MALFORMED through the same retry path as
-            # NEEDS_CHANGES but tag the reason so the ledger / logs make
-            # the distinction visible. A follow-up phase will add a
-            # stricter system-prompt prefix on retry and a
-            # MALFORMED-specific escalation ladder. See plan: Phase 1.3
-            # "If wiring the orchestrator-side MALFORMED handling is too
-            # invasive for this PR, ship the parser change + treat-as-
-            # NEEDS_CHANGES-with-warning intermediate."
+            # v0.41.0 (A1): a MALFORMED verdict is ambiguous at the text
+            # layer — it covers BOTH "reviewer ran out of turns and emitted
+            # an empty/truncated response" (an INFRA failure) and "developer
+            # produced a diff so broken the reviewer couldn't form a verdict"
+            # (a genuine content/format failure). Disambiguate on the
+            # reviewer's adapter ``subtype`` BEFORE routing: turn-exhaustion
+            # must NOT be charged to the developer as a bad diff (the Run-3
+            # failure mode that looped 4× then blocked a correct diff).
+            if verdict == "MALFORMED" and _reviewer_exhausted_turns(
+                orch, review_result
+            ):
+                # INFRA path: retry the *reviewer* with an escalated turn
+                # budget (the per-(task, role) budget-escalation tracker in
+                # ``delegate`` auto-bumps max_turns on consecutive
+                # ``error_max_turns`` for the same pair), then re-parse.
+                logger.warning(
+                    "execute_phase.reviewer_infra_exhausted",
+                    task_id=task.id,
+                    subtype=(
+                        review_result.subtype
+                        if review_result is not None
+                        else getattr(orch, "_last_adapter_subtype", None)
+                    ),
+                    note=(
+                        "reviewer exhausted its turn budget; classifying as "
+                        "an infra failure (NOT a developer-discard) and "
+                        "retrying the reviewer with an escalated budget."
+                    ),
+                )
+                retry_review_result: AgentResult | None = None
+                try:
+                    retry_review_result = await delegate(
+                        orch,
+                        "reviewer",
+                        review_env,
+                        retry_count=task.retry_count,
+                        last_issues=last_issues,
+                        cwd_override=worktree,
+                    )
+                except GuardrailExceededError as exc:
+                    logger.warning(
+                        "execute_phase.guardrail_exceeded",
+                        task_id=task.id,
+                        reason=str(exc),
+                    )
+                    task = await orch.plan_manager.update_task_status(
+                        task.id,
+                        "blocked",
+                        meta=_build_guardrail_block_meta(
+                            orch=orch, task_id=task.id, exc=exc
+                        ),
+                    )
+                    return task
+
+                retry_verdict, retry_issues = _parse_review_verdict(
+                    retry_review_result.text
+                )
+                if retry_verdict != "MALFORMED" or not _reviewer_exhausted_turns(
+                    orch, retry_review_result
+                ):
+                    # The escalated retry produced a parseable verdict (or a
+                    # genuine non-exhaustion MALFORMED). Re-stamp evidence and
+                    # fall through to the normal verdict routing below.
+                    verdict = retry_verdict
+                    issues = retry_issues
+                    review_result = retry_review_result
+                    review_result_text = retry_review_result.text
+                    review_ev = ReviewEvidence(
+                        task_id=task.id,
+                        verdict=cast(
+                            "Literal['APPROVED', 'NEEDS_CHANGES', "
+                            "'REJECTED', 'MALFORMED']",
+                            verdict,
+                        ),
+                        issues=issues,
+                        output_text=review_result_text,
+                        raw_response=review_result_text,
+                    )
+                    await write_evidence(orch.cwd, task.id, review_ev)
+                else:
+                    # SOFT-PASS: the reviewer still ran out of room after the
+                    # escalated budget. Accept the developer's diff rather
+                    # than discarding correct work for an infra reason. Stamp
+                    # a durable, replay-safe APPROVED ReviewEvidence carrying
+                    # the soft-pass marker, log the event, and fall through to
+                    # the test step (verdict normalised to APPROVED below).
+                    logger.warning(
+                        "execute_phase.reviewer_infra_softpass",
+                        task_id=task.id,
+                        note=(
+                            "reviewer exhausted its turn budget even after a "
+                            "budget escalation; SOFT-PASSING the review and "
+                            "accepting the developer diff (infra failure, not "
+                            "a bad diff)."
+                        ),
+                    )
+                    verdict = "APPROVED"
+                    issues = [
+                        "reviewer_infra_softpass: reviewer exhausted turns "
+                        "(escalated); developer diff accepted without a "
+                        "reviewer verdict"
+                    ]
+                    review_result_text = retry_review_result.text
+                    review_ev = ReviewEvidence(
+                        task_id=task.id,
+                        verdict="APPROVED",
+                        issues=issues,
+                        output_text=review_result_text,
+                        raw_response=review_result_text,
+                    )
+                    await write_evidence(orch.cwd, task.id, review_ev)
+            # v0.31.0 (Phase 1.3): a genuine MALFORMED (the reviewer did NOT
+            # exhaust turns — the response was unparseable for some other
+            # reason) is still a machinery/format failure. Route it through
+            # the same retry path as NEEDS_CHANGES but tag the reason so the
+            # ledger / logs make the distinction visible.
             if verdict == "MALFORMED":
                 logger.warning(
                     "execute_phase.review_malformed",
@@ -6526,6 +6649,32 @@ _TURN_EXHAUSTION_SUBTYPES: frozenset[str] = frozenset(
 )
 
 
+def _reviewer_exhausted_turns(
+    orch: "Orchestrator",
+    review_result: "AgentResult | None",
+) -> bool:
+    """v0.41.0 (A1): did the REVIEWER itself run out of turns?
+
+    A reviewer that exhausts its turn budget returns an empty / truncated
+    response, which :func:`_parse_review_verdict` classifies as
+    ``MALFORMED`` — indistinguishable, at the text layer, from a developer
+    diff so broken the reviewer couldn't form a verdict. The adapter
+    ``subtype`` is the disambiguator: ``error_max_turns`` (or the
+    escalation-exhausted synthetic subtype) means "reviewer ran out of
+    room" (an INFRA failure), NOT "developer produced a bad diff".
+
+    Prefers the reviewer's own :class:`AgentResult.subtype` when the
+    caller captured it (non-tournament path). Falls back to
+    ``orch._last_adapter_subtype`` (set by :func:`delegate` after every
+    dispatch) so the review-tournament path — which doesn't surface a
+    single ``AgentResult`` — is still covered.
+    """
+    if review_result is not None:
+        return review_result.subtype in _TURN_EXHAUSTION_SUBTYPES
+    last_subtype = getattr(orch, "_last_adapter_subtype", None)
+    return last_subtype in _TURN_EXHAUSTION_SUBTYPES
+
+
 async def _maybe_accept_approved_on_exhaustion(
     orch: "Orchestrator",
     task: "Task",
@@ -6942,6 +7091,13 @@ async def _run_qa_gates(
             getattr(repo_capacity, "total_bytes", "?"),
         )
 
+    # ADR-0046: the reproduce + debug-tag gates ride on the diagnosis-phase
+    # toggle (the natural switch). ``getattr`` keeps legacy configs (which
+    # predate ``cfg.diagnosis``) safe — they degrade to disabled.
+    diagnosis_gates_enabled = bool(
+        getattr(getattr(orch.cfg, "diagnosis", None), "enabled", False)
+    )
+
     # v0.22.0: gates are ``(name, enabled, callable)`` triples so the
     # warn-surface helper can attribute findings to a gate.
     gates: list[tuple[str, bool, Callable[[], Awaitable[GateResult]]]] = [
@@ -6993,6 +7149,23 @@ async def _run_qa_gates(
                     cfg, "code_size_baseline_enabled", False
                 ),
             ),
+        ),
+        # ADR-0046 QA gates — gated on the diagnosis phase toggle (the natural
+        # switch). ``reproduce_gate`` is POST-fix: it BLOCKS only when a
+        # persisted diagnosis reproduction loop still fails, else soft-passes
+        # (no loop / fidelity none|live / unavailable). ``debug_tag`` is cheap
+        # and BLOCKS on leftover ``[DEBUG-...]`` markers. Both take the same
+        # diff-scoped ``secretscan_paths`` and return GateResult, so the
+        # severity-dispatch loop below handles them with no extra code.
+        (
+            "reproduce_gate",
+            diagnosis_gates_enabled,
+            lambda: run_reproduce_gate(cwd, secretscan_paths),
+        ),
+        (
+            "debug_tag",
+            diagnosis_gates_enabled,
+            lambda: run_debug_tag_gate(cwd, secretscan_paths),
         ),
     ]
 

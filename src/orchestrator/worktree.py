@@ -917,6 +917,95 @@ class WorktreeManager:
             commit_message=commit_message,
         )
 
+    async def abort_failed_apply(
+        self,
+        targets: list[str] | None = None,
+    ) -> None:
+        """v0.41.0 (A3): restore the main repo to a clean tree after a
+        failed apply / 3-way merge.
+
+        :meth:`apply_patch_to_main` with ``three_way=True`` falls back to
+        git's merge machinery; when the 3-way *also* fails, git can leave
+        the main working tree in one of two dirty states:
+
+        * an **in-progress merge** (``--3way`` left ``MERGE_HEAD`` /
+          ``.git/rebase-apply`` behind, with conflict markers staged), or
+        * a **partial apply** (some hunks landed, some staged) with no
+          merge in progress.
+
+        Without cleanup, those conflict markers / partial hunks bleed into
+        the *next* task's per-task worktree (created at ``HEAD`` of the main
+        repo), corrupting an otherwise-correct downstream diff. This helper
+        guarantees a clean tree before the caller marks the task blocked.
+
+        Strategy (idempotent — safe to call when already clean):
+
+        1. If a merge / 3-way-apply is in progress (``MERGE_HEAD`` or a
+           ``.git/rebase-apply`` directory exists) → ``git merge --abort``.
+        2. Otherwise (or if the abort is a no-op) → ``git reset --hard HEAD``
+           to drop staged/partial hunks, then ``git clean -fd`` to remove
+           any untracked files the apply introduced. When ``targets`` is
+           supplied the ``git clean`` is **scoped to those paths** so
+           unrelated untracked working-tree state is never swept.
+
+        ``targets`` are repo-relative paths (typically ``task.files``).
+        ``None`` / empty falls back to a repo-wide ``git clean -fd`` of
+        untracked files, which is still safe because ``reset --hard``
+        already restored every tracked file to ``HEAD``.
+
+        Never raises: a cleanup failure here must not mask the underlying
+        apply failure the caller is already handling. Errors are logged and
+        swallowed.
+        """
+        git_dir = self._main / ".git"
+        merge_in_progress = (git_dir / "MERGE_HEAD").exists() or (
+            git_dir / "rebase-apply"
+        ).is_dir()
+
+        if merge_in_progress:
+            # ``git merge --abort`` resets the index and working tree to the
+            # pre-merge state, clearing conflict markers and MERGE_HEAD.
+            rc, _, err = await _run_git(self._main, ["merge", "--abort"])
+            if rc == 0:
+                self._log.info("worktree.abort_failed_apply.merge_aborted")
+                return
+            # Fall through to the hard-reset path if the abort itself
+            # failed (e.g. the merge state was already half-cleared).
+            self._log.warning(
+                "worktree.abort_failed_apply.merge_abort_failed",
+                err=err.strip(),
+            )
+
+        # Drop any staged/partial hunks so tracked files match HEAD again.
+        reset_rc, _, reset_err = await _run_git(
+            self._main, ["reset", "--hard", "HEAD"]
+        )
+        if reset_rc != 0:
+            self._log.warning(
+                "worktree.abort_failed_apply.reset_failed",
+                err=reset_err.strip(),
+            )
+
+        # Remove untracked files the partial apply may have created. Scope
+        # to the attempted targets when known so unrelated untracked state
+        # (e.g. a developer's scratch file elsewhere) is untouched.
+        clean_args = ["clean", "-fd"]
+        scoped = [t for t in (targets or []) if t]
+        if scoped:
+            clean_args.append("--")
+            clean_args.extend(scoped)
+        clean_rc, _, clean_err = await _run_git(self._main, clean_args)
+        if clean_rc != 0:
+            self._log.warning(
+                "worktree.abort_failed_apply.clean_failed",
+                err=clean_err.strip(),
+            )
+        else:
+            self._log.info(
+                "worktree.abort_failed_apply.cleaned",
+                scoped=bool(scoped),
+            )
+
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 

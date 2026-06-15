@@ -323,6 +323,12 @@ class FakeWorktreeMgr:
     async def get_diff_vs_base(self, worktree, base_ref: str = "HEAD") -> str:
         return "diff --git a/foo b/foo\n+conflict\n"
 
+    async def abort_failed_apply(self, targets: list[str] | None = None) -> None:
+        # v0.41.0 A3: the conflict-escalation path now cleans the main tree
+        # before marking a task blocked. The fake tree needs the method to
+        # exist; there is nothing to clean in-memory, so this is a no-op.
+        self.abort_calls = getattr(self, "abort_calls", 0) + 1
+
 
 @pytest.mark.asyncio
 async def test_apply_with_conflict_escalation_rebase_and_retry(

@@ -52,6 +52,7 @@ from tournament import (
     _PhaseReviewContentHandler,
 )
 from tournament.effort import resolve_role_effort
+from tournament.llm import _TEXT_ONLY_NO_TOOL_ROLES
 from tournament.timeouts import resolve_role_timeout_s
 
 
@@ -170,7 +171,20 @@ def _build_role_overrides(
         if spec is None:
             continue
         role_max_turns[role] = spec.max_turns or 1
-        role_allowed_tools[role] = list(spec.tools) if spec.tools else []
+        # v0.41.0 A4: the pure text-only roles (critic_t / synthesizer) are
+        # fed their entire working set inline by the content handler, so they
+        # must NOT carry Read — a single speculative read at a tiny turn
+        # budget exhausts the only turn (error_max_turns → dead branch). Drop
+        # Read here at the runner boundary (belt) so the override map is
+        # explicit; AdapterLLMClient._resolve_allowed_tools also enforces it
+        # (suspenders) by refusing to re-add the ["Read"] sentinel for these
+        # roles. architect_b is excluded — it keeps its registry tools.
+        if role in _TEXT_ONLY_NO_TOOL_ROLES:
+            role_allowed_tools[role] = []
+        else:
+            role_allowed_tools[role] = (
+                list(spec.tools) if spec.tools else []
+            )
         timeout_s = resolve_role_timeout_s(role, plan_complexity)
         if timeout_s is not None:
             role_timeout_s[role] = timeout_s

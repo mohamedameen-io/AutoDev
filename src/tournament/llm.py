@@ -59,6 +59,23 @@ _EXPENSIVE_TRANSIENT_SUBSTRINGS = (
 )
 
 
+# v0.41.0 A4: tournament roles that are *pure* text-in / text-out. Their
+# entire working set (candidate plan, diff, prior-round critic text) is
+# inlined into the prompt by the content handlers
+# (:mod:`tournament.prompts` and :mod:`tournament.phase_review`), so they
+# never need to touch the filesystem. Granting them ``Read`` was actively
+# harmful: at a tiny turn budget a single speculative read consumed the only
+# turn and the role died with ``error_max_turns``, failing the whole branch
+# (Run-3: all 3 plan-tournament branches died this way). We therefore resolve
+# them to an EMPTY tool set and the empty-list-normalisation that would
+# otherwise re-introduce ``["Read"]`` is suppressed for these roles.
+#
+# ``architect_b`` is deliberately EXCLUDED: although it is currently text-only
+# too, it may legitimately need ``Read`` for richer revisions, so its empty
+# tool list keeps the benign ``["Read"]`` sentinel.
+_TEXT_ONLY_NO_TOOL_ROLES = frozenset({"critic_t", "synthesizer"})
+
+
 # Subtypes that the CLI reports for deterministic failures — retrying with the
 # same prompt cannot help. When :class:`AgentResult.subtype` matches one of
 # these, ``_classify_error`` short-circuits transient classification and the
@@ -251,6 +268,14 @@ class AdapterLLMClient:
         ``["Read"]``: the Claude CLI's variadic ``--allowed-tools`` flag is
         skipped on falsy values, which would silently allow all tools.
         ``Read`` is a benign read-only sentinel for text-only roles.
+
+        v0.41.0 A4 exception: the pure text-only roles in
+        :data:`_TEXT_ONLY_NO_TOOL_ROLES` (``critic_t`` / ``synthesizer``)
+        resolve to an EMPTY tool set instead — their working content is
+        inlined into the prompt, so the empty→``["Read"]`` normalisation is
+        deliberately suppressed for them (a granted ``Read`` would let a
+        single speculative read exhaust a tiny turn budget → ``error_max_turns``
+        → dead tournament branch).
     """
 
     def __init__(
@@ -289,14 +314,31 @@ class AdapterLLMClient:
         return self._role_max_turns.get(role, 1)
 
     def _resolve_allowed_tools(self, role: str) -> list[str] | None:
+        # Legacy back-compat: a caller that never opted into per-role tool
+        # restriction (no map, or this role absent from it) keeps the old
+        # behaviour — ``None`` → the adapter omits ``--allowed-tools`` and all
+        # tools remain available. The A4 suppression below only intervenes for
+        # callers that DID configure the role (the tournament runners always
+        # do), so it never changes behaviour for un-opted-in callers.
         if self._role_allowed_tools is None:
             return None
         if role not in self._role_allowed_tools:
             return None
         configured = self._role_allowed_tools[role]
+        # v0.41.0 A4: pure text-only roles (critic_t / synthesizer) resolve to
+        # an EMPTY tool set when configured. Their content is fully inlined
+        # into the prompt, so Read is never needed — and granting it lets a
+        # single speculative read burn the only turn (error_max_turns → dead
+        # branch). Returning ``[]`` here takes precedence over the
+        # empty→["Read"] sentinel below so Read is NOT re-added for these
+        # roles.
+        if role in _TEXT_ONLY_NO_TOOL_ROLES:
+            return []
         # Empty list = "no tools" intent. The Claude CLI's variadic
         # --allowed-tools flag is omitted on falsy values, so we substitute a
         # benign read-only sentinel that actually restricts the toolset.
+        # (Applies to roles like ``architect_b`` that are NOT in the
+        # text-only-no-tool set above.)
         if configured is not None and len(configured) == 0:
             return ["Read"]
         return configured
@@ -534,4 +576,5 @@ __all__ = [
     "ExpensiveTransientError",
     "StubLLMClient",
     "TransientError",
+    "_TEXT_ONLY_NO_TOOL_ROLES",
 ]
