@@ -13,6 +13,7 @@ from config.schema import (
     HiveConfig,
     IntakePhaseConfig,
     QAGatesConfig,
+    ResolverConfig,
     TournamentPhaseConfig,
     TournamentsConfig,
 )
@@ -46,6 +47,10 @@ _AGENT_MODEL_DEFAULTS: dict[str, str | None] = {
     "intake_enricher": None,
     "intake_clarifier": None,
     "diagnostician": None,
+    # ADR-0047: Universal Blocker Resolver specialist role. Same pattern as the
+    # framing/intake/diagnosis specialists — absent from REQUIRED_AGENT_ROLES,
+    # dispatched self-contained, backfilled into legacy configs by the loader.
+    "resolver": None,
 }
 
 _AGENT_MAX_TURNS: dict[str, int] = {
@@ -81,6 +86,10 @@ _AGENT_MAX_TURNS: dict[str, int] = {
     "intake_enricher": 1,
     "intake_clarifier": 1,
     "diagnostician": 5,
+    # ADR-0047: the resolver selects one bounded action from a fixed vocabulary
+    # via forced structured output — a single reasoning turn suffices (mirrors
+    # the framing/altitude_judge specialist budget tier).
+    "resolver": 1,
 }
 
 
@@ -298,5 +307,13 @@ def default_config(platform: str = "auto") -> AutodevConfig:
             require_loop_to_plan=True,
             on_no_live_loop="synthetic_plus_artifact",
             diagnostician_model=None,
+        ),
+        # ADR-0047: Universal Blocker Resolver — on by default, fast-path-only
+        # (≈0 cost until a terminal/unrecognized blocker fires).
+        resolver=ResolverConfig(
+            enabled=True,
+            max_cycles_per_blocker=3,
+            fast_path_only_on_known=True,
+            model=None,
         ),
     )

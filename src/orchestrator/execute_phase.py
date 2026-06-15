@@ -1573,6 +1573,343 @@ async def _dispatch_architect_consult(
     )
 
 
+# ---------------------------------------------------------------------------
+# ADR-0047: Universal Blocker Resolver chokepoint (Part B wiring).
+#
+# Every terminal failure site routes its blocker through ``_maybe_resolve_blocker``
+# BEFORE it blocks/degrades. The resolver (orchestrator.blocker_resolver) picks a
+# bounded action; ``_apply_resolution`` maps that action onto the SAME recovery
+# primitives the architect-consult rung already uses (continue = retry-reset;
+# refine = corrective injection). FAIL-SAFE invariant: when the resolver is
+# disabled (cfg.resolver.enabled is False / ``AUTODEV_RESOLVER_DISABLED``), errors,
+# or declines (``fall_through`` / ``ask_human`` / no usable recovery), the helper
+# returns ``None`` and the caller does EXACTLY its legacy block/degrade. The helper
+# NEVER raises. Loop-safety is enforced inside ``resolve_blocker`` (per-blocker
+# cycle budget + ladder advancement via ``recovery_already_tried``).
+# ---------------------------------------------------------------------------
+
+# The bounded action vocabulary surfaced to the resolver as context. Mirrors
+# state.schemas.ResolutionActionType (informational for the LLM path).
+_DEFAULT_RESOLVER_ACTIONS: tuple[str, ...] = (
+    "retry_with_changes",
+    "split_task",
+    "narrow_scope",
+    "re_architect",
+    "re_plan",
+    "reroute",
+    "repair_environment",
+    "relax_constraint",
+    "escalate_budget",
+    "escalate_model",
+    "soft_pass_with_evidence",
+    "consult_knowledge",
+    "web_search",
+    "ask_human",
+    "fall_through",
+)
+
+
+def _prior_resolution_actions(
+    orch: "Orchestrator", task_id: str | None, fclass: str
+) -> list[str]:
+    """Resume-safe: the resolver actions already applied for this blocker key.
+
+    Read from the ledger (``resolution_chosen`` ops) so the deterministic ladder
+    advances across retries / process restarts instead of re-picking its first
+    rung forever. Mirrors the key used by ``blocker_resolver.blocker_key``.
+    Best-effort — any failure yields ``[]`` (the per-blocker cycle budget is a
+    separate hard stop, so an empty list cannot cause an unbounded loop).
+    """
+    if task_id is None:
+        return []
+    try:
+        from state.ledger import read_entries
+
+        key = f"{task_id}:{fclass}"
+        out: list[str] = []
+        for entry in read_entries(orch.cwd):
+            if entry.op != "resolution_chosen":
+                continue
+            payload = entry.payload if isinstance(entry.payload, dict) else {}
+            if payload.get("blocker_key") == key:
+                act = payload.get("action")
+                if isinstance(act, str):
+                    out.append(act)
+        return out
+    except Exception:  # noqa: BLE001 - audit read must never block recovery
+        return []
+
+
+async def _resolver_retry(
+    orch: "Orchestrator", task: Task, *, note: str
+) -> Task | None:
+    """Re-enable ``task`` for another attempt (the architect-continue pattern).
+
+    Resets the developer retry budget and transitions the task back to
+    ``in_progress`` so the outer loop re-dispatches it; stamps a typed
+    ``resolver_note`` into the task metadata for forensics + next-attempt
+    guidance. Returns the refreshed Task, or ``None`` if the transition failed
+    (caller falls through to its legacy block).
+    """
+    try:
+        target = "in_progress" if task.status != "in_progress" else task.status
+        await orch.plan_manager.update_task_status(
+            task.id,
+            target,
+            meta={
+                "retry_count": 0,
+                "resolver_action": "retry",
+                "resolver_note": note[:500],
+            },
+        )
+        return await orch.plan_manager.get_task(task.id) or task
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.resolver_retry_failed", task_id=task.id, err=str(exc)
+        )
+        return None
+
+
+async def _resolver_corrective(
+    orch: "Orchestrator", task: Task, direction: str
+) -> Task | None:
+    """Inject corrective sub-tasks from ``direction`` and skip ``task`` (the
+    architect-refine pattern). Returns the skipped Task on success, or ``None``
+    (caller falls through to its legacy block) when no direction is usable, no
+    plan/phase is loadable, or injection fails.
+    """
+    if not direction or not direction.strip():
+        return None
+    try:
+        from orchestrator.corrective_parser import parse_corrective_direction
+
+        phase_id = task.phase_id
+        cap = int(getattr(orch.cfg, "max_corrective_tasks_per_phase", 8))
+        plan_cap = int(getattr(orch.cfg, "max_corrective_tasks_per_plan", 24))
+        plan = await orch.plan_manager.load()
+        if plan is None:
+            return None
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            return None
+        base_task_count = len(phase.tasks)
+        corrective_tasks = parse_corrective_direction(
+            direction,
+            phase_id=phase_id,
+            base_task_count=base_task_count,
+            phase_complexity=task.complexity,
+            max_tasks=cap,
+        )
+        if not corrective_tasks:
+            return None
+        await orch.plan_manager.append_corrective_tasks(
+            phase_id,
+            corrective_tasks,
+            max_corrective_tasks_per_phase=cap,
+            max_corrective_tasks_per_plan=plan_cap,
+        )
+        return await orch.plan_manager.update_task_status(
+            task.id,
+            "skipped",
+            meta={
+                "blocked_reason": (
+                    f"resolver: refined into corrective sub-tasks "
+                    f"(see phase {phase_id})"
+                ),
+                "resolver_action": "refine",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.resolver_corrective_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return None
+
+
+async def _apply_resolution(
+    orch: "Orchestrator",
+    task: Task | None,
+    ctx: object,
+    action: object,
+) -> Task | None:
+    """Map a ``ResolutionAction`` onto an existing recovery primitive.
+
+    Returns a non-``None`` Task when the blocker was actively re-enabled (caller
+    SKIPS its legacy block), or ``None`` to fall through to the legacy block.
+    Conservative by design: the heavyweight / human-decision actions
+    (``ask_human``/``fall_through``/``web_search``/``reroute``) fall through; the
+    structural re-plan actions only act when a task + direction are available.
+    """
+    a = getattr(action, "action", "fall_through")
+    rationale = (getattr(action, "rationale", "") or "")[:300]
+    params = getattr(action, "params", {}) or {}
+    if task is None:
+        # Plan-level structural site (no task to mutate) — observability only.
+        return None
+    if a in ("ask_human", "fall_through", "web_search", "reroute"):
+        return None
+    if a in ("split_task", "narrow_scope", "re_architect", "re_plan"):
+        direction = str(params.get("direction") or rationale or "")
+        return await _resolver_corrective(orch, task, direction)
+    if a == "consult_knowledge":
+        try:
+            from orchestrator import blocker_resolver as _br
+
+            summary = await _br.consult_knowledge(orch, ctx)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001
+            summary = ""
+        note = (
+            f"consult_knowledge — prior failures:\n{summary[:800]}"
+            if summary
+            else f"consult_knowledge: {rationale}"
+        )
+        return await _resolver_retry(orch, task, note=note)
+    if a in (
+        "retry_with_changes",
+        "escalate_budget",
+        "relax_constraint",
+        "escalate_model",
+        "repair_environment",
+        "soft_pass_with_evidence",
+    ):
+        return await _resolver_retry(orch, task, note=f"{a}: {rationale}")
+    # Unknown action string — fail safe to legacy block.
+    return None
+
+
+async def _maybe_resolve_blocker(
+    orch: "Orchestrator",
+    task: Task | None,
+    *,
+    failure_class: str,
+    raw_error: str = "",
+    failing_role: str | None = None,
+    phase_id: str | None = None,
+    evidence_refs: list[str] | None = None,
+) -> Task | None:
+    """ADR-0047 chokepoint. Route a terminal blocker through the resolver before
+    the caller's legacy block/degrade.
+
+    Returns a non-``None`` Task when the resolver actively recovered the blocker
+    (caller MUST use it and SKIP the legacy block); ``None`` otherwise (caller
+    does its legacy block unchanged). NEVER raises. The
+    ``cfg.resolver.enabled`` + ``AUTODEV_RESOLVER_DISABLED`` gate lives here so a
+    disabled resolver is a zero-cost no-op at every call site.
+    """
+    import os
+
+    try:
+        rcfg = getattr(orch.cfg, "resolver", None)
+        if rcfg is None or not getattr(rcfg, "enabled", False):
+            return None
+        if os.environ.get("AUTODEV_RESOLVER_DISABLED", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+
+    # Loop-safety backstop (B5), independent of the ledger: an in-memory
+    # per-(task, failure_class) cap on the orchestrator instance. ``resolve_blocker``
+    # also enforces a resume-safe ledger-based budget, but that reads 0 forever
+    # when the PlanManager's ledger is a unit-test fake — so a resolver recovery
+    # that re-enables a task whose underlying failure persists would loop
+    # unboundedly. This counter guarantees the chokepoint stops recovering and
+    # falls through to the legacy block after ``max_cycles_per_blocker`` hits,
+    # regardless of ledger state.
+    try:
+        max_cycles = int(getattr(rcfg, "max_cycles_per_blocker", 3))
+        guard_key = f"{task.id if task is not None else '-'}:{failure_class}"
+        counts = getattr(orch, "_resolver_cycle_counts", None)
+        if counts is None:
+            counts = {}
+            try:
+                orch._resolver_cycle_counts = counts  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                counts = {}
+        if counts.get(guard_key, 0) >= max_cycles:
+            return None
+        counts[guard_key] = counts.get(guard_key, 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        from orchestrator import blocker_resolver as _br
+        from orchestrator import failure_classes as _fc
+        from state.schemas import BlockerContext
+
+        fclass = _fc.classify(failure_class)
+        task_id = task.id if task is not None else None
+        ph = phase_id
+        if ph is None and task is not None:
+            ph = getattr(task, "phase_id", None)
+        ctx = BlockerContext(
+            failure_class=fclass,
+            raw_error=(raw_error or "")[:2000],
+            failing_role=failing_role,
+            task_id=task_id,
+            phase_id=ph,
+            attempt_history=[],
+            recovery_already_tried=_prior_resolution_actions(orch, task_id, fclass),
+            evidence_refs=evidence_refs or [],
+            available_actions=list(_DEFAULT_RESOLVER_ACTIONS),
+        )
+        action = await _br.resolve_blocker(orch, ctx)
+    except Exception as exc:  # noqa: BLE001 - resolver must never break the loop
+        logger.warning(
+            "execute_phase.resolver_dispatch_failed",
+            failure_class=failure_class,
+            err=str(exc),
+        )
+        return None
+
+    try:
+        recovered = await _apply_resolution(orch, task, ctx, action)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.resolver_apply_failed",
+            action=getattr(action, "action", None),
+            err=str(exc),
+        )
+        recovered = None
+
+    act_name = getattr(action, "action", "fall_through")
+    if recovered is not None:
+        outcome = "recovered"
+    elif act_name == "ask_human":
+        outcome = "ask_human"
+    else:
+        outcome = "fell_through"
+    try:
+        await orch.plan_manager.ledger_append(
+            op="resolution_outcome",
+            payload={
+                "task_id": getattr(ctx, "task_id", None),
+                "action": act_name,
+                "outcome": outcome,
+                "reason": (getattr(action, "rationale", "") or "")[:300],
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.ledger_append_failed",
+            op="resolution_outcome",
+            err=str(exc),
+        )
+    if recovered is not None:
+        logger.info(
+            "execute_phase.blocker_resolved",
+            task_id=getattr(ctx, "task_id", None),
+            failure_class=getattr(ctx, "failure_class", None),
+            action=act_name,
+        )
+    return recovered
+
+
 async def _escalate_stuck_to_critic(
     orch: "Orchestrator",
     task: Task,
@@ -2028,7 +2365,8 @@ async def run_execute_phase(
             DagValidationError,
             EditScopeViolation,
             collect_edit_scope_violations,
-            validate_phase_dag,
+            validate_dag_cycles_global,
+            validate_dag_undefined_refs,
         )
 
         # v0.27 Phase 3 (audit §3): per-task scoped block. The v0.26.2
@@ -2116,6 +2454,16 @@ async def run_execute_phase(
                 logger.warning(
                     "execute_phase.cross_phase_dag_invalid", err=str(exc)
                 )
+                # ADR-0047: route the structural blocker through the resolver
+                # for observability (re_plan is the recommendation); the plan-
+                # level site has no single task to mutate, so it falls through
+                # to the legacy block below.
+                await _maybe_resolve_blocker(
+                    orch,
+                    None,
+                    failure_class="cross_phase_dag_invalid",
+                    raw_error=str(exc),
+                )
                 for phase in plan.phases:
                     for t in phase.tasks:
                         if t.status == "pending":
@@ -2133,17 +2481,27 @@ async def run_execute_phase(
                                 pass
                 return processed
         else:
-            for phase in plan.phases:
-                try:
-                    validate_phase_dag(phase)
-                except DagValidationError as exc:
-                    logger.warning(
-                        "execute_phase.dag_invalid",
-                        phase_id=phase.id,
-                        err=str(exc),
-                    )
-                    # Block every pending task in the offending phase so the
-                    # run terminates cleanly.
+            # v0.42.0 (C3): validate ``depends_on`` against ALL plan tasks so a
+            # legitimate cross-phase dep (e.g. task 2.1 depends_on 1.1, which the
+            # architect now emits via A2) is NOT falsely rejected as "undefined"
+            # by the per-phase validator. The scheduler
+            # (``PlanManager.next_pending_tasks``) already resolves cross-phase
+            # deps globally; this lifts the validation gate to match. Undefined-
+            # ref check first (precondition for the cycle pass), then plan-wide
+            # cycle detection. A genuine DAG error anywhere means the dependency
+            # graph is broken, so we block all pending tasks and terminate
+            # cleanly (matching the cross-phase path above).
+            try:
+                validate_dag_undefined_refs(plan)
+                validate_dag_cycles_global(plan)
+            except DagValidationError as exc:
+                logger.warning("execute_phase.dag_invalid", err=str(exc))
+                # ADR-0047: route the structural blocker through the resolver
+                # for observability before the legacy block.
+                await _maybe_resolve_blocker(
+                    orch, None, failure_class="dag_invalid", raw_error=str(exc)
+                )
+                for phase in plan.phases:
                     for t in phase.tasks:
                         if t.status == "pending":
                             try:
@@ -2156,6 +2514,7 @@ async def run_execute_phase(
                                 )
                             except Exception:  # noqa: BLE001
                                 pass
+                return processed
 
         # v0.21.0 B1: cross-phase parallelism. When enabled, run a
         # single dispatcher across all phases — tasks from phase N+1
@@ -3166,6 +3525,17 @@ async def _execute_one_worker(
                     f"{task.id.replace('/', '_').replace(' ', '_')}-*.txt"
                 ],
             )
+        # ADR-0047: route the worker crash through the resolver before the
+        # legacy block; a recovery (e.g. retry_with_changes / consult_knowledge)
+        # re-enables the task.
+        _recovered = await _maybe_resolve_blocker(
+            orch,
+            task,
+            failure_class="worker_exception",
+            raw_error=str(exc),
+        )
+        if _recovered is not None:
+            return _recovered
         try:
             blocked = await orch.plan_manager.update_task_status(
                 task.id,
@@ -3986,6 +4356,16 @@ async def _execute_one(
                     task_id=task.id,
                     reason=str(exc),
                 )
+                # ADR-0047: route through the resolver before the legacy
+                # guardrail block; a recovery re-enables the task.
+                _recovered = await _maybe_resolve_blocker(
+                    orch,
+                    task,
+                    failure_class="guardrail_exceeded",
+                    raw_error=str(exc),
+                )
+                if _recovered is not None:
+                    return _recovered
                 # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
                 # also stamps a structured RecoveryHint.
                 task = await orch.plan_manager.update_task_status(
@@ -4197,6 +4577,16 @@ async def _execute_one(
                         task_id=task.id,
                         reason=str(exc),
                     )
+                    # ADR-0047: route through the resolver before the legacy
+                    # guardrail block; a recovery re-enables the task.
+                    _recovered = await _maybe_resolve_blocker(
+                        orch,
+                        task,
+                        failure_class="guardrail_exceeded",
+                        raw_error=str(exc),
+                    )
+                    if _recovered is not None:
+                        return _recovered
                     # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
                     # also stamps a structured RecoveryHint.
                     task = await orch.plan_manager.update_task_status(
@@ -4260,6 +4650,16 @@ async def _execute_one(
                         task_id=task.id,
                         reason=str(exc),
                     )
+                    # ADR-0047: route through the resolver before the legacy
+                    # guardrail block; a recovery re-enables the task.
+                    _recovered = await _maybe_resolve_blocker(
+                        orch,
+                        task,
+                        failure_class="guardrail_exceeded",
+                        raw_error=str(exc),
+                    )
+                    if _recovered is not None:
+                        return _recovered
                     # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
                     # also stamps a structured RecoveryHint.
                     task = await orch.plan_manager.update_task_status(
@@ -4338,6 +4738,16 @@ async def _execute_one(
                         task_id=task.id,
                         reason=str(exc),
                     )
+                    # ADR-0047: route through the resolver before the legacy
+                    # guardrail block; a recovery re-enables the task.
+                    _recovered = await _maybe_resolve_blocker(
+                        orch,
+                        task,
+                        failure_class="guardrail_exceeded",
+                        raw_error=str(exc),
+                    )
+                    if _recovered is not None:
+                        return _recovered
                     task = await orch.plan_manager.update_task_status(
                         task.id,
                         "blocked",
@@ -4460,6 +4870,16 @@ async def _execute_one(
                     task_id=task.id,
                     reason=str(exc),
                 )
+                # ADR-0047: route through the resolver before the legacy
+                # guardrail block; a recovery re-enables the task.
+                _recovered = await _maybe_resolve_blocker(
+                    orch,
+                    task,
+                    failure_class="guardrail_exceeded",
+                    raw_error=str(exc),
+                )
+                if _recovered is not None:
+                    return _recovered
                 # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
                 # also stamps a structured RecoveryHint.
                 task = await orch.plan_manager.update_task_status(
@@ -4800,6 +5220,17 @@ async def _execute_one(
                             "autodev doctor",
                         ],
                     )
+                    # ADR-0047: route the persistent test-diagnosis failure
+                    # through the resolver before the legacy block.
+                    _recovered = await _maybe_resolve_blocker(
+                        orch,
+                        task,
+                        failure_class="test_diagnosis_hardfail",
+                        raw_error=f"test_diagnosis: {diagnosis}",
+                        failing_role="test_engineer",
+                    )
+                    if _recovered is not None:
+                        return _recovered
                     task = await orch.plan_manager.update_task_status(
                         task.id,
                         "blocked",
@@ -4834,6 +5265,17 @@ async def _execute_one(
                     evidence_files=[f".autodev/evidence/{task.id}-test.json"],
                     commands=[f"autodev requeue --task {task.id}"],
                 )
+                # ADR-0047: route the inconclusive test result through the
+                # resolver before the legacy block.
+                _recovered = await _maybe_resolve_blocker(
+                    orch,
+                    task,
+                    failure_class="test_diagnosis_no_signal",
+                    raw_error="test result inconclusive — no diagnostic signal",
+                    failing_role="test_engineer",
+                )
+                if _recovered is not None:
+                    return _recovered
                 task = await orch.plan_manager.update_task_status(
                     task.id,
                     "blocked",
@@ -5406,6 +5848,20 @@ async def _try_retry_or_escalate(
         if resolution is not None:
             # Branch on the critic's chosen action.
             if resolution.action == "soft-blocker":
+                # ADR-0047: route the SOFT_BLOCKER escalation rung through the
+                # resolver before the human-decision block. A recovery
+                # (consult_knowledge / retry_with_changes) re-enables the task;
+                # the per-blocker cycle budget caps repeated soft-blocker
+                # recoveries and then falls through to the legacy block below.
+                _recovered = await _maybe_resolve_blocker(
+                    orch,
+                    task,
+                    failure_class="soft_blocker",
+                    raw_error=(resolution.guidance or "soft-blocker"),
+                    evidence_refs=list(prior_attempts or []),
+                )
+                if _recovered is not None:
+                    return _recovered
                 await orch.plan_manager.mark_escalated(task.id)
                 guidance_text = resolution.guidance or "human decision required"
                 # v0.32.0 (Phase 5, Gap G): structured recovery hint so

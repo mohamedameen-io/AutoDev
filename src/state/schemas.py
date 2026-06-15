@@ -927,8 +927,93 @@ to round-trip a ``dict`` into the correct subclass.
 """
 
 
+# --- ADR-0047: Universal Blocker Resolver schemas (B3) -------------------------
+
+# The bounded action vocabulary (B4). Each maps to an existing recovery
+# primitive (see ``orchestrator.blocker_resolver`` for the handlers):
+#   retry_with_changes     -> budget/turn escalation (budget_escalation.py)
+#   split_task / narrow_scope -> corrective injection / scope degradation
+#   re_architect / re_plan -> rethink at altitude (recovery tiers)
+#   reroute                -> skip a broken component, use a fallback
+#   repair_environment     -> backfill role / rebuild worktree / reset tree
+#   relax_constraint / escalate_budget -> widen a cap (guardrails)
+#   escalate_model         -> sonnet -> opus (recovery Tier-5)
+#   soft_pass_with_evidence-> accept + record (A1 reviewer soft-pass pattern)
+#   consult_knowledge / web_search -> past-failure memory / web
+#   ask_human              -> LAST resort: a precise question via intake/clarify
+#   fall_through           -> decline: use the call site's legacy block/degrade
+ResolutionActionType = Literal[
+    "retry_with_changes",
+    "split_task",
+    "narrow_scope",
+    "re_architect",
+    "re_plan",
+    "reroute",
+    "repair_environment",
+    "relax_constraint",
+    "escalate_budget",
+    "escalate_model",
+    "soft_pass_with_evidence",
+    "consult_knowledge",
+    "web_search",
+    "ask_human",
+    "fall_through",
+]
+
+
+class BlockerContext(BaseModel):
+    """The input to :func:`orchestrator.blocker_resolver.resolve_blocker`.
+
+    Captures everything the resolver needs to reason about a terminal blocker
+    without re-reading orchestrator internals: the failure class, the raw error,
+    the failing role/task/phase, the ledger trajectory, what recovery has
+    already been tried (loop-safety), evidence references, and the bounded set
+    of actions available at this call site.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # One of ``orchestrator.failure_classes.ALL_FAILURE_CLASSES`` (an arbitrary
+    # string is treated as ``"unknown"`` — the novel-failure path).
+    failure_class: str
+    raw_error: str = ""
+    failing_role: str | None = None
+    task_id: str | None = None
+    phase_id: str | None = None
+    # Ledger trajectory leading to this blocker (most-recent-last), e.g.
+    # ``["discard", "pivot", "soft_blocker_handoff"]``.
+    attempt_history: list[str] = Field(default_factory=list)
+    # Recovery actions already attempted for THIS blocker key — drives the
+    # per-blocker cycle budget + loop detection (B5).
+    recovery_already_tried: list[str] = Field(default_factory=list)
+    # Pointers (paths / ledger seqs) to evidence the resolver may cite.
+    evidence_refs: list[str] = Field(default_factory=list)
+    # The subset of the action vocabulary the call site can actually apply.
+    available_actions: list[str] = Field(default_factory=list)
+
+
+class ResolutionAction(BaseModel):
+    """The output of :func:`orchestrator.blocker_resolver.resolve_blocker`.
+
+    A single bounded, executable action chosen by the resolver (deterministic
+    fast-path for known classes, or the LLM resolver for novel ones). The call
+    site maps :attr:`action` onto the existing recovery primitive and records
+    the outcome in the ledger (``resolution_outcome``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: ResolutionActionType
+    # Action-specific parameters (e.g. ``{"question": "..."}`` for ask_human,
+    # ``{"new_max_turns": 12}`` for escalate_budget). Kept as a free dict so the
+    # vocabulary can grow without a schema migration.
+    params: dict[str, Any] = Field(default_factory=dict)
+    rationale: str = ""
+
+
 __all__ = [
     "AcceptanceCriterion",
+    "BlockerContext",
     "ClarifyingAnswer",
     "ClarifyingQuestion",
     "CoderEvidence",
@@ -945,6 +1030,8 @@ __all__ = [
     "Phase",
     "Plan",
     "RecoveryHint",
+    "ResolutionAction",
+    "ResolutionActionType",
     "ReviewCandidate",
     "ReviewEvidence",
     "ReviewTournamentEvidence",

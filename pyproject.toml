@@ -124,6 +124,9 @@ include = [
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["src", "."]
+markers = [
+    "resolver_enabled: opt the test back into the ADR-0047 blocker-resolver chokepoint (disabled by default in the suite via the autouse fixture in tests/conftest.py)",
+]
 filterwarnings = [
     "ignore:coroutine 'create_subprocess_exec' was never awaited:RuntimeWarning",
     "ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited:RuntimeWarning",

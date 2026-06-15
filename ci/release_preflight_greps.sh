@@ -186,6 +186,36 @@ preflight_v041() {
   check "v0.41 framing diag signal"   src/orchestrator/framing_phase.py            "diagnosis_signals"
 }
 
+preflight_v042() {
+  # ADR-0047 — Universal Blocker Resolver
+  check "v0.42 resolver module"       src/orchestrator/blocker_resolver.py         "async def resolve_blocker"
+  check "v0.42 resolver fastpath"     src/orchestrator/blocker_resolver.py         "def deterministic_action"
+  check "v0.42 resolver degrade"      src/orchestrator/blocker_resolver.py         "async def record_phase_degrade"
+  check "v0.42 resolver prompt"       src/agents/prompts/resolver.md               "You are the RESOLVER agent"
+  check "v0.42 failure classes"       src/orchestrator/failure_classes.py          "STRUCTURAL_FAILURE_CLASSES"
+  check "v0.42 resolver chokepoint"   src/orchestrator/execute_phase.py            "_maybe_resolve_blocker"
+  check "v0.42 resolver config"       src/config/schema.py                         "class ResolverConfig"
+  check "v0.42 resolver role"         src/config/schema.py                         "SPECIALIST_ROLES"
+  check "v0.42 blocker context"       src/state/schemas.py                         "class BlockerContext"
+  check "v0.42 resolution action"     src/state/schemas.py                         "class ResolutionAction"
+  check "v0.42 resolver ledger op"    src/state/ledger.py                          "resolution_chosen"
+  check "v0.42 resolver killswitch"   src/orchestrator/execute_phase.py            "AUTODEV_RESOLVER_DISABLED"
+  # C1 — intake/diagnosis DOA fix (specialist-role backfill) + source gates
+  check "v0.42 C1 backfill"           src/config/loader.py                         "_backfill_specialist_roles"
+  check "v0.42 C1 github gate"        src/orchestrator/intake_sources/github.py    "_gh_available"
+  # A4 — plan-tournament text-only tool scoping
+  check "v0.42 A4 plan-tourn scope"   src/orchestrator/plan_tournament_runner.py   "_TEXT_ONLY_NO_TOOL_ROLES"
+  # C3 — cross-phase depends_on validation
+  check "v0.42 C3 undefined refs"     src/orchestrator/dag.py                      "def validate_dag_undefined_refs"
+  check "v0.42 C3 global cycles"      src/orchestrator/dag.py                      "def validate_dag_cycles_global"
+  # C4 — worktree pool atomicity
+  check "v0.42 C4 claim lock"         src/orchestrator/worktree_pool.py            "_claim_lock"
+  check "v0.42 C4 task index"         src/orchestrator/worktree_pool.py            "_task_to_path"
+  # C5 — corrective test-repair duration cap
+  check "v0.42 C5 cap field"          src/config/schema.py                         "max_duration_s_per_test_repair_task"
+  check "v0.42 C5 enforcer select"    src/guardrails/enforcer.py                   "_eff_max_duration_s_per_test_repair_task"
+}
+
 case "$target" in
   v0.32) preflight_v032 ;;
   v0.33) preflight_v033 ;;
@@ -197,9 +227,10 @@ case "$target" in
   v0.39) preflight_v039 ;;
   v0.40) preflight_v040 ;;
   v0.41) preflight_v041 ;;
-  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ; preflight_v041 ;;
+  v0.42) preflight_v042 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ; preflight_v041 ; preflight_v042 ;;
   *)
-    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | v0.41 | all)" >&2
+    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | v0.41 | v0.42 | all)" >&2
     exit 2
     ;;
 esac

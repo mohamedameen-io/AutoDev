@@ -494,6 +494,15 @@ async def run_intake_phase(
         return await _run_intake_phase_inner(orch, intent, interactive=interactive)
     except Exception as exc:  # noqa: BLE001 - intake must never block planning
         logger.warning("intake_phase.degraded", err=str(exc))
+        # ADR-0047 (B1): make the degrade EXPLICIT in the ledger instead of a
+        # silent warning (the Run-4 DOA lesson). Observability-only — intake
+        # still returns its degraded pass-through outcome.
+        try:
+            from orchestrator.blocker_resolver import record_phase_degrade
+
+            await record_phase_degrade(orch, "intake", exc)
+        except Exception:  # noqa: BLE001
+            pass
         return IntakeOutcome(
             spec=intent, spec_hash=_spec_hash(intent), degraded=True
         )

@@ -441,6 +441,14 @@ async def run_diagnosis_phase(
         await _ledger_op(
             orch, "seam_finding", {"seam": "unknown", "degraded": True, "err": str(exc)}
         )
+        # ADR-0047 (B1): record the degrade as an explicit resolver decision
+        # (observability-only; diagnosis still returns its degraded outcome).
+        try:
+            from orchestrator.blocker_resolver import record_phase_degrade
+
+            await record_phase_degrade(orch, "diagnosis", exc)
+        except Exception:  # noqa: BLE001
+            pass
         return _degraded_outcome("dispatch_error")
 
 

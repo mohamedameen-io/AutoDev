@@ -84,6 +84,17 @@ class WorktreePool:
         self._claimed: dict[str, str] = {}
         # Map from claimed path → owning task_id for forensics.
         self._claim_task: dict[str, str] = {}
+        # C4: explicit reverse index task_id → claimed path. Maintained in
+        # lockstep with ``_claim_task`` so ``remove_per_task`` does an O(1)
+        # direct lookup instead of an O(n) racy reverse scan of ``_claim_task``
+        # (which mis-assigned worktrees when two corrective tasks raced).
+        self._task_to_path: dict[str, str] = {}
+        # C4: serialize the read-modify-write across the queue + both claim
+        # maps so concurrent corrective tasks (ids like '1.c4'/'1.c5') can
+        # never double-assign the same pooled path or leave ``_claimed`` and
+        # ``_claim_task`` diverged. asyncio.Lock binds to the running loop on
+        # first ``async with``; safe to construct here (no loop required).
+        self._claim_lock = asyncio.Lock()
         # Baseline commit — captured at cold_start. Empty until then.
         self._baseline: str = ""
         # Tracks every label this pool created so cleanup_all can remove
@@ -177,33 +188,40 @@ class WorktreePool:
             # the orchestrator never blocks if cold-start raced with
             # dispatch.
             self._available = asyncio.Queue()
-        if not self._available.empty():
-            path = self._available.get_nowait()
-            label = self._label_for(path)
-            self._claimed[str(path)] = label
-            if task_id is not None:
-                self._claim_task[str(path)] = task_id
-            self._log.info(
-                "worktree_pool.claim.from_queue",
-                label=label,
-                path=str(path),
-                task_id=task_id,
-            )
-            return path
+
+        # C4: the queue pop AND both map writes happen under one lock so a
+        # second concurrent claim can never observe a half-updated state and
+        # hand out a path that's already been (or is being) assigned. Pinned
+        # to the FULL task_id per [[explicit-identity]].
+        async with self._claim_lock:
+            if not self._available.empty():
+                path = self._available.get_nowait()
+                label = self._label_for(path)
+                self._record_claim(path, label, task_id)
+                self._log.info(
+                    "worktree_pool.claim.from_queue",
+                    label=label,
+                    path=str(path),
+                    task_id=task_id,
+                )
+                return path
 
         # Pool exhausted — create an overflow worktree lazily. Uses the
-        # per-task subdir under tournament_dir/tasks/<id>.
+        # per-task subdir under tournament_dir/tasks/<id>. The create itself
+        # is outside the lock (it's a slow git+disk op and creates a fresh,
+        # task-scoped path that no other claim can collide on); only the
+        # bookkeeping write below re-enters the lock.
         if task_id is None:
-            task_id = f"overflow-{len(self._claimed)}"
+            async with self._claim_lock:
+                task_id = f"overflow-{len(self._claimed)}"
         path = await self._mgr.create_per_task(
             task_id, base_ref=self._baseline or "HEAD"
         )
         # Per-task worktrees live under pool_dir/tasks/<task_id>; their
         # "label" for our purposes is the task_id. We track them in
         # _claimed so release() / cleanup_all can find them.
-        self._claimed[str(path)] = f"tasks/{task_id}"
-        if task_id is not None:
-            self._claim_task[str(path)] = task_id
+        async with self._claim_lock:
+            self._record_claim(path, f"tasks/{task_id}", task_id)
         self._log.info(
             "worktree_pool.claim.overflow",
             task_id=task_id,
@@ -231,8 +249,31 @@ class WorktreePool:
         if self._available is None:
             self._available = asyncio.Queue()
         path_str = str(worktree)
-        label = self._claimed.pop(path_str, None)
-        self._claim_task.pop(path_str, None)
+
+        # C4: pop both maps atomically and verify the path was claimed by the
+        # task_id we're releasing for (explicit-identity guard). A mismatch
+        # means a concurrent claim overwrote this path's owner — warn loudly
+        # but still proceed with teardown so we never leak the worktree.
+        async with self._claim_lock:
+            label = self._claimed.pop(path_str, None)
+            owner = self._claim_task.pop(path_str, None)
+            # Keep the reverse index consistent: drop whatever task_id mapped
+            # to this path (the recorded owner, not necessarily ``task_id``).
+            if owner is not None:
+                self._task_to_path.pop(owner, None)
+            if task_id is not None and owner is not None and owner != task_id:
+                self._task_to_path.pop(task_id, None)
+        if (
+            task_id is not None
+            and owner is not None
+            and owner != task_id
+        ):
+            self._log.warning(
+                "worktree_pool.release.task_identity_mismatch",
+                path=path_str,
+                claimed_by=owner,
+                releasing_as=task_id,
+            )
 
         if not worktree.exists():
             self._log.warning(
@@ -288,7 +329,8 @@ class WorktreePool:
                 )
             return
 
-        await self._available.put(worktree)
+        async with self._claim_lock:
+            await self._available.put(worktree)
         self._log.info(
             "worktree_pool.release.queued",
             label=label or self._label_for(worktree),
@@ -329,17 +371,32 @@ class WorktreePool:
     async def remove_per_task(self, task_id: str, force: bool = True) -> None:
         """:class:`WorktreeManager`-compatible facade — delegates to release().
 
-        The release path locates the worktree via the per-claim mapping
-        kept in :attr:`_claim_task`. If the task isn't currently claimed
-        (e.g. because the worker raised before claim), this is a no-op.
+        C4: locates the worktree via the explicit reverse index
+        :attr:`_task_to_path` (O(1) direct lookup) under ``_claim_lock``,
+        instead of the previous O(n) reverse scan of :attr:`_claim_task` —
+        the scan let two concurrent corrective tasks race so that the second
+        claim's overwrite made the first task's lookup find the wrong (or no)
+        path, silently leaking a worktree or mis-assigning one.
+
+        If the task isn't tracked (e.g. the worker raised before claim, or a
+        concurrent claim already stole/overwrote the slot), this logs a
+        structured ``worktree_pool.remove_per_task_not_found`` warning and
+        returns WITHOUT raising — raising here in production could mask real
+        cleanup or crash the dispatcher mid-fan-out.
         """
         del force
-        # Find the path owned by ``task_id`` and release it.
-        path_str = next(
-            (p for p, tid in self._claim_task.items() if tid == task_id),
-            None,
-        )
+        # Snapshot the reverse index under the lock so we read a consistent
+        # task→path pairing even while peers are claiming/releasing.
+        async with self._claim_lock:
+            path_str = self._task_to_path.get(task_id)
         if path_str is None:
+            async with self._claim_lock:
+                tracked = sorted(self._task_to_path.keys())
+            self._log.warning(
+                "worktree_pool.remove_per_task_not_found",
+                task_id=task_id,
+                tracked=tracked,
+            )
             return
         await self.release(Path(path_str), task_id=task_id)
 
@@ -422,10 +479,27 @@ class WorktreePool:
 
         self._claimed.clear()
         self._claim_task.clear()
+        self._task_to_path.clear()
         self._all_labels.clear()
         self._log.info("worktree_pool.cleanup_all.done")
 
     # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _record_claim(
+        self, path: Path, label: str, task_id: str | None
+    ) -> None:
+        """Record a claim into all three maps. Caller MUST hold ``_claim_lock``.
+
+        Writes ``_claimed`` (path→label) plus, when ``task_id`` is given, the
+        forward ``_claim_task`` (path→task_id) and reverse ``_task_to_path``
+        (task_id→path) indexes together so they never diverge. Pins the FULL
+        task_id per [[explicit-identity]].
+        """
+        path_str = str(path)
+        self._claimed[path_str] = label
+        if task_id is not None:
+            self._claim_task[path_str] = task_id
+            self._task_to_path[task_id] = path_str
 
     def _label_for(self, path: Path) -> str:
         """Map a pool worktree path back to its label."""

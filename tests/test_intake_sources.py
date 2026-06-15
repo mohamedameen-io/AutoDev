@@ -172,7 +172,14 @@ async def test_session_unavailable_without_prior_sessions(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_gather_facts_returns_parsed_facts(tmp_path: Path) -> None:
+async def test_gather_facts_returns_parsed_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # v0.42.0 (C1): the github source now also gates on `gh` being on PATH.
+    # Force it available so this test is deterministic on a gh-less CI runner.
+    monkeypatch.setattr(
+        "orchestrator.intake_sources.github._gh_available", lambda: True
+    )
     _bootstrap_repo(tmp_path)
     await _write_explore(tmp_path)
     response = _facts_block(

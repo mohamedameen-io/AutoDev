@@ -26,6 +26,34 @@ REQUIRED_AGENT_ROLES: tuple[str, ...] = (
 )
 
 
+# v0.42.0 (C1): specialist roles introduced after the original 14 required
+# roles. They are dispatched via a *self-contained* path (each phase reads
+# ``cfg.agents[role]`` for model/max-turns and invokes the role directly,
+# like ``framing._invoke_framing_role``) — NOT through ``build_registry``,
+# which only holds :data:`REQUIRED_AGENT_ROLES`. Because they are not
+# required, ``require_all_roles()`` never validated them, so a pre-v0.41
+# ``config.json`` (written before these roles existed) lacks the
+# ``cfg.agents[role]`` entry → ``KeyError`` at dispatch → silent fail-safe
+# degrade (the Run-4 DEAD-ON-ARRIVAL bug for intake/diagnosis). The fix is a
+# load-time backfill (see ``config.loader.load_config``) that adds a default
+# :class:`AgentConfig` for any specialist role missing from an on-disk config,
+# idempotently (operator customizations are never overwritten).
+#
+# Keep this in sync with the specialist keys in
+# ``config.defaults._AGENT_MODEL_DEFAULTS`` / ``_AGENT_MAX_TURNS``.
+SPECIALIST_ROLES: tuple[str, ...] = (
+    "framing",
+    "altitude_judge",
+    "intake_enricher",
+    "intake_clarifier",
+    "diagnostician",
+    # v0.42.0 (ADR-0047): the Universal Blocker Resolver role. Registered as a
+    # specialist (self-contained dispatch, forced structured output) so it can
+    # never repeat the DOA bug it was built to eliminate.
+    "resolver",
+)
+
+
 # v0.38.0 HK1: one-shot warning ledger for the ``"coder"`` → ``"developer"``
 # kind-label migration shim. Pydantic's ``model_validator(mode="after")``
 # can fire many times per process (one per config load + per model copy),
@@ -492,6 +520,56 @@ def _default_diagnosis_cfg() -> "DiagnosisPhaseConfig":
     )
 
 
+class ResolverConfig(BaseModel):
+    """Universal Blocker Resolver config (ADR-0047).
+
+    Mirrors :class:`FramingPhaseConfig`'s ``extra="forbid"`` strictness and
+    ``default_factory`` wiring so a legacy ``config.json`` lacking the field
+    still validates. The resolver is the orchestrator-level catch-all that
+    fires when a downstream agent/phase hits a *terminal* blocker (or an
+    *unrecognized* failure): it reasons about the blocker and chooses a bounded
+    recovery action to re-enable the workflow instead of dead-ending at
+    ``blocked: user_decision_required`` or silently degrading.
+
+    Two-tier design: the existing deterministic recovery ladder is the cheap
+    fast path; this resolver is the catch-all above it. With
+    ``fast_path_only_on_known=True`` (default) the resolver only fires at
+    terminal rungs or on failure classes the deterministic ladder does not
+    recognise, so the common-case cost stays ≈ 0.
+
+    Kill-switch: ``AUTODEV_RESOLVER_DISABLED=1`` forces the resolver off
+    regardless of ``enabled`` (every call site falls through to its prior
+    block/degrade behaviour — fail-safe).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    # Per-blocker resolution budget (ledger-tracked). Once a single blocker has
+    # consumed this many resolver cycles without recovery, the resolver stops
+    # recursing and falls through to a bounded ``ask_human`` (loop-safety B5).
+    max_cycles_per_blocker: int = Field(default=3, ge=1, le=10)
+    # When True, the resolver only engages at terminal recovery rungs or on
+    # failure classes the deterministic ladder does not handle (keeps cost ≈ 0
+    # for the common, already-recoverable case). When False, the resolver is
+    # consulted on every routed blocker (more LLM calls; useful for evaluation).
+    fast_path_only_on_known: bool = True
+    model: str | None = None
+
+
+def _default_resolver_cfg() -> "ResolverConfig":
+    """Default-on resolver config used when an existing ``config.json`` omits
+    the new field (ADR-0047). On by default; ``fast_path_only_on_known=True``
+    plus the per-blocker cycle budget and the global circuit-breaker keep the
+    common-case cost ≈ 0 and make runaway loops impossible."""
+    return ResolverConfig(
+        enabled=True,
+        max_cycles_per_blocker=3,
+        fast_path_only_on_known=True,
+        model=None,
+    )
+
+
 class TournamentsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -707,6 +785,15 @@ class GuardrailsConfig(BaseModel):
     # which legitimate runs trip on the guardrail rather than on the
     # subprocess timeout. Operators with explicit values are unaffected.
     max_duration_s_per_task: int = 2400
+    # v0.42.0 (C5): a tighter duration cap selected by the enforcer for
+    # *corrective test-run / test-repair* tasks specifically. These tasks run a
+    # test suite and apply a small repair; they have a different (usually
+    # shorter) duration profile than a full developer task, and the v0.41
+    # field's 2400s default let a wedged corrective test-repair burn the whole
+    # window. ``None`` (default) means "fall back to ``max_duration_s_per_task``"
+    # — byte-identical to v0.41 behaviour until an operator sets it (or the
+    # resolver's ``relax_constraint``/``split_task`` actions reach it).
+    max_duration_s_per_test_repair_task: int | None = None
     max_diff_bytes: int = 5_242_880
     cost_budget_usd_per_plan: float | None = None
 
@@ -1025,6 +1112,10 @@ class KnowledgeConfig(BaseModel):
             "intake_enricher",
             "intake_clarifier",
             "diagnostician",
+            # ADR-0047: the resolver reasons over its own bounded action
+            # vocabulary + failure context; seed-pack minimality lessons are
+            # irrelevant noise for it (seed-pack isolation, mirrors framing).
+            "resolver",
         ]
     )
     # v0.18.0 B1: lane-aware lesson injection toggle. When True (default),
@@ -1150,6 +1241,11 @@ class AutodevConfig(BaseModel):
     # under ``extra="forbid"`` (the factory defaults to ``enabled=True``,
     # bug-gated). Kill-switch: ``AUTODEV_DIAGNOSIS_DISABLED=1``.
     diagnosis: DiagnosisPhaseConfig = Field(default_factory=_default_diagnosis_cfg)
+    # ADR-0047: Universal Blocker Resolver config. ``default_factory`` is
+    # mandatory so a legacy ``config.json`` lacking the field still validates
+    # under ``extra="forbid"`` (the factory defaults to ``enabled=True``,
+    # fast-path-only). Kill-switch: ``AUTODEV_RESOLVER_DISABLED=1``.
+    resolver: ResolverConfig = Field(default_factory=_default_resolver_cfg)
     # v0.16.0 hallucination-guard top-level toggle. Default True — the
     # guard ships on by default so projects benefit immediately. Skip
     # patterns: dynamic imports, third-party packages not installed in

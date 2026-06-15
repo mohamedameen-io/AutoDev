@@ -13,6 +13,7 @@ instruction and PARSES the ``github``-sourced facts.
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 
 from autologging import get_logger
@@ -21,6 +22,19 @@ from config.schema import IntakePhaseConfig
 from state.schemas import GatheredFact
 
 logger = get_logger()
+
+
+def _gh_available() -> bool:
+    """Return whether the ``gh`` CLI is on PATH (no network — a ``shutil.which``
+    probe, mirroring ``qa.env`` / ``cli.commands.doctor``).
+
+    The agent fetches the canonical issue with ``gh issue view`` / ``gh pr view``;
+    in a headless runner with no ``gh`` binary that dispatch is wasted (the agent
+    can emit no ``github`` fact), so the source gates on the CLI being present.
+    A module-level function so tests can monkeypatch BOTH branches without a
+    network call. Never raises.
+    """
+    return shutil.which("gh") is not None
 
 # ``#199`` / ``org/repo#199`` / ``GH-199`` shorthand references.
 _ISSUE_REF_RE = re.compile(r"(?:\b[\w.-]+/[\w.-]+)?#(\d+)\b|\bGH-(\d+)\b")
@@ -54,8 +68,18 @@ class GitHubSource:
     async def available(
         self, *, cwd: Path, intent: str, cfg: IntakePhaseConfig
     ) -> bool:
+        # Two-part gate (ADR-0045): a concrete issue/PR ref in the intent AND the
+        # ``gh`` CLI on PATH. Both are required — a ``#NNN`` with no ``gh`` binary
+        # (the Run-4 headless reality) means the dispatched agent could not run
+        # ``gh issue view`` anyway, so we deactivate instead of spending a wasted
+        # fragment that can only ever yield no ``github`` fact.
         short, urls = _references(intent)
-        return bool(short or urls)
+        if not (short or urls):
+            return False
+        if not _gh_available():
+            logger.info("intake.gather.github_skipped_no_gh", refs=short + urls)
+            return False
+        return True
 
     async def prepare_prompt(
         self, *, cwd: Path, intent: str, cfg: IntakePhaseConfig

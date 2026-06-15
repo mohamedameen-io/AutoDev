@@ -1,0 +1,144 @@
+"""Canonical failure-class taxonomy for the Universal Blocker Resolver (ADR-0047).
+
+Before v0.42.0 the orchestrator expressed terminal failures as ad-hoc string
+literals scattered across ``execute_phase.py`` (``"dag_invalid"``,
+``"test_diagnosis"``, ``"edit_scope_violation"`` …) and embedded them in
+``blocked_reason`` metadata. The blocker resolver needs a single, named
+vocabulary so it can (a) route a known failure to a deterministic fast-path
+action without an LLM call, and (b) recognise an *unrecognised* class and hand
+it to the LLM resolver. This module is that vocabulary.
+
+The taxonomy is intentionally coarse — one entry per terminal *site class* from
+the recovery audit, plus the phase-degrade classes and a catch-all
+:data:`UNKNOWN` for novel/unseen failures (the case the resolver exists to
+handle). ``failure_class`` strings on :class:`state.schemas.BlockerContext` are
+expected (but not required) to be one of :data:`ALL_FAILURE_CLASSES`; an
+arbitrary string is treated as :data:`UNKNOWN` by :func:`classify`.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+# --- Terminal failure sites in execute_phase.py (the recovery audit) ----------
+# DAG / scope — structural plan errors (resolver typically re-plans or falls
+# through to the legacy block; these are not task-local).
+DAG_INVALID = "dag_invalid"
+CROSS_PHASE_DAG_INVALID = "cross_phase_dag_invalid"
+EDIT_SCOPE_VIOLATION = "edit_scope_violation"
+
+# Merge-conflict escalation.
+CONFLICT_3WAY_FAILED = "conflict_3way_failed"
+CONFLICT_ABANDON = "conflict_abandon"
+CONFLICT_REWRITE_CAP_EXCEEDED = "conflict_rewrite_cap_exceeded"
+
+# Guardrail exhaustion (decision-cost / turn budget overruns).
+GUARDRAIL_EXCEEDED = "guardrail_exceeded"
+
+# Test-diagnosis terminal signals.
+TEST_DIAGNOSIS_HARDFAIL = "test_diagnosis_hardfail"
+TEST_DIAGNOSIS_NO_SIGNAL = "test_diagnosis_no_signal"
+
+# Worker crash (developer/test adapter raised at the code layer).
+WORKER_EXCEPTION = "worker_exception"
+
+# Infra circuit breaker (auth/rate-limit/server failures across tasks).
+INFRA_CIRCUIT_OPEN = "infra_circuit_open"
+
+# Soft-blocker handoff rung (escalation ladder terminal).
+SOFT_BLOCKER = "soft_blocker"
+
+# Worktree apply failure (patch could not be applied to the working tree).
+WORKTREE_APPLY_FAILED = "worktree_apply_failed"
+
+# --- Phase-degrade classes (intake/diagnosis/framing convert silent degrade) --
+PHASE_DEGRADED = "phase_degraded"
+
+# --- Catch-all: a failure the deterministic ladder does not recognise. This is
+# the class the LLM resolver exists to handle. ---------------------------------
+UNKNOWN = "unknown"
+
+FailureClass = Literal[
+    "dag_invalid",
+    "cross_phase_dag_invalid",
+    "edit_scope_violation",
+    "conflict_3way_failed",
+    "conflict_abandon",
+    "conflict_rewrite_cap_exceeded",
+    "guardrail_exceeded",
+    "test_diagnosis_hardfail",
+    "test_diagnosis_no_signal",
+    "worker_exception",
+    "infra_circuit_open",
+    "soft_blocker",
+    "worktree_apply_failed",
+    "phase_degraded",
+    "unknown",
+]
+
+ALL_FAILURE_CLASSES: tuple[str, ...] = (
+    DAG_INVALID,
+    CROSS_PHASE_DAG_INVALID,
+    EDIT_SCOPE_VIOLATION,
+    CONFLICT_3WAY_FAILED,
+    CONFLICT_ABANDON,
+    CONFLICT_REWRITE_CAP_EXCEEDED,
+    GUARDRAIL_EXCEEDED,
+    TEST_DIAGNOSIS_HARDFAIL,
+    TEST_DIAGNOSIS_NO_SIGNAL,
+    WORKER_EXCEPTION,
+    INFRA_CIRCUIT_OPEN,
+    SOFT_BLOCKER,
+    WORKTREE_APPLY_FAILED,
+    PHASE_DEGRADED,
+    UNKNOWN,
+)
+
+# Structural plan errors: the resolver should NOT attempt task-local recovery
+# (these need architect re-planning or are intentionally phase-wide). Wiring
+# still routes them through ``resolve_blocker`` for observability, but the
+# default policy is to re-plan or fall through to the legacy block.
+STRUCTURAL_FAILURE_CLASSES: frozenset[str] = frozenset(
+    {DAG_INVALID, CROSS_PHASE_DAG_INVALID, EDIT_SCOPE_VIOLATION, INFRA_CIRCUIT_OPEN}
+)
+
+
+def classify(raw: str | None) -> str:
+    """Normalise an arbitrary failure-class string to a known class.
+
+    Returns the string unchanged if it is in :data:`ALL_FAILURE_CLASSES`,
+    otherwise :data:`UNKNOWN` (the novel-failure path the resolver handles).
+    """
+    if raw is not None and raw in ALL_FAILURE_CLASSES:
+        return raw
+    return UNKNOWN
+
+
+def is_known(raw: str | None) -> bool:
+    """True if ``raw`` names a known failure class (not the catch-all)."""
+    return raw is not None and raw in ALL_FAILURE_CLASSES and raw != UNKNOWN
+
+
+__all__ = [
+    "FailureClass",
+    "ALL_FAILURE_CLASSES",
+    "STRUCTURAL_FAILURE_CLASSES",
+    "classify",
+    "is_known",
+    # Constants
+    "DAG_INVALID",
+    "CROSS_PHASE_DAG_INVALID",
+    "EDIT_SCOPE_VIOLATION",
+    "CONFLICT_3WAY_FAILED",
+    "CONFLICT_ABANDON",
+    "CONFLICT_REWRITE_CAP_EXCEEDED",
+    "GUARDRAIL_EXCEEDED",
+    "TEST_DIAGNOSIS_HARDFAIL",
+    "TEST_DIAGNOSIS_NO_SIGNAL",
+    "WORKER_EXCEPTION",
+    "INFRA_CIRCUIT_OPEN",
+    "SOFT_BLOCKER",
+    "WORKTREE_APPLY_FAILED",
+    "PHASE_DEGRADED",
+    "UNKNOWN",
+]

@@ -4,6 +4,58 @@ All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-06-15
+
+### Added
+
+- **Universal Blocker Resolver (ADR-0047).** A new orchestrator-level chokepoint that, whenever a
+  downstream agent/phase hits a *terminal* failure, routes the blocker through a single resolver
+  (`orchestrator.blocker_resolver.resolve_blocker`) that diagnoses it and chooses a **bounded,
+  executable recovery action** — instead of dead-ending at `blocked: user_decision_required` or
+  silently degrading. Two-tier: a ladder-aware **deterministic fast-path** for known failure
+  classes (no LLM, cost ≈ 0) and an **LLM resolver** (the self-contained `resolver` role, forced
+  structured output) for *novel/unseen* errors. The bounded action vocabulary unifies existing
+  primitives (`retry_with_changes`, `split_task`/`narrow_scope`, `re_architect`/`re_plan`,
+  `repair_environment`, `escalate_budget`/`relax_constraint`, `escalate_model`,
+  `soft_pass_with_evidence`, `consult_knowledge`, and `ask_human` as a precise last resort).
+  Wired at the task-local terminal sites in execute (worker-exception, guardrail-exhaustion,
+  test-diagnosis hard-fail / no-signal, soft-blocker) with active recovery, at plan-level DAG
+  validation for observability, and at the intake/diagnosis **phase-degrade** wrappers (converting
+  the silent degrade into an explicit, ledger-recorded decision). Loop-safety is make-or-break: a
+  resume-safe per-blocker cycle budget *plus* a ledger-independent in-memory guard, and
+  resolver-self-failure falls straight through to a bounded `ask_human` (never recurses). New
+  ledger ops `blocker_escalated` / `resolution_chosen` / `resolution_outcome` (audit-only,
+  resume-safe). On by default; kill-switch `resolver.enabled=false` or `AUTODEV_RESOLVER_DISABLED=1`
+  (fail-safe — every call site falls back to its prior block/degrade).
+
+### Fixed
+
+- **Intake & Diagnosis are no longer dead-on-arrival on legacy configs (C1).** A pre-v0.41
+  `.autodev/config.json` lacked the new specialist agent roles, and `require_all_roles()` only
+  validated the 14 required roles, so the specialist dispatch (`cfg.agents[role]`) hit a
+  `KeyError` → silent fail-safe degrade (intake/diagnosis were no-ops every run, masked by the
+  degrade wrappers and missed by isolation-only tests). The config loader now **backfills** any
+  missing specialist role (`framing`, `altitude_judge`, `intake_enricher`, `intake_clarifier`,
+  `diagnostician`, `resolver`) idempotently at load time, so a legacy config is byte-identical to
+  a fresh one for those roles. New integration tests exercise the *real* dispatch through the
+  orchestrator (not mocks) and assert `outcome.degraded is False`.
+- **Plan tournament no longer exhausts text-only roles on a stray read (A4).** The v0.41 Read
+  suppression for `critic_t`/`synthesizer` only reached the phase-review tournament;
+  `plan_tournament_runner._build_role_overrides` now mirrors it, so the plan tournament's
+  text-only roles can't trip `error_max_turns` and kill every branch.
+- **Cross-phase `depends_on` is no longer rejected as "undefined" (C3).** DAG validation now runs
+  plan-wide (`validate_dag_undefined_refs` + `validate_dag_cycles_global`) so a legitimate
+  cross-phase edge (e.g. task `2.1` depends_on `1.1`, which the architect now emits) validates,
+  matching the scheduler that already resolves cross-phase deps globally.
+- **Worktree pool no longer mis-assigns or leaks worktrees under concurrent correctives (C4).**
+  `claim`/`release`/`remove_per_task` are now atomic under a per-pool `asyncio.Lock` with an
+  explicit `task_id → path` index (O(1), no racy reverse scan) and a loud not-found guard, so two
+  concurrent corrective tasks can't claim the same pooled path.
+- **Corrective test-repair tasks get a tighter duration cap (C5).** New
+  `guardrails.max_duration_s_per_test_repair_task` (default: fall back to the global cap),
+  selected by the enforcer for corrective `.cN` tasks so a wedged test-repair can't burn the full
+  per-task window.
+
 ## [0.41.0] - 2026-06-15
 
 ### Added

@@ -391,6 +391,7 @@ autodev/                          # project root
 | [0044](decisions/0044-framing-altitude-phase.md) | Framing/Altitude Phase for Autonomous Patch-vs-Architecture Decisions (Proposed) |
 | [0045](decisions/0045-intake-clarification-phase.md) | Intake & Clarification Phase: gather, enrich, and clarify under-specified specs before autonomous planning (Accepted) |
 | [0046](decisions/0046-diagnosis-phase-reproduce-first.md) | Diagnosis Phase: a reproduce-first bug-fix workflow (feedback loop before plan), adapted from Matt Pocock's `diagnose` skill (Accepted) |
+| [0047](decisions/0047-universal-blocker-resolver.md) | Universal Blocker Resolver: orchestrator-level recovery from any terminal failure (Accepted) |
 
 ### Reference Documents (`docs/design_documentation/`)
 

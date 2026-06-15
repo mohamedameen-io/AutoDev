@@ -13,6 +13,31 @@ from config.loader import save_config
 from config.schema import AutodevConfig, QAGatesConfig
 
 
+@pytest.fixture(autouse=True)
+def _resolver_disabled_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.42.0 (ADR-0047): scope the Universal Blocker Resolver OFF by default
+    in the test suite.
+
+    The resolver actively recovers at terminal failure sites (re-enabling tasks
+    instead of blocking) — an intentional behavior change. The legacy suite
+    encodes the pre-resolver block behavior, so the resolver *chokepoint*
+    (``execute_phase._maybe_resolve_blocker``, which honours
+    ``AUTODEV_RESOLVER_DISABLED``) is disabled here to give every legacy test
+    EXACT pre-resolver behavior — true fail-safe + no recovery loops. The
+    resolver's own logic is covered directly by ``test_blocker_resolver.py``
+    (which calls ``resolve_blocker`` without the env gate), and the wiring is
+    covered by tests marked ``@pytest.mark.resolver_enabled`` (which opt back
+    in). Production / the CLI / the benchmark do NOT set this env var, so the
+    resolver is ON there.
+    """
+    if request.node.get_closest_marker("resolver_enabled"):
+        monkeypatch.delenv("AUTODEV_RESOLVER_DISABLED", raising=False)
+    else:
+        monkeypatch.setenv("AUTODEV_RESOLVER_DISABLED", "1")
+
+
 @pytest.fixture
 def tmp_project_dir(tmp_path: Path) -> Path:
     """Create a fresh project dir with `.autodev/config.json` from defaults."""

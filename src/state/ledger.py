@@ -596,6 +596,23 @@ LedgerOp = Literal[
     "intake_answered",
     "intake_defaults_assumed",
     "spec_locked",
+    # ADR-0047: Universal Blocker Resolver audit breadcrumbs. All three are
+    # audit-only — they NEVER mutate plan state (the resolver's chosen action
+    # applies via the regular ``update_task_status`` / ``append_corrective_tasks``
+    # / ``budget_escalation`` ops emitted alongside). Resume re-reads them to
+    # reconstruct the per-blocker resolution budget WITHOUT re-invoking the
+    # resolver (loop-safety + determinism). Payload shapes:
+    # - ``blocker_escalated``: ``{task_id, phase_id, failure_class, failing_role,
+    #   raw_error_excerpt, recovery_already_tried: list[str]}``. Emitted when a
+    #   terminal site routes a blocker to ``resolve_blocker``.
+    # - ``resolution_chosen``: ``{task_id, failure_class, action,
+    #   rationale_excerpt, params}``. Emitted once the resolver picks an action.
+    # - ``resolution_outcome``: ``{task_id, action, outcome: "applied" |
+    #   "fell_through" | "ask_human", reason}``. Emitted after the site applies
+    #   (or declines) the action.
+    "blocker_escalated",
+    "resolution_chosen",
+    "resolution_outcome",
 ]
 
 
@@ -939,6 +956,17 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # plan is persisted via ``init_plan``). They never mutate plan state and
         # may legitimately precede any plan-containing op on replay, so they MUST
         # return early here — before the ``plan is None`` guard below.
+        return plan
+
+    if op in ("blocker_escalated", "resolution_chosen", "resolution_outcome"):
+        # ADR-0047: audit-only breadcrumbs for the Universal Blocker Resolver.
+        # The resolver fires during execute_phase (plan already persisted), but
+        # these ops never mutate plan state — the chosen action applies via the
+        # regular ``update_task_status`` / ``append_corrective_tasks`` /
+        # ``budget_escalation`` ops emitted alongside. Resume re-reads them to
+        # rebuild the per-blocker resolution budget without re-invoking the
+        # resolver. Returned early here (before the ``plan is None`` guard) so
+        # replay is order-independent, mirroring the framing/intake/diagnosis ops.
         return plan
 
     if op in ("mark_in_flight", "clear_in_flight"):

@@ -202,6 +202,84 @@ def validate_phase_dag(phase: Phase) -> None:
     warn_unordered_file_sharers(phase)
 
 
+def validate_dag_undefined_refs(plan: Plan) -> None:
+    """Plan-wide undefined-reference check across ALL phases.
+
+    Builds a single ``{task_id: task}`` index over every phase of ``plan``
+    and raises :class:`DagValidationError` if any ``Task.depends_on`` id is
+    not present *anywhere* in the plan. Unlike :func:`validate_phase_dag`'s
+    per-phase undefined-ref pass (which only sees one phase's task ids), this
+    accepts legitimate cross-phase dependencies — e.g. task ``2.1`` declaring
+    ``depends_on: ["1.1"]`` no longer trips a false "undefined task" error.
+
+    This is C3's gate for cross-phase deps. It mirrors Pass 1 of the legacy
+    ``orchestrator.execute_phase._validate_cross_phase_dag`` so both halves of
+    plan-wide validation now live here; cycle detection is the companion
+    :func:`validate_dag_cycles_global`.
+
+    No-op for an empty plan (no phases / no tasks).
+    """
+    by_id: dict[str, Task] = {}
+    for phase in plan.phases:
+        for t in phase.tasks:
+            by_id[t.id] = t
+
+    for tid, t in by_id.items():
+        for dep in t.depends_on:
+            if dep not in by_id:
+                raise DagValidationError(
+                    f"task {tid!r} depends_on undefined task {dep!r} "
+                    "(plan-level)"
+                )
+
+
+def validate_dag_cycles_global(plan: Plan) -> None:
+    """Plan-wide cycle detection over the unified cross-phase DAG.
+
+    Walks every ``Task.depends_on`` edge across ALL phases via DFS with a
+    recursion stack (``WHITE`` = unvisited, ``GRAY`` = on the current stack,
+    ``BLACK`` = fully processed). Any cycle — including a back-edge from a
+    later phase to an earlier one (e.g. ``1.1 -> 2.1 -> 1.1``) or a self-loop
+    — raises :class:`DagValidationError` with the full cycle path embedded in
+    the message.
+
+    Mirrors Pass 2 of the legacy
+    ``orchestrator.execute_phase._validate_cross_phase_dag``. Assumes every
+    dep id resolves to a task in the plan; callers should run
+    :func:`validate_dag_undefined_refs` first (an undefined dep would
+    otherwise surface as a ``KeyError`` here, not a clean
+    :class:`DagValidationError`).
+
+    No-op for an empty plan.
+    """
+    by_id: dict[str, Task] = {}
+    for phase in plan.phases:
+        for t in phase.tasks:
+            by_id[t.id] = t
+
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: dict[str, int] = {tid: WHITE for tid in by_id}
+
+    def dfs(node: str, path: list[str]) -> None:
+        color[node] = GRAY
+        path.append(node)
+        for dep in by_id[node].depends_on:
+            if color[dep] == GRAY:
+                start = path.index(dep)
+                cycle = " -> ".join(path[start:] + [dep])
+                raise DagValidationError(
+                    f"cycle detected (plan-level): {cycle}"
+                )
+            if color[dep] == WHITE:
+                dfs(dep, path)
+        path.pop()
+        color[node] = BLACK
+
+    for tid in by_id:
+        if color[tid] == WHITE:
+            dfs(tid, [])
+
+
 def _reachable_pairs(phase: Phase) -> set[tuple[str, str]]:
     """Return every ordered ``(a, b)`` where ``a`` transitively depends on ``b``.
 
@@ -640,6 +718,8 @@ __all__ = [
     "find_file_overlaps",
     "is_in_scope",
     "topological_levels",
+    "validate_dag_cycles_global",
+    "validate_dag_undefined_refs",
     "validate_edit_scope",
     "validate_edit_scope_with_critic_review",
     "validate_phase_dag",
