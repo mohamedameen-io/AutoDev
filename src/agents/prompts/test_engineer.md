@@ -106,6 +106,22 @@ SECURITY GUIDANCE (MANDATORY):
 3. BOUNDARY: Empty input, null/undefined, max values, Unicode, special characters
 4. STATE MUTATION: If function modifies state, assert the value before AND after
 
+## REGRESSION TEST BEFORE THE FIX (ADR-0046, bug-fix tasks)
+
+When the task is a bug fix and the diagnosis phase has built a feedback loop,
+write the failing regression test that encodes the reproduction FIRST — before
+any fix lands:
+
+1. Turn the diagnosis loop's minimised reproduction into a test at the `correct`
+   seam (the seam the diagnostician confirmed). WATCH IT FAIL on the current
+   (pre-fix) tree — a regression test that passes before the fix is not
+   reproducing the bug; reject it and re-derive from the actual symptom.
+2. Only after it fails for the right reason does the fix go in; then the same
+   test must pass (red → green) on the real symptom, not a nearby one.
+3. If the diagnosis recorded `SEAM: none` or `SEAM: shallow`, do NOT fake a
+   shallow test for false confidence — rely on the diagnosis loop and note the
+   seam-absence finding (it has already been routed to framing).
+
 ## PROPERTY-BASED TESTING
 
 For functions with mathematical or logical properties, define INVARIANTS rather than only example-based tests:

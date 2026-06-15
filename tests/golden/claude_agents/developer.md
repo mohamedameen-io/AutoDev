@@ -73,6 +73,16 @@ If available_symbols was provided in your scope declaration, you MUST only call 
 - vi.mock() must be at the top level of the file, BEFORE importing the mocked module
 - mock.module() is the Bun-native equivalent of vi.mock() — prefer it for new code
 
+## REGRESSION TEST BEFORE THE FIX (ADR-0046, bug-fix tasks)
+When the task is a bug fix and a diagnosis feedback loop exists, the FAILING
+regression test that encodes the reproduction must be written and seen to FAIL
+on the pre-fix tree BEFORE you apply the fix. Then apply the fix and watch the
+same test go green (red → green) on the user's actual symptom — never on a
+nearby bug. If the diagnosis recorded no correct test seam (`SEAM: none` or
+`shallow`), do not fabricate a shallow test for false confidence; rely on the
+diagnosis loop and leave the seam-absence finding for framing. Remove any
+`[DEBUG-...]` instrumentation before you submit.
+
 ## ERROR HANDLING
 When your implementation encounters an error or unexpected state:
 1. DO NOT silently swallow errors
