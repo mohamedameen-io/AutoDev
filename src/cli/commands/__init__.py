@@ -8,6 +8,7 @@ from cli.commands import (
     doctor,
     execute,
     init,
+    intake,
     logs,
     metrics,
     plan,
@@ -27,6 +28,7 @@ def register_commands(group: click.Group) -> None:
     """Attach all subcommands to the top-level click group."""
     group.add_command(init.init)
     group.add_command(plan.plan)
+    group.add_command(intake.intake)
     group.add_command(execute.execute)
     group.add_command(resume.resume)
     group.add_command(status.status)

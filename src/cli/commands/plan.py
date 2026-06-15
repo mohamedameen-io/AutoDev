@@ -100,11 +100,32 @@ def _maybe_refresh_index(cwd: Path, cfg) -> None:
         "context it needs from elsewhere)."
     ),
 )
+@click.option(
+    "--no-intake",
+    is_flag=True,
+    default=False,
+    help=(
+        "ADR-0045: disable the intake & clarification phase for this run "
+        "(plan against the raw intent, skip gather/enrich/clarify)."
+    ),
+)
+@click.option(
+    "--assume-defaults",
+    is_flag=True,
+    default=False,
+    help=(
+        "ADR-0045: headless intake — apply each clarifying question's "
+        "recommended default instead of waiting for an operator (never "
+        "hangs in CI/cron). This is already the headless default."
+    ),
+)
 def plan(
     intent: str,
     platform: str | None,
     complexity: str | None,
     skip_spec_validation: bool,
+    no_intake: bool,
+    assume_defaults: bool,
 ) -> None:
     """Run PLAN phase: explore, research, draft, gate, persist."""
     console = Console()
@@ -125,13 +146,29 @@ def plan(
     if complexity is not None:
         cfg = cfg.model_copy(update={"user_complexity": complexity})
 
+    # ADR-0045: intake-phase flag plumbing. ``--no-intake`` disables the phase;
+    # ``--assume-defaults`` pins the headless ``on_unanswered`` policy. Integration
+    # wires ``run_intake_phase`` into ``run_plan_phase``; here we only set the
+    # config the phase reads. ``model_copy`` on the nested model keeps the parent
+    # immutable-by-copy semantics consistent with the complexity override above.
+    intake_enabled = cfg.intake.enabled and not no_intake
+    intake_update: dict[str, object] = {"enabled": intake_enabled}
+    if assume_defaults:
+        intake_update["on_unanswered"] = "assume_defaults"
+    cfg = cfg.model_copy(update={"intake": cfg.intake.model_copy(update=intake_update)})
+
     # v0.36.0 G1: cheap front-gate. Reject obviously under-specified
     # intents before paying for explorer + domain_expert + architect.
     # The validator inspects the intent text directly (intent is what
     # ``run_plan_phase`` later writes to ``spec.md``); a path-based
     # variant lives in :func:`orchestrator.spec_validator.validate_spec`
     # for callers that hand in a file.
-    if not skip_spec_validation:
+    #
+    # ADR-0045: when intake is ENABLED it RESOLVES under-specification
+    # (gather → enrich → clarify), so the hard G1 reject is bypassed —
+    # the thin spec is the input intake exists to enrich, not to bounce.
+    # The deterministic gate still runs when intake is off / skipped.
+    if not skip_spec_validation and not intake_enabled:
         result = validate_spec_text(intent)
         if not result.ok:
             console.print(

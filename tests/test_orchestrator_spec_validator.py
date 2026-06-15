@@ -111,11 +111,14 @@ def _write_min_cfg(cwd: Path) -> None:
 
 
 def test_plan_command_short_circuits_on_invalid_spec(tmp_path: Path) -> None:
+    # ADR-0045: with intake ON (the default) a thin spec is RESOLVED, not bounced,
+    # so the G1 hard-reject only fires when intake is explicitly disabled. Pass
+    # ``--no-intake`` to exercise the legacy reject-with-exit-4 path.
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
         cwd = Path(raw_cwd)
         _write_min_cfg(cwd)
-        result = runner.invoke(cli, ["plan", "fix"])
+        result = runner.invoke(cli, ["plan", "fix", "--no-intake"])
         assert result.exit_code == 4, result.output
         assert "spec rejected" in result.output
 
@@ -148,6 +151,31 @@ def test_plan_command_skip_spec_validation_flag_bypasses_check(
                 catch_exceptions=False,
             )
             assert result.exit_code == 0, result.output
+
+
+def test_plan_command_intake_on_bypasses_g1_reject(tmp_path: Path) -> None:
+    # ADR-0045: intake on-by-default resolves a thin spec, so the G1 gate does
+    # NOT short-circuit with exit 4 — the command proceeds to plan. We mock the
+    # orchestrator so no real planning runs; the point is "no exit 4".
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_min_cfg(cwd)
+        with (
+            patch("cli.commands.plan.get_adapter") as mock_get_adapter,
+            patch("cli.commands.plan.Orchestrator") as mock_orch_cls,
+        ):
+            mock_get_adapter.return_value = (MagicMock(), {"platform": "claude_code"})
+            mock_orch = MagicMock()
+            mock_plan = MagicMock()
+            mock_plan.metadata = {"title": "stub"}
+            mock_plan.plan_id = "stub-id"
+            mock_plan.phases = []
+            mock_orch.plan = AsyncMock(return_value=mock_plan)
+            mock_orch_cls.return_value = mock_orch
+            result = runner.invoke(cli, ["plan", "fix"], catch_exceptions=False)
+            assert result.exit_code == 0, result.output
+            assert "spec rejected" not in result.output
 
 
 def test_validate_spec_result_is_frozen_dataclass() -> None:
