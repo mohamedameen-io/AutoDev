@@ -570,6 +570,32 @@ LedgerOp = Literal[
     # signals_fired}; framing_strategy_chosen={chosen_approach_name, altitude}.
     "framing_classified",
     "framing_strategy_chosen",
+    # ADR-0046: diagnosis-phase audit breadcrumbs. Like the framing ops they
+    # run AHEAD of the architect/plan (before ``init_plan``) and never mutate
+    # plan state — replay treats them as no-ops. Payloads:
+    # diagnosis_loop_built={method, fidelity, deterministic};
+    # bug_reproduced={symptom, reproduced} / repro_unavailable_live={symptom,
+    # fidelity, artifact}; hypotheses_ranked={count}; cause_confirmed={cause,
+    # seam}; seam_finding={seam, recurrence_at_seam, no_correct_seam}.
+    "diagnosis_loop_built",
+    "bug_reproduced",
+    "repro_unavailable_live",
+    "hypotheses_ranked",
+    "cause_confirmed",
+    "seam_finding",
+    # ADR-0045: intake & clarification audit breadcrumbs. Like the framing /
+    # diagnosis ops they run AHEAD of the architect/plan (before ``init_plan``)
+    # and never mutate plan state — replay treats them as no-ops. Payloads:
+    # intake_assessed={ok, missing}; intake_gathered={n_facts, sources};
+    # intake_enriched={chars}; intake_questions_posed={count};
+    # intake_answered / intake_defaults_assumed={count}; spec_locked={spec_hash}.
+    "intake_assessed",
+    "intake_gathered",
+    "intake_enriched",
+    "intake_questions_posed",
+    "intake_answered",
+    "intake_defaults_assumed",
+    "spec_locked",
 ]
 
 
@@ -882,6 +908,37 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # the architect). Like ``plan_tournament_complete`` they may legitimately
         # precede any plan-containing op on replay, so they MUST return early
         # here — before the ``plan is None`` guard below — and never mutate plan.
+        return plan
+
+    if op in (
+        "diagnosis_loop_built",
+        "bug_reproduced",
+        "repro_unavailable_live",
+        "hypotheses_ranked",
+        "cause_confirmed",
+        "seam_finding",
+    ):
+        # ADR-0046: audit-only breadcrumbs appended during the diagnosis phase,
+        # which (like framing) runs BEFORE the plan is persisted via ``init_plan``.
+        # They never mutate plan state and may legitimately precede any
+        # plan-containing op on replay, so they MUST return early here — before
+        # the ``plan is None`` guard below.
+        return plan
+
+    if op in (
+        "intake_assessed",
+        "intake_gathered",
+        "intake_enriched",
+        "intake_questions_posed",
+        "intake_answered",
+        "intake_defaults_assumed",
+        "spec_locked",
+    ):
+        # ADR-0045: audit-only breadcrumbs appended during the intake phase, which
+        # runs at the very FRONT of the plan pipeline (before framing, before the
+        # plan is persisted via ``init_plan``). They never mutate plan state and
+        # may legitimately precede any plan-containing op on replay, so they MUST
+        # return early here — before the ``plan is None`` guard below.
         return plan
 
     if op in ("mark_in_flight", "clear_in_flight"):

@@ -409,6 +409,89 @@ def _default_framing_cfg() -> "FramingPhaseConfig":
     )
 
 
+class IntakePhaseConfig(BaseModel):
+    """Behavioral config for the intake & clarification phase (ADR-0045).
+
+    Mirrors :class:`FramingPhaseConfig`'s ``extra="forbid"`` strictness.
+    ``enabled`` has no inline default — it is set by :func:`_default_intake_cfg`
+    so the ``default_factory`` on :attr:`AutodevConfig.intake` keeps legacy
+    on-disk configs (which omit the field) valid. On by default, but a no-op
+    for well-formed specs (the completeness gate is a cheap deterministic scan).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    # Host question-UI cap (the §3.5 wire contract renders at most this many).
+    max_questions: int = Field(default=4, ge=1, le=4)
+    sources: list[str] = Field(default_factory=lambda: ["repo", "github", "jira"])
+    # Benchmark contamination guard — never pull content matching these globs
+    # (e.g. the solution PR branch). Mirrors the framing exclude pattern.
+    exclude_globs: list[str] = Field(default_factory=list)
+    # Headless policy when no operator answers the clarifying questions.
+    on_unanswered: Literal["assume_defaults", "block", "fail"] = "assume_defaults"
+    # Repo gather rides the existing explorer evidence (no second pass).
+    reuse_explorer_evidence: bool = True
+    enricher_model: str | None = None
+    clarifier_model: str | None = None
+
+
+def _default_intake_cfg() -> "IntakePhaseConfig":
+    """Default-on intake config used when an existing ``config.json`` omits the
+    new field (ADR-0045). On by default; the no-op fast path on well-formed
+    specs (+0 LLM calls) and the headless ``assume_defaults`` policy are the
+    offset (cron/CI never deadlock)."""
+    return IntakePhaseConfig(
+        enabled=True,
+        max_questions=4,
+        sources=["repo", "github", "jira"],
+        exclude_globs=[],
+        on_unanswered="assume_defaults",
+        reuse_explorer_evidence=True,
+        enricher_model=None,
+        clarifier_model=None,
+    )
+
+
+class DiagnosisPhaseConfig(BaseModel):
+    """Behavioral config for the diagnosis phase (ADR-0046).
+
+    Mirrors :class:`FramingPhaseConfig`'s ``extra="forbid"`` strictness.
+    ``enabled`` has no inline default — it is set by :func:`_default_diagnosis_cfg`
+    so the ``default_factory`` on :attr:`AutodevConfig.diagnosis` keeps legacy
+    on-disk configs (which omit the field) valid. On by default, but bug-gated
+    (``bug_only=True``) so feature work skips the phase entirely (+0 cost).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    bug_only: bool = True
+    max_hypotheses: int = Field(default=5, ge=3, le=5)
+    require_loop_to_plan: bool = True
+    # Sandbox fallback when only a *live* loop reproduces (§5.2): build a
+    # synthetic/replay loop + deliver a live-repro artifact, or block.
+    on_no_live_loop: Literal["synthetic_plus_artifact", "block"] = (
+        "synthetic_plus_artifact"
+    )
+    diagnostician_model: str | None = None
+
+
+def _default_diagnosis_cfg() -> "DiagnosisPhaseConfig":
+    """Default-on diagnosis config used when an existing ``config.json`` omits
+    the new field (ADR-0046). On by default but bug-gated; the synthetic-loop +
+    delivered-artifact fallback keeps reproduce-first possible headlessly
+    instead of deadlocking on network/credential-bound bugs."""
+    return DiagnosisPhaseConfig(
+        enabled=True,
+        bug_only=True,
+        max_hypotheses=5,
+        require_loop_to_plan=True,
+        on_no_live_loop="synthetic_plus_artifact",
+        diagnostician_model=None,
+    )
+
+
 class TournamentsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -937,6 +1020,11 @@ class KnowledgeConfig(BaseModel):
             # framing / altitude_judge cohort (minimality suspended there).
             "framing",
             "altitude_judge",
+            # ADR-0045 / ADR-0046: keep seed-pack lessons out of the intake and
+            # diagnosis specialist cohorts (seed-pack isolation, mirrors framing).
+            "intake_enricher",
+            "intake_clarifier",
+            "diagnostician",
         ]
     )
     # v0.18.0 B1: lane-aware lesson injection toggle. When True (default),
@@ -1052,6 +1140,16 @@ class AutodevConfig(BaseModel):
     # so a legacy ``config.json`` lacking the field still validates under
     # ``extra="forbid"`` (the factory defaults to ``enabled=True``).
     framing: FramingPhaseConfig = Field(default_factory=_default_framing_cfg)
+    # ADR-0045: intake & clarification phase config. ``default_factory`` is
+    # mandatory so a legacy ``config.json`` lacking the field still validates
+    # under ``extra="forbid"`` (the factory defaults to ``enabled=True``; a no-op
+    # for well-formed specs). Kill-switch: ``AUTODEV_INTAKE_DISABLED=1``.
+    intake: IntakePhaseConfig = Field(default_factory=_default_intake_cfg)
+    # ADR-0046: diagnosis (reproduce-first) phase config. ``default_factory`` is
+    # mandatory so a legacy ``config.json`` lacking the field still validates
+    # under ``extra="forbid"`` (the factory defaults to ``enabled=True``,
+    # bug-gated). Kill-switch: ``AUTODEV_DIAGNOSIS_DISABLED=1``.
+    diagnosis: DiagnosisPhaseConfig = Field(default_factory=_default_diagnosis_cfg)
     # v0.16.0 hallucination-guard top-level toggle. Default True — the
     # guard ships on by default so projects benefit immediately. Skip
     # patterns: dynamic imports, third-party packages not installed in

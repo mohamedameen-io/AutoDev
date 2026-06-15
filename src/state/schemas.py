@@ -597,6 +597,181 @@ class FramingEvidence(_BaseEvidence):
     raw_response: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Intake & Clarification phase (ADR-0045)
+# ---------------------------------------------------------------------------
+
+
+class SpecGaps(BaseModel):
+    """Structured completeness assessment of an intent (ADR-0045).
+
+    Produced by the upgraded ``spec_validator.assess(text)``; the named
+    ``missing`` dimensions drive the gather/enrich/clarify path. ``ok`` is the
+    back-compat boolean (``True`` ⇔ no gaps) so existing binary callers of the
+    validator keep working. Standalone value model (no ``task_id``/``kind``);
+    Pydantic v2 does not inherit ``model_config``, so ``extra="forbid"`` is
+    restated.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    missing: list[Literal["scope", "acceptance", "constraints", "touchpoints"]] = (
+        Field(default_factory=list)
+    )
+
+
+class GatheredFact(BaseModel):
+    """A single provenance-carrying fact gathered from a source (ADR-0045).
+
+    Each fact MUST carry a ``ref`` (file:line / issue URL / Jira key / session
+    id); the enricher is constrained to cited evidence and a post-parse check
+    rejects facts with no ``ref``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["repo", "github", "jira", "session"]
+    ref: str
+    summary: str
+
+
+class ClarifyingQuestion(BaseModel):
+    """A single constraint-focused clarifying question (ADR-0045).
+
+    KD1 (constraints-not-solutions): ``kind`` is restricted to constraint-shaped
+    categories; the clarifier must never enumerate or select solution strategies
+    (that is framing's job, ADR-0044). ``recommended`` MUST be one of ``options``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    question: str
+    kind: Literal["constraint", "environment", "done_bar", "risk_latitude", "compat"]
+    options: list[str] = Field(default_factory=list)
+    recommended: str
+
+
+class ClarifyingAnswer(BaseModel):
+    """An answer to a :class:`ClarifyingQuestion` (ADR-0045).
+
+    ``source`` distinguishes a real operator answer from a headless
+    default-assumption applied under ``on_unanswered=assume_defaults``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str
+    answer: str
+    source: Literal["operator", "default_assumed"]
+
+
+class IntakeEvidence(_BaseEvidence):
+    """Artifact produced by the intake & clarification phase (ADR-0045).
+
+    Persisted as evidence kind ``intake`` (file ``plan-intake-intake.json``) and
+    re-read on resume instead of re-gathering / re-asking. Pydantic v2 does NOT
+    inherit ``model_config``, so ``extra="forbid"`` is restated explicitly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["intake"] = "intake"
+    raw_intent: str
+    gaps: SpecGaps
+    gathered: list[GatheredFact] = Field(default_factory=list)
+    enriched_spec: str
+    questions: list[ClarifyingQuestion] = Field(default_factory=list)
+    answers: list[ClarifyingAnswer] = Field(default_factory=list)
+    # Defaults applied when unanswered (headless): human-readable assumption lines.
+    assumptions: list[str] = Field(default_factory=list)
+    locked_spec_hash: str
+    sources_used: list[str] = Field(default_factory=list)
+    excluded_globs: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Diagnosis phase (ADR-0046)
+# ---------------------------------------------------------------------------
+
+
+class FeedbackLoop(BaseModel):
+    """A sandbox-runnable reproduction loop (ADR-0046).
+
+    The "loop is the product" — the strongest deterministic pass/fail signal the
+    autonomous (network-less, TTY-less) agent can run. ``fidelity`` is labelled
+    honestly: ``live`` is forbidden on a network-less run (NFR5). Standalone
+    value model; Pydantic v2 does not inherit ``model_config``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal[
+        "failing_test",
+        "replay_trace",
+        "throwaway_harness",
+        "property_fuzz",
+        "differential",
+        "bisection",
+        "cli_snapshot",
+        "dev_server_curl",
+        "headless_browser",
+        "hitl",
+    ]
+    command: str
+    fidelity: Literal["live", "synthetic", "replay", "none"]
+    deterministic: bool = True
+    runtime_s: float | None = None
+
+
+class Hypothesis(BaseModel):
+    """A ranked, falsifiable hypothesis about a bug's root cause (ADR-0046).
+
+    Each hypothesis states a ``prediction`` ("if X, then changing Y makes it
+    disappear") so it can be tested; "vibe" hypotheses with no prediction are
+    rejected upstream.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rank: int
+    statement: str
+    prediction: str
+    status: Literal["untested", "supported", "refuted"] = "untested"
+
+
+class DiagnosisEvidence(_BaseEvidence):
+    """Artifact produced by the diagnosis phase (ADR-0046).
+
+    Persisted as evidence kind ``diagnosis`` (file ``plan-diagnosis-diagnosis.json``)
+    and re-read on resume instead of re-instrumenting. ``seam`` is the
+    architectural finding fed to framing (``none``/``shallow`` ⇒ a structural
+    signal). Pydantic v2 does NOT inherit ``model_config``, so ``extra="forbid"``
+    is restated explicitly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["diagnosis"] = "diagnosis"
+    loop: FeedbackLoop | None = None
+    reproduced: bool = False
+    # Exact captured failure mode (the user's symptom, not a nearby one).
+    symptom: str = ""
+    hypotheses: list[Hypothesis] = Field(default_factory=list)
+    confirmed_cause: str | None = None
+    seam: Literal["correct", "shallow", "none", "unknown"] = "unknown"
+    # Loop fidelity restated at the evidence level (mirrors ``loop.fidelity``)
+    # so resume + framing can read it without dereferencing a ``None`` loop.
+    loop_fidelity: Literal["live", "synthetic", "replay", "none"] = "none"
+    # Path to the delivered live-repro script/procedure when fidelity != live.
+    live_repro_artifact: str | None = None
+    # Structural signals routed to framing (ADR-0044): e.g. ``recurrence_at_seam``,
+    # ``no_correct_seam``. Mirrors ``FramingEvidence.signals_fired`` conventions.
+    recurrence_at_seam: bool = False
+    no_correct_seam: bool = False
+
+
 class CriticEvidence(_BaseEvidence):
     """Artifact produced by the ``critic`` role (plan-gate or sounding-board)."""
 
@@ -739,6 +914,8 @@ Evidence = Annotated[
         ExploreEvidence,
         SMEEvidence,
         FramingEvidence,
+        IntakeEvidence,
+        DiagnosisEvidence,
         CriticEvidence,
         TournamentEvidence,
         ReviewTournamentEvidence,
@@ -752,12 +929,19 @@ to round-trip a ``dict`` into the correct subclass.
 
 __all__ = [
     "AcceptanceCriterion",
+    "ClarifyingAnswer",
+    "ClarifyingQuestion",
     "CoderEvidence",
     "CriterionVote",
     "CriticEvidence",
+    "DiagnosisEvidence",
     "Evidence",
     "ExploreEvidence",
+    "FeedbackLoop",
     "FramingEvidence",
+    "GatheredFact",
+    "Hypothesis",
+    "IntakeEvidence",
     "Phase",
     "Plan",
     "RecoveryHint",
@@ -766,6 +950,7 @@ __all__ = [
     "ReviewTournamentEvidence",
     "SMEEvidence",
     "SolutionApproach",
+    "SpecGaps",
     "Task",
     "TaskStatus",
     "TestEvidence",

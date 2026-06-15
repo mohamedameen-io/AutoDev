@@ -7,9 +7,11 @@ from pathlib import Path
 from config.schema import (
     AgentConfig,
     AutodevConfig,
+    DiagnosisPhaseConfig,
     FramingPhaseConfig,
     GuardrailsConfig,
     HiveConfig,
+    IntakePhaseConfig,
     QAGatesConfig,
     TournamentPhaseConfig,
     TournamentsConfig,
@@ -36,6 +38,14 @@ _AGENT_MODEL_DEFAULTS: dict[str, str | None] = {
     # dispatch (_invoke_framing_role) can read model/max-turns for the invocation.
     "framing": None,
     "altitude_judge": None,
+    # ADR-0045 / ADR-0046: unregistered specialist roles for the intake and
+    # diagnosis phases. Same pattern as framing/altitude_judge — absent from
+    # REQUIRED_AGENT_ROLES, but cfg.agents needs an entry so the phase dispatch
+    # can read model/max-turns. Default model tier mirrors framing (``None`` →
+    # resolved per platform by ``resolve_model``).
+    "intake_enricher": None,
+    "intake_clarifier": None,
+    "diagnostician": None,
 }
 
 _AGENT_MAX_TURNS: dict[str, int] = {
@@ -43,22 +53,34 @@ _AGENT_MAX_TURNS: dict[str, int] = {
     "explorer": 3,
     "domain_expert": 3,
     "developer": 10,
-    # v0.31.0 (Phase 1.4): bumped 3 → 5. Reviewers genuinely need more
-    # turns on non-trivial diffs (the prior cap was a tail contributor
-    # to Hypothesis A — empty result when the turn budget ran out
-    # before the model emitted the verdict).
-    "reviewer": 5,
+    # v0.41.0 (A1): bumped 5 → 8. On large diffs the reviewer ran out of
+    # turns and its empty/truncated output was misparsed as MALFORMED →
+    # routed as a developer discard+retry loop. The robust fix is
+    # diff-scoping (cap + summarize the diff handed to the reviewer),
+    # handled in execute_phase.py / phase_review_runner.py elsewhere; this
+    # budget bump is the belt-and-suspenders complement.
+    "reviewer": 8,
     "test_engineer": 5,
     "critic_sounding_board": 3,
     "critic_drift_verifier": 3,
     "docs": 3,
     "designer": 3,
-    "critic_t": 1,
+    # v0.41.0 (A4): bumped 1 → 6. These text-only tournament roles get Read
+    # access (tournament/llm.py normalizes empty tools → ["Read"]); a single
+    # read at max_turns=1 → error_max_turns → all branches died (Run-3: all 3
+    # plan-tournament branches failed). The robust fix is feeding content
+    # inline + dropping Read (handled elsewhere); this bump is the complement.
+    "critic_t": 6,
     "architect_b": 5,
-    "synthesizer": 1,
+    "synthesizer": 6,
     "judge": 1,
     "framing": 1,
     "altitude_judge": 1,
+    # ADR-0045 / ADR-0046: intake/diagnosis specialist roles. Mirror the
+    # framing specialist budget tier.
+    "intake_enricher": 1,
+    "intake_clarifier": 1,
+    "diagnostician": 5,
 }
 
 
@@ -254,5 +276,27 @@ def default_config(platform: str = "auto") -> AutodevConfig:
             altitude_judge_panel_size=3,
             classifier_model=None,
             altitude_judge_model=None,
+        ),
+        # ADR-0045: intake & clarification phase — on by default, no-op for
+        # well-formed specs, headless ``assume_defaults`` so CI never hangs.
+        intake=IntakePhaseConfig(
+            enabled=True,
+            max_questions=4,
+            sources=["repo", "github", "jira"],
+            exclude_globs=[],
+            on_unanswered="assume_defaults",
+            reuse_explorer_evidence=True,
+            enricher_model=None,
+            clarifier_model=None,
+        ),
+        # ADR-0046: diagnosis (reproduce-first) phase — on by default,
+        # bug-gated, with the synthetic-loop + delivered-artifact fallback.
+        diagnosis=DiagnosisPhaseConfig(
+            enabled=True,
+            bug_only=True,
+            max_hypotheses=5,
+            require_loop_to_plan=True,
+            on_no_live_loop="synthetic_plus_artifact",
+            diagnostician_model=None,
         ),
     )

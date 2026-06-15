@@ -1730,6 +1730,18 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
         # ADR-0044: audit-only breadcrumbs (see ledger._apply_op). No plan mutation.
         return plan
 
+    if op in (
+        "intake_assessed",
+        "intake_gathered",
+        "intake_enriched",
+        "intake_questions_posed",
+        "intake_answered",
+        "intake_defaults_assumed",
+        "spec_locked",
+    ):
+        # ADR-0045: audit-only breadcrumbs (see ledger._apply_op). No plan mutation.
+        return plan
+
     return plan
 
 
