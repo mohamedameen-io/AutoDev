@@ -111,6 +111,8 @@ async def test_code_size_gate_dispatched_when_enabled(
             secretscan_per_extension_thresholds = None
             mutation_test_enabled = False
             mutation_test_threshold = 0.7
+            lint_timeout_s = 120.0
+            test_timeout_s = 600.0
             code_size = True
             code_size_baseline_enabled = False
             code_size_thresholds = StrictThresholds()
@@ -190,6 +192,8 @@ async def test_code_size_gate_skipped_when_disabled(
             secretscan_per_extension_thresholds = None
             mutation_test_enabled = False
             mutation_test_threshold = 0.7
+            lint_timeout_s = 120.0
+            test_timeout_s = 600.0
             code_size = False  # default
             code_size_baseline_enabled = False
             code_size_thresholds = None

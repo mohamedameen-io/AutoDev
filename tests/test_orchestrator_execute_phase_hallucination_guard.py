@@ -33,6 +33,8 @@ def _stub_orch(tmp_path: Path, *, hallucination_guard: bool = True) -> object:
             secretscan_per_extension_thresholds = None
             mutation_test_enabled = False
             mutation_test_threshold = 0.7
+            lint_timeout_s = 120.0
+            test_timeout_s = 600.0
 
         # Top-level toggle (read off cfg.hallucination_guard, mirrors
         # the existing pattern for `cfg.qa_gates.*`).

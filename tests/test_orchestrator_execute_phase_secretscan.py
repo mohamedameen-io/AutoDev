@@ -160,6 +160,8 @@ async def test_secretscan_invoked_with_developer_diff_paths(
             secretscan_per_extension_thresholds = None
             mutation_test_enabled = False
             mutation_test_threshold = 0.7
+            lint_timeout_s = 120.0
+            test_timeout_s = 600.0
 
     orch = type(
         "OrchStub",
@@ -230,6 +232,8 @@ async def test_secretscan_invoked_with_empty_paths_when_no_developer_result(
             secretscan_per_extension_thresholds = None
             mutation_test_enabled = False
             mutation_test_threshold = 0.7
+            lint_timeout_s = 120.0
+            test_timeout_s = 600.0
 
     orch = type(
         "OrchStub",
@@ -296,6 +300,8 @@ async def test_hallucination_guard_passes_empty_paths_when_no_developer_result(
             secretscan_per_extension_thresholds = None
             mutation_test_enabled = False
             mutation_test_threshold = 0.7
+            lint_timeout_s = 120.0
+            test_timeout_s = 600.0
 
     orch = type(
         "OrchStub",

@@ -4535,13 +4535,89 @@ async def _execute_one(
                             ),
                         )
                         await asyncio.sleep(backoff_s)
-                        # Continue retry — don't raise. The
-                        # per-task retry counter below still gates
-                        # the legacy attempts==2 hard-fail, so
-                        # back-to-back capture_failed on a single
-                        # task still ends blocked.
+                        # Continue retry — don't raise. The cross-task
+                        # breaker above is the systemic-halt path; the
+                        # per-task retry/soft-pass decision below gates a
+                        # SINGLE task's fate (and, post-v0.41.0, soft-passes
+                        # an uncapturable ``capture_failed`` rather than
+                        # blocking it).
 
-                if attempts == 1:
+                # v0.41.0 (P1-F): bounded soft-pass for ``capture_failed``.
+                # The cross-task circuit breaker (above) still trips on a
+                # SYSTEMICALLY broken runner — many tasks each emitting
+                # ``capture_failed`` exhaust the backoff budget and raise
+                # ``InfrastructureCircuitOpenError`` (operator-halt). But a
+                # SINGLE otherwise-passing task whose test RESULT merely
+                # cannot be CAPTURED (empty ``text``/``raw_stderr``,
+                # ``total==0`` and — critically — zero captured ``failed``)
+                # should NOT hard-fail to ``blocked``. The legacy
+                # ``attempts==2`` branch below did exactly that, looping the
+                # task reviewed→in_progress→reviewed until its retries were
+                # spent (observed on a trivial one-line edit to
+                # ``tooling_agent.py``). After
+                # ``cfg.capture_failed_soft_pass_after`` consecutive
+                # uncapturable attempts on this task, advance to ``tested``
+                # (falling through to Step 6 like the happy path) and stamp
+                # ``soft_passed=True`` on the evidence.
+                #
+                # CRITICAL invariants — only soft-pass a GENUINE capture
+                # failure:
+                #   * ``diagnosis == "capture_failed"`` only. ``collection_
+                #     failed`` / ``runtime_crash`` carry signal (collection
+                #     errors, timeouts/kills) and keep retry-then-hard-fail.
+                #   * ``failed == 0`` — a real RED test parses ``total>0`` →
+                #     diagnosis ``ok`` and never reaches this branch, so a
+                #     captured failure is NEVER soft-passed; this guard is
+                #     belt-and-suspenders.
+                soft_pass_after = getattr(
+                    orch.cfg, "capture_failed_soft_pass_after", 2
+                )
+                if (
+                    diagnosis == "capture_failed"
+                    and failed == 0
+                    and attempts >= soft_pass_after
+                ):
+                    soft_pass_reason = (
+                        f"capture_failed persisted across {attempts} "
+                        f"attempt(s) with no captured failures "
+                        f"(passed={passed} failed={failed} total={total}); "
+                        f"test result could not be captured — soft-passing "
+                        f"an otherwise-passing task instead of blocking"
+                    )
+                    logger.warning(
+                        "execute_phase.test_capture_soft_pass",
+                        task_id=task.id,
+                        diagnosis=diagnosis,
+                        attempts=attempts,
+                        soft_pass_after=soft_pass_after,
+                        reason=soft_pass_reason,
+                    )
+                    # Re-stamp the evidence (atomic overwrite of the same
+                    # ``{task_id}-test.json``) so downstream consumers and
+                    # forensics see the soft-pass marker alongside the
+                    # preserved ``capture_failed`` diagnosis.
+                    test_ev_soft = TestEvidence(
+                        task_id=task.id,
+                        passed=passed,
+                        failed=failed,
+                        total=total,
+                        output_text=test_result.text,
+                        raw_response=test_result.text,
+                        diagnosis=diagnosis,
+                        runner_stderr_tail=stderr_tail or None,
+                        soft_passed=True,
+                        soft_pass_reason=soft_pass_reason,
+                    )
+                    await write_evidence(orch.cwd, task.id, test_ev_soft)
+                    task = await orch.plan_manager.update_task_status(
+                        task.id, "tested"
+                    )
+                    # Fall through to Step 6 (impl tournament) — do NOT
+                    # ``continue``/``return``; the task advances toward
+                    # ``complete`` exactly like the ``no_tests_found`` /
+                    # passing branches above.
+
+                elif attempts == 1:
                     log_method = (
                         logger.error
                         if diagnosis == "capture_failed"
@@ -4568,45 +4644,51 @@ async def _execute_one(
                         task.id, "in_progress"
                     )
                     continue
-                # Second occurrence — hard-fail.
-                logger.error(
-                    "execute_phase.test_diagnosis_hard_fail",
-                    task_id=task.id,
-                    diagnosis=diagnosis,
-                    attempts=attempts,
-                )
-                # v0.32.0 (Phase 5, Gap G): structured recovery hint so
-                # the operator sees the exact diagnosis + the evidence
-                # path containing the captured stderr tail.
-                hint_hardfail = _build_recovery_hint(
-                    task_id=task.id,
-                    hint_class="missing_test_output",
-                    action=(
-                        f"Test runner produced an infrastructure-class "
-                        f"failure ({diagnosis}) that persisted across "
-                        f"{attempts} attempts. Inspect "
-                        f".autodev/evidence/{task.id}-test.json (stderr "
-                        f"tail captured) to fix the runner, then "
-                        f"`autodev requeue --task {task.id}`."
-                    ),
-                    evidence_files=[f".autodev/evidence/{task.id}-test.json"],
-                    commands=[
-                        f"autodev requeue --task {task.id}",
-                        "autodev doctor",
-                    ],
-                )
-                task = await orch.plan_manager.update_task_status(
-                    task.id,
-                    "blocked",
-                    meta={
-                        "blocked_reason": (
-                            f"test_diagnosis: {diagnosis} "
-                            f"(persisted across {attempts} attempts)"
+                else:
+                    # Second occurrence of a signal-bearing infra failure
+                    # (``collection_failed`` / ``runtime_crash``), or a
+                    # ``capture_failed`` with captured failures / soft-pass
+                    # disabled — hard-fail with the diagnosis preserved.
+                    logger.error(
+                        "execute_phase.test_diagnosis_hard_fail",
+                        task_id=task.id,
+                        diagnosis=diagnosis,
+                        attempts=attempts,
+                    )
+                    # v0.32.0 (Phase 5, Gap G): structured recovery hint so
+                    # the operator sees the exact diagnosis + the evidence
+                    # path containing the captured stderr tail.
+                    hint_hardfail = _build_recovery_hint(
+                        task_id=task.id,
+                        hint_class="missing_test_output",
+                        action=(
+                            f"Test runner produced an infrastructure-class "
+                            f"failure ({diagnosis}) that persisted across "
+                            f"{attempts} attempts. Inspect "
+                            f".autodev/evidence/{task.id}-test.json (stderr "
+                            f"tail captured) to fix the runner, then "
+                            f"`autodev requeue --task {task.id}`."
                         ),
-                        "recovery_hint": hint_hardfail,
-                    },
-                )
-                return task
+                        evidence_files=[
+                            f".autodev/evidence/{task.id}-test.json"
+                        ],
+                        commands=[
+                            f"autodev requeue --task {task.id}",
+                            "autodev doctor",
+                        ],
+                    )
+                    task = await orch.plan_manager.update_task_status(
+                        task.id,
+                        "blocked",
+                        meta={
+                            "blocked_reason": (
+                                f"test_diagnosis: {diagnosis} "
+                                f"(persisted across {attempts} attempts)"
+                            ),
+                            "recovery_hint": hint_hardfail,
+                        },
+                    )
+                    return task
             else:
                 # ``no_signal`` — soft-block with an explicit reason
                 # rather than masquerading as a generic test failure.
@@ -6864,9 +6946,9 @@ async def _run_qa_gates(
     # warn-surface helper can attribute findings to a gate.
     gates: list[tuple[str, bool, Callable[[], Awaitable[GateResult]]]] = [
         ("syntax_check", cfg.syntax_check, lambda: run_syntax_check(cwd, language)),
-        ("lint", cfg.lint, lambda: run_lint(cwd, language)),
+        ("lint", cfg.lint, lambda: run_lint(cwd, language, paths=secretscan_paths, timeout_s=cfg.lint_timeout_s)),
         ("build_check", cfg.build_check, lambda: run_build_check(cwd, language)),
-        ("test_runner", cfg.test_runner, lambda: run_tests(cwd)),
+        ("test_runner", cfg.test_runner, lambda: run_tests(cwd, paths=secretscan_paths, timeout_s=cfg.test_timeout_s)),
         (
             "secretscan",
             secretscan_enabled,

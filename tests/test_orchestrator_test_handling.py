@@ -210,6 +210,167 @@ async def test_no_signal_soft_blocks_with_explicit_reason(
 
 
 @pytest.mark.asyncio
+async def test_capture_failed_bounded_soft_pass_advances_not_blocked(
+    tmp_path: Path,
+) -> None:
+    """v0.41.0 (P1-F): repeated ``capture_failed`` soft-passes, not blocks.
+
+    The test step cannot CAPTURE a result (empty ``text``/``raw_stderr``,
+    zero counts) on every attempt. The legacy behaviour retried once then
+    hard-failed to ``blocked``. With the bounded soft-pass (default
+    ``capture_failed_soft_pass_after=2``) the task instead advances to
+    ``complete`` after the second uncapturable attempt, and the evidence is
+    stamped ``soft_passed=True`` with a reason. The ``capture_failed``
+    diagnosis is still preserved for forensics.
+    """
+    import json
+
+    capture_fail = AgentResult(
+        success=False,
+        text="",
+        raw_stderr="",
+        error=None,
+        duration_s=0.01,
+    )
+
+    adapter = StubAdapter(
+        {
+            # One retry on the first capture_failed → developer runs twice.
+            "developer": [_coder_ok_with_diff("v1"), _coder_ok_with_diff("v2")],
+            "reviewer": _reviewer_approved(),
+            "test_engineer": [capture_fail, capture_fail],
+        }
+    )
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    tasks = await orch.execute()
+
+    assert len(tasks) == 1
+    final = tasks[0]
+    # Advanced all the way to complete — NOT blocked.
+    assert final.status == "complete", (
+        f"expected complete, got {final.status} "
+        f"(blocked_reason={final.blocked_reason})"
+    )
+    assert final.blocked_reason is None
+    # Exactly two test_engineer invocations: one initial + one retry, then
+    # the second result soft-passes (no further retries).
+    assert adapter.count("test_engineer") == 2
+
+    # Evidence carries the soft-pass marker + preserved diagnosis.
+    evfile = tmp_path / ".autodev" / "evidence" / "1.1-test.json"
+    assert evfile.exists()
+    data = json.loads(evfile.read_text())
+    assert data.get("soft_passed") is True
+    assert data.get("diagnosis") == "capture_failed"
+    assert "could not be captured" in (data.get("soft_pass_reason") or "")
+
+
+@pytest.mark.asyncio
+async def test_capture_failed_soft_pass_after_one_disables_retry(
+    tmp_path: Path,
+) -> None:
+    """``capture_failed_soft_pass_after=1`` soft-passes on the FIRST result.
+
+    Pins the knob: with the threshold at 1 there is no retry — the very
+    first uncapturable result advances the task.
+    """
+    capture_fail = AgentResult(
+        success=False, text="", raw_stderr="", error=None, duration_s=0.01
+    )
+
+    adapter = StubAdapter(
+        {
+            "developer": _coder_ok_with_diff(),
+            "reviewer": _reviewer_approved(),
+            "test_engineer": capture_fail,
+        }
+    )
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    orch.cfg.capture_failed_soft_pass_after = 1
+    tasks = await orch.execute()
+
+    final = tasks[0]
+    assert final.status == "complete"
+    # No retry — a single test_engineer call soft-passed immediately.
+    assert adapter.count("test_engineer") == 1
+
+
+@pytest.mark.asyncio
+async def test_captured_real_failure_is_not_soft_passed(
+    tmp_path: Path,
+) -> None:
+    """A real RED test (captured ``failed>0``) must NOT be soft-passed.
+
+    The runner reports ``passed=1 failed=1 total=2`` with ``success=False``
+    → diagnosis ``ok`` (tests were collected). This is a genuine failure and
+    must follow the existing retry/escalate path, never the bounded
+    capture soft-pass. With retries exhausted the task ends blocked, and the
+    evidence must NOT be stamped ``soft_passed``.
+    """
+    import json
+
+    real_fail = AgentResult(
+        success=False,
+        text="RESULTS: passed=1 failed=1 total=2\nFAILED test_x",
+        raw_stderr="",
+        error=None,
+        duration_s=0.01,
+    )
+
+    # Provide ample developer/test results so the retry ladder exhausts on
+    # the real failure rather than running out of stubbed responses.
+    adapter = StubAdapter(
+        {
+            "developer": [_coder_ok_with_diff(f"v{i}") for i in range(8)],
+            "reviewer": _reviewer_approved(),
+            "test_engineer": [real_fail for _ in range(8)],
+        }
+    )
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    tasks = await orch.execute()
+
+    final = tasks[0]
+    # Real failure never reaches complete via soft-pass.
+    assert final.status != "complete"
+
+    evfile = tmp_path / ".autodev" / "evidence" / "1.1-test.json"
+    assert evfile.exists()
+    data = json.loads(evfile.read_text())
+    # Captured failure → diagnosis ok, and crucially NOT soft-passed.
+    assert data.get("diagnosis") == "ok"
+    assert data.get("soft_passed") in (None, False)
+
+
+@pytest.mark.asyncio
+async def test_capture_succeeds_path_unchanged(tmp_path: Path) -> None:
+    """When capture succeeds (diagnosis ``ok``, tests pass), behaviour is
+    unchanged: the task completes with no soft-pass marker."""
+    import json
+
+    passing = ok("RESULTS: passed=3 failed=0 total=3\nall green")
+
+    adapter = StubAdapter(
+        {
+            "developer": _coder_ok_with_diff(),
+            "reviewer": _reviewer_approved(),
+            "test_engineer": passing,
+        }
+    )
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    tasks = await orch.execute()
+
+    final = tasks[0]
+    assert final.status == "complete"
+    assert final.blocked_reason is None
+    assert adapter.count("test_engineer") == 1
+
+    evfile = tmp_path / ".autodev" / "evidence" / "1.1-test.json"
+    data = json.loads(evfile.read_text())
+    assert data.get("diagnosis") == "ok"
+    assert data.get("soft_passed") in (None, False)
+
+
+@pytest.mark.asyncio
 async def test_no_tests_found_persists_diagnosis_in_evidence(
     tmp_path: Path,
 ) -> None:

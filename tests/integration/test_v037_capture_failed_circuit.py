@@ -131,6 +131,13 @@ async def _make_orch(cwd: Path, adapter: StubAdapter) -> Orchestrator:
     # Also clamp the parallel-pool drain so the HK6 fast-teardown
     # contract is exercised by this integration test.
     cfg.parallel_pool_drain_timeout_s = 1.0
+    # v0.41.0 (P1-F): this suite pins the CROSS-TASK systemic-halt breaker
+    # in isolation. The new per-task bounded soft-pass would otherwise
+    # advance a single task's ``capture_failed`` before the breaker
+    # accumulates a systemic signal, so disable it here (set the threshold
+    # far above any single task's retry budget). The soft-pass behaviour is
+    # covered separately in ``test_orchestrator_test_handling``.
+    cfg.capture_failed_soft_pass_after = 999
     registry = build_registry(cfg)
     orch = Orchestrator(
         cwd=cwd,
@@ -269,6 +276,12 @@ async def test_two_capture_failed_in_window_does_not_trip(
     cfg.tournaments.plan.enabled = False
     cfg.tournaments.impl.enabled = False
     cfg.test_diag_breaker_threshold = 5  # well above the 2 we'll feed
+    # v0.41.0 (P1-F): disable the per-task bounded soft-pass so this test
+    # exercises the legacy per-task retry-then-hard-fail path it was written
+    # to pin (a single task ending ``blocked`` after two ``capture_failed``).
+    # With the soft-pass enabled (default) the task would advance instead —
+    # that new contract is covered in ``test_orchestrator_test_handling``.
+    cfg.capture_failed_soft_pass_after = 999
     registry = build_registry(cfg)
     orch = Orchestrator(
         cwd=tmp_path,
