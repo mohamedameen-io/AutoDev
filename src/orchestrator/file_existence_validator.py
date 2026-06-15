@@ -18,7 +18,14 @@ The flow:
    * is a directory prefix under which at least one tracked file lives
      (for the ``*_scope`` lists), OR
    * is listed in ``Task.files_new`` — the v0.24.3 opt-out for paths the
-     task itself will create.
+     task itself will create, OR
+   * (v0.40.1) exists on the real filesystem even when the git ls-files
+     snapshot misses it. ``Task.files`` accepts an on-disk *file*; the
+     ``*_scope`` lists accept an on-disk *file or directory*. This closes
+     the false-rejection class where a gitignored or freshly-written path
+     (e.g. ``.env.example``) or a file-shaped scope entry (e.g.
+     ``pyproject.toml`` declared in ``edit_scope``) was rejected despite
+     existing. The fallback only ever loosens acceptance.
 
 3. On the first miss, :class:`PathValidationError` flows back into the
    existing v0.22.4 architect-retry envelope at
@@ -195,6 +202,26 @@ class _RepoFileSnapshot:
         self._ensure_loaded()
         return rel_path in self._tracked
 
+    def exists_on_disk(self, rel_path: str) -> bool:
+        """True if ``cwd/rel_path`` exists on the real filesystem as a file.
+
+        Additive fallback to :meth:`exists` for ``Task.files`` entries. The
+        git ls-files snapshot misses two real-but-untracked populations the
+        architect may legitimately reference: gitignored files
+        (``.env.example``) and freshly-written-but-not-yet-committed files.
+        Both exist on disk; rejecting them as ``missing_on_disk`` is a false
+        rejection. This check loosens acceptance only — a path absent from
+        BOTH the snapshot and the filesystem still falls through to the
+        existing raise.
+
+        ``is_file()`` (not ``exists()``) keeps the file/dir distinction the
+        ``Task.files`` contract carries: ``files`` entries are files, not
+        directory prefixes (that's ``extended_scope`` / ``edit_scope``).
+        """
+        if not rel_path:
+            return False
+        return (self._cwd / rel_path).is_file()
+
     def is_dir_prefix(self, rel_path: str) -> bool:
         """True if any tracked file path starts with ``rel_path + "/"``.
 
@@ -208,6 +235,28 @@ class _RepoFileSnapshot:
         self._ensure_loaded()
         prefix = rel_path.rstrip("/") + "/"
         return any(p.startswith(prefix) for p in self._tracked)
+
+    def scope_exists_on_disk(self, rel_path: str) -> bool:
+        """True if ``cwd/rel_path`` exists on disk as a directory OR a file.
+
+        Additive fallback to :meth:`is_dir_prefix` for the ``*_scope`` lists
+        (``Plan.edit_scope``, ``Phase.edit_scope``, ``Task.extended_scope``).
+        Two cases the tracked-prefix check alone misses:
+
+        * A real directory that contains only untracked / gitignored files
+          (so no tracked path carries the ``rel_path + "/"`` prefix) — the
+          architect's intent to edit within it is still valid.
+        * A FILE path declared in an ``*_scope`` list. The dir-prefix check
+          structurally fails for a file (no tracked path starts with
+          ``file + "/"``), yet a file entry is the architect declaring intent
+          to edit that one existing file. Accepting it is correct.
+
+        ``exists()`` (file or dir) is intentionally broad here: unlike
+        ``Task.files``, scope entries legitimately name either shape.
+        """
+        if not rel_path:
+            return False
+        return (self._cwd / rel_path.rstrip("/")).exists()
 
     def closest(self, rel_path: str) -> str | None:
         """Return the closest tracked path.
@@ -349,6 +398,18 @@ def validate_files_exist(
     is responsible for ledger emission. The
     ``path_validation_resolved_via_plan_global`` op encodes the
     ``{task_id, path, declaring_task_id}`` payload.
+
+    v0.40.1: additive real-filesystem fallback. The git ls-files snapshot
+    is a *tracked* view; it misses gitignored files, freshly-written
+    uncommitted files, and dirs holding only untracked files. Each check
+    site now also accepts a path that actually exists on disk:
+    ``Task.files`` via :meth:`_RepoFileSnapshot.exists_on_disk` (file only),
+    and the ``*_scope`` lists via
+    :meth:`_RepoFileSnapshot.scope_exists_on_disk` (file or directory). An
+    on-disk ``Task.files`` admission is a *present* file, not a ``[new]``
+    one, so it does NOT append to *resolutions*. The fallback is purely
+    additive — a path missing from BOTH the snapshot AND the filesystem
+    still raises ``PathValidationError`` with the unchanged shape.
     """
     # v0.25.0: try to wire the IndexQuery for richer suggestions. Best-effort:
     # if the index module isn't importable (e.g. parallel agent's code not
@@ -370,27 +431,35 @@ def validate_files_exist(
 
     plan_global_new = _collect_plan_new_files(plan)
 
-    # Plan-level edit_scope: dir-prefix check.
+    # Plan-level edit_scope: dir-prefix check, with on-disk fallback
+    # (a real dir with only untracked files, or a file path the architect
+    # declares intent to edit).
     for entry in plan.edit_scope:
-        if not snapshot.is_dir_prefix(entry):
-            raise PathValidationError(
-                raw=entry,
-                reason="missing_on_disk",
-                suggestion=snapshot.closest(entry),
-                error_class=_classify_rejection(entry),
-            )
+        if snapshot.is_dir_prefix(entry):
+            continue
+        if snapshot.scope_exists_on_disk(entry):
+            continue
+        raise PathValidationError(
+            raw=entry,
+            reason="missing_on_disk",
+            suggestion=snapshot.closest(entry),
+            error_class=_classify_rejection(entry),
+        )
 
     for phase in plan.phases:
         # Phase-level edit_scope override (None = inherit, list = explicit).
         if phase.edit_scope is not None:
             for entry in phase.edit_scope:
-                if not snapshot.is_dir_prefix(entry):
-                    raise PathValidationError(
-                        raw=entry,
-                        reason="missing_on_disk",
-                        suggestion=snapshot.closest(entry),
-                        error_class=_classify_rejection(entry),
-                    )
+                if snapshot.is_dir_prefix(entry):
+                    continue
+                if snapshot.scope_exists_on_disk(entry):
+                    continue
+                raise PathValidationError(
+                    raw=entry,
+                    reason="missing_on_disk",
+                    suggestion=snapshot.closest(entry),
+                    error_class=_classify_rejection(entry),
+                )
 
         for task in phase.tasks:
             new_files: frozenset[str] = frozenset(task.files_new or [])
@@ -399,6 +468,12 @@ def validate_files_exist(
                 if entry in new_files:
                     continue
                 if snapshot.exists(entry):
+                    continue
+                # On-disk fallback: the file exists on the real filesystem
+                # but is absent from the git ls-files snapshot (gitignored,
+                # or written-but-uncommitted). It is present, not "new", so
+                # it does NOT flow through the plan-global resolutions ledger.
+                if snapshot.exists_on_disk(entry):
                     continue
                 # v0.33.0 A1: plan-global ``[new]`` admission. A sibling
                 # task declaring this path with ``[new]`` is enough — the
@@ -428,13 +503,16 @@ def validate_files_exist(
                 )
 
             for entry in task.extended_scope:
-                if not snapshot.is_dir_prefix(entry):
-                    raise PathValidationError(
-                        raw=entry,
-                        reason="missing_on_disk",
-                        suggestion=snapshot.closest(entry),
-                        error_class=_classify_rejection(entry),
-                    )
+                if snapshot.is_dir_prefix(entry):
+                    continue
+                if snapshot.scope_exists_on_disk(entry):
+                    continue
+                raise PathValidationError(
+                    raw=entry,
+                    reason="missing_on_disk",
+                    suggestion=snapshot.closest(entry),
+                    error_class=_classify_rejection(entry),
+                )
 
 
 __all__ = ["validate_files_exist"]

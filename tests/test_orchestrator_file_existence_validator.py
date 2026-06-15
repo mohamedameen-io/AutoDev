@@ -331,6 +331,155 @@ def test_missing_on_disk_raises_when_no_task_declares_new(
     assert excinfo.value.reason == "missing_on_disk"
 
 
+# ---------------------------------------------------------------------------
+# v0.40.1: additive real-filesystem fallback. The git ls-files snapshot is a
+# tracked-only view; a path that exists on disk but is gitignored / uncommitted
+# (or a file-shaped scope entry) must no longer be false-rejected.
+# ---------------------------------------------------------------------------
+
+
+def test_task_files_on_disk_but_untracked_passes(tmp_path: Path) -> None:
+    """A ``Task.files`` path that exists on disk but is NOT git-tracked
+    (gitignored) is admitted via the on-disk fallback — no
+    ``PathValidationError``.
+
+    The snapshot is non-empty (``src/foo.cpp`` is tracked, so the empty-
+    snapshot short-circuit does not fire), yet ``.env.example`` is absent
+    from ``git ls-files`` because ``.gitignore`` excludes it. It exists on
+    disk, so the fallback accepts it."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.cpp").write_text("// foo\n", encoding="utf-8")
+    # Gitignore .env.example so it is real-on-disk but untracked.
+    (tmp_path / ".gitignore").write_text(".env.example\n", encoding="utf-8")
+    (tmp_path / ".env.example").write_text("KEY=value\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+
+    # Sanity: the snapshot genuinely does not list the untracked file.
+    snapshot = _RepoFileSnapshot.for_cwd(tmp_path)
+    assert not snapshot.exists(".env.example")
+    assert snapshot.exists_on_disk(".env.example")
+
+    plan = _make_plan(files=["src/foo.cpp", ".env.example"])
+    assert validate_files_exist(plan, tmp_path) is None
+
+
+def test_task_files_on_disk_fallback_does_not_record_resolution(
+    tmp_path: Path,
+) -> None:
+    """An on-disk-but-untracked ``Task.files`` admission is a *present*
+    file, not a ``[new]`` one — it must NOT append to the resolutions
+    out-channel (that ledger op is reserved for plan-global ``[new]``
+    admissions)."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.cpp").write_text("// foo\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".env.example\n", encoding="utf-8")
+    (tmp_path / ".env.example").write_text("KEY=value\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+
+    plan = _make_plan(files=[".env.example"])
+    resolutions: list[dict[str, str]] = []
+    assert validate_files_exist(plan, tmp_path, resolutions=resolutions) is None
+    assert resolutions == []
+
+
+def test_plan_edit_scope_file_path_on_disk_passes(tmp_path: Path) -> None:
+    """A FILE path (not a directory) in ``plan.edit_scope`` is accepted when
+    it exists on disk. The dir-prefix check structurally fails for a file
+    (no tracked path starts with ``pyproject.toml/``); the on-disk scope
+    fallback admits it as the architect declaring intent to edit that
+    existing file."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.cpp").write_text("// foo\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'x'\n", encoding="utf-8"
+    )
+    _git_add_and_commit(tmp_path)
+
+    # ``pyproject.toml`` IS tracked here, but it is a file — is_dir_prefix
+    # returns False for it. The scope fallback (file-or-dir) is what admits
+    # it. (The bug report's pyproject.toml was tracked yet still rejected
+    # precisely because of this file-vs-dir-prefix mismatch.)
+    snapshot = _RepoFileSnapshot.for_cwd(tmp_path)
+    assert not snapshot.is_dir_prefix("pyproject.toml")
+    assert snapshot.scope_exists_on_disk("pyproject.toml")
+
+    plan = _make_plan(files=["src/foo.cpp"], plan_edit_scope=["pyproject.toml"])
+    assert validate_files_exist(plan, tmp_path) is None
+
+
+def test_extended_scope_file_path_on_disk_passes(tmp_path: Path) -> None:
+    """The on-disk scope fallback also applies to ``Task.extended_scope``
+    file-shaped entries."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.cpp").write_text("// foo\n", encoding="utf-8")
+    (tmp_path / "Makefile").write_text("all:\n\t@true\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+
+    plan = _make_plan(files=["src/foo.cpp"], extended_scope=["Makefile"])
+    assert validate_files_exist(plan, tmp_path) is None
+
+
+def test_scope_dir_with_only_untracked_files_passes(tmp_path: Path) -> None:
+    """A real directory containing only gitignored files carries no tracked
+    ``dir/`` prefix, so ``is_dir_prefix`` is False — but it exists on disk,
+    so the scope fallback admits it."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.cpp").write_text("// foo\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("build/\n", encoding="utf-8")
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "artifact.o").write_text("x\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+
+    snapshot = _RepoFileSnapshot.for_cwd(tmp_path)
+    assert not snapshot.is_dir_prefix("build")
+    assert snapshot.scope_exists_on_disk("build")
+
+    plan = _make_plan(files=["src/foo.cpp"], plan_edit_scope=["build"])
+    assert validate_files_exist(plan, tmp_path) is None
+
+
+def test_genuinely_missing_path_still_raises_after_fallback(
+    tmp_path: Path,
+) -> None:
+    """Regression guard: a path absent from BOTH the tracked snapshot AND
+    the real filesystem still raises ``PathValidationError`` — the fallback
+    loosens acceptance but never suppresses a genuine miss."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.cpp").write_text("// foo\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+
+    plan = _make_plan(files=["src/foo.cpp", "src/does_not_exist.cpp"])
+    with pytest.raises(PathValidationError) as excinfo:
+        validate_files_exist(plan, tmp_path)
+    assert excinfo.value.raw == "src/does_not_exist.cpp"
+    assert excinfo.value.reason == "missing_on_disk"
+
+
+def test_genuinely_missing_scope_still_raises_after_fallback(
+    tmp_path: Path,
+) -> None:
+    """Regression guard for the ``*_scope`` path: a scope entry that is
+    neither a tracked-dir prefix nor present on disk still raises."""
+    _git_init(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.cpp").write_text("// foo\n", encoding="utf-8")
+    _git_add_and_commit(tmp_path)
+
+    plan = _make_plan(
+        files=["src/foo.cpp"], plan_edit_scope=["totally/absent/dir"]
+    )
+    with pytest.raises(PathValidationError) as excinfo:
+        validate_files_exist(plan, tmp_path)
+    assert excinfo.value.raw == "totally/absent/dir"
+    assert excinfo.value.reason == "missing_on_disk"
+
+
 def test_snapshot_caches_one_subprocess_call(tmp_path: Path) -> None:
     """Three lookups against the same ``_RepoFileSnapshot`` instance must
     only invoke ``subprocess.run`` once — the snapshot is built lazily on
