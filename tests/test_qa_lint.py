@@ -95,3 +95,63 @@ async def test_lint_go(tmp_path: Path) -> None:
         result = await run_lint(tmp_path, language="go")
     assert result.passed
     assert mock_exec.call_args.args[0] == "golangci-lint"
+
+
+@pytest.mark.asyncio
+async def test_lint_python_flake8_command(tmp_path: Path) -> None:
+    (tmp_path / ".flake8").write_text("[flake8]\n", encoding="utf-8")
+    proc = _make_proc(0)
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+        result = await run_lint(tmp_path, language="python")
+    assert result.passed
+    args = list(mock_exec.call_args.args)
+    assert args[0] == "flake8"
+    assert "check" not in args  # flake8 has no `check` subcommand
+
+
+@pytest.mark.asyncio
+async def test_lint_python_ruff_command(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+    proc = _make_proc(0)
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+        result = await run_lint(tmp_path, language="python")
+    assert result.passed
+    args = list(mock_exec.call_args.args)
+    assert args[0] == "ruff"
+    assert "check" in args
+
+
+@pytest.mark.asyncio
+async def test_lint_python_paths_scoped(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    proc = _make_proc(0)
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+        result = await run_lint(
+            tmp_path, language="python", paths=[Path("a.py"), Path("b.txt")]
+        )
+    assert result.passed
+    args = list(mock_exec.call_args.args)
+    assert "a.py" in args
+    assert "b.txt" not in args
+    assert "." not in args
+
+
+@pytest.mark.asyncio
+async def test_lint_python_paths_no_python(tmp_path: Path) -> None:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_exec:
+        result = await run_lint(tmp_path, language="python", paths=[Path("README.md")])
+    assert result.passed
+    assert "no changed python files" in result.details
+    mock_exec.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_lint_python_paths_skips_absent_new_file(tmp_path: Path) -> None:
+    # A changed .py path not yet materialized in cwd (a new file that lands
+    # later) must be skipped, not passed to the linter — passing it would raise
+    # E902 (file-not-found) and fail the gate spuriously. Regression guard.
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_exec:
+        result = await run_lint(tmp_path, language="python", paths=[Path("new_module.py")])
+    assert result.passed
+    assert "present on disk" in result.details
+    mock_exec.assert_not_called()

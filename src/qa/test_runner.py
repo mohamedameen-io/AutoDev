@@ -14,9 +14,13 @@ from pathlib import Path
 
 from plugins.registry import GateResult
 from qa.detect import detect_language
+from qa.env import resolve_tool
 
 
-_DEFAULT_TIMEOUT_S = 60
+# The orchestrator normally overrides this via ``cfg.test_timeout_s``; the
+# default gives real (large) suites headroom rather than the old 60s ceiling
+# that could not finish them.
+_DEFAULT_TIMEOUT_S = 600
 
 
 async def run_tests(
@@ -24,8 +28,13 @@ async def run_tests(
     language: str | None = None,
     *,
     timeout_s: float = _DEFAULT_TIMEOUT_S,
+    paths: list[Path] | None = None,
 ) -> GateResult:
     """Run the test suite appropriate for *language* (auto-detected when ``None``).
+
+    When *paths* is given (repo-relative changed files), the Python suite is
+    scoped to the changed tests (or a bounded default); otherwise the full
+    default suite runs.
 
     Returns a :class:`GateResult` with ``passed=True`` on success or when the
     test runner is not available.
@@ -34,8 +43,10 @@ async def run_tests(
     if lang is None:
         return GateResult(passed=True, details="language not detected, skipping tests")
 
+    if lang == "python":
+        return await _run_pytest(cwd, timeout_s=timeout_s, paths=paths)
+
     runners: dict[str, object] = {
-        "python": _run_pytest,
         "nodejs": _run_npm_test,
         "rust": _run_cargo_test,
         "go": _run_go_test,
@@ -44,6 +55,13 @@ async def run_tests(
     if runner is None:
         return GateResult(passed=True, details=f"no test runner configured for language={lang!r}, skipping")
     return await runner(cwd, timeout_s=timeout_s)  # type: ignore[operator]
+
+
+def _is_test_path(p: Path) -> bool:
+    """True when *p* looks like a pytest test module or lives under ``tests/``."""
+    if p.suffix == ".py" and (p.name.startswith("test_") or p.name.endswith("_test.py")):
+        return True
+    return "tests" in p.parts
 
 
 async def _run_subprocess(
@@ -75,8 +93,29 @@ async def _run_subprocess(
     return GateResult(passed=False, details=f"{tool_name} tests failed:\n{combined}")
 
 
-async def _run_pytest(cwd: Path, *, timeout_s: float) -> GateResult:
-    return await _run_subprocess(["pytest"], cwd, timeout_s=timeout_s, tool_name="pytest")
+async def _run_pytest(
+    cwd: Path,
+    *,
+    timeout_s: float,
+    paths: list[Path] | None,
+) -> GateResult:
+    """Run pytest via the repo's tooling, scoped to changed tests if *paths* given."""
+    base = resolve_tool(cwd, "pytest")
+
+    if paths is None:
+        targets: list[str] = []
+    else:
+        changed_tests = [str(p) for p in paths if _is_test_path(p)]
+        if changed_tests:
+            targets = changed_tests
+        elif any(p.suffix == ".py" for p in paths):
+            # Source-only change: run a bounded default suite when present.
+            targets = ["tests/unit"] if (cwd / "tests" / "unit").is_dir() else []
+        else:
+            return GateResult(passed=True, details="tests: no python changes")
+
+    args = [*base, *targets, "-q"]
+    return await _run_subprocess(args, cwd, timeout_s=timeout_s, tool_name="pytest")
 
 
 async def _run_npm_test(cwd: Path, *, timeout_s: float) -> GateResult:

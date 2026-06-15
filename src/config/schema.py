@@ -596,6 +596,15 @@ class QAGatesConfig(BaseModel):
     # even when the worktree is sparse (operators on small projects or
     # with full local resolution may prefer the strict default).
     hallucination_guard_sparse_downgrade: bool = True
+    # v0.40.1: configurable test-gate wall-clock timeout (seconds). The legacy
+    # hardcoded 60s could not finish large pytest suites; default 600s gives
+    # real suites headroom. Threaded into ``run_tests(timeout_s=...)``.
+    test_timeout_s: float = 600.0
+    # v0.40.1: configurable lint-gate wall-clock timeout (seconds). Lint is
+    # fast, but scoping to changed files on a huge repo can still spin up the
+    # target's env (uv run / .venv); 120s is a safe ceiling. Threaded into
+    # ``run_lint(timeout_s=...)``.
+    lint_timeout_s: float = 120.0
 
 
 class GuardrailsConfig(BaseModel):
@@ -1241,6 +1250,30 @@ class AutodevConfig(BaseModel):
     test capture is not a code defect. The real diagnosis is still
     recorded on ``TestEvidence.diagnosis`` for forensics. Default False
     preserves the strict behaviour."""
+
+    # v0.41.0 (P1-F): bounded soft-pass for ``capture_failed`` specifically.
+    # Observed failure: a trivial, otherwise-passing task whose test step
+    # could not CAPTURE/parse a result (empty ``text``/``raw_stderr`` from the
+    # ``test_engineer``, ``total==0``) looped reviewed→in_progress→reviewed and
+    # exhausted its retries straight into ``blocked``. Capture failing is an
+    # infrastructure problem, not a code defect, so after this many capture
+    # attempts the test step SOFT-PASSES (advances the task to ``tested`` and
+    # stamps ``TestEvidence.soft_passed=True`` + a reason) rather than
+    # hard-failing. A real RED test (captured ``failed > 0`` → diagnosis
+    # ``ok``) is never soft-passed; this knob only governs the genuinely
+    # uncapturable ``capture_failed`` path. ``collection_failed`` and
+    # ``runtime_crash`` carry signal and keep their retry-then-hard-fail
+    # behaviour. Set to a high value to effectively disable the bounded
+    # soft-pass (restores pre-v0.41.0 retry-once-then-block for
+    # ``capture_failed``); cannot be < 1.
+    capture_failed_soft_pass_after: int = Field(default=2, ge=1)
+    """Number of consecutive ``capture_failed`` test attempts on a single
+    task after which the test step soft-passes (advances to ``tested`` with
+    ``TestEvidence.soft_passed=True``) instead of hard-failing to ``blocked``.
+    Default ``2`` = one retry, then soft-pass on the second uncapturable
+    result. Only applies to ``capture_failed`` with no captured failures;
+    real failures and ``collection_failed`` / ``runtime_crash`` are
+    unaffected."""
 
     # v0.38.0 I4: exponential backoff + auto-reset for the test-diag
     # stream. Threshold-crossing no longer hard-halts immediately —

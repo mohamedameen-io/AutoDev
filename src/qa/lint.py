@@ -14,6 +14,7 @@ from pathlib import Path
 
 from plugins.registry import GateResult
 from qa.detect import detect_language
+from qa.env import detect_python_linter, resolve_tool
 
 
 _DEFAULT_TIMEOUT_S = 60
@@ -24,8 +25,12 @@ async def run_lint(
     language: str | None = None,
     *,
     timeout_s: float = _DEFAULT_TIMEOUT_S,
+    paths: list[Path] | None = None,
 ) -> GateResult:
     """Run the appropriate linter for *language* (auto-detected when ``None``).
+
+    When *paths* is given (repo-relative changed files), the Python linter is
+    scoped to the changed ``.py`` files; otherwise it lints the whole tree.
 
     Returns a :class:`GateResult` with ``passed=True`` on success or when the
     linter is not available.
@@ -34,8 +39,10 @@ async def run_lint(
     if lang is None:
         return GateResult(passed=True, details="language not detected, skipping lint")
 
+    if lang == "python":
+        return await _run_python_lint(cwd, timeout_s=timeout_s, paths=paths)
+
     runners: dict[str, object] = {
-        "python": _run_ruff,
         "nodejs": _run_eslint,
         "rust": _run_cargo_clippy,
         "go": _run_golangci_lint,
@@ -76,8 +83,31 @@ async def _run_subprocess(
     return GateResult(passed=False, details=f"{tool_name} lint failed:\n{combined}")
 
 
-async def _run_ruff(cwd: Path, *, timeout_s: float) -> GateResult:
-    return await _run_subprocess(["ruff", "check", "."], cwd, timeout_s=timeout_s, tool_name="ruff")
+async def _run_python_lint(
+    cwd: Path,
+    *,
+    timeout_s: float,
+    paths: list[Path] | None,
+) -> GateResult:
+    """Run the repo's Python linter (ruff or flake8), scoped to *paths* if given."""
+    linter = detect_python_linter(cwd)
+    base = resolve_tool(cwd, linter)
+
+    if paths is None:
+        # Whole-tree lint (back-compat: a bare repo yields ``["ruff", "check", "."]``).
+        args = [*base, "check", "."] if linter == "ruff" else [*base, "."]
+        return await _run_subprocess(args, cwd, timeout_s=timeout_s, tool_name=linter)
+
+    # Only lint changed ``.py`` files that actually exist in *cwd*. A changed
+    # path absent on disk is a new file not yet materialized in the main
+    # worktree (it lands later); passing it to the linter would raise E902
+    # (file-not-found) and fail the gate spuriously — the legacy whole-tree
+    # ``ruff check .`` simply skipped such paths, so we match that behavior.
+    py_files = [str(p) for p in paths if p.suffix == ".py" and (cwd / p).is_file()]
+    if not py_files:
+        return GateResult(passed=True, details="lint: no changed python files present on disk")
+    args = [*base, "check", *py_files] if linter == "ruff" else [*base, *py_files]
+    return await _run_subprocess(args, cwd, timeout_s=timeout_s, tool_name=linter)
 
 
 async def _run_eslint(cwd: Path, *, timeout_s: float) -> GateResult:

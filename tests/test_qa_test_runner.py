@@ -91,3 +91,56 @@ async def test_run_tests_timeout(tmp_path: Path) -> None:
         result = await run_tests(tmp_path, language="python")
     assert not result.passed
     assert "timed out" in result.details
+
+
+@pytest.mark.asyncio
+async def test_run_tests_default_suite_args(tmp_path: Path) -> None:
+    # Back-compat: paths=None → bare suite with just ``-q`` appended.
+    proc = _make_proc(0, stdout=b"5 passed")
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+        result = await run_tests(tmp_path, language="python")
+    assert result.passed
+    assert list(mock_exec.call_args.args) == ["pytest", "-q"]
+
+
+@pytest.mark.asyncio
+async def test_run_tests_paths_changed_test(tmp_path: Path) -> None:
+    proc = _make_proc(0, stdout=b"1 passed")
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+        result = await run_tests(
+            tmp_path, language="python", paths=[Path("tests/test_foo.py")]
+        )
+    assert result.passed
+    args = list(mock_exec.call_args.args)
+    assert args[0] == "pytest"
+    assert "tests/test_foo.py" in args
+    assert "-q" in args
+
+
+@pytest.mark.asyncio
+async def test_run_tests_paths_source_with_tests_unit(tmp_path: Path) -> None:
+    (tmp_path / "tests" / "unit").mkdir(parents=True)
+    proc = _make_proc(0, stdout=b"5 passed")
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+        result = await run_tests(tmp_path, language="python", paths=[Path("src/foo.py")])
+    assert result.passed
+    args = list(mock_exec.call_args.args)
+    assert "tests/unit" in args
+
+
+@pytest.mark.asyncio
+async def test_run_tests_paths_source_without_tests_unit(tmp_path: Path) -> None:
+    proc = _make_proc(0, stdout=b"5 passed")
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+        result = await run_tests(tmp_path, language="python", paths=[Path("src/foo.py")])
+    assert result.passed
+    assert list(mock_exec.call_args.args) == ["pytest", "-q"]
+
+
+@pytest.mark.asyncio
+async def test_run_tests_paths_no_python(tmp_path: Path) -> None:
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_exec:
+        result = await run_tests(tmp_path, language="python", paths=[Path("docs/readme.md")])
+    assert result.passed
+    assert "no python changes" in result.details
+    mock_exec.assert_not_called()

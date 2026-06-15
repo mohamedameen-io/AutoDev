@@ -126,6 +126,8 @@ async def test_run_qa_gates_fails_closed_on_garbage_diff_for_diff_task(
             secretscan_per_extension_thresholds = None
             mutation_test_enabled = False
             mutation_test_threshold = 0.7
+            lint_timeout_s = 120.0
+            test_timeout_s = 600.0
 
     orch = type(
         "OrchStub",
@@ -207,6 +209,8 @@ async def test_run_qa_gates_skips_diff_gate_for_investigation_task(
                 secretscan_per_extension_thresholds = None
                 mutation_test_enabled = False
                 mutation_test_threshold = 0.7
+                lint_timeout_s = 120.0
+                test_timeout_s = 600.0
 
         orch = type(
             "OrchStub",
