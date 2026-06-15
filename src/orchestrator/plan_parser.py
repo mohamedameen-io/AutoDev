@@ -27,6 +27,7 @@ from typing import Literal, cast
 
 from errors import AutodevError
 from autologging import get_logger
+from orchestrator.dependency_inference import infer_plan_dependencies
 from state.schemas import AcceptanceCriterion, Phase, Plan, Task
 
 
@@ -614,6 +615,17 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
 
     if not phases:
         raise PlanParseError("no phases found in plan markdown")
+
+    # v0.41.0 A2: populate implicit ``depends_on`` for same-phase tasks that
+    # consume an earlier task's output (file overlap on a created/edited path,
+    # or a task-id reference in the description). The architect now emits
+    # explicit ``Depends:`` lines in most cases (see architect.md "TASK
+    # DEPENDENCIES"), but inference is the belt-and-suspenders that closes the
+    # Run-3 parallel-worktree incoherence (1.1 creates a serializer, 1.2 routes
+    # through it, no dep declared). Tasks with an explicit ``depends_on`` are
+    # left untouched; inference only ever adds backward edges (later → earlier
+    # in declaration order) so it cannot introduce a cycle.
+    infer_plan_dependencies(phases)
 
     now = _iso_now()
     return Plan(

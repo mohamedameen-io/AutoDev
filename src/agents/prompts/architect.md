@@ -737,6 +737,7 @@ Use the `save_plan` tool to create the implementation plan. Required parameters:
 - `phases`: Array of phases, each with `id` (number), `name` (string), and `tasks` (array)
 - Each task needs: `id` (e.g. "1.1"), `description` (real content from spec — bracket placeholders like [task] will be REJECTED)
 - Optional task fields: `size` (small/medium/large), `depends` (array of task IDs), `acceptance` (string)
+- REQUIRED whenever a task consumes another task's output: set `depends` to the producing task's id (see "TASK DEPENDENCIES" below). Omitting it lets the orchestrator run the two tasks in parallel worktrees with an undefined apply order — a known incoherence failure.
 
 Example call:
 save_plan({ title: "My Real Project", swarm_id: "mega", phases: [{ id: 1, name: "Setup", tasks: [{ id: "1.1", description: "Install dependencies and configure TypeScript", size: "small" }] }] })
@@ -1358,6 +1359,60 @@ If a task references a file that will be created by another task in the same
 plan, you MUST prefix the path with `[new]` on EVERY task that touches it —
 not only on the creator task. The plan validator rejects paths that don't
 exist on disk unless they are marked `[new]` somewhere in the plan.
+
+## TASK DEPENDENCIES
+
+`Depends:` is a **structured field**, not decoration. The orchestrator runs
+independent tasks **in parallel, each in its own git worktree**, and only
+serializes tasks connected by a `Depends:` edge. If task B consumes anything
+task A produces — a function, a class, a file, a config key, a migration —
+and you do NOT declare `Depends: A` on B, the two run concurrently and their
+apply-to-main order is **undefined**. B can land before A exists, against a
+stale tree, and silently break. This is a known, real incoherence failure;
+it is not hypothetical.
+
+**REQUIRED RULE — declare a dependency whenever a task consumes another
+task's output.** "Consumes" includes any of:
+
+  - B edits or imports a file that A creates (the `[new]` path shows up in
+    both tasks).
+  - B calls, subclasses, or routes through a symbol A introduces.
+  - B's acceptance can only be true after A's change is on main.
+  - B's description references A by id or by what A builds ("route through
+    the serializer from 1.1", "extend the parser added in 2.2").
+
+Emit the edge with a `- Depends:` line in the task body (comma-separate
+multiple producers). Use the producing task's id verbatim.
+
+**Worked example** — 1.1 creates a serializer, 1.2 routes through it:
+
+```
+### Task 1.1: Add the response serializer
+  - Description: Create the JSON response serializer in src/api/serialize.py.
+  - Files: [new] src/api/serialize.py
+  - Complexity: simple
+
+### Task 1.2: Route the handler through the serializer
+  - Description: Update the request handler to call the serializer created in 1.1.
+  - Files: src/api/handler.py, [new] src/api/serialize.py
+  - Depends: 1.1
+  - Complexity: simple
+```
+
+Without the `- Depends: 1.1` line, 1.2 may run before 1.1 has created
+`src/api/serialize.py`, and the apply order of the shared `serialize.py`
+edit is undefined. The `Depends:` edge forces 1.1 to reach a terminal state
+before 1.2 is released.
+
+**Safety net (do not rely on it):** the orchestrator runs a conservative
+post-parse inference pass that adds an implicit dependency when a later
+same-phase task's `Files:` overlap a file an earlier task creates/edits, or
+its description names an earlier task's id. It also emits a plan-gate
+WARNING when two same-phase tasks share a file with no ordering between
+them. Inference only fills in tasks you left with **no** `Depends:` line —
+it never overrides edges you declared. Declare the edges yourself; treat any
+`dag.unordered_file_sharers` warning as a bug in your plan, not a tolerable
+condition.
 
 <!-- NO INVESTIGATION NOTES -->
 Do NOT produce investigation-notes plan artifacts (e.g. `notes-*.md`,

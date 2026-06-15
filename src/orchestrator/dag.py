@@ -42,8 +42,11 @@ from __future__ import annotations
 import posixpath
 from pathlib import PurePosixPath
 
+from autologging import get_logger
 from errors import AutodevError
 from state.schemas import Phase, Plan, Task
+
+logger = get_logger(__name__)
 
 
 def _normalize_for_diagnostic(path: str) -> str:
@@ -186,6 +189,103 @@ def validate_phase_dag(phase: Phase) -> None:
     for tid in task_ids:
         if color[tid] == WHITE:
             dfs(tid, [])
+
+    # v0.41.0 A2: soft plan-gate signal. After the hard structural checks
+    # pass, flag same-phase tasks that share a file with NO dependency edge
+    # between them. This is the exact Run-3 parallel-worktree incoherence
+    # (1.1 creates a serializer, 1.2 routes through it, neither depends on the
+    # other → undefined apply-to-main order). Dependency inference
+    # (:func:`orchestrator.dependency_inference.infer_dependencies`) repairs
+    # most of these at parse time; this surfaces any that survive (e.g. both
+    # tasks already carry explicit but unrelated deps). It is a WARNING, never
+    # a hard failure — emitting it must not block an otherwise valid DAG.
+    warn_unordered_file_sharers(phase)
+
+
+def _reachable_pairs(phase: Phase) -> set[tuple[str, str]]:
+    """Return every ordered ``(a, b)`` where ``a`` transitively depends on ``b``.
+
+    Built from the ``depends_on`` edges by transitive closure so the
+    file-sharing warning can ask "is there ANY ordering between these two
+    tasks?" — a direct edge, or a path through intermediate tasks, both
+    count as "ordered". Edges to ids outside ``phase`` are ignored (the
+    undefined-ref pass in :func:`validate_phase_dag` rejects those before
+    this runs).
+    """
+    by_id = {t.id: t for t in phase.tasks}
+    # Direct ancestors: task id -> set of ids it directly depends on.
+    direct: dict[str, set[str]] = {
+        t.id: {d for d in t.depends_on if d in by_id} for t in phase.tasks
+    }
+    closure: set[tuple[str, str]] = set()
+    for start in by_id:
+        # DFS over depends_on edges from ``start``.
+        stack = list(direct[start])
+        seen: set[str] = set()
+        while stack:
+            anc = stack.pop()
+            if anc in seen:
+                continue
+            seen.add(anc)
+            closure.add((start, anc))
+            stack.extend(direct.get(anc, set()))
+    return closure
+
+
+def warn_unordered_file_sharers(
+    phase: Phase,
+    tracked_files: set[str] | None = None,
+) -> list[str]:
+    """Return (and log) a warning per same-phase task pair sharing a file
+    with no ordering between them.
+
+    "Ordering" means a transitive ``depends_on`` relationship in EITHER
+    direction — if A depends on B (directly or via a chain) or B depends on
+    A, the pair is ordered and produces no warning. Only an *unordered*
+    shared-file pair is flagged: those are the worktree-apply races the
+    dispatcher serializes opportunistically but whose merge order is
+    otherwise undefined.
+
+    Glob entries are expanded against ``tracked_files`` (reusing
+    :func:`find_file_overlaps`) when a cache is supplied; without one they
+    are compared literally — matching the rest of this module's
+    backward-compatible behavior.
+
+    This is a diagnostic surface, NOT an enforcement gate: it returns the
+    messages (so callers can attach them to a status surface) and logs each
+    at WARNING level. It never raises. Returns ``[]`` for a clean phase.
+    """
+    if len(phase.tasks) < 2:
+        return []
+
+    overlaps = find_file_overlaps(phase.tasks, tracked_files)
+    ordered = _reachable_pairs(phase)
+
+    warnings: list[str] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for task in phase.tasks:
+        for other_id in sorted(overlaps.get(task.id, set())):
+            pair = tuple(sorted((task.id, other_id)))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)  # type: ignore[arg-type]
+            a, b = pair
+            # Ordered if either direction is reachable in the dep closure.
+            if (a, b) in ordered or (b, a) in ordered:
+                continue
+            msg = (
+                f"tasks {a!r} and {b!r} in phase {phase.id!r} share a file "
+                f"but neither depends_on the other; their worktree apply "
+                f"order is undefined (declare 'Depends:' on the consumer)"
+            )
+            warnings.append(msg)
+            logger.warning(
+                "dag.unordered_file_sharers",
+                phase_id=phase.id,
+                task_a=a,
+                task_b=b,
+            )
+    return warnings
 
 
 def topological_levels(phase: Phase) -> list[list[Task]]:
@@ -543,4 +643,5 @@ __all__ = [
     "validate_edit_scope",
     "validate_edit_scope_with_critic_review",
     "validate_phase_dag",
+    "warn_unordered_file_sharers",
 ]
