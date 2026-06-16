@@ -164,7 +164,6 @@ async def test_glob_path_not_statted(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_ledger_failure_never_raises(tmp_path: Path) -> None:
     """A ledger_append that raises must be swallowed (advisory never breaks)."""
-    ledger_ops: list = []
 
     class ExplodingPlanManager:
         async def ledger_append(self, *, op, payload):

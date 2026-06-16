@@ -23,7 +23,6 @@ from config.defaults import default_config
 from orchestrator import Orchestrator
 from orchestrator.delegation_envelope import DelegationEnvelope
 from orchestrator.execute_phase import delegate
-from state.plan_manager import PlanManager
 from state.schemas import (
     AcceptanceCriterion,
     Phase,

@@ -9,7 +9,6 @@ B1 pairs with a ``reap_orphans`` reset).
 
 from __future__ import annotations
 
-import pytest
 
 from errors import AutodevError, PhaseStuckError
 

@@ -9,7 +9,6 @@ hatch is set.
 
 from __future__ import annotations
 
-import pytest
 
 from orchestrator.execute_phase import maybe_enable_auto_soft_pass
 

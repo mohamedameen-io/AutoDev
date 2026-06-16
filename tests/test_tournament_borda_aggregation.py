@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json as _json
+from pathlib import Path as _Path
+
 import pytest
+
+from tournament import aggregate_rankings, parse_ranking
+
 hypothesis = pytest.importorskip("hypothesis")
 given = hypothesis.given
 settings = hypothesis.settings
 st = hypothesis.strategies
-
-from tournament import aggregate_rankings, parse_ranking
 
 
 # ── Basic cases ───────────────────────────────────────────────────────────
@@ -228,9 +232,6 @@ def test_valid_count_matches_non_none(
 # ── Autoreason golden-fixture regression ────────────────────────────────
 # Reproduces Borda scores from a real autoreason run (pass 1 of paper's run).
 # This guarantees our port matches the reference implementation bit-exactly.
-
-import json as _json
-from pathlib import Path as _Path
 
 
 def test_autoreason_golden_pass_01_scores() -> None:

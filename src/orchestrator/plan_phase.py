@@ -20,7 +20,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from adapters.types import AgentInvocation, AgentResult
 from errors import AutodevError, TournamentError
@@ -871,9 +871,6 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         # for the forensic summary.
         last_parsed_plan: Plan | None = None
         archived_dumps_paths: list[str] = []
-        # v0.32.0 Phase 1.4: model override applied by tier 5 model
-        # escalation. ``None`` means "use the registry default".
-        architect_model_override: str | None = None
         architect_spec = orch.registry.get("architect")
         retry_max = (
             (architect_spec.max_turns or 5) + 2 if architect_spec else 7
@@ -1772,9 +1769,9 @@ async def _delegate(
     if injected_ids and envelope.task_id:
         correlation = getattr(orch, "_injected_lessons_by_task", None)
         if correlation is not None:
-            key = (envelope.task_id, role)
-            existing = correlation.get(key, [])
-            correlation[key] = existing + [
+            corr_key = (envelope.task_id, role)
+            existing = correlation.get(corr_key, [])
+            correlation[corr_key] = existing + [
                 i for i in injected_ids if i not in existing
             ]
 

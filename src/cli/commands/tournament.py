@@ -26,7 +26,7 @@ import asyncio
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import click
 from rich.console import Console
@@ -622,7 +622,8 @@ def phase_review_subcommand(
         from state.paths import autodev_root, spec_path
 
         adapter, selection_meta = await get_adapter(
-            cfg.platform,
+            # "inline" is rewritten to "claude_code" at config load; cast is a runtime no-op.
+            cast('Literal["claude_code", "cursor", "auto"]', cfg.platform),
             cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
@@ -771,7 +772,8 @@ async def _run_plan_tournament_cli(
         # tournament-driver invocations are forensics-skipped until a
         # standalone ledger plumbing exists.
         adapter, _selection_meta = await get_adapter(
-            cfg.platform,
+            # "inline" is rewritten to "claude_code" at config load; cast is a runtime no-op.
+            cast('Literal["claude_code", "cursor", "auto"]', cfg.platform),
             cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
@@ -898,7 +900,8 @@ async def _run_impl_tournament_cli(
         # v0.38.0 HK10: see plan-tournament site above — same forensics
         # skip rationale (no Orchestrator on this CLI path).
         adapter, _selection_meta = await get_adapter(
-            cfg.platform,
+            # "inline" is rewritten to "claude_code" at config load; cast is a runtime no-op.
+            cast('Literal["claude_code", "cursor", "auto"]', cfg.platform),
             cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,

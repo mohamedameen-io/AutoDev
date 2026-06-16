@@ -278,7 +278,7 @@ def regex_timeouts_cmd(cwd: Path, top: int, report: str) -> None:
             raw_rows.append(
                 {
                     "seq": entry.seq,
-                    "ts": entry.timestamp.isoformat()
+                    "ts": entry.timestamp.isoformat()  # type: ignore[attr-defined]  # ledger timestamp is ISO str; guarded by hasattr below
                     if hasattr(entry, "timestamp") and entry.timestamp
                     else None,
                     "path": path,

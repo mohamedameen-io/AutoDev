@@ -31,7 +31,6 @@ from tournament import (
     TournamentArtifactStore,
     TournamentConfig,
 )
-from tournament.core import ResumeState
 from tournament.prompts import JUDGE_RANK_3_PROMPT
 
 

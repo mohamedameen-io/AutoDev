@@ -59,7 +59,7 @@ def test_append_run_summary_is_idempotent_one_line_per_call(tmp_path: Path) -> N
     append_run_summary(tmp_path, phase="execute", cost_usd=2.0, elapsed_s=2.0, tasks=2)
     lines = run_summary_path(tmp_path).read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2
-    phases = [json.loads(l)["phase"] for l in lines]
+    phases = [json.loads(line)["phase"] for line in lines]
     assert phases == ["plan", "execute"]
 
 

@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 
-from adapters.types import AgentResult
 from plugins.registry import GateResult
 
 

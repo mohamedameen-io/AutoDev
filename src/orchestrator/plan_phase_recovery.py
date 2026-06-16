@@ -436,7 +436,10 @@ async def record_phase_degrade(
 
 
 __all__ = [
-    "RecoveryHintStub",
+    # Resolved lazily at runtime via the PEP 562 module-level ``__getattr__``
+    # above (re-exports state.schemas.RecoveryHint); ruff's static analysis
+    # cannot see through ``__getattr__`` so this is a false positive.
+    "RecoveryHintStub",  # noqa: F822
     "RecoveryOutcome",
     "ScopeDegradationResult",
     "attempt_scope_degradation",

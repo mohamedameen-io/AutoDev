@@ -15,7 +15,6 @@ import asyncio
 import datetime as _dt
 from pathlib import Path
 
-import pytest
 
 from state.ledger import append_entry
 from state.plan_manager import PlanManager

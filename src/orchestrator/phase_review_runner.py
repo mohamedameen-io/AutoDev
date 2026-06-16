@@ -515,7 +515,7 @@ async def run_phase_review_tournament(
                         payload={
                             "task_id": phase.id,
                             "similarity": _CONVERGENCE_SIMILARITY_THRESHOLD,
-                            "attempt": int(attempt_memo.get(phase.id, 0)),
+                            "attempt": int((attempt_memo or {}).get(phase.id, 0)),
                         },
                     )
                 except Exception as exc:  # noqa: BLE001

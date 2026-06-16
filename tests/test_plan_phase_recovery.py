@@ -25,7 +25,6 @@ from orchestrator import Orchestrator
 from orchestrator.plan_phase_recovery import (
     RecoveryHintStub,
     RecoveryOutcome,
-    ScopeDegradationResult,
     attempt_scope_degradation,
     build_forensic_summary,
     run_recovery_tiers,

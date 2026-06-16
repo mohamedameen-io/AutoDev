@@ -109,7 +109,7 @@ def _task_sparse_cone(task: "Task") -> list[str] | None:
     cone = [
         p
         for p in raw
-        if isinstance(p, str) and p.strip() and not (p in seen or seen.add(p))
+        if isinstance(p, str) and p.strip() and not (p in seen or seen.add(p))  # type: ignore[func-returns-value]  # set.add returns None (falsy) by design — dedup idiom
     ]
     return cone or None
 

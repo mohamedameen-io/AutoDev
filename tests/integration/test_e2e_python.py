@@ -80,7 +80,8 @@ def _make_stub(extras: Iterable[tuple[str, object]] | None = None) -> StubAdapte
 @pytest.mark.asyncio
 async def test_python_init_produces_config(tmp_git_repo: Path) -> None:
     """autodev init writes .autodev/config.json."""
-    cfg = make_autodev_config(tmp_git_repo)
+    # Side-effecting call: writes .autodev/config.json (asserted below).
+    make_autodev_config(tmp_git_repo)
     config_path = tmp_git_repo / ".autodev" / "config.json"
     assert config_path.exists(), "config.json must exist after init"
     raw = json.loads(config_path.read_text())

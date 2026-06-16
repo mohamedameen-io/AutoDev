@@ -1522,8 +1522,8 @@ class IndexQuery:
                 fkey = (hit.file_path, "")
                 file_score[fkey] = file_score.get(fkey, 0.0) + 0.5
             for fhit in self.search_files(token, limit=5):
-                key = (fhit.path, fhit.lang)
-                file_score[key] = file_score.get(key, 0.0) + 1.0
+                file_key = (fhit.path, fhit.lang)
+                file_score[file_key] = file_score.get(file_key, 0.0) + 1.0
 
         sym_hits = [
             SymbolHit(

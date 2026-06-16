@@ -34,7 +34,6 @@ from errors import TournamentError
 from tournament.errors import AuthenticationFailedError
 from tournament.llm import (
     AdapterLLMClient,
-    TransientError,
 )
 from tournament.llm import _classify_error  # type: ignore
 

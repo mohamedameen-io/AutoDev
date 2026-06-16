@@ -22,7 +22,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from autologging import get_logger
 from pydantic import ValidationError
@@ -546,7 +546,9 @@ async def run_framing_phase(
             signals_fired = signals_fired + ["parse_degraded"]
             chosen = _local_patch_approach()
             approaches = [chosen]
-            final_classification = "local_defect"
+            final_classification: Literal[
+                "local_defect", "realized_design_failure"
+            ] = "local_defect"
             is_design = False
             logger.info("framing_phase.local_defect_path", reason="parse_degraded")
             # v0.42.1 F1b (ADR-0047): the framing phase classified a

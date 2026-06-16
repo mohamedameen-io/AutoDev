@@ -137,17 +137,17 @@ def classify(
     try:
         from orchestrator.path_validator import PathValidationError  # noqa: PLC0415
     except Exception:  # noqa: BLE001 — defensive against test-time stub envs
-        PathValidationError = None  # type: ignore[assignment]
+        PathValidationError = None  # type: ignore[misc,assignment]
 
     try:
         from orchestrator.plan_parser import PlanParseError  # noqa: PLC0415
     except Exception:  # noqa: BLE001
-        PlanParseError = None  # type: ignore[assignment]
+        PlanParseError = None  # type: ignore[misc,assignment]
 
     try:
         from pydantic import ValidationError as _PydValidationError  # noqa: PLC0415
     except Exception:  # noqa: BLE001
-        _PydValidationError = None  # type: ignore[assignment]
+        _PydValidationError = None  # type: ignore[misc,assignment]
 
     # ----- Plan-time exceptions -----
     if PathValidationError is not None and isinstance(

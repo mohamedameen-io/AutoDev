@@ -30,8 +30,6 @@ import pytest
 from config.defaults import default_config
 from config.schema import (
     AutodevConfig,
-    TournamentPhaseConfig,
-    TournamentsConfig,
 )
 
 

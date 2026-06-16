@@ -317,7 +317,7 @@ def _render_recovery_outcomes(
         try:
             from orchestrator.retry_envelope import diagnosis_for_class
         except Exception:  # noqa: BLE001
-            diagnosis_for_class = lambda _c: ""  # noqa: E731
+            diagnosis_for_class = lambda _c: ""  # type: ignore[assignment]  # noqa: E731 — import-fallback stub
         last = rejection_rows[-1].get("payload", {})
         cls = last.get("class", "missing_on_disk")
         action = diagnosis_for_class(cls)
@@ -524,8 +524,8 @@ def _render_blocked_section(
             dumps = []
         if dumps:
             console.print("[bold]Archived Rejected Plans[/bold]")
-            for path in dumps:
-                console.print(f"  - {path}")
+            for dump_path in dumps:
+                console.print(f"  - {dump_path}")
 
 
 def _print_knowledge_summary(console: Console, swarm_count: int, hive_count: int) -> None:

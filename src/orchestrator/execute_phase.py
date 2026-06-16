@@ -78,7 +78,9 @@ from tournament.task_overrides import (
 
 
 if TYPE_CHECKING:
+    from config.schema import QAGatesConfig
     from orchestrator import Orchestrator
+    from state.schemas import RecoveryHint
 
 
 logger = get_logger(__name__)
@@ -342,7 +344,7 @@ def _build_recovery_hint(
         ]
     )
     return RecoveryHint(
-        class_=hint_class,
+        class_=hint_class,  # type: ignore[call-arg]  # pydantic alias: class_ valid via populate_by_name
         recommended_user_action=action,
         relevant_evidence_files=evid,
         relevant_debug_files=dbg,
@@ -495,7 +497,7 @@ async def _build_recent_evidence_block(
 
 def _build_recovery_hint_from_reason(
     *, task_id: str, reason: str
-) -> "state.schemas.RecoveryHint":  # noqa: F821 — string annotation, lazy import
+) -> "RecoveryHint":
     """Map a free-form ``reason`` string to a typed :class:`RecoveryHint`.
 
     Used by sites that already classify via the ``reason`` text passed
@@ -2391,7 +2393,6 @@ async def run_execute_phase(
         # validator is a no-op and the loop proceeds unchanged.
         from orchestrator.dag import (
             DagValidationError,
-            EditScopeViolation,
             collect_edit_scope_violations,
             validate_dag_cycles_global,
             validate_dag_undefined_refs,
@@ -4270,7 +4271,7 @@ async def _execute_one(
                     sparse_paths = [
                         p
                         for p in _task_cone
-                        if not (p in _seen or _seen.add(p))
+                        if not (p in _seen or _seen.add(p))  # type: ignore[func-returns-value]  # set.add returns None (falsy) by design — dedup idiom
                     ]
                     logger.info(
                         "execute_phase.sparse_cone_from_task_files",
@@ -5487,7 +5488,7 @@ async def _enforce_retry_backoff(
     last_retry_at: str | None,
     min_interval_s: float,
     *,
-    now: Callable[[], "datetime"] | None = None,
+    now: Callable[[], "_dt.datetime"] | None = None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> float:
     """v0.25.1 Bug #4: pause until the retry interval has elapsed.
@@ -7413,7 +7414,7 @@ def _surface_warning(task: "Task", gate_name: str, result: GateResult) -> None:
 
 
 def _run_secretscan_with_cfg(
-    cwd: Path, secretscan_paths: list[Path] | None, cfg: object
+    cwd: Path, secretscan_paths: list[Path] | None, cfg: "QAGatesConfig"
 ) -> Awaitable[GateResult]:
     """v0.23.0 C2: bridge that only forwards new C2 kwargs when set.
 
@@ -7424,7 +7425,7 @@ def _run_secretscan_with_cfg(
     through (and any test that exercises the C2 surface will mock
     accordingly).
     """
-    extra: dict[str, object] = {}
+    extra: dict[str, Any] = {}
     ignore = getattr(cfg, "secretscan_ignore_paths", None)
     if ignore:
         extra["ignore_paths"] = ignore

@@ -203,7 +203,8 @@ async def test_architect_refine_response_injects_corrective_tasks(
         )
     )
     orch = _make_orch(tmp_path, pm)
-    task = (await pm.get_task("1.1")) or pytest.fail("task not found")
+    # Side-effecting assertion: fetch the task and fail the test if absent.
+    (await pm.get_task("1.1")) or pytest.fail("task not found")
     # Move to in_progress so the FSM transition to ``skipped`` is allowed.
     await pm.update_task_status("1.1", "in_progress")
 

@@ -83,7 +83,8 @@ def _make_stub(extras: Iterable[tuple[str, object]] | None = None) -> StubAdapte
 @pytest.mark.asyncio
 async def test_go_init_produces_config(tmp_git_repo_go: Path) -> None:
     """autodev init writes .autodev/config.json for a Go repo."""
-    cfg = make_autodev_config(tmp_git_repo_go)
+    # Side-effecting call: writes .autodev/config.json (asserted below).
+    make_autodev_config(tmp_git_repo_go)
     config_path = tmp_git_repo_go / ".autodev" / "config.json"
     assert config_path.exists()
     raw = json.loads(config_path.read_text())

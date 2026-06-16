@@ -14,7 +14,6 @@ from typing import Any
 from adapters.base import NetworkProbeFailure, PlatformAdapter
 from adapters.git_utils import (
     _diff_files,
-    _git_diff,
     _git_diff_with_untracked,
     _git_porcelain_set,
 )
