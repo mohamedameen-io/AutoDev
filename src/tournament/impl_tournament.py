@@ -42,6 +42,7 @@ from tournament.prompts import (
     CRITIC_SYSTEM,
     SYNTHESIZER_SYSTEM,
 )
+from tournament.util import _limit
 
 
 VariantLabel = Literal["A", "B", "AB"]
@@ -688,15 +689,6 @@ class ImplTournament(Tournament[ImplBundle]):
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
-
-
-def _limit(text: str, limit: int) -> str:
-    """Return ``text`` truncated to ``limit`` chars with a suffix marker."""
-    if text is None:
-        return ""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n... (truncated {len(text) - limit} bytes)"
 
 
 def _fmt_files(files: list[str]) -> str:

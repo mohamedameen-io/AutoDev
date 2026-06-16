@@ -30,6 +30,7 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from state.schemas import AcceptanceCriterion
+from tournament.util import _limit
 
 
 VariantLabel = Literal["A", "B", "AB"]
@@ -437,14 +438,6 @@ def _render_variant_body(t: PhaseReviewBundle) -> str:
         return f"CORRECTIVE DIRECTION:\n{t.direction_text}"
     # Defensive: shouldn't happen under normal flow.
     return f"(variant {t.variant_label} produced no direction text)"
-
-
-def _limit(text: str, limit: int) -> str:
-    if text is None:
-        return ""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n... (truncated {len(text) - limit} bytes)"
 
 
 def _fmt_files(files: list[str]) -> str:

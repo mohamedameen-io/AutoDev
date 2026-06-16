@@ -26,6 +26,7 @@ from tournament.prompts import (
     JUDGE_RANK_3_PROMPT,
     SYNTHESIZER_PROMPT,
 )
+from tournament.util import _limit
 
 
 logger = get_logger(__name__)
@@ -77,24 +78,38 @@ class PlanContentHandler:
 
         The canonical :data:`CRITIC_PROMPT` in :mod:`tournament.prompts`
         takes only ``version_a``; ``task_prompt`` is implicit (the critic does
-        not need the original task to identify problems in the proposal).
+        not need the original task to identify problems in the proposal) and is
+        never embedded, so it needs no bound. The incumbent plan IS bounded —
+        unbounded inlining of the full plan was the Run-5 ``critic_t
+        error_max_turns`` root cause (see :mod:`tournament.util`).
         """
-        return CRITIC_PROMPT.format(version_a=t)
+        return CRITIC_PROMPT.format(version_a=_limit(t, 12000))
 
     def render_for_architect_b(self, task_prompt: str, a: str, critic_text: str) -> str:
-        """Render the architect_b prompt with task, incumbent A, and the critique."""
+        """Render the architect_b prompt with task, incumbent A, and the critique.
+
+        Both large inputs are bounded: the incumbent plan ``a`` and the LLM
+        critique ``critic_text`` (an LLM critique can itself be large). The
+        ``task_prompt`` is the enriched spec, which can also be large, so it is
+        bounded too.
+        """
         return ARCHITECT_B_PROMPT.format(
-            task_prompt=task_prompt, version_a=a, critic=critic_text
+            task_prompt=_limit(task_prompt, 12000),
+            version_a=_limit(a, 12000),
+            critic=_limit(critic_text, 12000),
         )
 
     def render_for_synthesizer(self, task_prompt: str, x: str, y: str) -> str:
         """Render the synthesizer prompt over two equal-weight versions.
 
         The tournament engine coin-flips which of A or B becomes X / Y so the
-        synthesizer has no positional bias.
+        synthesizer has no positional bias. Both plan versions are bounded;
+        ``task_prompt`` (the enriched spec) is bounded too — it can be large.
         """
         return SYNTHESIZER_PROMPT.format(
-            task_prompt=task_prompt, version_x=x, version_y=y
+            task_prompt=_limit(task_prompt, 8000),
+            version_x=_limit(x, 8000),
+            version_y=_limit(y, 8000),
         )
 
     def render_for_judge(
@@ -111,14 +126,20 @@ class PlanContentHandler:
         ("A" | "B" | "AB"). We fill PROPOSAL slots 1/2/3 in that order so the
         judge cannot infer identity from position.
         """
-        versions = {"A": v_a, "B": v_b, "AB": v_ab}
+        # Each plan version is bounded before it lands in a PROPOSAL slot;
+        # ``task_prompt`` (the enriched spec) is bounded too — it can be large.
+        versions = {
+            "A": _limit(v_a, 8000),
+            "B": _limit(v_b, 8000),
+            "AB": _limit(v_ab, 8000),
+        }
         parts: list[str] = []
         for slot in (1, 2, 3):
             label = order_map[slot]
             body = versions[label]
             parts.append(f"PROPOSAL {slot}:\n---\n{body}\n---")
         return JUDGE_RANK_3_PROMPT.format(
-            task_prompt=task_prompt,
+            task_prompt=_limit(task_prompt, 8000),
             judge_proposals="\n\n".join(parts),
         )
 
