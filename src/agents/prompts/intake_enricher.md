@@ -48,7 +48,10 @@ fetch and which tool to use:
   inline. Do NOT re-explore. Distill the bug-relevant call-path/contract facts,
   each with a `file.py:line` ref drawn from the findings.
 - **github** — run Bash `gh issue view NNN` (or `gh pr view NNN`) for a `#NNN`
-  ref, or `WebFetch` a full URL. The linked issue is often richer than the pasted
+  ref, or `WebFetch` a full URL. The fragment may instead name a DISCOVERED ref
+  (`github:owner/repo#NNN`) the source found by symptom search when the intent
+  named none — pull that exact issue the same way and normalize it to a
+  `github:owner/repo#NNN` fact. The linked issue is often richer than the pasted
   summary — pull it. Honor any EXCLUSION GUARD: never fetch content matching an
   excluded glob (e.g. the solution branch); skip it and emit no fact.
 - **jira** — call the Jira MCP tools (e.g. `jira_get_issue`) for the named key.

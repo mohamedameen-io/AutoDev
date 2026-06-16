@@ -36,10 +36,28 @@ class RepoSource:
     async def available(
         self, *, cwd: Path, intent: str, cfg: IntakePhaseConfig
     ) -> bool:
+        """Available iff explorer evidence with non-empty findings exists and
+        ``cfg.reuse_explorer_evidence`` is on. NEVER raises.
+
+        The repo source is network-free and the highest-value enrichment, so a
+        skip is logged with a STRUCTURED reason (``reuse_disabled`` |
+        ``no_evidence`` | ``empty_findings``) — a Run-5-style silent ``n_facts=0``
+        must be auditable. ``reuse_explorer_evidence`` defaults ``True`` for any
+        config (legacy or fresh) that does not explicitly set it ``false``.
+        """
         if not cfg.reuse_explorer_evidence:
+            logger.info("intake.gather.repo_skipped", reason="reuse_disabled")
             return False
         ev = await self._explore_evidence(cwd)
-        return ev is not None and bool(ev.findings.strip())
+        if ev is None:
+            logger.info("intake.gather.repo_skipped", reason="no_evidence")
+            return False
+        if not ev.findings.strip():
+            # Explorer ran but produced no usable findings (e.g. rate-limited →
+            # empty .text written as ExploreEvidence.findings at plan_phase.py).
+            logger.info("intake.gather.repo_skipped", reason="empty_findings")
+            return False
+        return True
 
     async def prepare_prompt(
         self, *, cwd: Path, intent: str, cfg: IntakePhaseConfig
