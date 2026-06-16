@@ -229,7 +229,16 @@ class ClaudeCodeAdapter(PlatformAdapter):
         # user-global default from ``~/.claude/settings.json``.
         if inv.effort:
             cmd += ["--effort", inv.effort]
-        if inv.allowed_tools:
+        if inv.allowed_tools is not None:
+            # None → omit --allowed-tools entirely (CLI default = all tools).
+            # [] → explicit "no tools": ",".join([]) == "" so we pass
+            #      --allowed-tools "" (an empty allow-list). A bare
+            #      `if inv.allowed_tools:` would drop [] and silently grant ALL
+            #      tools — the Run-5 no-op (v0.42.1 F2b). Only the text-only
+            #      tournament roles (critic_t/synthesizer) reach the adapter
+            #      with literal []; tournament/llm.py normalizes [] -> ["Read"]
+            #      for every other role, so the blast radius is exactly those
+            #      two roles.
             cmd += ["--allowed-tools", ",".join(inv.allowed_tools)]
         # huge-repo (Cluster B1): isolate the spawned agent from the
         # target repo's SessionStart hooks + MCP servers (cold-start

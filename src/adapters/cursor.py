@@ -199,12 +199,17 @@ class CursorAdapter(PlatformAdapter):
         # into CLI flags. See ``_max_mode_flag_for`` and
         # ``docs/cursor-cli-flags.md`` for current behaviour.
         cmd += _max_mode_flag_for(inv.max_mode)
-        if inv.allowed_tools:
+        if inv.allowed_tools is not None:
+            # ``is not None`` (v0.42.1 F2b): surface the intent for an explicit
+            # empty list too. ``[]`` means "no tools" (the text-only tournament
+            # roles); a bare ``if inv.allowed_tools:`` swallowed it silently.
+            # Cursor still cannot ENFORCE any allow-list (no --allowed-tools
+            # flag), but the intent must not be dropped without a trace.
             logger.warning(
                 "cursor.allowed_tools_ignored",
                 role=inv.role,
                 allowed_tools=inv.allowed_tools,
-                note="cursor has no --allowed-tools; express constraints in .cursor/rules/ (Phase 3)",
+                note="cursor has no --allowed-tools (an empty [] no-tools intent is also unenforceable); express constraints in .cursor/rules/ (Phase 3)",
             )
         return cmd
 
