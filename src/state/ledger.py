@@ -608,11 +608,24 @@ LedgerOp = Literal[
     # - ``resolution_chosen``: ``{task_id, failure_class, action,
     #   rationale_excerpt, params}``. Emitted once the resolver picks an action.
     # - ``resolution_outcome``: ``{task_id, action, outcome: "applied" |
-    #   "fell_through" | "ask_human", reason}``. Emitted after the site applies
-    #   (or declines) the action.
+    #   "fell_through" | "ask_human" | "observed", reason}``. Emitted after the
+    #   site applies (or declines) the action. The ``"observed"`` outcome (Phase
+    #   1A Step 1) marks an observability-only breadcrumb on the quarantine path:
+    #   the site is recording that a recovery-class transition is about to
+    #   happen (e.g. ``quarantine_pending_operator``), not that the resolver
+    #   chose-and-applied an action.
     "blocker_escalated",
     "resolution_chosen",
     "resolution_outcome",
+    # Phase 1A Step 1 (RECOVERY-CONTRACT §7.1): the conflict-escalation critic's
+    # merge-strategy DECISION. Audit-only — NEVER mutates plan state (the chosen
+    # branch's terminal block, if any, applies via ``block_task`` →
+    # ``update_task_status`` alongside). Payload shape:
+    # ``{task_id, action: "rebase-and-retry" | "abandon-task" | "rewrite",
+    #   conflict_files: list[str], rewrite_rounds: int}``. Records the critic's
+    # CHOICE (previously invisible — zero ledger ops) so post-mortems can audit
+    # how a 3-way merge conflict was resolved before any block.
+    "conflict_critic_decision",
 ]
 
 
@@ -958,8 +971,17 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # return early here — before the ``plan is None`` guard below.
         return plan
 
-    if op in ("blocker_escalated", "resolution_chosen", "resolution_outcome"):
+    if op in (
+        "blocker_escalated",
+        "resolution_chosen",
+        "resolution_outcome",
+        "conflict_critic_decision",
+    ):
         # ADR-0047: audit-only breadcrumbs for the Universal Blocker Resolver.
+        # Phase 1A Step 1 adds ``conflict_critic_decision`` (the conflict
+        # critic's merge-strategy choice) to the same audit-only set — it never
+        # mutates plan state; the chosen branch's terminal block (if any)
+        # applies via the regular ``update_task_status`` op emitted alongside.
         # The resolver fires during execute_phase (plan already persisted), but
         # these ops never mutate plan state — the chosen action applies via the
         # regular ``update_task_status`` / ``append_corrective_tasks`` /

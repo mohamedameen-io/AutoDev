@@ -2109,6 +2109,44 @@ async def _apply_with_conflict_escalation(
                 conflict_files=list(task.files),
             )
 
+            # Phase 1A Step 1 (RECOVERY-CONTRACT §7.1): record the critic's
+            # merge-strategy CHOICE as a typed audit breadcrumb. Previously
+            # the rebase/rewrite/abandon decision was invisible (zero ledger
+            # ops); the terminal branches below emit ``blocker_escalated`` via
+            # ``block_task`` but the CHOICE itself was unrecorded. Pure
+            # observability — does NOT mutate plan state. Best-effort: wrapped
+            # so a ledger hiccup never derails conflict recovery, but it MUST
+            # normally fire.
+            try:
+                from state.ledger import append_entry as _append_entry
+                from state.lockfile import plan_lock as _plan_lock
+
+                async with _plan_lock(
+                    orch.cwd,
+                    timeout_s=getattr(
+                        orch.plan_manager, "_lock_timeout_s", 30.0
+                    ),
+                ):
+                    await _append_entry(
+                        orch.cwd,
+                        op="conflict_critic_decision",
+                        payload={
+                            "task_id": task.id,
+                            "action": resolution.action,
+                            "conflict_files": list(task.files),
+                            "rewrite_rounds": rewrite_rounds,
+                        },
+                        session_id=getattr(
+                            orch.plan_manager, "_session_id", orch.session_id
+                        ),
+                    )
+            except Exception as exc_dec:  # noqa: BLE001 — best-effort breadcrumb
+                logger.warning(
+                    "execute_phase.conflict_critic_decision_emit_failed",
+                    task_id=task.id,
+                    err=str(exc_dec),
+                )
+
             if resolution.action == "rebase-and-retry":
                 # Try 3-way apply. If THIS also fails, fall through to
                 # abandon (no infinite loop on persistent conflicts).
@@ -3457,6 +3495,53 @@ async def _execute_one_worker(
         # underlying issue. Re-raising propagates through
         # ``_execute_phase_dag`` (which has its own typed catch) up to
         # ``run_execute_phase`` for the structured-log + abort.
+        #
+        # Phase 1A Step 1 (RECOVERY-CONTRACT §7.1): emit a typed
+        # ``resolution_outcome`` breadcrumb IMMEDIATELY BEFORE the
+        # quarantine transition so every terminal ``quarantined``
+        # transition is preceded by a recovery-decision op (closes the
+        # WS1 two-channel-split breadcrumb gap). Pure observability — does
+        # NOT mutate plan state and does NOT (yet) route through
+        # ``block_task`` (that is Step 7). Best-effort: wrapped so it can
+        # never mask the original typed exception, but it MUST normally
+        # fire. ``failure_class`` is ``infra_circuit_open`` for the
+        # circuit-breaker path and the typed prefix (``auth_failed``) for
+        # the single-shot auth path.
+        _halt_fcls = (
+            _fcls.INFRA_CIRCUIT_OPEN
+            if isinstance(exc, InfrastructureCircuitOpenError)
+            else _halt_reason_prefix(exc)
+        )
+        try:
+            from state.ledger import append_entry as _append_entry
+            from state.lockfile import plan_lock as _plan_lock
+
+            async with _plan_lock(
+                orch.cwd,
+                timeout_s=getattr(
+                    orch.plan_manager, "_lock_timeout_s", 30.0
+                ),
+            ):
+                await _append_entry(
+                    orch.cwd,
+                    op="resolution_outcome",
+                    payload={
+                        "task_id": task.id,
+                        "action": "quarantine_pending_operator",
+                        "outcome": "observed",
+                        "failure_class": _halt_fcls,
+                        "reason": f"{_halt_reason_prefix(exc)}: {exc}",
+                    },
+                    session_id=getattr(
+                        orch.plan_manager, "_session_id", orch.session_id
+                    ),
+                )
+        except Exception as exc3:  # noqa: BLE001 — never mask the original
+            logger.warning(
+                "execute_phase.quarantine_breadcrumb_failed",
+                task_id=task.id,
+                err=str(exc3),
+            )
         try:
             await orch.plan_manager.update_task_status(
                 task.id,
