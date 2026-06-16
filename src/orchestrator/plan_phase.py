@@ -1368,6 +1368,26 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                             "attempt": 0,
                         },
                     )
+                    # v0.42.1 F1b (ADR-0047): the plan tournament's refined
+                    # output was rejected and we silently fall back to the
+                    # pre-tournament plan — THE Run-5 silent fallback. Route the
+                    # degrade through the resolver so it leaves a breadcrumb
+                    # (observability only — the fallback still applies).
+                    try:
+                        from orchestrator.blocker_resolver import (
+                            record_phase_degrade,
+                        )
+
+                        await record_phase_degrade(
+                            orch,
+                            "plan_tournament",
+                            RuntimeError(
+                                rejection_reason
+                                or "tournament_output_rejected"
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001 - never break planning
+                        pass
                     plan = fallback_plan
                     plan_md = fallback_plan_md
             else:
@@ -1630,6 +1650,20 @@ async def _run_phase1_4_recovery(
                 "plan_phase.recovery_tier5_failed", err=str(exc)
             )
             # Fall through to Tier 6/7 (caller hard-fails).
+
+    # v0.42.1 F1b (ADR-0047): all recovery tiers are exhausted — this is the
+    # Tier-7 hard-fail. Route the degrade through the resolver as an EXPLICIT,
+    # auditable breadcrumb before the caller re-raises (observability only; the
+    # hard-fail still propagates). Lives behind the recovery module's thin async
+    # wrapper so the enforced ``record_phase_degrade`` setter stays the path.
+    try:
+        from orchestrator.plan_phase_recovery import (  # noqa: PLC0415
+            record_phase_degrade as _record_recovery_degrade,
+        )
+
+        await _record_recovery_degrade(orch, last_exc)
+    except Exception:  # noqa: BLE001 - never mask the hard-fail
+        pass
 
     # Tier 6 already fired (the recovery_hint was logged above); the
     # caller (the architect-retry loop) hard-fails the plan-phase by

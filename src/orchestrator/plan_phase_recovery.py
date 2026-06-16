@@ -408,12 +408,40 @@ def run_recovery_tiers(
     return outcome
 
 
+async def record_phase_degrade(
+    orch: "Any", last_exception: BaseException | None
+) -> None:
+    """v0.42.1 F1b (ADR-0047): route the Tier-7 plan-recovery hard-fail through
+    the resolver as an EXPLICIT phase degrade.
+
+    ``run_recovery_tiers`` is a pure, synchronous function with no ``orch`` / no
+    event loop, so it cannot record the degrade itself. This thin async helper
+    (invoked by the async plan-phase caller once recovery is exhausted) keeps
+    the ``record_phase_degrade(`` call inside this module — the single, enforced
+    degrade setter — while threading it onto the async boundary the caller owns.
+    Observability only; best-effort; never raises.
+    """
+    try:
+        from orchestrator.blocker_resolver import (
+            record_phase_degrade as _record,
+        )
+
+        await _record(
+            orch,
+            "plan_recovery",
+            last_exception or RuntimeError("plan_recovery_exhausted"),
+        )
+    except Exception:  # noqa: BLE001 - never break the plan-phase hard-fail
+        pass
+
+
 __all__ = [
     "RecoveryHintStub",
     "RecoveryOutcome",
     "ScopeDegradationResult",
     "attempt_scope_degradation",
     "build_forensic_summary",
+    "record_phase_degrade",
     "run_recovery_tiers",
     "should_change_model_for_class",
     "should_escalate_model",

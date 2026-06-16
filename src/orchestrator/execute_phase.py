@@ -33,6 +33,8 @@ from adapters.git_utils import _git_rev_parse_head, extract_files_from_diff
 from adapters.types import AgentInvocation, AgentResult
 from errors import AutodevError, GuardrailExceededError, TournamentError
 from autologging import get_logger
+from orchestrator import failure_classes as _fcls
+from orchestrator.blocker_guard import block_task
 from orchestrator.delegation_envelope import DelegationEnvelope
 from orchestrator.worktree import WorktreeError, WorktreeManager
 from state.evidence import write_evidence, write_patch
@@ -1410,9 +1412,11 @@ async def _dispatch_architect_consult(
                     ],
                 )
                 try:
-                    return await orch.plan_manager.update_task_status(
-                        task.id,
-                        "blocked",
+                    return await block_task(
+                        orch,
+                        task,
+                        failure_class=_fcls.UNKNOWN,
+                        raw_error=cap_reason_text,
                         meta={
                             "blocked_reason": cap_reason_text,
                             "architect_consult_action": "cap_reached",
@@ -1518,9 +1522,11 @@ async def _dispatch_architect_consult(
                 "autodev resume",
             ],
         )
-        return await orch.plan_manager.update_task_status(
-            task.id,
-            "blocked",
+        return await block_task(
+            orch,
+            task,
+            failure_class=_fcls.INFRA_CIRCUIT_OPEN,
+            raw_error=f"architect_consult: infrastructure: {diagnosis}",
             meta={
                 "blocked_reason": f"architect_consult: infrastructure: {diagnosis}",
                 "architect_consult_action": "infrastructure",
@@ -1560,9 +1566,13 @@ async def _dispatch_architect_consult(
             "to retry the consult, narrow the task, or skip."
         ),
     )
-    return await orch.plan_manager.update_task_status(
-        task.id,
-        "blocked",
+    return await block_task(
+        orch,
+        task,
+        failure_class=_fcls.UNKNOWN,
+        raw_error=(
+            f"architect_consult: unparseable response — {(arch_resolution.guidance or '')[:200]}"
+        ),
         meta={
             "blocked_reason": (
                 f"architect_consult: unparseable response — {(arch_resolution.guidance or '')[:200]}"
@@ -2128,9 +2138,11 @@ async def _apply_with_conflict_escalation(
                     await worktree_mgr.abort_failed_apply(
                         targets=list(task.files)
                     )
-                    await orch.plan_manager.update_task_status(
-                        task.id,
-                        "blocked",
+                    await block_task(
+                        orch,
+                        task,
+                        failure_class=_fcls.CONFLICT_3WAY_FAILED,
+                        raw_error=f"conflict_escalation:3way_failed: {exc2}",
                         meta={
                             "blocked_reason": f"conflict_escalation:3way_failed: {exc2}"
                         },
@@ -2138,9 +2150,11 @@ async def _apply_with_conflict_escalation(
                     return False
 
             if resolution.action == "abandon-task":
-                await orch.plan_manager.update_task_status(
-                    task.id,
-                    "blocked",
+                await block_task(
+                    orch,
+                    task,
+                    failure_class=_fcls.CONFLICT_ABANDON,
+                    raw_error="conflict_escalation:abandon",
                     meta={
                         "blocked_reason": "conflict_escalation:abandon"
                     },
@@ -2154,9 +2168,11 @@ async def _apply_with_conflict_escalation(
                     task_id=task.id,
                     cap=_CONFLICT_REWRITE_RETRY_CAP,
                 )
-                await orch.plan_manager.update_task_status(
-                    task.id,
-                    "blocked",
+                await block_task(
+                    orch,
+                    task,
+                    failure_class=_fcls.CONFLICT_REWRITE_CAP_EXCEEDED,
+                    raw_error="conflict_escalation:rewrite_cap_exceeded",
                     meta={
                         "blocked_reason": "conflict_escalation:rewrite_cap_exceeded"
                     },
@@ -2184,9 +2200,11 @@ async def _apply_with_conflict_escalation(
                     task_id=task.id,
                     err=str(exc),
                 )
-                await orch.plan_manager.update_task_status(
-                    task.id,
-                    "blocked",
+                await block_task(
+                    orch,
+                    task,
+                    failure_class=_fcls.CONFLICT_REWRITE_CAP_EXCEEDED,
+                    raw_error=f"conflict_escalation:rewrite_developer_failed: {exc}",
                     meta={
                         "blocked_reason": f"conflict_escalation:rewrite_developer_failed: {exc}"
                     },
@@ -2223,6 +2241,16 @@ async def run_execute_phase(
     # removed alongside InlineAdapter itself — no inline adapter exists,
     # so no mismatch is possible.
     processed: list[Task] = []
+
+    # v0.42.1 F1: register the resolver chokepoint so ``blocker_guard.block_task``
+    # routes every terminal block through ``_maybe_resolve_blocker`` (the
+    # "registered at startup" path). ``block_task``'s call-time fallback import
+    # covers code paths / tests that do not enter via ``run_execute_phase``.
+    try:
+        if getattr(orch, "block_hook", None) is None:
+            setattr(orch, "block_hook", _maybe_resolve_blocker)
+    except Exception:  # noqa: BLE001 - best-effort registration; never fatal
+        pass
 
     if task_id is not None:
         task = await orch.plan_manager.get_task(task_id)
@@ -2421,9 +2449,11 @@ async def run_execute_phase(
                         else f"edit_scope_violation (blanket): {violations[0]}"
                     )
                     try:
-                        await orch.plan_manager.update_task_status(
-                            t.id,
-                            "blocked",
+                        await block_task(
+                            orch,
+                            t,
+                            failure_class=_fcls.EDIT_SCOPE_VIOLATION,
+                            raw_error=msg,
                             meta={"blocked_reason": msg},
                         )
                         await orch.plan_manager.ledger_append(
@@ -2468,9 +2498,11 @@ async def run_execute_phase(
                     for t in phase.tasks:
                         if t.status == "pending":
                             try:
-                                await orch.plan_manager.update_task_status(
-                                    t.id,
-                                    "blocked",
+                                await block_task(
+                                    orch,
+                                    t,
+                                    failure_class=_fcls.CROSS_PHASE_DAG_INVALID,
+                                    raw_error=str(exc),
                                     meta={
                                         "blocked_reason": (
                                             f"cross_phase_dag_invalid: {exc}"
@@ -2505,9 +2537,11 @@ async def run_execute_phase(
                     for t in phase.tasks:
                         if t.status == "pending":
                             try:
-                                await orch.plan_manager.update_task_status(
-                                    t.id,
-                                    "blocked",
+                                await block_task(
+                                    orch,
+                                    t,
+                                    failure_class=_fcls.DAG_INVALID,
+                                    raw_error=str(exc),
                                     meta={
                                         "blocked_reason": f"dag_invalid: {exc}"
                                     },
@@ -3525,21 +3559,15 @@ async def _execute_one_worker(
                     f"{task.id.replace('/', '_').replace(' ', '_')}-*.txt"
                 ],
             )
-        # ADR-0047: route the worker crash through the resolver before the
-        # legacy block; a recovery (e.g. retry_with_changes / consult_knowledge)
-        # re-enables the task.
-        _recovered = await _maybe_resolve_blocker(
-            orch,
-            task,
-            failure_class="worker_exception",
-            raw_error=str(exc),
-        )
-        if _recovered is not None:
-            return _recovered
+        # ADR-0047 / v0.42.1 F1: route the worker crash through the single
+        # chokepoint; a recovery (e.g. retry_with_changes / consult_knowledge)
+        # re-enables the task and ``block_task`` returns it non-blocked.
         try:
-            blocked = await orch.plan_manager.update_task_status(
-                task.id,
-                "blocked",
+            blocked = await block_task(
+                orch,
+                task,
+                failure_class=_fcls.WORKER_EXCEPTION,
+                raw_error=str(exc),
                 meta={
                     "blocked_reason": blocked_reason,
                     "block_reason_class": block_reason_class,
@@ -3562,6 +3590,9 @@ async def _execute_one_worker(
                 err=str(exc2),
             )
             return task
+        if blocked.status != "blocked":
+            # Resolver recovered the task — skip the cascade-block.
+            return blocked
         try:
             await orch.plan_manager.mark_blocked_descendants(
                 task.phase_id, task.id, str(exc)
@@ -4356,21 +4387,13 @@ async def _execute_one(
                     task_id=task.id,
                     reason=str(exc),
                 )
-                # ADR-0047: route through the resolver before the legacy
-                # guardrail block; a recovery re-enables the task.
-                _recovered = await _maybe_resolve_blocker(
+                # v0.42.1 F1: single chokepoint (was guard + legacy block).
+                # The consolidated meta-builder still stamps the RecoveryHint.
+                task = await block_task(
                     orch,
                     task,
-                    failure_class="guardrail_exceeded",
+                    failure_class=_fcls.GUARDRAIL_EXCEEDED,
                     raw_error=str(exc),
-                )
-                if _recovered is not None:
-                    return _recovered
-                # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
-                # also stamps a structured RecoveryHint.
-                task = await orch.plan_manager.update_task_status(
-                    task.id,
-                    "blocked",
                     meta=_build_guardrail_block_meta(
                         orch=orch, task_id=task.id, exc=exc
                     ),
@@ -4577,21 +4600,13 @@ async def _execute_one(
                         task_id=task.id,
                         reason=str(exc),
                     )
-                    # ADR-0047: route through the resolver before the legacy
-                    # guardrail block; a recovery re-enables the task.
-                    _recovered = await _maybe_resolve_blocker(
+                    # v0.42.1 F1: single chokepoint (was guard + legacy block).
+                    # The consolidated meta-builder still stamps the RecoveryHint.
+                    task = await block_task(
                         orch,
                         task,
-                        failure_class="guardrail_exceeded",
+                        failure_class=_fcls.GUARDRAIL_EXCEEDED,
                         raw_error=str(exc),
-                    )
-                    if _recovered is not None:
-                        return _recovered
-                    # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
-                    # also stamps a structured RecoveryHint.
-                    task = await orch.plan_manager.update_task_status(
-                        task.id,
-                        "blocked",
                         meta=_build_guardrail_block_meta(
                             orch=orch, task_id=task.id, exc=exc
                         ),
@@ -4650,21 +4665,13 @@ async def _execute_one(
                         task_id=task.id,
                         reason=str(exc),
                     )
-                    # ADR-0047: route through the resolver before the legacy
-                    # guardrail block; a recovery re-enables the task.
-                    _recovered = await _maybe_resolve_blocker(
+                    # v0.42.1 F1: single chokepoint (was guard + legacy block).
+                    # The consolidated meta-builder still stamps the RecoveryHint.
+                    task = await block_task(
                         orch,
                         task,
-                        failure_class="guardrail_exceeded",
+                        failure_class=_fcls.GUARDRAIL_EXCEEDED,
                         raw_error=str(exc),
-                    )
-                    if _recovered is not None:
-                        return _recovered
-                    # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
-                    # also stamps a structured RecoveryHint.
-                    task = await orch.plan_manager.update_task_status(
-                        task.id,
-                        "blocked",
                         meta=_build_guardrail_block_meta(
                             orch=orch, task_id=task.id, exc=exc
                         ),
@@ -4738,19 +4745,12 @@ async def _execute_one(
                         task_id=task.id,
                         reason=str(exc),
                     )
-                    # ADR-0047: route through the resolver before the legacy
-                    # guardrail block; a recovery re-enables the task.
-                    _recovered = await _maybe_resolve_blocker(
+                    # v0.42.1 F1: single chokepoint (was guard + legacy block).
+                    task = await block_task(
                         orch,
                         task,
-                        failure_class="guardrail_exceeded",
+                        failure_class=_fcls.GUARDRAIL_EXCEEDED,
                         raw_error=str(exc),
-                    )
-                    if _recovered is not None:
-                        return _recovered
-                    task = await orch.plan_manager.update_task_status(
-                        task.id,
-                        "blocked",
                         meta=_build_guardrail_block_meta(
                             orch=orch, task_id=task.id, exc=exc
                         ),
@@ -4870,21 +4870,13 @@ async def _execute_one(
                     task_id=task.id,
                     reason=str(exc),
                 )
-                # ADR-0047: route through the resolver before the legacy
-                # guardrail block; a recovery re-enables the task.
-                _recovered = await _maybe_resolve_blocker(
+                # v0.42.1 F1: single chokepoint (was guard + legacy block).
+                # The consolidated meta-builder still stamps the RecoveryHint.
+                task = await block_task(
                     orch,
                     task,
-                    failure_class="guardrail_exceeded",
+                    failure_class=_fcls.GUARDRAIL_EXCEEDED,
                     raw_error=str(exc),
-                )
-                if _recovered is not None:
-                    return _recovered
-                # v0.32.0 (Phase 5, Gap G): consolidated meta-builder
-                # also stamps a structured RecoveryHint.
-                task = await orch.plan_manager.update_task_status(
-                    task.id,
-                    "blocked",
                     meta=_build_guardrail_block_meta(
                         orch=orch, task_id=task.id, exc=exc
                     ),
@@ -5220,20 +5212,13 @@ async def _execute_one(
                             "autodev doctor",
                         ],
                     )
-                    # ADR-0047: route the persistent test-diagnosis failure
-                    # through the resolver before the legacy block.
-                    _recovered = await _maybe_resolve_blocker(
+                    # v0.42.1 F1: single chokepoint (was guard + legacy block).
+                    task = await block_task(
                         orch,
                         task,
-                        failure_class="test_diagnosis_hardfail",
+                        failure_class=_fcls.TEST_DIAGNOSIS_HARDFAIL,
                         raw_error=f"test_diagnosis: {diagnosis}",
                         failing_role="test_engineer",
-                    )
-                    if _recovered is not None:
-                        return _recovered
-                    task = await orch.plan_manager.update_task_status(
-                        task.id,
-                        "blocked",
                         meta={
                             "blocked_reason": (
                                 f"test_diagnosis: {diagnosis} "
@@ -5265,20 +5250,13 @@ async def _execute_one(
                     evidence_files=[f".autodev/evidence/{task.id}-test.json"],
                     commands=[f"autodev requeue --task {task.id}"],
                 )
-                # ADR-0047: route the inconclusive test result through the
-                # resolver before the legacy block.
-                _recovered = await _maybe_resolve_blocker(
+                # v0.42.1 F1: single chokepoint (was guard + legacy block).
+                task = await block_task(
                     orch,
                     task,
-                    failure_class="test_diagnosis_no_signal",
+                    failure_class=_fcls.TEST_DIAGNOSIS_NO_SIGNAL,
                     raw_error="test result inconclusive — no diagnostic signal",
                     failing_role="test_engineer",
-                )
-                if _recovered is not None:
-                    return _recovered
-                task = await orch.plan_manager.update_task_status(
-                    task.id,
-                    "blocked",
                     meta={
                         "blocked_reason": (
                             "test result inconclusive — "
@@ -5848,20 +5826,11 @@ async def _try_retry_or_escalate(
         if resolution is not None:
             # Branch on the critic's chosen action.
             if resolution.action == "soft-blocker":
-                # ADR-0047: route the SOFT_BLOCKER escalation rung through the
-                # resolver before the human-decision block. A recovery
-                # (consult_knowledge / retry_with_changes) re-enables the task;
-                # the per-blocker cycle budget caps repeated soft-blocker
-                # recoveries and then falls through to the legacy block below.
-                _recovered = await _maybe_resolve_blocker(
-                    orch,
-                    task,
-                    failure_class="soft_blocker",
-                    raw_error=(resolution.guidance or "soft-blocker"),
-                    evidence_refs=list(prior_attempts or []),
-                )
-                if _recovered is not None:
-                    return _recovered
+                # v0.42.1 F1: route the SOFT_BLOCKER escalation rung through the
+                # single chokepoint. A resolver recovery (consult_knowledge /
+                # retry_with_changes) re-enables the task; the per-blocker cycle
+                # budget caps repeated soft-blocker recoveries and then falls
+                # through to the legacy block (``block_task`` commits it).
                 await orch.plan_manager.mark_escalated(task.id)
                 guidance_text = resolution.guidance or "human decision required"
                 # v0.32.0 (Phase 5, Gap G): structured recovery hint so
@@ -5881,9 +5850,12 @@ async def _try_retry_or_escalate(
                         f"autodev requeue --task {task.id}",
                     ],
                 )
-                updated = await orch.plan_manager.update_task_status(
-                    task.id,
-                    "blocked",
+                updated = await block_task(
+                    orch,
+                    task,
+                    failure_class=_fcls.SOFT_BLOCKER,
+                    raw_error=(resolution.guidance or "soft-blocker"),
+                    evidence_refs=list(prior_attempts or []),
                     meta={
                         "blocked_reason": (
                             f"soft-blocker: {guidance_text}"
@@ -5891,6 +5863,10 @@ async def _try_retry_or_escalate(
                         "recovery_hint": soft_block_hint,
                     },
                 )
+                if updated.status != "blocked":
+                    # Resolver actively recovered the task — return the
+                    # re-enabled task and SKIP the soft-blocker handoff ops.
+                    return updated
                 # Audit-only ledger op + cross-run lesson.
                 try:
                     await orch.plan_manager.ledger_append(
@@ -6070,9 +6046,15 @@ async def _try_retry_or_escalate(
         retry_exhausted_hint = _build_recovery_hint_from_reason(
             task_id=task.id, reason=reason
         )
-        updated = await orch.plan_manager.update_task_status(
-            task.id,
-            "blocked",
+        # v0.42.1 F1: route the retry-exhaustion escalation through the single
+        # chokepoint (UNKNOWN so the LLM resolver gets a shot at recovery); a
+        # resolver recovery re-enables the task, otherwise ``block_task`` commits
+        # the legacy block unchanged.
+        updated = await block_task(
+            orch,
+            task,
+            failure_class=_fcls.UNKNOWN,
+            raw_error=f"escalated: {reason}",
             meta={
                 "blocked_reason": f"escalated: {reason}",
                 "recovery_hint": retry_exhausted_hint,
@@ -6615,7 +6597,40 @@ async def delegate(
     import time as _time
 
     _t0 = _time.time()
-    result = await orch.adapter.execute(inv)
+    try:
+        result = await orch.adapter.execute(inv)
+    except Exception as _dispatch_exc:  # noqa: BLE001 - observability only; re-raised
+        # v0.42.1 F1e (ADR-0047): an UNEXPECTED raw-dispatch crash (the adapter
+        # raised instead of returning a failure ``AgentResult``) used to vanish
+        # up the stack with no escalation breadcrumb — so the Run-6 invariant
+        # "every terminal block is preceded by an escalation op" could be
+        # violated on a dispatch crash. Emit a structured log + a best-effort
+        # ``blocker_escalated``-shaped ledger breadcrumb, then RE-RAISE unchanged
+        # (control flow / propagation / guardrail semantics are untouched —
+        # pure log + crumb + re-raise).
+        logger.warning(
+            "delegate.dispatch_failed",
+            role=role,
+            task_id=envelope.task_id,
+            err=str(_dispatch_exc),
+            exc_type=type(_dispatch_exc).__name__,
+        )
+        try:
+            if getattr(orch, "plan_manager", None) is not None:
+                await orch.plan_manager.ledger_append(
+                    op="blocker_escalated",
+                    payload={
+                        "task_id": envelope.task_id,
+                        "phase_id": None,
+                        "failure_class": _fcls.WORKER_EXCEPTION,
+                        "failing_role": role,
+                        "raw_error_excerpt": str(_dispatch_exc)[:500],
+                        "source": "delegate.dispatch_failed",
+                    },
+                )
+        except Exception:  # noqa: BLE001 - crumb must never mask the raise
+            pass
+        raise
     orch.guardrails.post_invocation(envelope.task_id, result)
     # v0.29.0 Bug 6: stash the most recent adapter ``subtype`` (and
     # ``api_error_status``) on the orchestrator so the

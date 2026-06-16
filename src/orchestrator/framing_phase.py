@@ -549,6 +549,24 @@ async def run_framing_phase(
             final_classification = "local_defect"
             is_design = False
             logger.info("framing_phase.local_defect_path", reason="parse_degraded")
+            # v0.42.1 F1b (ADR-0047): the framing phase classified a
+            # design-altitude failure but generation produced no usable design
+            # option, so it silently falls back to a local patch. Make that
+            # degrade EXPLICIT in the ledger via the resolver (observability
+            # only — framing still returns its degraded local_defect outcome).
+            try:
+                from orchestrator.blocker_resolver import record_phase_degrade
+
+                await record_phase_degrade(
+                    orch,
+                    "framing",
+                    RuntimeError(
+                        "framing parse_degraded: design classified but no "
+                        "usable non-local approach generated"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - observability must never break framing
+                pass
         else:
             # Real selection: altitude_judge Borda panel (minimality suspended).
             chosen, rationale = await _run_altitude_judge_panel(

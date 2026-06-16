@@ -310,6 +310,56 @@ async def test_resolve_blocker_llm_bare_json(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# v0.42.1 F1f — resolution_chosen emitted on EVERY resolver path
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_blocker_records_chosen_on_fast_path(tmp_path: Path) -> None:
+    """F1f: a known failure class (deterministic fast-path) ALWAYS appends a
+    ``resolution_chosen`` ledger op before returning — no LLM call involved."""
+    adapter = StubAdapter({})
+    orch = _make_orch(tmp_path, adapter)
+    assert orch.cfg.resolver.fast_path_only_on_known is True
+
+    ctx = _ctx(fc.GUARDRAIL_EXCEEDED, task_id="f1f.1")
+    action = await br.resolve_blocker(orch, ctx)
+
+    # Fast-path: no resolver dispatch, yet a chosen op is recorded.
+    assert adapter.count("resolver") == 0
+    chosen = _payloads(tmp_path, "resolution_chosen")
+    assert len(chosen) == 1
+    assert chosen[0]["blocker_key"] == br.blocker_key(ctx)
+    assert chosen[0]["action"] == action.action
+
+
+@pytest.mark.asyncio
+async def test_resolve_blocker_records_chosen_on_llm_path(tmp_path: Path) -> None:
+    """F1f: a novel failure class (LLM path) ALSO always appends a
+    ``resolution_chosen`` op carrying the LLM-chosen action."""
+    payload = {
+        "action": "reroute",
+        "params": {"skip_component": "wedged_thing"},
+        "rationale": "route around the wedged component",
+    }
+    adapter = StubAdapter(
+        {"resolver": ok("```json\n" + json.dumps(payload) + "\n```")}
+    )
+    orch = _make_orch(tmp_path, adapter)
+
+    ctx = _ctx("totally_novel_class_f1f", task_id="f1f.2")
+    action = await br.resolve_blocker(orch, ctx)
+
+    # LLM path: the resolver role was dispatched AND a chosen op recorded.
+    assert adapter.count("resolver") == 1
+    assert action.action == "reroute"
+    chosen = _payloads(tmp_path, "resolution_chosen")
+    assert len(chosen) == 1
+    assert chosen[0]["blocker_key"] == br.blocker_key(ctx)
+    assert chosen[0]["action"] == "reroute"
+
+
+# --------------------------------------------------------------------------
 # resolver-self-failure -> ask_human (B5)
 # --------------------------------------------------------------------------
 
