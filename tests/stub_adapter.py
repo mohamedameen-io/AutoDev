@@ -9,11 +9,51 @@ No subprocesses are spawned; tests run entirely in-process.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Callable, Union
 
 from adapters.base import PlatformAdapter
 from adapters.types import AgentInvocation, AgentResult, AgentSpec
+
+
+class StubMissingError(RuntimeError):
+    """Raised under ``STUB_STRICT=1`` when a safety-critical role is unstubbed.
+
+    The default (lenient) StubAdapter returns permissive gate-PASS values for
+    several safety-critical roles when a test forgets to stub them (e.g. a
+    drift-verifier ``VERDICT: APPROVED``). That silently masks the rejection /
+    failure path the test believes it is exercising. Setting ``STUB_STRICT=1``
+    turns those silent passes into a loud failure so the masking is visible.
+    """
+
+
+# Roles whose *permissive default* in ``execute()`` masks a real verdict / gate
+# outcome (i.e. the fallback fabricates a PASS/APPROVED/no-op that a test could
+# mistake for a genuine result). Derived directly from the role-aware fallbacks
+# below:
+#   - critic_drift_verifier  -> fabricated ``VERDICT: APPROVED`` (drift gate)
+#   - critic_sounding_board  -> fabricated EXTENDED_SCOPE approval
+#   - synthesizer            -> fabricated no-op merged diff
+#   - framing                -> fabricated ``local_defect`` classification
+#   - altitude_judge         -> fabricated ranking
+# Plus the generic ``[stub:{role}] default-ok`` consumers that parse a verdict:
+#   - reviewer / critic / critic_t -> the generic default reads as a "pass" to
+#     reviewer/critic verdict parsers, masking REJECTED/CHANGES paths.
+# Non-critical roles (e.g. ``developer``) are intentionally excluded: their
+# generic default is inert text, not a fabricated gate verdict.
+SAFETY_CRITICAL_ROLES: frozenset[str] = frozenset(
+    {
+        "critic_drift_verifier",
+        "critic_sounding_board",
+        "synthesizer",
+        "framing",
+        "altitude_judge",
+        "reviewer",
+        "critic",
+        "critic_t",
+    }
+)
 
 
 StubHandler = Union[
@@ -49,6 +89,19 @@ class StubAdapter(PlatformAdapter):
         self._counters[inv.role] = self._counters.get(inv.role, 0) + 1
         handler = self._responses.get(inv.role)
         if handler is None:
+            # B1 / STUB_STRICT: refuse to fabricate a gate verdict for an
+            # unstubbed safety-critical role. Without this, the permissive
+            # fallbacks below silently mask the rejection/failure path a test
+            # believes it is exercising. Default (env unset) behavior is
+            # UNCHANGED so existing stub-using suites keep passing.
+            if (
+                os.environ.get("STUB_STRICT") == "1"
+                and inv.role in SAFETY_CRITICAL_ROLES
+            ):
+                raise StubMissingError(
+                    f"unstubbed safety-critical role {inv.role!r} "
+                    "under STUB_STRICT=1"
+                )
             # v0.17.0 S1: role-aware fallback for ``critic_drift_verifier``.
             # Drift-verifier output is parsed for ``VERDICT: APPROVED|REJECTED``;
             # the legacy ``[stub:{role}] default-ok`` text is unparseable and

@@ -2,11 +2,25 @@
 # Mirror of the grep-style preflights in .github/workflows/release.yml so
 # the same checks can be run locally before pushing a release tag.
 #
-# Usage: ci/release_preflight_greps.sh [v0.32 | v0.33 | all]   (default: all)
+# Usage: ci/release_preflight_greps.sh [v0.32 | v0.33 | ... | v1.0.0 | all]
+#        (default: all)
 #
-# Each block locks the integration of a shipped phase against accidental
-# removal. Adding a new release? Append a block and update the dispatch
-# below.
+# Each pre-v1.0 block locks the integration of a shipped phase against
+# accidental removal via cheap presence greps — a first tripwire only.
+#
+# The v1.0.0 gate (Phase 0 / B6, closes WS3-release-gate-presence-only-anchors)
+# is DIFFERENT: ``preflight_v100`` is BEHAVIORAL. It runs the resolver
+# engagement suite (``pytest -m resolver_enabled``) and FAILS unless the
+# engagement op demonstrably FIRES (>0 passed/xfailed AND >0 collected). A
+# presence grep can pass on dead code; this one cannot.
+#
+# The N2 broken-control (must turn this RED):
+#   AUTODEV_RESOLVER_FORCE_DISABLED=1 bash ci/release_preflight_greps.sh v1.0.0
+# ``AUTODEV_RESOLVER_FORCE_DISABLED`` is the OPERATOR override that the
+# tests/conftest.py autouse fixture does NOT auto-unset (unlike the suite's
+# internal default-off ``AUTODEV_RESOLVER_DISABLED``, which conftest manages),
+# so it forces the resolver OFF for the whole engagement suite, the engagement
+# assertions go red, pytest exits non-zero, and this script exits non-zero.
 
 set -euo pipefail
 
@@ -242,6 +256,66 @@ preflight_v042_1() {
   check "v0.42.1 F5 engagement"       tests/test_resolver_engagement.py            "assert_no_silent_dead_ends"
 }
 
+# ---------------------------------------------------------------------------
+# v1.0.0 — the BEHAVIORAL engagement gate (Phase 0 / B6, gate N2).
+#
+# Replaces the pure-grep "resolver-engagement" anchors (kept above as a cheap
+# first tripwire) with a real run of the engagement suite. This is the gate the
+# v0.42.x grep anchors could not be: presence ≠ engagement.
+# ---------------------------------------------------------------------------
+preflight_v100() {
+  # 1) Cheap tripwire first: the resolver + engagement-test anchors must exist.
+  #    (Behavioral gate below is the real authority; these just fail fast/clear.)
+  check "v1.0 resolver chokepoint"   src/orchestrator/execute_phase.py  "_maybe_resolve_blocker"
+  check "v1.0 single block setter"   src/orchestrator/blocker_guard.py  "async def block_task"
+  check "v1.0 engagement suite"      tests/test_resolver_engagement.py  "assert_no_silent_dead_ends"
+
+  # 2) BEHAVIORAL: run the engagement suite (resolver ON for the real gate).
+  echo ">>>> [v1.0] running engagement suite: uv run pytest -m resolver_enabled -q"
+  local out_file rc
+  out_file="$(mktemp)"
+  # Do NOT pipe pytest into tail/grep — a pipe masks pytest's exit code. Capture
+  # output to a file, capture the exit code directly, then parse the file. The
+  # ``|| true`` keeps ``set -e`` from aborting before we can inspect ``rc``.
+  uv run pytest -m resolver_enabled -q >"$out_file" 2>&1 && rc=0 || rc=$?
+  echo "---- engagement suite tail ----"
+  tail -n 8 "$out_file"
+  echo "-------------------------------"
+
+  # 2a) Non-zero exit is a hard fail (the broken-control path lands here).
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL [v1.0 engagement]: pytest -m resolver_enabled exited non-zero (rc=$rc)"
+    rm -f "$out_file"
+    return 1
+  fi
+
+  # 2b) Zero-collected is a hard fail — an empty marker set must NOT pass
+  #     vacuously (the exact anti-vacuity property the gate requires).
+  if grep -qiE 'collected 0 items|no tests ran' "$out_file"; then
+    echo "FAIL [v1.0 engagement]: 0 tests collected for marker resolver_enabled (vacuous pass blocked)"
+    rm -f "$out_file"
+    return 1
+  fi
+
+  # 2c) Engagement op must demonstrably FIRE: the summary must report >0
+  #     passed OR >0 xfailed for the marker (a brand-new xfail realloop test
+  #     still counts as the suite running, per the B6 note). Parse the pytest
+  #     summary line ("N passed", "N xfailed").
+  local n_passed n_xfailed
+  n_passed="$(grep -oE '[0-9]+ passed' "$out_file" | grep -oE '[0-9]+' | tail -n 1 || true)"
+  n_xfailed="$(grep -oE '[0-9]+ xfailed' "$out_file" | grep -oE '[0-9]+' | tail -n 1 || true)"
+  n_passed="${n_passed:-0}"
+  n_xfailed="${n_xfailed:-0}"
+  if [ "$n_passed" -eq 0 ] && [ "$n_xfailed" -eq 0 ]; then
+    echo "FAIL [v1.0 engagement]: suite ran but reported 0 passed AND 0 xfailed — engagement op did not fire"
+    rm -f "$out_file"
+    return 1
+  fi
+
+  rm -f "$out_file"
+  echo "ok   [v1.0 engagement]: resolver engagement fired ($n_passed passed, $n_xfailed xfailed, >0 collected)"
+}
+
 case "$target" in
   v0.32) preflight_v032 ;;
   v0.33) preflight_v033 ;;
@@ -255,9 +329,14 @@ case "$target" in
   v0.41) preflight_v041 ;;
   v0.42) preflight_v042 ;;
   v0.42.1) preflight_v042_1 ;;
-  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ; preflight_v041 ; preflight_v042 ; preflight_v042_1 ;;
+  # The v1.0 release gate. ``v1.0.0``/``v1.0`` AND any plain ``1.0.0``-style
+  # input (release.yml passes the bare X.Y.Z version) run the BEHAVIORAL
+  # engagement gate on top of every cheap presence tripwire.
+  v1.0.0|v1.0|1.0.0|1.0)
+    preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ; preflight_v041 ; preflight_v042 ; preflight_v042_1 ; preflight_v100 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ; preflight_v041 ; preflight_v042 ; preflight_v042_1 ; preflight_v100 ;;
   *)
-    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | v0.41 | v0.42 | v0.42.1 | all)" >&2
+    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | v0.41 | v0.42 | v0.42.1 | v1.0.0 | all)" >&2
     exit 2
     ;;
 esac
