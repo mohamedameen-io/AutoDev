@@ -114,6 +114,26 @@ service, browser), do NOT deadlock and do NOT dress a proxy up as live:
 3. Set `LOOP_FIDELITY` to `synthetic` or `replay` — **never `live`** on this
    network-less run. Honesty over green.
 
+## ALWAYS EMIT A LOOP (universal mandate — read this before OUTPUT)
+
+**Never emit nothing.** Producing no `LOOP_METHOD` is a failure, not an honest
+"I couldn't run it." Even when you could not build OR run any loop, you MUST
+still:
+
+1. Emit a `LOOP_METHOD` — your **best proxy** constructed from *reading the
+   code*. Pick the closest VALID method you would write if you had time, e.g.
+   `failing_test` (the test you'd add at the seam) or `throwaway_harness` (the
+   minimal in-process call you'd construct). Never leave it blank.
+2. Emit `LOOP_FIDELITY: none` — this is explicitly acceptable when no runnable
+   loop exists. It tells the planner you reasoned from code, not from a run.
+3. Emit a `CONFIRMED_CAUSE` and a `SEAM` derived from **code-reading** — the
+   most likely root cause and the seam where a regression test belongs, even if
+   you could not execute anything to confirm them.
+
+A **none-fidelity diagnosis with a clear cause and a named seam is VALID and
+required** — far better than an empty block. State the cause as your best
+code-read conclusion (not "unknown") whenever the explorer findings let you.
+
 ## OUTPUT (MANDATORY — emit exactly these lines)
 
 Emit a single fenced `diagnosis` block. `||` separates each hypothesis's
@@ -136,7 +156,15 @@ LIVE_REPRO_ARTIFACT: <path under scripts/repro/, or none>
 ```
 
 Rules:
+- **Never emit nothing.** You MUST always emit a `LOOP_METHOD` (your best proxy
+  from reading the code if you could not run anything), a `LOOP_FIDELITY` (use
+  `none` when no runnable loop exists — that is VALID and required), and a
+  `CONFIRMED_CAUSE` + `SEAM` from code-reading. See the universal mandate above.
 - `LOOP_FIDELITY` must NEVER be `live` — you have no network/creds here.
+- `LOOP_METHOD` must be one of the VALID tokens listed in the OUTPUT block
+  (`failing_test`, `replay_trace`, `throwaway_harness`, `property_fuzz`,
+  `differential`, `bisection`, `cli_snapshot`, `dev_server_curl`,
+  `headless_browser`, `hitl`) — never a made-up token, never blank.
 - Emit at least 3 and at most `max_hypotheses` HYPOTHESIS lines, each with a `||`
   prediction. No prediction ⇒ the hypothesis is dropped.
 - If you could not reproduce: `REPRODUCED: false`, state the SYMPTOM you targeted,

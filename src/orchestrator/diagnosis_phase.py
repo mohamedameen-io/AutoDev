@@ -33,7 +33,12 @@ from autologging import get_logger
 from adapters.types import AgentInvocation
 from agents import load_prompt
 from state.evidence import read_evidence, write_evidence
-from state.schemas import DiagnosisEvidence, FeedbackLoop, Hypothesis
+from state.schemas import (
+    DiagnosisEvidence,
+    ExploreEvidence,
+    FeedbackLoop,
+    Hypothesis,
+)
 
 if TYPE_CHECKING:
     from orchestrator import Orchestrator
@@ -110,6 +115,12 @@ _HYPOTHESIS_RE = re.compile(
 )
 
 _TRUTHY = ("true", "yes", "1")
+
+# Char bound on the explorer findings rendered into the diagnostician CONTEXT.
+# The on-disk ``ExploreEvidence.findings`` is NOT pre-truncated to 4000 (the
+# caller passes ``explorer_result.text[:4000]``), so we apply our own sane cap
+# here to keep the prompt from blowing up while still being richer than 4000.
+_FINDINGS_CHAR_CAP = 8000
 
 DegradeReason = Literal[
     "disabled",
@@ -295,15 +306,27 @@ def _enforce_fidelity_honesty(
 
 
 def _build_context_for_dispatch(
-    spec: str, explore_ev: str, max_hypotheses: int
+    spec: str,
+    explore_ev: str,
+    max_hypotheses: int,
+    files_referenced: list[str] | None = None,
 ) -> str:
     """Render the CONTEXT block appended to the diagnostician prompt.
 
     The diagnostician prompt references a CONTEXT block (the specialist path does
     not call ``render_prompt`` — nothing substitutes ``{{…}}`` tokens), mirroring
     ``framing_phase._render_context``.
+
+    ``explore_ev`` is the findings text (already char-bounded by the caller);
+    ``files_referenced`` is the explorer's STRUCTURED file list (read from the
+    on-disk ``ExploreEvidence``) — rendered as its own section so the
+    diagnostician can target the code paths directly instead of re-exploring.
     """
     loop_order = " > ".join(_SANDBOX_LOOP_ORDER)
+    files = files_referenced or []
+    files_block = (
+        "\n".join(f"- {p}" for p in files) if files else "(none reported)"
+    )
     return (
         "## CONTEXT\n"
         f"action: diagnose\n"
@@ -311,8 +334,29 @@ def _build_context_for_dispatch(
         f"sandbox_loop_order: {loop_order}\n"
         f"live_methods_become_artifact: {', '.join(sorted(_LIVE_LOOP_METHODS))}\n"
         f"\n### spec\n{spec}\n"
+        f"\n### files_referenced\n{files_block}\n"
         f"\n### explorer_findings\n{explore_ev}\n"
     )
+
+
+async def _read_explore_evidence(
+    orch: "Orchestrator",
+) -> tuple[str | None, list[str]]:
+    """Read the on-disk ``ExploreEvidence`` (``plan-explore``/``explore``).
+
+    Returns ``(findings_or_None, files_referenced)``. FAIL-SAFE: any error (or
+    a missing / wrong-kind bundle) yields ``(None, [])`` — the caller then falls
+    back to the passed-in ``explore_ev`` string. NEVER raises: diagnosis must
+    degrade gracefully (mirrors the phase-wide fail-safe contract).
+    """
+    try:
+        ev = await read_evidence(orch.cwd, "plan-explore", "explore")
+    except Exception as exc:  # noqa: BLE001 - degrade, never raise into diagnosis
+        logger.warning("diagnosis.explore_read_failed", err=str(exc))
+        return None, []
+    if not isinstance(ev, ExploreEvidence):
+        return None, []
+    return ev.findings, list(ev.files_referenced)
 
 
 async def _invoke_diagnostician(
@@ -326,9 +370,23 @@ async def _invoke_diagnostician(
 
     NEVER ``_delegate`` (registry-gated). Reads model/max-turns from
     ``cfg.agents['diagnostician']``; honors ``cfg.diagnosis.diagnostician_model``.
+
+    Part A (F4): reads the explorer's STRUCTURED ``files_referenced`` (and the
+    richer, not-pre-truncated ``findings``) from the on-disk ``ExploreEvidence``
+    and threads them into the CONTEXT block. Fail-safe: when no evidence is on
+    disk (or the read fails), falls back to the passed-in ``explore_ev`` string.
     """
     raw_prompt = load_prompt("diagnostician")
-    context_block = _build_context_for_dispatch(spec, explore_ev, max_hypotheses)
+
+    # Part A: prefer the on-disk ExploreEvidence (richer findings + structured
+    # files_referenced); fall back to the passed-in string on miss/error.
+    disk_findings, files_referenced = await _read_explore_evidence(orch)
+    findings = disk_findings if disk_findings is not None else explore_ev
+    findings = (findings or "")[:_FINDINGS_CHAR_CAP]
+
+    context_block = _build_context_for_dispatch(
+        spec, findings, max_hypotheses, files_referenced
+    )
     full_prompt = "\n\n---\n".join([raw_prompt.strip(), context_block])
 
     dx_cfg = orch.cfg.diagnosis
@@ -341,7 +399,18 @@ async def _invoke_diagnostician(
         max_turns=agent_cfg.max_turns or 1,
     )
     result = await orch.adapter.execute(inv)
-    return result.text or ""
+    text = result.text or ""
+
+    # Part C: observability — warn (no control-flow change) when the response is
+    # suspiciously short or missing the LOOP_METHOD marker, a likely truncation
+    # or dispatch issue. Makes a field run like Run-5 ("nothing usable") auditable.
+    if len(text.strip()) < 80 or _LOOP_METHOD_RE.search(text) is None:
+        logger.warning(
+            "diagnosis.suspiciously_short_response",
+            chars=len(text.strip()),
+            has_loop_method=_LOOP_METHOD_RE.search(text) is not None,
+        )
+    return text
 
 
 def _outcome_from_evidence(ev: DiagnosisEvidence) -> DiagnosisOutcome:

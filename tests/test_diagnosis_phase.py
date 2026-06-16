@@ -23,8 +23,24 @@ from orchestrator.diagnosis_phase import (
 )
 from state.evidence import read_evidence, write_evidence
 from state.ledger import read_entries
-from state.schemas import DiagnosisEvidence, FeedbackLoop, Hypothesis
+from state.schemas import DiagnosisEvidence, ExploreEvidence, FeedbackLoop, Hypothesis
 from stub_adapter import StubAdapter, ok
+
+
+async def _write_explore(
+    cwd: Path,
+    *,
+    findings: str = "explorer says: retry.py drops the de-amplified header",
+    files_referenced: list[str] | None = None,
+) -> None:
+    """Seed an on-disk ExploreEvidence at ``plan-explore`` (mirrors the
+    ``_write_explore`` helper in ``tests/test_intake_sources.py``)."""
+    ev = ExploreEvidence(
+        task_id="plan-explore",
+        findings=findings,
+        files_referenced=files_referenced or ["src/foo.py"],
+    )
+    await write_evidence(cwd, "plan-explore", ev)
 
 
 def _bootstrap_repo(tmp_path: Path) -> None:
@@ -379,3 +395,105 @@ async def test_resume_rereads_evidence_zero_dispatches(tmp_path: Path) -> None:
     assert outcome.confirmed_cause == "de-amplified retry not applied"
     assert "no_correct_seam" in outcome.structural_signals
     assert "recurrence_at_seam" in outcome.structural_signals
+
+
+# --- F4 gate-b: richer context in + always-emit-loop out ---------------------
+
+
+@pytest.mark.asyncio
+async def test_context_includes_structured_files_referenced(tmp_path: Path) -> None:
+    """Part A: the diagnostician prompt must include the explorer's STRUCTURED
+    ``files_referenced`` (read from on-disk ExploreEvidence), not just the
+    findings text, plus the enriched spec."""
+    _bootstrap_repo(tmp_path)
+    await _write_explore(
+        tmp_path,
+        findings="ON_DISK_FINDINGS: bar() forgets the de-amplified retry",
+        files_referenced=["src/foo.py", "src/bar.py"],
+    )
+    adapter = StubAdapter({"diagnostician": ok(_diagnosis_text())})
+    orch = _make_orch(tmp_path, adapter)
+    await run_diagnosis_phase(orch, _BUG_SPEC, "passed-in-string (caller truncated)")
+    prompts = adapter.prompts_for("diagnostician")
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    # Structured files list must be present.
+    assert "src/foo.py" in prompt
+    assert "src/bar.py" in prompt
+    assert "files_referenced" in prompt
+    # On-disk (richer) findings preferred over the passed-in string.
+    assert "ON_DISK_FINDINGS" in prompt
+    # The enriched spec is carried into the context.
+    assert "429 rate_limited crash" in prompt
+
+
+@pytest.mark.asyncio
+async def test_context_falls_back_to_passed_string_when_no_evidence(
+    tmp_path: Path,
+) -> None:
+    """Part A fail-safe: with NO on-disk ExploreEvidence the context falls back
+    to the passed-in ``explore_ev`` string and never raises."""
+    _bootstrap_repo(tmp_path)
+    adapter = StubAdapter({"diagnostician": ok(_diagnosis_text())})
+    orch = _make_orch(tmp_path, adapter)
+    outcome = await run_diagnosis_phase(
+        orch, _BUG_SPEC, "FALLBACK_STRING_FINDINGS only"
+    )
+    assert outcome.reason == "ok"
+    prompt = adapter.prompts_for("diagnostician")[0]
+    assert "FALLBACK_STRING_FINDINGS" in prompt
+
+
+@pytest.mark.asyncio
+async def test_short_response_warns(tmp_path: Path, capsys) -> None:
+    """Part C: a suspiciously short / marker-less diagnostician response logs a
+    ``diagnosis.suspiciously_short_response`` warning (no control-flow change).
+
+    Autologging routes through ``structlog.PrintLoggerFactory`` to stdout, so
+    ``capsys`` is the right capture mechanism (mirrors
+    ``test_parse_synthesis_no_h1_logs_and_passes_through``)."""
+    _bootstrap_repo(tmp_path)
+    adapter = StubAdapter({"diagnostician": ok("...")})  # tiny, no LOOP_METHOD
+    orch = _make_orch(tmp_path, adapter)
+    outcome = await run_diagnosis_phase(orch, _BUG_SPEC, "")
+    # Control flow unchanged: still parses (skeptically) and returns ok.
+    assert outcome.reason == "ok"
+    captured = capsys.readouterr()
+    assert "diagnosis.suspiciously_short_response" in (captured.out + captured.err)
+
+
+@pytest.mark.asyncio
+async def test_well_formed_response_does_not_warn(
+    tmp_path: Path, capsys
+) -> None:
+    """Part C: a well-formed (long, LOOP_METHOD-bearing) response does NOT fire
+    the short-response warning."""
+    _bootstrap_repo(tmp_path)
+    adapter = StubAdapter({"diagnostician": ok(_diagnosis_text())})
+    orch = _make_orch(tmp_path, adapter)
+    await run_diagnosis_phase(orch, _BUG_SPEC, "")
+    captured = capsys.readouterr()
+    assert "diagnosis.suspiciously_short_response" not in (
+        captured.out + captured.err
+    )
+
+
+# --- F4 gate-b: prompt contract (always emit a non-empty loop) ---------------
+
+
+def test_diagnostician_prompt_mandates_always_emit_loop() -> None:
+    """Part B: the diagnostician prompt must carry the universal mandate to
+    ALWAYS emit a LOOP_METHOD and accept LOOP_FIDELITY: none, derived from
+    reading the code when nothing could be run."""
+    from agents import load_prompt
+
+    prompt = load_prompt("diagnostician").lower()
+    # Universal mandate: never emit nothing.
+    assert "never emit nothing" in prompt
+    # none-fidelity is explicitly valid/required.
+    assert "loop_fidelity: none" in prompt
+    assert "valid" in prompt and "required" in prompt
+    # Best-proxy loop method language.
+    assert "best proxy" in prompt
+    # Honesty rule preserved: never `live` on this run.
+    assert "never" in prompt and "live" in prompt
