@@ -42,6 +42,21 @@ TEST_DIAGNOSIS_NO_SIGNAL = "test_diagnosis_no_signal"
 # Worker crash (developer/test adapter raised at the code layer).
 WORKER_EXCEPTION = "worker_exception"
 
+# --- Retry-loop terminal sites (Step 3: real classes for _try_retry_or_escalate)
+# These are the in-loop QA/review/test failures the escalation ladder threads to
+# its terminal rung. They are retry-mappable (the resolver can retry / consult /
+# rescope), so they are NOT in STRUCTURAL_FAILURE_CLASSES.
+# Auto-gate (syntax/lint/build/test_runner/secretscan) failure.
+QA_GATE_FAILED = "qa_gate_failed"
+# Review tournament hit max_rounds without convergence.
+REVIEW_ESCALATED = "review_escalated"
+# Reviewer verdict was unparseable (not a turn-budget exhaustion).
+REVIEW_MALFORMED = "review_malformed"
+# Reviewer returned NEEDS_CHANGES / REJECTED.
+REVIEW_REJECTED = "review_rejected"
+# Tests collected and ran but at least one failed (diagnosis == "ok").
+TESTS_FAILED = "tests_failed"
+
 # Infra circuit breaker (auth/rate-limit/server failures across tasks).
 INFRA_CIRCUIT_OPEN = "infra_circuit_open"
 
@@ -69,6 +84,11 @@ FailureClass = Literal[
     "test_diagnosis_hardfail",
     "test_diagnosis_no_signal",
     "worker_exception",
+    "qa_gate_failed",
+    "review_escalated",
+    "review_malformed",
+    "review_rejected",
+    "tests_failed",
     "infra_circuit_open",
     "soft_blocker",
     "worktree_apply_failed",
@@ -87,6 +107,11 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     TEST_DIAGNOSIS_HARDFAIL,
     TEST_DIAGNOSIS_NO_SIGNAL,
     WORKER_EXCEPTION,
+    QA_GATE_FAILED,
+    REVIEW_ESCALATED,
+    REVIEW_MALFORMED,
+    REVIEW_REJECTED,
+    TESTS_FAILED,
     INFRA_CIRCUIT_OPEN,
     SOFT_BLOCKER,
     WORKTREE_APPLY_FAILED,
@@ -136,6 +161,11 @@ __all__ = [
     "TEST_DIAGNOSIS_HARDFAIL",
     "TEST_DIAGNOSIS_NO_SIGNAL",
     "WORKER_EXCEPTION",
+    "QA_GATE_FAILED",
+    "REVIEW_ESCALATED",
+    "REVIEW_MALFORMED",
+    "REVIEW_REJECTED",
+    "TESTS_FAILED",
     "INFRA_CIRCUIT_OPEN",
     "SOFT_BLOCKER",
     "WORKTREE_APPLY_FAILED",

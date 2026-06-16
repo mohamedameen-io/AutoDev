@@ -1624,13 +1624,23 @@ _DEFAULT_RESOLVER_ACTIONS: tuple[str, ...] = (
 def _prior_resolution_actions(
     orch: "Orchestrator", task_id: str | None, fclass: str
 ) -> list[str]:
-    """Resume-safe: the resolver actions already applied for this blocker key.
+    """Resume-safe: the recovery actions already applied for this task's blocker.
 
-    Read from the ledger (``resolution_chosen`` ops) so the deterministic ladder
-    advances across retries / process restarts instead of re-picking its first
-    rung forever. Mirrors the key used by ``blocker_resolver.blocker_key``.
-    Best-effort — any failure yields ``[]`` (the per-blocker cycle budget is a
-    separate hard stop, so an empty list cannot cause an unbounded loop).
+    Read from the ledger so the deterministic ladder advances across retries /
+    process restarts instead of re-picking its first rung forever:
+
+    * ``resolution_chosen`` ops for THIS blocker key (the resolver's own actions),
+      keyed by ``blocker_key == f"{task_id}:{fclass}"`` (mirrors
+      ``blocker_resolver.blocker_key``).
+    * Step 3: the LEGACY escalation-ladder recovery ops for this task —
+      ``stuck_refine`` -> ``"refine"`` and ``stuck_pivot`` -> ``"pivot"`` — keyed
+      by ``task_id`` (these ops predate the per-class blocker key). Surfacing them
+      gives the resolver the FULL recovery history (it now knows the ladder has
+      already tried refine/pivot) instead of only the resolver's own attempts.
+
+    Returned in ledger seq order. Best-effort — any failure yields ``[]`` (the
+    per-blocker cycle budget is a separate hard stop, so an empty list cannot
+    cause an unbounded loop).
     """
     if task_id is None:
         return []
@@ -1640,13 +1650,60 @@ def _prior_resolution_actions(
         key = f"{task_id}:{fclass}"
         out: list[str] = []
         for entry in read_entries(orch.cwd):
-            if entry.op != "resolution_chosen":
+            payload = entry.payload if isinstance(entry.payload, dict) else {}
+            if entry.op == "resolution_chosen":
+                if payload.get("blocker_key") == key:
+                    act = payload.get("action")
+                    if isinstance(act, str):
+                        out.append(act)
+            elif entry.op == "stuck_refine":
+                if payload.get("task_id") == task_id:
+                    out.append("refine")
+            elif entry.op == "stuck_pivot":
+                if payload.get("task_id") == task_id:
+                    out.append("pivot")
+        return out
+    except Exception:  # noqa: BLE001 - audit read must never block recovery
+        return []
+
+
+def _ledger_trajectory(
+    orch: "Orchestrator", task_id: str | None
+) -> list[str]:
+    """Resume-safe ledger trajectory for ``task_id`` across the ladder op families.
+
+    Step 3 (RECOVERY-CONTRACT §7): populate ``BlockerContext.attempt_history``
+    (always ``[]`` before this) with the persisted recovery trajectory for this
+    task, in seq order (most-recent-last), as a list of short ``(op, …)`` strings
+    the resolver can reason over. Reads the ladder/resolver op families
+    ``stuck_refine`` / ``stuck_pivot`` / ``resolution_chosen`` /
+    ``budget_escalation`` / ``budget_cycle``. Mirrors
+    :func:`_prior_resolution_actions`'s read pattern. Best-effort — never raises.
+    """
+    if task_id is None:
+        return []
+    _families = {
+        "stuck_refine",
+        "stuck_pivot",
+        "resolution_chosen",
+        "budget_escalation",
+        "budget_cycle",
+    }
+    try:
+        from state.ledger import read_entries
+
+        out: list[str] = []
+        for entry in read_entries(orch.cwd):
+            if entry.op not in _families:
                 continue
             payload = entry.payload if isinstance(entry.payload, dict) else {}
-            if payload.get("blocker_key") == key:
+            if payload.get("task_id") != task_id:
+                continue
+            if entry.op == "resolution_chosen":
                 act = payload.get("action")
-                if isinstance(act, str):
-                    out.append(act)
+                out.append(f"resolution_chosen:{act}" if act else "resolution_chosen")
+            else:
+                out.append(entry.op)
         return out
     except Exception:  # noqa: BLE001 - audit read must never block recovery
         return []
@@ -1865,7 +1922,9 @@ async def _maybe_resolve_blocker(
             failing_role=failing_role,
             task_id=task_id,
             phase_id=ph,
-            attempt_history=[],
+            # Step 3: populate the ledger trajectory (was always []) so the
+            # resolver sees the recovery history that led to this blocker.
+            attempt_history=_ledger_trajectory(orch, task_id),
             recovery_already_tried=_prior_resolution_actions(orch, task_id, fclass),
             evidence_refs=evidence_refs or [],
             available_actions=list(_DEFAULT_RESOLVER_ACTIONS),
@@ -4562,6 +4621,8 @@ async def _execute_one(
                     task,
                     retry_limit,
                     reason=_build_adapter_failure_reason(developer_result),
+                    # Developer adapter failed at the code layer (no usable diff).
+                    failure_class=_fcls.WORKER_EXCEPTION,
                 )
                 if task.escalated:
                     return task
@@ -4609,7 +4670,12 @@ async def _execute_one(
                     "repository's code, not AutoDev's internal run state"
                 )
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason=_containment_reason
+                    orch,
+                    task,
+                    retry_limit,
+                    reason=_containment_reason,
+                    # Diff confined to .autodev/ — a scope violation.
+                    failure_class=_fcls.EDIT_SCOPE_VIOLATION,
                 )
                 if task.escalated:
                     return task
@@ -4631,7 +4697,12 @@ async def _execute_one(
                     details=gate_failure,
                 )
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason=gate_failure
+                    orch,
+                    task,
+                    retry_limit,
+                    reason=gate_failure,
+                    # Auto-gate (syntax/lint/build/test_runner/secretscan) failed.
+                    failure_class=_fcls.QA_GATE_FAILED,
                 )
                 if task.escalated:
                     return task
@@ -4728,6 +4799,8 @@ async def _execute_one(
                         task,
                         retry_limit,
                         reason="review_tournament max_rounds",
+                        # Review tournament hit max_rounds without convergence.
+                        failure_class=_fcls.REVIEW_ESCALATED,
                     )
                     if task.escalated:
                         return task
@@ -4917,7 +4990,12 @@ async def _execute_one(
                     ),
                 )
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason="reviewer MALFORMED"
+                    orch,
+                    task,
+                    retry_limit,
+                    reason="reviewer MALFORMED",
+                    # Reviewer verdict unparseable (NOT a turn-budget exhaustion).
+                    failure_class=_fcls.REVIEW_MALFORMED,
                 )
                 if task.escalated:
                     return task
@@ -4931,7 +5009,12 @@ async def _execute_one(
                     issues=issues,
                 )
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason=f"reviewer {verdict}"
+                    orch,
+                    task,
+                    retry_limit,
+                    reason=f"reviewer {verdict}",
+                    # Reviewer returned NEEDS_CHANGES / REJECTED.
+                    failure_class=_fcls.REVIEW_REJECTED,
                 )
                 if task.escalated:
                     return task
@@ -5056,7 +5139,12 @@ async def _execute_one(
                     total=total,
                 )
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason="tests failed"
+                    orch,
+                    task,
+                    retry_limit,
+                    reason="tests failed",
+                    # Tests collected and ran but at least one failed.
+                    failure_class=_fcls.TESTS_FAILED,
                 )
                 if task.escalated:
                     return task
@@ -5622,8 +5710,20 @@ async def _try_retry_or_escalate(
     task: Task,
     retry_limit: int,
     reason: str,
+    *,
+    failure_class: str,
 ) -> Task:
     """Bump retry count or escalate when the limit is reached.
+
+    Step 3 (RECOVERY-CONTRACT §7): ``failure_class`` is REQUIRED (keyword-only,
+    no default) so every caller threads the REAL terminal-failure class. The
+    retry-exhaustion rung passes it to :func:`block_task` instead of the old
+    ``_fcls.UNKNOWN`` — so when the resolver is finally reached at the terminal
+    rung it classifies a concrete failure (and the deterministic ladder can pick
+    a real recovery action) rather than treating every real-loop failure as
+    novel/unseen. The keyword-only-no-default shape makes a silent UNKNOWN a
+    compile-error-equivalent (TypeError at every unported call site) rather than
+    an easy-to-miss default.
 
     Returns the updated task. If ``task.escalated`` becomes True on return,
     the caller should stop the loop.
@@ -6132,14 +6232,15 @@ async def _try_retry_or_escalate(
         retry_exhausted_hint = _build_recovery_hint_from_reason(
             task_id=task.id, reason=reason
         )
-        # v0.42.1 F1: route the retry-exhaustion escalation through the single
-        # chokepoint (UNKNOWN so the LLM resolver gets a shot at recovery); a
-        # resolver recovery re-enables the task, otherwise ``block_task`` commits
-        # the legacy block unchanged.
+        # v0.42.1 F1 / Step 3: route the retry-exhaustion escalation through the
+        # single chokepoint with the REAL terminal failure_class threaded from
+        # the call site (was ``_fcls.UNKNOWN`` — which made the resolver treat
+        # every real-loop failure as novel/unseen). A resolver recovery re-enables
+        # the task; otherwise ``block_task`` commits the legacy block unchanged.
         updated = await block_task(
             orch,
             task,
-            failure_class=_fcls.UNKNOWN,
+            failure_class=failure_class,
             raw_error=f"escalated: {reason}",
             meta={
                 "blocked_reason": f"escalated: {reason}",

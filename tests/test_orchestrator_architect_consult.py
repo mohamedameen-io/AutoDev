@@ -535,7 +535,8 @@ async def test_try_retry_dispatches_to_architect_consult_at_threshold(
     monkeypatch.setattr(ep, "_escalate_stuck_to_critic", fake_critic)
 
     await ep._try_retry_or_escalate(
-        orch, task, retry_limit=10, reason="failed"
+        orch, task, retry_limit=10, reason="failed",
+        failure_class="worker_exception",
     )
 
     assert dispatched["called"] is True, "architect-consult dispatch did not fire"

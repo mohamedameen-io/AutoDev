@@ -12,29 +12,34 @@ task to a *terminal* block site. We then audit the on-disk ledger.
 The R2 gate has three assertions:
 
   (a) ``blocker_escalated`` AND ``resolution_chosen`` are in the ledger ops — the
-      resolver was REACHED from the real loop (not bypassed). **Green on HEAD.**
+      resolver was REACHED from the real loop (not bypassed). **Green since HEAD.**
   (b) the resolution's ``failure_class`` is a REAL class, NOT ``"unknown"`` — the
-      resolver should classify the failure, not treat the whole real-loop path
-      as a novel/unseen failure. **Red on HEAD.**
-  (c) the task actually RECOVERED (final status != ``"blocked"``) — the truest
-      engagement signal. **Red on HEAD.**
+      resolver classifies the failure, not treating the whole real-loop path as a
+      novel/unseen failure. **LIVE since Step 3.**
+  (c) the resolver recovers WITHOUT WEDGING — the real loop reaches a clean
+      terminal with no ``PhaseStuckError``. **RED until Step 4** (re-dispatch of a
+      resolver-recovered task is not yet wired), carried as strict-xfail.
 
-Per the RECOVERY-CONTRACT, on current HEAD the resolver is SHADOWED by the
-legacy escalation ladder: a failing developer with a low retry limit drives the
-``next_step == "continue"`` legacy retry-exhaustion path
-(``execute_phase.py``, the ``retry_exhausted`` block), which calls
-``block_task(failure_class=_fcls.UNKNOWN, ...)``. UNKNOWN routes to the LLM
-resolver; the stubbed/unparseable resolver response yields ``ask_human``,
-``_apply_resolution`` falls through, and ``block_task`` commits ``blocked``. So
-the resolver **fires but falls through to blocked** with ``failure_class ==
-"unknown"`` — exactly the field failure mode the contract predicts.
+On HEAD the resolver was SHADOWED by the legacy escalation ladder: a failing
+developer with a low retry limit drove the ``next_step == "continue"`` legacy
+retry-exhaustion path, which called ``block_task(failure_class=_fcls.UNKNOWN)``.
+UNKNOWN routed to the LLM resolver; the stubbed response yielded ``ask_human``,
+``_apply_resolution`` fell through, and ``block_task`` committed ``blocked`` —
+so the resolver fired but fell through to blocked with ``failure_class ==
+"unknown"``.
 
-Therefore (b) and (c) are RED on HEAD and live under
-``@pytest.mark.xfail(strict=True)``. They are the carry-forward signal: when
-Phase 1A fixes the resolver (real classification + real recovery on this path)
-these tests XPASS, ``strict`` flips XPASS -> FAIL, and we are FORCED to delete
-the marker. (a) is genuinely green on HEAD and stays a LIVE (non-xfail)
-assertion.
+Step 3 (RECOVERY-CONTRACT §7) added a REQUIRED ``failure_class`` to
+``_try_retry_or_escalate`` and threaded the REAL terminal class through to
+``block_task``: the failing-developer path now classifies as ``worker_exception``
+→ the deterministic ladder's first rung is ``retry_with_changes`` → the resolver
+ACTIVELY recovers (re-enables the task) instead of falling through. That flipped
+(b) from strict-xfail to LIVE green. (c) does NOT flip yet: re-dispatch of a
+resolver-recovered task is wired in Step 4, so until then the re-enabled task is
+left ``in_progress`` with nothing to re-spawn and the phase DAG loop raises
+``PhaseStuckError`` — i.e. the resolver recovers but the loop WEDGES. (c) asserts
+the absence of that wedge and stays strict-xfail until Step 4 (when it XPASSes →
+forces removal of the marker). For (a)/(b) the ledger-audit driver tolerates the
+intermediate wedge so the breadcrumbs (written before the wedge) are readable.
 
 Engagement-first / no-vacuous-gate guarantee: the LIVE (a) assertion drives the
 resolver through the *real* loop, so a planted resolver-disable must turn it
@@ -66,11 +71,6 @@ from state.schemas import AcceptanceCriterion, Phase, Plan, Task
 from stub_adapter import StubAdapter, fail, ok
 
 pytestmark = pytest.mark.resolver_enabled
-
-_XFAIL_REASON = (
-    "Phase 1A: WS1-resolver-shadowed-by-ladder + structural-actions-inert — "
-    "resolver fires but falls through / class=UNKNOWN"
-)
 
 
 def _iso() -> str:
@@ -161,7 +161,20 @@ async def _drive_failing_developer(repo: Path) -> tuple[Orchestrator, Path]:
         registry=registry,
         session_id="realloop-exec",
     )
-    await ep.run_execute_phase(orch)
+    # Step 3: the failing-developer path now threads a REAL class
+    # (``worker_exception``), so the resolver ACTIVELY recovers it (the
+    # deterministic ladder's first rung is ``retry_with_changes``) and re-enables
+    # the task to ``in_progress``. Re-dispatch of a resolver-recovered task is
+    # wired in Step 4/5; until then the phase DAG loop has no pending task to
+    # re-spawn and raises ``PhaseStuckError``. All resolver breadcrumbs are
+    # written to the on-disk ledger BEFORE that point, so the gate assertions
+    # (which audit the ledger) hold; we tolerate the Step-4/5-pending wedge here.
+    from errors import PhaseStuckError
+
+    try:
+        await ep.run_execute_phase(orch)
+    except PhaseStuckError:
+        pass
     return orch, repo
 
 
@@ -255,19 +268,18 @@ async def test_live_assertion_a_goes_red_when_resolver_disabled(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_REASON)
 @pytest.mark.asyncio
 async def test_resolver_records_real_failure_class(tmp_path: Path) -> None:
     """R2 gate (b): the resolution breadcrumbs carry a REAL failure class, not
     the catch-all ``"unknown"``.
 
-    RED on HEAD: the failing-developer path drives the legacy retry-exhaustion
-    escalation, which blocks with ``failure_class=_fcls.UNKNOWN``, so every
-    ``blocker_escalated`` / ``resolution_chosen`` breadcrumb on this path
-    records ``"unknown"``. Phase 1A makes the resolver classify the real-loop
-    failure (a developer that never produces a usable diff is a concrete
-    failure class, not a novel/unseen one) → this XPASSes → strict-xfail FAILS →
-    forces removal of the marker."""
+    LIVE since Step 3 (RECOVERY-CONTRACT §7): ``_try_retry_or_escalate`` now
+    threads the REAL terminal class through to ``block_task``, so the
+    failing-developer path classifies as ``worker_exception`` (a developer that
+    never produces a usable diff is a concrete failure class, not a novel/unseen
+    one) instead of ``"unknown"``. Was strict-xfail on HEAD; the Step-3 change
+    made it XPASS, which (per the carry-forward contract) forced removal of the
+    marker — this is now a live green assertion."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git_init(repo)
@@ -283,29 +295,63 @@ async def test_resolver_records_real_failure_class(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# (c) — RED on HEAD: the task actually RECOVERS (final status != blocked).
+# (c) — RED until Step 4: the resolver recovers WITHOUT WEDGING the loop.
 # ---------------------------------------------------------------------------
 
+_TERMINAL_STATUSES = frozenset({"complete", "blocked", "skipped"})
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_REASON)
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Step 4 (move resolver before next_step): the resolver now re-enables a "
+        "worker_exception task to in_progress, but re-dispatch of a "
+        "resolver-recovered task is not wired until Step 4 — so the phase DAG "
+        "loop has no pending task to re-spawn and raises PhaseStuckError (the "
+        "loop WEDGES). Step 4 wires re-dispatch → the loop drives the re-enabled "
+        "task to a clean terminal with no wedge → XPASS → remove this marker."
+    ),
+)
 @pytest.mark.asyncio
-async def test_resolver_recovers_task_in_real_loop(tmp_path: Path) -> None:
-    """R2 gate (c): the truest engagement signal — after the resolver fires from
-    the real loop, the task is NOT left ``blocked``.
+async def test_resolver_recovers_without_wedging(tmp_path: Path) -> None:
+    """R2 gate (c): the resolver must recover the task WITHOUT wedging the loop.
 
-    RED on HEAD: the resolver fires but falls through (LLM resolver returns
-    ``ask_human`` on the UNKNOWN class, ``_apply_resolution`` returns ``None``),
-    so ``block_task`` commits ``blocked``. Phase 1A makes the resolver actively
-    recover this path → final status != ``"blocked"`` → XPASS → strict-xfail
-    FAILS → forces removal of the marker."""
+    The always-failing developer SHOULD eventually reach a clean terminal (it
+    never produces a usable diff, so a clean ``blocked`` is the correct outcome).
+    The engagement signal across Steps 3→4 is that the resolver's re-enable does
+    not strand the task: ``run_execute_phase`` must NOT raise ``PhaseStuckError``
+    and every task must end terminal.
+
+    RED until Step 4: Step 3 makes the resolver re-enable the task to
+    ``in_progress`` (real ``worker_exception`` class → ``retry_with_changes``),
+    but with no re-dispatch wired the phase DAG loop wedges (``PhaseStuckError``).
+    Step 4 moves the resolver before ``next_step`` so the loop re-dispatches the
+    re-enabled task and drives it to a clean terminal — flipping this green.
+
+    (A separate Step-5 e2e test will prove a *recoverable* failure actually
+    completes once resolver guidance is injected into ``last_issues``.)"""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git_init(repo)
 
-    orch, _cwd = await _drive_failing_developer(repo)
+    cfg = _make_cfg()
+    registry = build_registry(cfg)
+    adapter = StubAdapter(
+        {"explorer": ok("ok"), "developer": fail("developer always fails")}
+    )
+    pm = PlanManager(repo, session_id="realloop-c-init")
+    await pm.init_plan(_mk_plan())
+    orch = Orchestrator(
+        cwd=repo, cfg=cfg, adapter=adapter, registry=registry,
+        session_id="realloop-c-exec",
+    )
 
-    status = await _final_task_status(orch)
-    assert status != "blocked", (
-        "resolver fired but fell through — task left blocked instead of "
-        f"recovered (status={status!r})"
+    # No PhaseStuckError tolerance here — wedging IS the failure (c) detects.
+    await ep.run_execute_phase(orch)  # raises PhaseStuckError on Step 3 (xfail)
+
+    plan = await orch.plan_manager.load()
+    assert plan is not None
+    statuses = [t.status for t in plan.phases[0].tasks]
+    assert all(s in _TERMINAL_STATUSES for s in statuses), (
+        f"resolver-recovered task left non-terminal (wedge): {statuses}"
     )
