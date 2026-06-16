@@ -216,6 +216,32 @@ preflight_v042() {
   check "v0.42 C5 enforcer select"    src/guardrails/enforcer.py                   "_eff_max_duration_s_per_test_repair_task"
 }
 
+preflight_v042_1() {
+  # v0.42.1 — make v0.42.0 features actually engage (Run-5 gate fixes)
+  # F1 — universal resolver escalation by construction
+  check "v0.42.1 F1 block_task"       src/orchestrator/blocker_guard.py            "async def block_task"
+  check "v0.42.1 F1 single degrade"   src/orchestrator/blocker_guard.py            "record_phase_degrade"
+  check "v0.42.1 F1 block_task used"  src/orchestrator/execute_phase.py            "block_task"
+  check "v0.42.1 F1 hook register"    src/orchestrator/execute_phase.py            "block_hook"
+  check "v0.42.1 F1d enforcement"     tests/test_block_path_invariant.py           "only_block_task_commits_blocked"
+  check "v0.42.1 F1 framing degrade"  src/orchestrator/framing_phase.py            "record_phase_degrade"
+  check "v0.42.1 F1 tourn degrade"    src/orchestrator/plan_phase.py               "record_phase_degrade"
+  # F2 — A4: bounded tournament inputs + real tool-scoping
+  check "v0.42.1 F2 _limit hoist"     src/tournament/util.py                       "def _limit"
+  check "v0.42.1 F2a plan bound"      src/tournament/plan_tournament.py            "_limit("
+  check "v0.42.1 F2b adapter scope"   src/adapters/claude_code.py                  "inv.allowed_tools is not None"
+  # F3 — intake gather: repo activation + autonomous github discovery
+  check "v0.42.1 F3 repo skip log"    src/orchestrator/intake_sources/repo.py      "repo_skipped"
+  check "v0.42.1 F3 gh discovery"     src/orchestrator/intake_sources/github.py    "_gh_issue_list"
+  check "v0.42.1 F3 gh match guard"   src/orchestrator/intake_sources/github.py    "_best_match"
+  # F4 — diagnosis: richer context + always-emit-loop mandate
+  check "v0.42.1 F4 struct findings"  src/orchestrator/diagnosis_phase.py          "files_referenced"
+  check "v0.42.1 F4 short-resp warn"  src/orchestrator/diagnosis_phase.py          "suspiciously_short_response"
+  check "v0.42.1 F4 loop mandate"     src/agents/prompts/diagnostician.md          "Never emit nothing"
+  # F5 — engagement tests
+  check "v0.42.1 F5 engagement"       tests/test_resolver_engagement.py            "assert_no_silent_dead_ends"
+}
+
 case "$target" in
   v0.32) preflight_v032 ;;
   v0.33) preflight_v033 ;;
@@ -228,9 +254,10 @@ case "$target" in
   v0.40) preflight_v040 ;;
   v0.41) preflight_v041 ;;
   v0.42) preflight_v042 ;;
-  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ; preflight_v041 ; preflight_v042 ;;
+  v0.42.1) preflight_v042_1 ;;
+  all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ; preflight_v041 ; preflight_v042 ; preflight_v042_1 ;;
   *)
-    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | v0.41 | v0.42 | all)" >&2
+    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | v0.41 | v0.42 | v0.42.1 | all)" >&2
     exit 2
     ;;
 esac

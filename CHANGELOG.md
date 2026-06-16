@@ -4,6 +4,62 @@ All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
+## [0.42.1] - 2026-06-16
+
+Make the v0.42.0 features **actually engage in the field**. The Run-5 gate
+(`thoughts/benchmarks/autodev-run5-v042-vs-pr200-mistral429.md`) confirmed v0.42.0's
+delivery is the best yet but the headline Universal Blocker Resolver fired **0×**, A4
+still broke, and intake-gather/diagnosis turned on but produced nothing. This release
+fixes the *engagement* (not just the test-green surface) and replaces "ships test-green
++ fail-safe" with **tests that assert engagement** — the durable v0.41.0/v0.42.0 lesson.
+
+### Fixed
+
+- **F1 — Universal resolver escalation BY CONSTRUCTION (the autonomy guarantee).** The
+  resolver fired 0× in Run-5 because terminal block/degrade sites bypassed it. A new
+  `orchestrator/blocker_guard.py` introduces `block_task` as the **only** way a task
+  reaches `blocked` (it routes the failure through the resolver first and commits
+  `update_task_status(..., "blocked")` only if the resolver does not recover) and makes
+  `record_phase_degrade` the **only** way a phase degrades. All 20 block sites in
+  `execute_phase.py` — including the 6 that previously bypassed the resolver
+  (architect-consult, conflict-escalation, edit-scope, soft-blocker, retry-exhaustion) —
+  plus the plan-tournament structural fallback and the Tier-7 recovery hard-fail now
+  route through these single setters. An AST invariant test
+  (`tests/test_block_path_invariant.py`) **fails CI** if any block/degrade is ever added
+  outside them, so a silent dead-end is impossible to introduce. The block path is wired
+  cycle-free via an `orch.block_hook` callback. The dispatch seam (`delegate`) emits an
+  escalation breadcrumb on raw failures, and `resolution_chosen` is recorded on every
+  resolver path (deterministic fast-path and LLM).
+- **F2 — A4: bounded tournament inputs + real tool-scoping.** `plan_tournament.py` inlined
+  the full plan (190K–262K-token reads → `critic_t error_max_turns`); its critic /
+  architect_b / synthesizer / judge renders now apply the proven `_limit` truncation
+  (hoisted to `tournament/util.py`; 12000/8000 caps). The adapter tool-scoping no-op is
+  fixed: `allowed_tools=[]` (text-only roles) now reaches the Claude CLI as an explicit
+  `--allowed-tools ""` restriction instead of being dropped (which silently granted all
+  tools); `None` still means "default". Applied to the cursor adapter too.
+- **F3 — Intake gather actually pulls facts.** The repo source now logs why it skips
+  (`reuse_disabled` / `no_evidence` / `empty_findings`) and activates whenever
+  plan-explore evidence with findings exists. The GitHub source gains **autonomous issue
+  discovery**: with no explicit `#NNN` in the spec it derives the repo from the git remote
+  and runs `gh issue list --search "<symptom keywords>"` with a title/symptom match guard,
+  so the linked issue is pulled even from a thin `bug.md`.
+- **F4 — Diagnosis emits a real loop.** The diagnostician now receives structured
+  `files_referenced` + the enriched spec (not just raw truncated explorer text), the
+  prompt **mandates** always emitting a `LOOP_METHOD` (best proxy from code-reading) with
+  `LOOP_FIDELITY: none` explicitly acceptable + a cause/seam, and a short/empty response
+  is warned for auditability.
+- **F5 — Engagement tests.** New real-orchestrator tests assert the features *engage*
+  (resolver fires and re-enables on a real blocker; the universal no-silent-dead-end
+  invariant — with a meta-test proving the invariant is non-vacuous; tournament prompts
+  ≤ bound; `[]` reaches the adapter as a real restriction; repo/github gather activation;
+  diagnosis prompt mandate). The field gate is **Run-6**
+  (`thoughts/benchmarks/autodev-run6-v0.42.1-protocol-DEFERRED.md`, operator-run).
+
+### Notes
+
+- Pushed to `main`; **not published to PyPI** (PyPI still serves v0.41.0). The field Run-6
+  benchmark is operator-deferred (needs the external synaptix repo + live API), as Run-5 was.
+
 ## [0.42.0] - 2026-06-15
 
 ### Added
