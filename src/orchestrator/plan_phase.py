@@ -1050,6 +1050,23 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                     _budget_tracker.record_failure(
                         _PLAN_PHASE_SCOPE, "architect", _sub
                     )
+                # RECOVERY-CONTRACT §7 Step 2 (gate R4): persist the NEW counter
+                # value so the plan-phase architect escalation ladder survives
+                # ``autodev resume`` (last-value-wins via a ``budget_cycle``
+                # ledger op). Best-effort — failures are swallowed so the
+                # architect retry loop is unaffected.
+                from orchestrator.budget_escalation import (  # noqa: PLC0415
+                    persist_budget_cycle,
+                )
+
+                await persist_budget_cycle(
+                    orch,
+                    _PLAN_PHASE_SCOPE,
+                    "architect",
+                    _budget_tracker.current_attempt(
+                        _PLAN_PHASE_SCOPE, "architect"
+                    ),
+                )
             plan_md = architect_result.text
             # Fallback: if architect wrote to a file instead of returning
             # text, try reading the plan from known file locations.

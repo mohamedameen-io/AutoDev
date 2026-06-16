@@ -6738,6 +6738,22 @@ async def delegate(
     # older orchestrator stubs used by some unit tests.
     if _budget_tracker is not None and envelope.task_id:
         _budget_tracker.record_result(envelope.task_id, role, result.subtype)
+        # RECOVERY-CONTRACT §7 Step 2 (gate R4): persist the NEW counter value
+        # so the per-(task_id, role) escalation ladder survives ``autodev
+        # resume`` (last-value-wins via a ``budget_cycle`` ledger op). The
+        # tracker is the in-memory write-through cache; the ledger is the source
+        # of truth on resume. Best-effort — the persist helper swallows ledger
+        # failures so the retry/escalate FSM still sees ``result`` unchanged.
+        from orchestrator.budget_escalation import (  # noqa: PLC0415
+            persist_budget_cycle,
+        )
+
+        await persist_budget_cycle(
+            orch,
+            envelope.task_id,
+            role,
+            _budget_tracker.current_attempt(envelope.task_id, role),
+        )
 
     # v0.30.0 Bug 4: per-adapter-failure audit breadcrumb. Append one
     # ``adapter_failure`` ledger op for every ``success=False`` result

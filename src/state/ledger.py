@@ -308,6 +308,17 @@ LedgerOp = Literal[
     # ``{from_max_turns: int, to_max_turns: int, attempt: int,
     # reason: str}``.
     "plan_phase_budget_escalation",
+    # RECOVERY-CONTRACT §7 Step 2 (gate R4): resume-safe per-(scope_id, role)
+    # consecutive-``error_max_turns`` COUNTER value. Audit-only; replay no-op.
+    # Persisted on EVERY counter change in the production path (last-value-wins:
+    # the current attempt for a key = the ``attempt`` of the highest-seq
+    # ``budget_cycle`` op for that key). Rehydrated into the
+    # ``BudgetEscalationTracker`` on construction so ``autodev resume`` does NOT
+    # restart the escalation ladder at 0. Distinct from ``budget_escalation``
+    # (which records the max_turns BUMP event); this op records the COUNTER.
+    # Payload shape: ``{scope_id: str, role: str, attempt: int}`` (attempt=0 on
+    # reset).
+    "budget_cycle",
     # v0.32.0 Phase 2: review-tournament lifecycle ops. All four are
     # audit-only — they do NOT mutate plan state on replay (the
     # underlying task status changes flow through the regular
@@ -1150,6 +1161,11 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # ``budget_escalation`` but scoped to the plan-phase
         # architect retry loop.
         "plan_phase_budget_escalation",
+        # RECOVERY-CONTRACT §7 Step 2 (gate R4): resume-safe budget COUNTER.
+        # Audit-only; replay no-op. The counter lives in the in-memory
+        # ``BudgetEscalationTracker`` (rehydrated from these ops on construction
+        # via last-value-wins) — replay must NOT mutate plan state here.
+        "budget_cycle",
         # v0.32.0 Phase 2: review-tournament lifecycle ops. All
         # audit-only — they do NOT mutate plan state. The underlying
         # task status changes (retry / escalate / soft-block) flow
