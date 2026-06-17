@@ -1848,6 +1848,30 @@ async def _apply_resolution(
     return None
 
 
+# Step 4: the in-loop retry/escalate sites (developer / reviewer / test_engineer)
+# don't share a single ``role`` local, so the chokepoint derives the originating
+# role from the REAL ``failure_class`` threaded in by the caller (Step 3). Used
+# only to populate ``BlockerContext.failing_role`` for resolver observability /
+# routing; an unmapped class yields None (no role attributed).
+_FAILURE_CLASS_TO_ROLE: dict[str, str] = {
+    _fcls.WORKER_EXCEPTION: "developer",
+    _fcls.QA_GATE_FAILED: "developer",
+    _fcls.EDIT_SCOPE_VIOLATION: "developer",
+    _fcls.WORKTREE_APPLY_FAILED: "developer",
+    _fcls.TESTS_FAILED: "developer",
+    _fcls.REVIEW_REJECTED: "reviewer",
+    _fcls.REVIEW_MALFORMED: "reviewer",
+    _fcls.REVIEW_ESCALATED: "reviewer",
+    _fcls.TEST_DIAGNOSIS_HARDFAIL: "test_engineer",
+    _fcls.TEST_DIAGNOSIS_NO_SIGNAL: "test_engineer",
+}
+
+
+def _failing_role_for_class(failure_class: str) -> str | None:
+    """Map a terminal ``failure_class`` to the role that produced it (or None)."""
+    return _FAILURE_CLASS_TO_ROLE.get(failure_class)
+
+
 async def _maybe_resolve_blocker(
     orch: "Orchestrator",
     task: Task | None,
@@ -5808,6 +5832,47 @@ async def _try_retry_or_escalate(
     knowledge_context: dict[str, Any] | None = None
     if detected_patterns:
         knowledge_context = {"detected_patterns": detected_patterns}
+
+    # Step 4 (RECOVERY-CONTRACT §7; gate R3) — THE KEYSTONE. Insert the resolver
+    # chokepoint BEFORE the legacy escalation ladder (``next_step``). Until now
+    # the resolver was SHADOWED: ``next_step`` ran the REFINE/PIVOT/ARCHITECT_CONSULT
+    # ladder (which returns WITHOUT block_task) and the resolver was only reached at
+    # the two terminal rungs (retry-exhaustion + soft-blocker → ``block_task``). The
+    # resolver therefore could not ACTIVELY recover a known-class failure ahead of
+    # the ladder. Here the chokepoint intercepts the failure FIRST, with the REAL
+    # ``failure_class`` (Step 3), and when it recovers (re-enables the task) we
+    # return the re-enabled task so the CALLER's loop re-dispatches it. The legacy
+    # ladder becomes the FALLBACK only when the resolver DECLINES (or is disabled).
+    #
+    # Termination: re-dispatching a still-failing developer re-enters this helper,
+    # which consults the resolver AGAIN — but ``_maybe_resolve_blocker`` enforces a
+    # per-(task, failure_class) cycle cap (the in-memory ``_resolver_cycle_counts``
+    # backstop + the resume-safe ledger budget). After ``max_cycles_per_blocker``
+    # hits the chokepoint returns None → falls through to ``next_step`` → the
+    # legacy terminal block. The loop is therefore BOUNDED; no new uncapped loop is
+    # introduced.
+    #
+    # Resolver OFF (the suite default, ``AUTODEV_RESOLVER_DISABLED=1``) makes
+    # ``_maybe_resolve_blocker`` a pure no-op → ``recovered is None`` → identical
+    # legacy behaviour (the ``next_step`` ladder runs exactly as before).
+    recovered = await _maybe_resolve_blocker(
+        orch,
+        task,
+        failure_class=failure_class,
+        raw_error=reason,
+        # No single ``role`` var is in scope across all call sites (developer /
+        # reviewer / test_engineer reach this helper); derive the originating role
+        # from the REAL failure_class so the resolver's BlockerContext carries it.
+        failing_role=_failing_role_for_class(failure_class),
+        phase_id=task.phase_id,
+    )
+    if recovered is not None and getattr(recovered, "status", None) != "blocked":
+        # Resolver ACTIVELY recovered (re-enabled the task). Return the
+        # non-escalated, re-enabled task so the caller's loop re-dispatches it.
+        # This is the unification: the resolver drives recovery for known classes;
+        # the legacy ladder (next_step) is the fallback only when it declines.
+        return recovered
+    # else: resolver declined (or is disabled) → fall through to the legacy ladder.
 
     step = next_step(stuck_state, knowledge_context=knowledge_context)
 

@@ -17,8 +17,10 @@ The R2 gate has three assertions:
       resolver classifies the failure, not treating the whole real-loop path as a
       novel/unseen failure. **LIVE since Step 3.**
   (c) the resolver recovers WITHOUT WEDGING — the real loop reaches a clean
-      terminal with no ``PhaseStuckError``. **RED until Step 4** (re-dispatch of a
-      resolver-recovered task is not yet wired), carried as strict-xfail.
+      terminal with no ``PhaseStuckError``. **LIVE since Step 4** (the resolver
+      chokepoint moved BEFORE the legacy ladder, so a resolver-recovered task is
+      re-dispatched and bounded out to a clean terminal by the per-blocker cycle
+      budget). Was strict-xfail until Step 4; the XPASS forced marker removal.
 
 On HEAD the resolver was SHADOWED by the legacy escalation ladder: a failing
 developer with a low retry limit drove the ``next_step == "continue"`` legacy
@@ -33,13 +35,18 @@ Step 3 (RECOVERY-CONTRACT §7) added a REQUIRED ``failure_class`` to
 ``block_task``: the failing-developer path now classifies as ``worker_exception``
 → the deterministic ladder's first rung is ``retry_with_changes`` → the resolver
 ACTIVELY recovers (re-enables the task) instead of falling through. That flipped
-(b) from strict-xfail to LIVE green. (c) does NOT flip yet: re-dispatch of a
-resolver-recovered task is wired in Step 4, so until then the re-enabled task is
-left ``in_progress`` with nothing to re-spawn and the phase DAG loop raises
-``PhaseStuckError`` — i.e. the resolver recovers but the loop WEDGES. (c) asserts
-the absence of that wedge and stays strict-xfail until Step 4 (when it XPASSes →
-forces removal of the marker). For (a)/(b) the ledger-audit driver tolerates the
-intermediate wedge so the breadcrumbs (written before the wedge) are readable.
+(b) from strict-xfail to LIVE green.
+
+Step 4 (RECOVERY-CONTRACT §7; gate R3) then moved the resolver chokepoint BEFORE
+the legacy ladder (``next_step``) inside ``_try_retry_or_escalate``: when the
+resolver recovers, the helper returns the re-enabled (non-escalated) task and the
+caller's loop re-dispatches it. The still-failing developer is re-attempted until
+the resolver's per-blocker cycle budget is hit, at which point the chokepoint
+declines → the legacy ladder runs → a clean terminal ``blocked`` (NO
+``PhaseStuckError``). That flipped (c) from strict-xfail to LIVE green. The
+``_drive_failing_developer`` ledger-audit driver still tolerates a
+``PhaseStuckError`` defensively (so (a)/(b) read the breadcrumbs even if a future
+regression re-introduces a wedge), but on Step-4 HEAD no wedge occurs.
 
 Engagement-first / no-vacuous-gate guarantee: the LIVE (a) assertion drives the
 resolver through the *real* loop, so a planted resolver-disable must turn it
@@ -301,17 +308,6 @@ async def test_resolver_records_real_failure_class(tmp_path: Path) -> None:
 _TERMINAL_STATUSES = frozenset({"complete", "blocked", "skipped"})
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Step 4 (move resolver before next_step): the resolver now re-enables a "
-        "worker_exception task to in_progress, but re-dispatch of a "
-        "resolver-recovered task is not wired until Step 4 — so the phase DAG "
-        "loop has no pending task to re-spawn and raises PhaseStuckError (the "
-        "loop WEDGES). Step 4 wires re-dispatch → the loop drives the re-enabled "
-        "task to a clean terminal with no wedge → XPASS → remove this marker."
-    ),
-)
 @pytest.mark.asyncio
 async def test_resolver_recovers_without_wedging(tmp_path: Path) -> None:
     """R2 gate (c): the resolver must recover the task WITHOUT wedging the loop.
@@ -322,11 +318,19 @@ async def test_resolver_recovers_without_wedging(tmp_path: Path) -> None:
     not strand the task: ``run_execute_phase`` must NOT raise ``PhaseStuckError``
     and every task must end terminal.
 
-    RED until Step 4: Step 3 makes the resolver re-enable the task to
-    ``in_progress`` (real ``worker_exception`` class → ``retry_with_changes``),
-    but with no re-dispatch wired the phase DAG loop wedges (``PhaseStuckError``).
-    Step 4 moves the resolver before ``next_step`` so the loop re-dispatches the
-    re-enabled task and drives it to a clean terminal — flipping this green.
+    LIVE since Step 4 (RECOVERY-CONTRACT §7; gate R3). Step 3 made the resolver
+    re-enable the task to ``in_progress`` (real ``worker_exception`` class →
+    ``retry_with_changes``), but with no re-dispatch wired the phase DAG loop
+    wedged (``PhaseStuckError``) — so this was strict-xfail. Step 4 moved the
+    resolver chokepoint BEFORE the legacy ladder (``next_step``) in
+    ``_try_retry_or_escalate``: when the resolver recovers, the helper returns the
+    re-enabled (non-escalated) task and the caller's loop re-dispatches it. The
+    still-failing developer is re-attempted until the resolver's per-blocker cycle
+    budget (``_maybe_resolve_blocker``'s ``_resolver_cycle_counts`` cap) is hit,
+    at which point the chokepoint declines → falls through to the legacy ladder →
+    clean terminal ``blocked``. No wedge. The Step-3 XPASS forced removal of the
+    strict-xfail marker (carry-forward contract); this is now a live green
+    assertion.
 
     (A separate Step-5 e2e test will prove a *recoverable* failure actually
     completes once resolver guidance is injected into ``last_issues``.)"""
