@@ -1797,6 +1797,90 @@ async def _resolver_corrective(
         return None
 
 
+# Step 5 (RECOVERY-CONTRACT §7; gate R3): the structural actions
+# (re_architect/re_plan/narrow_scope/split_task) USED to route their PROSE
+# ``rationale`` straight into ``_resolver_corrective`` → ``parse_corrective_direction``,
+# which splits on TOP-LEVEL bullets (``- ``/``* ``/``1. ``). Prose has no bullets, so
+# the parser returned 0 corrective tasks, ``_resolver_corrective`` returned ``None``,
+# and the resolver DECLINED → the task hard-blocked. This was the empirically-confirmed
+# delivery binding constraint (field-probes SYNTHESIS.md: ``conflict_3way_failed →
+# re_architect → fell_through → blocked``, reproduced on a feature, a refactor, and a
+# 50k-file repo). The fix: when the action did not already supply a structured
+# ``params['direction']``, SYNTHESIZE a real bulleted direction from the task context +
+# action type so the parser yields >= 1 corrective task. Deterministic — no LLM call.
+_STRUCTURAL_CORRECTIVE_ACTIONS: frozenset[str] = frozenset(
+    {"split_task", "narrow_scope", "re_architect", "re_plan"}
+)
+
+
+def _direction_has_bullets(direction: str) -> bool:
+    """True if ``direction`` already contains a top-level bullet the parser sees.
+
+    Mirrors ``corrective_parser._RE_TOP_LEVEL_BULLET`` (``- ``/``* ``/``1. `` at
+    column 0 or with one leading space) so an LLM-supplied structured
+    ``params['direction']`` is preserved verbatim and only PROSE (no bullets) is
+    re-synthesized. Cheap, import-light, never raises.
+    """
+    if not direction or not direction.strip():
+        return False
+    import re as _re
+
+    pat = _re.compile(r"^[ ]?(?:[-*]|\d+\.)\s+.+$")
+    return any(pat.match(line) for line in direction.splitlines())
+
+
+def _synthesize_corrective_direction(
+    task: Task, action: str, rationale: str
+) -> str:
+    """Build a STRUCTURED (bulleted) corrective direction for a structural action.
+
+    Step 5 keystone. Returns a string with >= 1 top-level ``- `` bullet so
+    ``corrective_parser.parse_corrective_direction`` yields >= 1 corrective Task —
+    turning a previously-inert structural resolver action into real injected work.
+    Deterministic: derived purely from the task context + action type (NO LLM).
+
+    Templates per action:
+
+      * ``re_architect`` — re-implement as smaller non-overlapping changes scoped
+        to the task's files (so colliding patches stop colliding).
+      * ``re_plan``      — re-plan into independently-applicable, well-ordered steps.
+      * ``narrow_scope`` — constrain to ONLY the task's declared in-scope files.
+      * ``split_task``   — TWO bullets (part 1 / part 2), each an independently
+        shippable half.
+
+    The trailing ``rationale`` (the resolver's prose) is appended INSIDE the bullet
+    body so it informs the developer without breaking the top-level bullet contract.
+    """
+    title = (task.title or task.id or "the blocked task").strip()
+    files = list(getattr(task, "files", None) or [])
+    files_str = ", ".join(files) if files else "the originally-claimed files"
+    tail = f" {rationale.strip()}" if rationale and rationale.strip() else ""
+
+    if action == "split_task":
+        return (
+            f'- {title} — part 1: the first, independently-shippable half of the '
+            f"change. Implement only this half; leave the rest for part 2.{tail}\n"
+            f'- {title} — part 2: the remaining half of the change, applied on top '
+            f"of part 1 so the two no longer collide."
+        )
+    if action == "narrow_scope":
+        return (
+            f'- Constrain "{title}" to ONLY its declared in-scope files: '
+            f"{files_str}. Do not edit anything outside that set.{tail}"
+        )
+    if action == "re_plan":
+        return (
+            f'- Re-plan "{title}" into independently-applicable steps with a '
+            f"well-formed dependency order, so each step applies cleanly on its "
+            f"own.{tail}"
+        )
+    # re_architect (default for the structural family).
+    return (
+        f'- Re-implement "{title}" as smaller, non-overlapping changes so the '
+        f"patches stop colliding. Scope strictly to: {files_str}.{tail}"
+    )
+
+
 async def _apply_resolution(
     orch: "Orchestrator",
     task: Task | None,
@@ -1819,8 +1903,16 @@ async def _apply_resolution(
         return None
     if a in ("ask_human", "fall_through", "web_search", "reroute"):
         return None
-    if a in ("split_task", "narrow_scope", "re_architect", "re_plan"):
-        direction = str(params.get("direction") or rationale or "")
+    if a in _STRUCTURAL_CORRECTIVE_ACTIONS:
+        # Step 5: prefer an LLM-supplied STRUCTURED direction; only synthesize a
+        # bulleted one when it's missing/prose. The synthesized direction is
+        # guaranteed to make ``parse_corrective_direction`` return >= 1 task, so
+        # the structural action is no longer inert (the prose→0→block cascade).
+        supplied = str(params.get("direction") or "")
+        if _direction_has_bullets(supplied):
+            direction = supplied
+        else:
+            direction = _synthesize_corrective_direction(task, a, rationale)
         return await _resolver_corrective(orch, task, direction)
     if a == "consult_knowledge":
         try:
@@ -4484,6 +4576,32 @@ async def _execute_one(
     try:
         # Retry loop — one iteration = one developer-then-gates cycle.
         last_issues: list[str] = []
+        # Step 5 (RECOVERY-CONTRACT §7 Part 3 — RECOVER_TASK guidance injection):
+        # when the resolver re-enabled this task via ``_resolver_retry`` it
+        # stamped a ``resolver_note`` onto ``Task.metadata`` (now a persisted,
+        # round-tripping field). Read it back into ``last_issues`` so the
+        # re-dispatched developer actually SEES the resolver's guidance — pre-Step-5
+        # the note was written and then discarded, never reaching the next
+        # developer envelope. The note is consumed (cleared) so it informs only
+        # the FIRST attempt of this re-dispatch, not every inner retry iteration.
+        try:
+            _resolver_note = (task.metadata or {}).get("resolver_note")
+            if _resolver_note:
+                last_issues = [f"resolver guidance: {_resolver_note}"]
+                await orch.plan_manager.update_task_status(
+                    task.id,
+                    task.status,
+                    meta={"resolver_note": None},
+                )
+                refreshed = await orch.plan_manager.get_task(task.id)
+                if refreshed is not None:
+                    task = refreshed
+        except Exception as exc:  # noqa: BLE001 — guidance injection is best-effort
+            logger.debug(
+                "execute_phase.resolver_note_inject_failed",
+                task_id=task.id,
+                err=str(exc),
+            )
         # v0.32.0 Phase 3 (Gap C): per-task attempt counters for the
         # infrastructure-class test diagnoses (collection_failed /
         # runtime_crash / capture_failed). Lives in this function's

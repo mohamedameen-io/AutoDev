@@ -399,6 +399,29 @@ class PlanManager:
                             f"verdict|infrastructure|cap|None, got {cls!r}"
                         )
                     task.block_reason_class = cls
+                # Step 5 (RECOVERY-CONTRACT §7 Part 3): persist the resolver's
+                # ``resolver_note`` / ``resolver_action`` onto the Task model so
+                # the guidance survives the status round-trip (a reload/replay).
+                # Pre-Step-5 these landed ONLY in the ledger payload above and
+                # were dropped from the in-memory Task + snapshot, so the
+                # developer loop could never read the resolver's guidance back
+                # into ``last_issues``. ``Task.metadata`` is a persisted field, so
+                # routing them there makes ``_resolver_retry``'s note readable
+                # after the transition (the RECOVER_TASK guidance-injection
+                # channel from the contract). Merge (don't clobber) so other
+                # metadata keys survive.
+                for _mkey in ("resolver_note", "resolver_action"):
+                    if _mkey not in meta:
+                        continue
+                    _mval = meta[_mkey]
+                    new_md = dict(task.metadata or {})
+                    if _mval is None:
+                        # Explicit clear (the developer loop consumes the note
+                        # after injecting it into last_issues).
+                        new_md.pop(_mkey, None)
+                    else:
+                        new_md[_mkey] = str(_mval)
+                    task.metadata = new_md
                 # v0.32.0 (Phase 5, Gap G): structured recovery hint.
                 # Accept either a :class:`RecoveryHint` model instance OR
                 # the equivalent ``dict`` payload (covers callers that
@@ -1577,6 +1600,18 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
                     task.recovery_hint = _RecoveryHint.model_validate(raw_hint)
                 except Exception:  # noqa: BLE001 - tolerate legacy payloads
                     task.recovery_hint = None
+        # Step 5 (RECOVERY-CONTRACT §7 Part 3): replay the resolver guidance onto
+        # ``Task.metadata`` so the snapshot fast-path's post-snapshot replay keeps
+        # the same note the full-replay path (ledger._apply_op) restores.
+        for _mkey in ("resolver_note", "resolver_action"):
+            if _mkey not in payload:
+                continue
+            _new_md = dict(task.metadata or {})
+            if payload[_mkey] is None:
+                _new_md.pop(_mkey, None)
+            else:
+                _new_md[_mkey] = str(payload[_mkey])
+            task.metadata = _new_md
         return plan
 
     if op == "mark_blocked":

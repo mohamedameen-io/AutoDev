@@ -637,6 +637,14 @@ LedgerOp = Literal[
     # CHOICE (previously invisible — zero ledger ops) so post-mortems can audit
     # how a 3-way merge conflict was resolved before any block.
     "conflict_critic_decision",
+    # Step 5 (RECOVERY-CONTRACT §7 Part 4): the terminal ``block_task`` commit
+    # found the PlanManager's ledger unexpectedly empty/absent ("no plan
+    # initialized"). Audit-only attributable breadcrumb so the field-observed
+    # ``worker_exception: "no plan initialized"`` on the conflict→corrective path
+    # is never silent/misclassified. The block still re-raises (genuine state
+    # corruption stays loud); this op records WHERE. Payload:
+    # ``{task_id, failure_class, raw_error, err}``. Replay is a forensic no-op.
+    "block_path_plan_uninitialized",
 ]
 
 
@@ -1267,6 +1275,12 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # alongside by the retry/escalation FSM; replay is a no-op
         # forensic breadcrumb.
         "containment_violation_autodev_paths",
+        # Step 5 (RECOVERY-CONTRACT §7 Part 4): terminal-block ledger-absence
+        # breadcrumb. Audit-only — the block re-raises so a genuine corruption
+        # still surfaces; this op only records WHERE it happened. Replay is a
+        # forensic no-op (and is tolerated even when plan is None, since this op
+        # is precisely the empty-ledger case).
+        "block_path_plan_uninitialized",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.
@@ -1327,6 +1341,20 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
                     task.recovery_hint = _RecoveryHint.model_validate(raw_hint)
                 except Exception:  # noqa: BLE001 - tolerate legacy payloads
                     task.recovery_hint = None
+        # Step 5 (RECOVERY-CONTRACT §7 Part 3): replay the resolver guidance
+        # onto ``Task.metadata`` so a full ledger-replay (no-snapshot) path
+        # restores the same note the snapshot fast-path carries. Mirrors the
+        # write side in ``PlanManager.update_task_status``. Merge so other
+        # metadata keys survive; pre-Step-5 entries simply omit these keys.
+        for _mkey in ("resolver_note", "resolver_action"):
+            if _mkey not in payload:
+                continue
+            _new_md = dict(task.metadata or {})
+            if payload[_mkey] is None:
+                _new_md.pop(_mkey, None)
+            else:
+                _new_md[_mkey] = str(payload[_mkey])
+            task.metadata = _new_md
         return plan
 
     if op == "mark_blocked":

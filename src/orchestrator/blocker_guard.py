@@ -102,6 +102,35 @@ async def block_task(
         recovered = None
     if recovered is not None and getattr(recovered, "status", None) != "blocked":
         return recovered
-    return await orch.plan_manager.update_task_status(
-        task.id, "blocked", meta=meta or {}
-    )
+    try:
+        return await orch.plan_manager.update_task_status(
+            task.id, "blocked", meta=meta or {}
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Step 5 (RECOVERY-CONTRACT §7 Part 4) — defensive guard for the
+        # field-observed ``worker_exception: "no plan initialized; call init_plan
+        # first"`` on the conflict→corrective retry path (field-probes P5/P6). If
+        # the terminal block commit fails because the PlanManager's ledger is
+        # unexpectedly empty/absent, the un-guarded raise propagated up the worker
+        # handler and was MISCLASSIFIED as a fresh ``worker_exception`` (masking
+        # the real cause). We catch ONLY that specific "no plan initialized"
+        # signature, emit an attributable breadcrumb so the missing-ledger
+        # condition is never silent, and re-raise so a GENUINE state corruption is
+        # still loud — but now correctly attributed (``block_path.plan_uninitialized``)
+        # rather than surfacing as a spurious worker crash. The root mechanism was
+        # not reproducible deterministically (see report); this guard makes any
+        # recurrence diagnosable instead of self-masking.
+        if "no plan initialized" in str(exc):
+            try:
+                await orch.plan_manager.ledger_append(
+                    op="block_path_plan_uninitialized",
+                    payload={
+                        "task_id": task.id,
+                        "failure_class": failure_class,
+                        "raw_error": (raw_error or "")[:300],
+                        "err": str(exc)[:300],
+                    },
+                )
+            except Exception:  # noqa: BLE001 - breadcrumb best-effort; never mask
+                pass
+        raise

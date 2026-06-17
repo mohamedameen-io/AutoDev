@@ -293,5 +293,37 @@ async def test_conflict_path_emits_conflict_critic_decision(
     assert payload.get("conflict_files") == ["src/a.py", "src/b.py"]
     assert payload.get("rewrite_rounds") == 0
 
-    # The downstream block IS still recorded canonically (no silent dead-end).
-    assert_every_terminal_has_decision(tmp_path)
+    # No silent dead-end. Step 5 (structural-action recovery) changed the
+    # downstream outcome for CONFLICT_*: the resolver's ``re_architect`` now
+    # synthesizes a structured corrective direction → injects corrective tasks →
+    # the original task is RECOVERED (``skipped``) rather than terminally
+    # ``blocked``. So the conflict path is covered by EITHER channel:
+    #   * a terminal block recorded canonically (R1 invariant), OR
+    #   * a structural recovery (``blocker_escalated`` + ``resolution_outcome``
+    #     with outcome=recovered, and the task left non-terminal/``skipped``).
+    ops = [e.op for e in entries]
+    terminal_entries = [
+        e
+        for e in entries
+        if e.op == "update_task_status"
+        and e.payload.get("status") in TERMINAL_STATUSES
+    ]
+    if terminal_entries:
+        # A terminal block did happen — it must be canonically recorded.
+        assert_every_terminal_has_decision(tmp_path)
+    else:
+        # Structural recovery path: the conflict was escalated to the resolver
+        # and an outcome was recorded — no silent dead-end.
+        assert "blocker_escalated" in ops, (
+            f"conflict neither blocked nor escalated to the resolver (ops={ops})"
+        )
+        assert "resolution_outcome" in ops, (
+            f"conflict recovery did not record a resolution_outcome (ops={ops})"
+        )
+        # And the original task is non-terminal (recovered), not a dead-end.
+        plan_after = await orch.plan_manager.load()
+        assert plan_after is not None
+        recovered_task = plan_after.phases[0].tasks[0]
+        assert recovered_task.status != "blocked", (
+            f"expected structural recovery, got status={recovered_task.status}"
+        )

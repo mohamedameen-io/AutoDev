@@ -263,27 +263,16 @@ async def test_broken_control_disabled_resolver_reverts_no_shadow(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Step 5: structural-action inertness — for CONFLICT_3WAY_FAILED the "
-        "deterministic ladder picks re_architect, which emits a prose rationale; "
-        "parse_corrective_direction turns prose into 0 corrective tasks → "
-        "_resolver_corrective returns None → resolver declines → the task BLOCKS. "
-        "Step 4 only moves the chokepoint EARLIER (the resolver now REACHES the "
-        "conflict), but it cannot recover structurally until Step 5 makes "
-        "re_architect emit real corrective tasks. Until then status == 'blocked'."
-    ),
-)
 @pytest.mark.asyncio
 async def test_conflict_3way_resolver_recovers_structurally(
     tmp_path: Path,
 ) -> None:
-    """Step-5 carry-forward: a CONFLICT_3WAY_FAILED routed through the Step-4
-    chokepoint should be actively recovered (``status != 'blocked'``). RED on
-    Step-4 HEAD: the resolver REACHES the conflict but ``re_architect`` is inert
-    (prose → 0 corrective tasks → decline → block). Proves the
-    resolver-reaches-it-but-can't-recover-structurally gap that Step 5 closes."""
+    """Step-5 LIVE gate (xfail removed): a CONFLICT_3WAY_FAILED routed through the
+    Step-4 chokepoint is now ACTIVELY recovered (``status != 'blocked'``). Pre-Step-5
+    this was strict-xfail: the resolver REACHED the conflict but ``re_architect`` was
+    inert (prose → 0 corrective tasks → decline → block). Step 5 makes the structural
+    action synthesize a STRUCTURED bulleted direction so ``parse_corrective_direction``
+    yields >= 1 corrective task → the original task is skipped (not blocked)."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git_init(repo)

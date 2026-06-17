@@ -129,6 +129,21 @@ def test_blocker_key_no_task_id_uses_dash() -> None:
             ["narrow_scope", "re_plan"],
             "ask_human",
         ),
+        # Step 5 (Part 2): the 5 new Step-3 classes mapped to deterministic
+        # ladders (were None → LLM fallback). qa_gate_failed / tests_failed:
+        # retry_with_changes -> ask_human.
+        (fc.QA_GATE_FAILED, [], "retry_with_changes"),
+        (fc.QA_GATE_FAILED, ["retry_with_changes"], "ask_human"),
+        (fc.TESTS_FAILED, [], "retry_with_changes"),
+        (fc.TESTS_FAILED, ["retry_with_changes"], "ask_human"),
+        # review_rejected / review_malformed: retry_with_changes -> ask_human.
+        (fc.REVIEW_REJECTED, [], "retry_with_changes"),
+        (fc.REVIEW_REJECTED, ["retry_with_changes"], "ask_human"),
+        (fc.REVIEW_MALFORMED, [], "retry_with_changes"),
+        (fc.REVIEW_MALFORMED, ["retry_with_changes"], "ask_human"),
+        # review_escalated: consult_knowledge -> ask_human.
+        (fc.REVIEW_ESCALATED, [], "consult_knowledge"),
+        (fc.REVIEW_ESCALATED, ["consult_knowledge"], "ask_human"),
     ],
 )
 def test_deterministic_action_ladder(

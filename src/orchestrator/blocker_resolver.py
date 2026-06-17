@@ -148,6 +148,11 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
       * ``dag_invalid`` /
         ``cross_phase_dag_invalid`` -> re_plan -> ask_human
       * ``edit_scope_violation``  -> narrow_scope -> re_plan -> ask_human
+      * ``qa_gate_failed`` /
+        ``tests_failed``          -> retry_with_changes -> ask_human
+      * ``review_rejected`` /
+        ``review_malformed``      -> retry_with_changes -> ask_human
+      * ``review_escalated``      -> consult_knowledge -> ask_human
       * ``infra_circuit_open``    -> fall_through  (legacy quarantine is intentional)
 
     Returns ``None`` for any class not in the map — the novel-failure path the
@@ -382,6 +387,84 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
                 question=(
                     "Work keeps spilling outside the declared edit scope. Should the "
                     "scope be widened, or is the change touching the wrong module?"
+                ),
+            ),
+        ]
+    elif cls in (fc.QA_GATE_FAILED, fc.TESTS_FAILED):
+        # Step 5 (Part 2): the developer-side verification failures are
+        # RETRY-mappable (not structural). A QA gate / test failure that survived
+        # the in-loop retry budget gets ONE knowledge-informed retry through the
+        # resolver, then escalates to a human. Mapping them here makes recovery
+        # deterministic + testable (was None → LLM fallback).
+        ladder = [
+            _act(
+                "retry_with_changes",
+                rationale=(
+                    "a QA gate / test run failed past the in-loop retry budget: "
+                    "retry the implementation once more with the failure context "
+                    "spliced in before giving up."
+                ),
+            ),
+            _act(
+                "ask_human",
+                rationale=(
+                    "the QA gate / tests still fail after a context-informed retry; "
+                    "this is not mechanically recoverable — ask the operator."
+                ),
+                question=(
+                    "QA gate / tests keep failing after a retry. Is the test wrong, "
+                    "the fix wrong, or the environment broken?"
+                ),
+            ),
+        ]
+    elif cls in (fc.REVIEW_REJECTED, fc.REVIEW_MALFORMED):
+        # Reviewer-side failures: a rejected or malformed review is also
+        # retry-mappable — re-dispatch the developer with the review feedback,
+        # then escalate.
+        ladder = [
+            _act(
+                "retry_with_changes",
+                rationale=(
+                    "the reviewer rejected the change (or returned a malformed "
+                    "verdict): retry the implementation with the review feedback "
+                    "spliced in before escalating."
+                ),
+            ),
+            _act(
+                "ask_human",
+                rationale=(
+                    "the reviewer still rejects (or keeps returning malformed "
+                    "verdicts) after a feedback-informed retry — ask the operator "
+                    "to adjudicate the change or the reviewer signal."
+                ),
+                question=(
+                    "The reviewer keeps rejecting / returning malformed verdicts "
+                    "after a retry. Is the change wrong, or is the review signal "
+                    "unreliable?"
+                ),
+            ),
+        ]
+    elif cls == fc.REVIEW_ESCALATED:
+        # An explicitly-escalated review wants more context, not another blind
+        # retry: consult past-failure knowledge first, then ask the operator.
+        ladder = [
+            _act(
+                "consult_knowledge",
+                rationale=(
+                    "the reviewer escalated for a decision: consult past-failure "
+                    "memory for a known resolution on this signature before "
+                    "surfacing it to a human."
+                ),
+            ),
+            _act(
+                "ask_human",
+                rationale=(
+                    "no prior knowledge resolves the escalated review; it genuinely "
+                    "needs an operator decision — surface a precise question."
+                ),
+                question=(
+                    "The reviewer escalated this change for a decision and prior "
+                    "runs have no recorded resolution. What should happen?"
                 ),
             ),
         ]
