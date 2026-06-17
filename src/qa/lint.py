@@ -127,7 +127,12 @@ async def _run_eslint(cwd: Path, *, timeout_s: float) -> GateResult:
 
 
 async def _run_cargo_clippy(cwd: Path, *, timeout_s: float) -> GateResult:
-    return await _run_subprocess(["cargo", "clippy"], cwd, timeout_s=timeout_s, tool_name="cargo clippy")
+    # WS2-10: ``--workspace`` lints every member crate, not just the package in
+    # ``cwd``. A lone-package (non-workspace) repo is treated by cargo as a
+    # one-member workspace, so the flag is safe to pass unconditionally.
+    return await _run_subprocess(
+        ["cargo", "clippy", "--workspace"], cwd, timeout_s=timeout_s, tool_name="cargo clippy"
+    )
 
 
 async def _run_golangci_lint(cwd: Path, *, timeout_s: float) -> GateResult:

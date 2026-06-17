@@ -146,13 +146,60 @@ async def _run_nodejs_build(cwd: Path, *, timeout_s: float) -> GateResult:
             return await _run_subprocess(
                 ["npm", "run", "build"], cwd, timeout_s=timeout_s, tool_name="npm build"
             )
-    return await _run_subprocess(
-        ["npx", "tsc", "--noEmit"], cwd, timeout_s=timeout_s, tool_name="tsc"
-    )
+
+    # WS2-9: only run ``tsc`` when a tsconfig.json exists. Config-less ``tsc``
+    # compiles every .js it can find and fails on perfectly valid JS-only repos
+    # (e.g. ``error TS18003: No inputs were found``), so without a tsconfig it
+    # would FALSE-BLOCK. No tsconfig → skip the tsc step (a pass, not a block).
+    if not (cwd / "tsconfig.json").exists():
+        return GateResult(
+            passed=True,
+            details="no tsconfig.json — skipping tsc (no type-check configured)",
+        )
+
+    # Resolve ``tsc`` from node_modules/.bin first (the project-pinned version),
+    # falling back to ``npx tsc`` only when no local binary is installed.
+    local_tsc = cwd / "node_modules" / ".bin" / "tsc"
+    if local_tsc.exists():
+        tsc_cmd = [str(local_tsc), "--noEmit"]
+    else:
+        tsc_cmd = ["npx", "tsc", "--noEmit"]
+    return await _run_subprocess(tsc_cmd, cwd, timeout_s=timeout_s, tool_name="tsc")
+
+
+def _is_virtual_workspace_manifest(cargo_toml: Path) -> bool:
+    """Return True for a *virtual* workspace manifest ([workspace], no [package]).
+
+    A virtual manifest has no package to build, so ``cargo check`` without
+    ``--workspace`` errors out. Detection is a lightweight text scan (avoids a
+    TOML dependency) for a ``[workspace]`` table header with no ``[package]``.
+    """
+    try:
+        text = cargo_toml.read_text()
+    except OSError:
+        return False
+    has_workspace = False
+    has_package = False
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("[workspace]") or stripped.startswith("[workspace."):
+            has_workspace = True
+        elif stripped == "[package]" or stripped.startswith("[package."):
+            has_package = True
+    return has_workspace and not has_package
 
 
 async def _run_cargo_check(cwd: Path, *, timeout_s: float) -> GateResult:
-    return await _run_subprocess(["cargo", "check"], cwd, timeout_s=timeout_s, tool_name="cargo check")
+    # WS2-10: pass ``--workspace`` so a workspace-root repo checks every member
+    # rather than false-blocking. A virtual manifest ([workspace] without
+    # [package]) *requires* it; for an ordinary package it is harmless and still
+    # checks the whole workspace it belongs to.
+    args = ["cargo", "check", "--workspace"]
+    if _is_virtual_workspace_manifest(cwd / "Cargo.toml"):
+        tool_name = "cargo check (workspace)"
+    else:
+        tool_name = "cargo check"
+    return await _run_subprocess(args, cwd, timeout_s=timeout_s, tool_name=tool_name)
 
 
 async def _run_go_build(cwd: Path, *, timeout_s: float) -> GateResult:

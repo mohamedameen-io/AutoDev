@@ -65,10 +65,24 @@ async def run_tests(
         "nodejs": _run_npm_test,
         "rust": _run_cargo_test,
         "go": _run_go_test,
+        "java": _run_java_test,
     }
     runner = runners.get(lang)
     if runner is None:
-        return GateResult(passed=True, details=f"no test runner configured for language={lang!r}, skipping")
+        # SAFE-DEGRADE languages (dotnet/ruby/swift/cpp/…) are NOT first-class:
+        # AutoDev does not drive their test toolchains here. Phase-1B convention
+        # for "unknown, not clean" applies — degrade LOUD (passed=False + an
+        # ``unsupported_language`` marker) so the resolver treats it as blocking
+        # rather than a silent vacuous green. severity stays the default 'block'.
+        return GateResult(
+            passed=False,
+            details=(
+                f"no first-class test runner for language={lang!r}: "
+                "unsupported toolchain (unsupported_language — degraded loud, "
+                "not a clean pass)"
+            ),
+            metrics={"unsupported_language": True, "language": lang},
+        )
     return await runner(cwd, timeout_s=timeout_s)  # type: ignore[operator]
 
 
@@ -92,6 +106,9 @@ _ZERO_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bcollected 0 items\b", re.IGNORECASE),
     re.compile(r"\[no test files\]", re.IGNORECASE),  # go test
     re.compile(r"\bno test files\b", re.IGNORECASE),
+    # Maven surefire / Gradle summary that affirmatively ran zero tests.
+    re.compile(r"\bTests run:\s*0\b", re.IGNORECASE),  # surefire: "Tests run: 0"
+    re.compile(r"\b0 tests completed\b", re.IGNORECASE),  # gradle
 )
 # Positive "tests actually ran" tokens. Their presence overrides a coincidental
 # zero-token (e.g. "0 failed, 5 passed").
@@ -101,6 +118,10 @@ _RAN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bcollected ([1-9]\d*) items?\b", re.IGNORECASE),
     re.compile(r"^ok\s", re.IGNORECASE | re.MULTILINE),  # go: "ok  pkg  0.5s"
     re.compile(r"\bok\b.*\bcoverage\b", re.IGNORECASE),
+    # Maven surefire: "Tests run: 5, Failures: 0, ..." (>=1 ran).
+    re.compile(r"\bTests run:\s*([1-9]\d*)\b", re.IGNORECASE),
+    # Gradle: "5 tests completed".
+    re.compile(r"\b([1-9]\d*) tests? completed\b", re.IGNORECASE),
 )
 
 
@@ -142,6 +163,8 @@ def _has_source(cwd: Path, language: str | None) -> bool:
         suffixes = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
     elif language == "rust":
         suffixes = (".rs",)
+    elif language == "java":
+        suffixes = (".java", ".kt")
     else:
         suffixes = ()
     if not suffixes:
@@ -253,8 +276,13 @@ async def _run_npm_test(cwd: Path, *, timeout_s: float) -> GateResult:
 
 
 async def _run_cargo_test(cwd: Path, *, timeout_s: float) -> GateResult:
+    # WS2-10: ``--workspace`` runs every member crate's tests. Without it a
+    # workspace-ROOT repo (a *virtual* manifest: ``[workspace]`` with no
+    # ``[package]``) false-fails because the root has no tests of its own.
+    # ``--workspace`` is a harmless no-op on a single-package crate, so it is
+    # always added rather than gated on manifest sniffing.
     return await _run_subprocess(
-        ["cargo", "test"],
+        ["cargo", "test", "--workspace"],
         cwd,
         timeout_s=timeout_s,
         tool_name="cargo test",
@@ -269,6 +297,41 @@ async def _run_go_test(cwd: Path, *, timeout_s: float) -> GateResult:
         timeout_s=timeout_s,
         tool_name="go test",
         scope_nonempty=_has_source(cwd, "go"),
+    )
+
+
+def _java_test_command(cwd: Path) -> tuple[list[str], str]:
+    """Return ``(argv, tool_name)`` for the java test runner in *cwd*.
+
+    Maven (``pom.xml``) → ``mvn -q test``. Otherwise Gradle, preferring the
+    repo's ``./gradlew`` wrapper (Maven/Gradle convention) over a bare
+    ``gradle`` on PATH. ``build.gradle`` *and* ``build.gradle.kts`` count.
+    Defaults to Maven when neither manifest is present (the detector already
+    proved this is a java repo).
+    """
+    if (cwd / "pom.xml").exists():
+        return (["mvn", "-q", "test"], "mvn test")
+    wrapper = cwd / "gradlew"
+    if wrapper.exists():
+        return ([str(wrapper), "test"], "gradlew test")
+    if (cwd / "build.gradle").exists() or (cwd / "build.gradle.kts").exists():
+        return (["gradle", "test"], "gradle test")
+    # No recognisable manifest — fall back to Maven; a missing binary will
+    # degrade LOUD via the toolchain-missing path.
+    return (["mvn", "-q", "test"], "mvn test")
+
+
+async def _run_java_test(cwd: Path, *, timeout_s: float) -> GateResult:
+    # WS2-3: java is first-class. Maven surefire ("Tests run: N, …") and Gradle
+    # ("N tests completed") run-counts are recognised by the shared classifier,
+    # so a non-empty java scope that runs 0 tests fails LOUD (no_test_coverage).
+    args, tool_name = _java_test_command(cwd)
+    return await _run_subprocess(
+        args,
+        cwd,
+        timeout_s=timeout_s,
+        tool_name=tool_name,
+        scope_nonempty=_has_source(cwd, "java"),
     )
 
 

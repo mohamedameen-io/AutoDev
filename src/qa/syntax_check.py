@@ -10,6 +10,7 @@ an informational message rather than crashing the orchestrator.
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sys
 from pathlib import Path
 
@@ -108,21 +109,68 @@ async def _python_syntax_check(cwd: Path, *, timeout_s: float) -> GateResult:
     return GateResult(passed=True, details=f"syntax ok ({len(py_files)} files)")
 
 
-async def _nodejs_syntax_check(cwd: Path, *, timeout_s: float) -> GateResult:
-    """Check JS files using ``node --check``.
+# Plain-JavaScript extensions that ``node --check`` can parse directly.
+_NODE_JS_EXTS = (".js", ".mjs", ".cjs")
+# TypeScript / JSX extensions that ``node --check`` CANNOT parse (it rejects
+# valid type annotations and JSX) — these need a TS-aware compiler.
+_TS_EXTS = (".ts", ".tsx", ".jsx", ".mts", ".cts")
+_EXCLUDED_DIR_PARTS = ("node_modules", ".venv")
 
-    Note: ``node --check`` only parses plain JavaScript; TypeScript files are
-    intentionally excluded because Node cannot parse TS syntax directly.
+
+def _collect_node_files(cwd: Path, exts: tuple[str, ...]) -> list[str]:
+    """Return source files under *cwd* whose suffix is in *exts*, skipping vendored dirs."""
+    out: list[str] = []
+    for ext in exts:
+        out.extend(
+            str(p)
+            for p in cwd.rglob(f"*{ext}")
+            if not any(part in _EXCLUDED_DIR_PARTS for part in p.parts)
+        )
+    return out
+
+
+def _resolve_tsc(cwd: Path) -> list[str] | None:
+    """Return the argv prefix to invoke ``tsc`` for the repo at *cwd*, or ``None``.
+
+    Cascade (first match wins):
+
+    * ``node_modules/.bin/tsc`` exists → run the project-local compiler.
+    * ``npx`` on PATH → ``npx --no-install tsc`` (uses a local/cached tsc only;
+      never auto-installs, so the check is deterministic and offline-safe).
+    * otherwise → ``None`` (no TS toolchain resolvable → caller degrades LOUD).
     """
-    js_files = [
-        str(p)
-        for p in cwd.rglob("*.js")
-        if "node_modules" not in p.parts and ".venv" not in p.parts
-    ]
-    if not js_files:
-        return GateResult(passed=True, details="no .js files found")
+    local_tsc = cwd / "node_modules" / ".bin" / "tsc"
+    if local_tsc.exists():
+        return [str(local_tsc)]
+    if shutil.which("npx"):
+        return ["npx", "--no-install", "tsc"]
+    return None
+
+
+async def _nodejs_syntax_check(cwd: Path, *, timeout_s: float) -> GateResult:
+    """Syntax-check a Node/TypeScript project.
+
+    Plain JavaScript (``.js``/``.mjs``/``.cjs``) is parsed with ``node --check``.
+    TypeScript and JSX (``.ts``/``.tsx``/``.jsx``/``.mts``/``.cts``) cannot be
+    parsed by ``node --check`` — Node rejects valid type annotations and JSX —
+    so they are checked with ``tsc --noEmit``.
+
+    WS2-8: a pure-TypeScript repo (only ``.ts`` files, no ``.js``) previously
+    produced a *vacuous* "no .js files found" pass — a real TS syntax error
+    sailed through undetected. Now TS files are caught, and when TS files exist
+    but no ``tsc`` is resolvable the gate degrades LOUD (``passed=False`` with a
+    ``skipped_toolchain_missing`` signal) rather than vacuous-passing.
+    """
+    js_files = _collect_node_files(cwd, _NODE_JS_EXTS)
+    ts_files = _collect_node_files(cwd, _TS_EXTS)
+
+    if not js_files and not ts_files:
+        return GateResult(passed=True, details="no JS/TS files found")
 
     errors: list[str] = []
+    checked = 0
+
+    # --- Plain JavaScript via ``node --check`` --------------------------------
     for js_file in js_files:
         try:
             proc = await asyncio.wait_for(
@@ -142,12 +190,58 @@ async def _nodejs_syntax_check(cwd: Path, *, timeout_s: float) -> GateResult:
         except asyncio.TimeoutError:
             return GateResult(passed=False, details="syntax check timed out")
 
+        checked += 1
         if proc.returncode != 0:
             errors.append(stderr.decode(errors="replace").strip())
 
+    # --- TypeScript / JSX via ``tsc --noEmit`` --------------------------------
+    if ts_files:
+        tsc = _resolve_tsc(cwd)
+        if tsc is None:
+            # Phase-1B degrade-LOUD: a missing TS compiler is *unknown*, not
+            # *clean* — never a vacuous pass for a repo that has .ts files.
+            return GateResult(
+                passed=False,
+                details=(
+                    f"{len(ts_files)} TypeScript file(s) present but no tsc resolvable: "
+                    "syntax toolchain missing (skipped_toolchain_missing)"
+                ),
+                metrics={"skipped_toolchain_missing": True, "tool": "tsc"},
+            )
+        try:
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *tsc,
+                    "--noEmit",
+                    *ts_files,
+                    cwd=cwd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                ),
+                timeout=timeout_s,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except FileNotFoundError:
+            # npx/tsc binary vanished between resolve and exec → degrade LOUD.
+            return GateResult(
+                passed=False,
+                details=(
+                    f"{len(ts_files)} TypeScript file(s) present but tsc not runnable: "
+                    "syntax toolchain missing (skipped_toolchain_missing)"
+                ),
+                metrics={"skipped_toolchain_missing": True, "tool": "tsc"},
+            )
+        except asyncio.TimeoutError:
+            return GateResult(passed=False, details="syntax check timed out")
+
+        checked += len(ts_files)
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace").strip() or stdout.decode(errors="replace").strip()
+            errors.append(err)
+
     if errors:
         return GateResult(passed=False, details="syntax errors:\n" + "\n".join(errors))
-    return GateResult(passed=True, details=f"syntax ok ({len(js_files)} files)")
+    return GateResult(passed=True, details=f"syntax ok ({checked} files)")
 
 
 __all__ = ["run_syntax_check"]

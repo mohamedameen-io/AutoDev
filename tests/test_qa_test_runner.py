@@ -27,9 +27,14 @@ async def test_run_tests_no_language(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_run_tests_unknown_language(tmp_path: Path) -> None:
+    # WS2-3 golden-baseline shift (feature-now-active): an unsupported /
+    # SAFE-DEGRADE language used to silent-pass (passed=True, "skipping"). Per
+    # the cross-cutting degrade-loud convention it now degrades LOUD —
+    # passed=False + an ``unsupported_language`` marker — so the resolver
+    # treats "we can't run this toolchain" as blocking, not a clean green.
     result = await run_tests(tmp_path, language="cobol")
-    assert result.passed
-    assert "skipping" in result.details
+    assert not result.passed
+    assert result.metrics.get("unsupported_language") is True
 
 
 @pytest.mark.asyncio

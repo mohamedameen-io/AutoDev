@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import re
+import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -1621,6 +1622,18 @@ _DEFAULT_RESOLVER_ACTIONS: tuple[str, ...] = (
 )
 
 
+# Loop-safety backstop (B5) storage. Keyed on the orchestrator INSTANCE via a
+# module-level ``WeakKeyDictionary`` so the per-(task, failure_class) cycle
+# counter survives even when the orch refuses ``setattr`` (``__slots__`` orchs,
+# attribute-guarded stubs). WeakKeyDictionary so a finished orchestrator is GC'd
+# without leaking its counter. This replaces the prior ephemeral pattern where a
+# swallowed ``setattr`` failure dropped the guard on the floor (a fresh ``{}``
+# every call → the cap never bound → the resolver could re-loop unboundedly).
+_RESOLVER_CYCLE_COUNTS: "weakref.WeakKeyDictionary[object, dict[str, int]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
 def _prior_resolution_actions(
     orch: "Orchestrator", task_id: str | None, fclass: str
 ) -> list[str]:
@@ -2006,22 +2019,25 @@ async def _maybe_resolve_blocker(
     # unboundedly. This counter guarantees the chokepoint stops recovering and
     # falls through to the legacy block after ``max_cycles_per_blocker`` hits,
     # regardless of ledger state.
-    try:
-        max_cycles = int(getattr(rcfg, "max_cycles_per_blocker", 3))
-        guard_key = f"{task.id if task is not None else '-'}:{failure_class}"
-        counts = getattr(orch, "_resolver_cycle_counts", None)
-        if counts is None:
-            counts = {}
-            try:
-                orch._resolver_cycle_counts = counts  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                counts = {}
-        if counts.get(guard_key, 0) >= max_cycles:
-            return None
-        counts[guard_key] = counts.get(guard_key, 0) + 1
-    except Exception:  # noqa: BLE001
-        pass
+    max_cycles = int(getattr(rcfg, "max_cycles_per_blocker", 3))
+    guard_key = f"{task.id if task is not None else '-'}:{failure_class}"
+    # Backstop storage: a module-level WeakKeyDictionary keyed on the orch
+    # INSTANCE. This survives even if the orch refuses ``setattr`` — the prior
+    # ``setattr(orch, "_resolver_cycle_counts", {})`` with a swallowed failure
+    # silently dropped the guard (a fresh ``{}`` every call → the cap never
+    # bound → unbounded re-loop). No ``except: pass``: the WeakKeyDictionary
+    # write cannot fail for a hashable orch, and the counter is the loop-safety
+    # invariant — a swallowed failure here is exactly the bug being closed.
+    counts = _RESOLVER_CYCLE_COUNTS.get(orch)
+    if counts is None:
+        counts = {}
+        _RESOLVER_CYCLE_COUNTS[orch] = counts
+    if counts.get(guard_key, 0) >= max_cycles:
+        return None
+    counts[guard_key] = counts.get(guard_key, 0) + 1
 
+    # Build the BlockerContext (cheap, local-helper reads; best-effort — a
+    # failure here is a pure fall-through, no visibility op needed).
     try:
         from orchestrator import blocker_resolver as _br
         from orchestrator import failure_classes as _fc
@@ -2045,6 +2061,21 @@ async def _maybe_resolve_blocker(
             evidence_refs=evidence_refs or [],
             available_actions=list(_DEFAULT_RESOLVER_ACTIONS),
         )
+    except Exception as exc:  # noqa: BLE001 - resolver must never break the loop
+        logger.warning(
+            "execute_phase.resolver_context_build_failed",
+            failure_class=failure_class,
+            err=str(exc),
+        )
+        return None
+
+    # Dispatch into the resolver. WS3 fix: a dispatch failure must NOT be a
+    # silent fall-through — resolver inertness has to be visible. Emit exactly
+    # one ``blocker_escalated`` op marked ``dispatch_failed`` (so a post-mortem
+    # can see the resolver was reached but failed to act) BEFORE falling through
+    # to the caller's legacy block. The ``except`` is scoped to the single
+    # ``resolve_blocker`` await — no broader than the dispatch it guards.
+    try:
         action = await _br.resolve_blocker(orch, ctx)
     except Exception as exc:  # noqa: BLE001 - resolver must never break the loop
         logger.warning(
@@ -2052,6 +2083,24 @@ async def _maybe_resolve_blocker(
             failure_class=failure_class,
             err=str(exc),
         )
+        try:
+            await orch.plan_manager.ledger_append(
+                op="blocker_escalated",
+                payload={
+                    "task_id": task_id,
+                    "phase_id": ph,
+                    "failure_class": fclass,
+                    "failing_role": failing_role,
+                    "raw_error_excerpt": str(exc)[:500],
+                    "source": "dispatch_failed",
+                },
+            )
+        except Exception as crumb_exc:  # noqa: BLE001 - crumb must not mask the loop
+            logger.warning(
+                "execute_phase.ledger_append_failed",
+                op="blocker_escalated",
+                err=str(crumb_exc),
+            )
         return None
 
     try:
@@ -6042,9 +6091,10 @@ async def _try_retry_or_escalate(
     #
     # Termination: re-dispatching a still-failing developer re-enters this helper,
     # which consults the resolver AGAIN — but ``_maybe_resolve_blocker`` enforces a
-    # per-(task, failure_class) cycle cap (the in-memory ``_resolver_cycle_counts``
-    # backstop + the resume-safe ledger budget). After ``max_cycles_per_blocker``
-    # hits the chokepoint returns None → falls through to ``next_step`` → the
+    # per-(task, failure_class) cycle cap (the in-memory ``_RESOLVER_CYCLE_COUNTS``
+    # WeakKeyDictionary backstop + the resume-safe ledger budget). After
+    # ``max_cycles_per_blocker`` hits the chokepoint returns None → falls through
+    # to ``next_step`` → the
     # legacy terminal block. The loop is therefore BOUNDED; no new uncapped loop is
     # introduced.
     #

@@ -10,6 +10,7 @@ import pytest
 from adapters.types import AgentResult
 from agents import build_registry
 from config.defaults import default_config
+from config.schema import QAGatesConfig
 from orchestrator import Orchestrator
 
 from stub_adapter import StubAdapter, ok
@@ -76,6 +77,26 @@ async def test_lesson_recorded_by_store_is_injected_into_next_coder_call(
     cfg.hive.path = tmp_path / "hive.jsonl"
     # Dial down promotion thresholds so we don't inadvertently promote.
     cfg.knowledge.promotion_min_confirmations = 99
+    # This test asserts the lesson→coder-prompt injection happens on the FIRST
+    # (and only) developer call. The repo is a manifest-less python repo (just
+    # ``math.py``), which the weighted ``qa/detect.py`` now correctly classifies
+    # as python — so the real ``qa/test_runner.py`` gate would run pytest, find
+    # 0 tests (the StubAdapter never materializes a test file in the worktree),
+    # fail loud via Phase-1B's WS2-2 non-vacuity check, and trigger retries —
+    # making the developer be invoked >1 time and breaking the single-injection
+    # assertion. That gate is correct product behavior and has dedicated
+    # coverage in ``tests/test_qa_test_runner.py``; this test is about the
+    # lesson-injection flow, so disable the environment-tooling gates (mirrors
+    # ``tests/integration/test_e2e_pipeline_full.py``).
+    cfg.qa_gates = QAGatesConfig(
+        syntax_check=False,
+        lint=False,
+        build_check=False,
+        test_runner=False,
+        secretscan=False,
+        sast_scan=False,
+        mutation_test=False,
+    )
 
     registry = build_registry(cfg)
     adapter = StubAdapter(

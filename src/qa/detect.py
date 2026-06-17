@@ -1,57 +1,199 @@
 """Language and toolchain detection for QA gates.
 
-Detects the primary language of a project by inspecting manifest files in the
-given working directory. Returns ``None`` when no known manifest is found.
+Detects the primary language of a project by inspecting manifest files and
+source extensions in the given working directory. Returns ``None`` when no
+known signal is found.
+
+v1.0 (Phase 2, WS2-4 / WS2-12): detection is now **weighted** rather than
+first-match. A polyglot / monorepo repo returns the *dominant* language by
+combined manifest + source weight, not whichever manifest happened to be
+checked first. The scan also descends into subdirectories so monorepos whose
+manifests live under ``services/`` / ``web/`` are detected (root-only first-
+match missed those entirely). Gradle-Kotlin / wrapper builds
+(``build.gradle.kts`` / ``settings.gradle[.kts]`` / ``gradlew``) are now
+recognised as ``java``.
+
+The output vocabulary is deliberately the *detection* vocabulary
+(``python`` / ``nodejs`` / ``rust`` / ``go`` / ``java`` / ``dotnet`` /
+``ruby`` / ``swift`` / ``cpp``) that the downstream QA runners
+(:mod:`qa.test_runner`, :mod:`qa.build_check`) key off — NOT the finer-grained
+``typescript`` / ``javascript`` split that :mod:`runtime.language_profile`
+uses for indexing. Extension weights below are aligned with
+``runtime.language_profile.EXTENSION_WEIGHTS`` but collapsed into this
+coarser vocabulary.
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
+
+from runtime.repo_probe import iter_repo_files
+
+# Per-extension (detection-language, weight). Aligned with
+# ``runtime.language_profile.EXTENSION_WEIGHTS`` but collapsed into the
+# detection vocabulary: ``typescript`` / ``javascript`` → ``nodejs`` and
+# ``c`` → ``cpp`` (the QA runners have no separate C path). A single ``.py``
+# (weight 100) outvotes a single ``.go`` / ``.rs`` (weight 50) — denser
+# signal per file — which keeps the single-file/manifest-only golden cases
+# resolving the same way they did under first-match.
+_EXTENSION_WEIGHTS: dict[str, tuple[str, int]] = {
+    ".ts": ("nodejs", 50),
+    ".tsx": ("nodejs", 50),
+    ".js": ("nodejs", 40),
+    ".jsx": ("nodejs", 40),
+    ".mjs": ("nodejs", 30),
+    ".cjs": ("nodejs", 30),
+    ".py": ("python", 100),
+    ".cpp": ("cpp", 80),
+    ".cc": ("cpp", 80),
+    ".cxx": ("cpp", 80),
+    ".h": ("cpp", 60),
+    ".hpp": ("cpp", 60),
+    ".c": ("cpp", 80),
+    ".java": ("java", 70),
+    ".kt": ("java", 70),
+    ".kts": ("java", 70),
+    ".go": ("go", 50),
+    ".rs": ("rust", 50),
+    ".cs": ("dotnet", 60),
+    ".rb": ("ruby", 50),
+    ".swift": ("swift", 50),
+}
+
+# Per-manifest (detection-language, weight). Manifests are a *strong* signal
+# (much heavier than any single source file) because their presence is a
+# deliberate declaration of the project's primary toolchain. The relative
+# weights also encode the precedence that the legacy first-match order used
+# to express, so the existing golden cases still resolve identically:
+#
+#   * dotnet (``*.csproj`` / ``*.sln`` carries a ``.csproj``) beats the
+#     lower-precedence cpp ``*.sln`` / ``*.vcxproj`` signal.
+#   * python / nodejs / java manifests beat a co-located CMake tree.
+#   * cpp project/CMake signals sit lowest, just above raw extension counts.
+#
+# A manifest contributes its weight ONCE regardless of how many copies exist
+# in the tree (counting copies would let a monorepo's many ``package.json``
+# shards drown out an otherwise-dominant language); source *extensions* carry
+# the per-file volume signal instead.
+_MANIFEST_WEIGHTS: dict[str, tuple[str, int]] = {
+    # python manifests carry a hair MORE weight than the other manifests so
+    # an *ambiguous*, source-free polyglot repo (bare ``pyproject.toml`` +
+    # ``package.json``, no source files) resolves to ``python`` — matching
+    # the legacy golden default. Real source volume (a single ``.ts`` adds
+    # 50, a ``.py`` adds 100) still overrides this nudge, so a JS-dominated
+    # tree correctly flips to ``nodejs`` (that is the whole point of WS2-4).
+    "pyproject.toml": ("python", 1010),
+    "setup.py": ("python", 1010),
+    "package.json": ("nodejs", 1000),
+    "Cargo.toml": ("rust", 1000),
+    "go.mod": ("go", 1000),
+    "pom.xml": ("java", 1000),
+    "build.gradle": ("java", 1000),
+    # WS2-12: Gradle-Kotlin DSL + settings + wrapper. A modern Gradle
+    # project may ship ONLY these (no ``build.gradle`` / ``pom.xml``).
+    "build.gradle.kts": ("java", 1000),
+    "settings.gradle": ("java", 1000),
+    "settings.gradle.kts": ("java", 1000),
+    "gradlew": ("java", 1000),
+    "Gemfile": ("ruby", 1000),
+    # cpp signals sit BELOW dotnet so a ``*.sln`` accompanying a ``*.csproj``
+    # does not steal the win (see ``*.csproj`` glob below).
+    "CMakeLists.txt": ("cpp", 300),
+}
+
+# Manifests matched by glob rather than exact name. Same one-shot weighting.
+# ``*.csproj`` (dotnet) outweighs the cpp ``*.sln`` / ``*.vcxproj`` so a .NET
+# solution (which carries both) resolves to dotnet, matching the legacy
+# precedence.
+_MANIFEST_GLOBS: tuple[tuple[str, str, int], ...] = (
+    ("*.csproj", "dotnet", 1000),
+    ("*.swift", "swift", 500),
+    ("*.sln", "cpp", 300),
+    ("*.vcxproj", "cpp", 300),
+)
+
+
+def _score_languages(cwd: Path) -> dict[str, float]:
+    """Return a ``{detection-language: weight}`` map for the repo at *cwd*.
+
+    Combines one-shot manifest signals (strong, presence-based) with
+    per-file source-extension signals (volume-based), scanning the whole
+    tree so monorepo subdir manifests are seen too. An empty map means no
+    known signal was found.
+    """
+    scores: dict[str, float] = defaultdict(float)
+
+    # Manifest + source-extension signals, in a single pass over the tree.
+    seen_manifests: set[str] = set()
+    seen_globs: set[str] = set()
+    for fp in iter_repo_files(cwd):
+        name = fp.name
+        # 1) Manifest signal (one-shot per manifest kind, anywhere in tree).
+        info = _MANIFEST_WEIGHTS.get(name)
+        if info is not None and name not in seen_manifests:
+            lang, weight = info
+            scores[lang] += float(weight)
+            seen_manifests.add(name)
+        suffix = fp.suffix.lower()
+        for pattern, glang, gweight in _MANIFEST_GLOBS:
+            ext = pattern[1:]  # ``*.csproj`` -> ``.csproj``
+            if suffix == ext and pattern not in seen_globs:
+                scores[glang] += float(gweight)
+                seen_globs.add(pattern)
+        # 2) Source-extension volume signal.
+        ext_info = _EXTENSION_WEIGHTS.get(suffix)
+        if ext_info is not None:
+            elang, eweight = ext_info
+            scores[elang] += float(eweight)
+
+    return dict(scores)
+
+
+def _neg_key(lang: str) -> tuple[int, ...]:
+    """Tie-break key: smaller (earlier-alphabetical) names sort *higher*.
+
+    ``max`` wants the larger key to win; we want the alphabetically-earliest
+    language to win ties, so invert each codepoint.
+    """
+    return tuple(-ord(ch) for ch in lang)
 
 
 def detect_language(cwd: Path) -> str | None:
-    """Return the primary language of the project rooted at *cwd*.
+    """Return the primary (dominant) language of the project rooted at *cwd*.
 
-    Detection order (first match wins):
+    Detection is **weighted**: every manifest and source file in the tree
+    contributes to a per-language score and the highest-scoring language
+    wins. Manifests dominate single source files, so a manifest-only repo
+    still resolves to that manifest's language; a polyglot repo carrying two
+    manifests (e.g. ``pyproject.toml`` AND ``package.json``) resolves to the
+    language whose *source* dominates.
 
-    * ``pyproject.toml`` or ``setup.py`` → ``"python"``
-    * ``package.json`` → ``"nodejs"``
-    * ``Cargo.toml`` → ``"rust"``
-    * ``go.mod`` → ``"go"``
-    * ``pom.xml`` or ``build.gradle`` → ``"java"``
-    * ``*.csproj`` → ``"dotnet"``
-    * ``Gemfile`` → ``"ruby"``
+    Recognised manifests / extensions (collapsed to the QA-runner
+    vocabulary):
+
+    * ``pyproject.toml`` / ``setup.py`` / ``*.py`` → ``"python"``
+    * ``package.json`` / ``*.ts`` / ``*.js`` / ... → ``"nodejs"``
+    * ``Cargo.toml`` / ``*.rs`` → ``"rust"``
+    * ``go.mod`` / ``*.go`` → ``"go"``
+    * ``pom.xml`` / ``build.gradle`` / ``build.gradle.kts`` /
+      ``settings.gradle[.kts]`` / ``gradlew`` / ``*.java`` / ``*.kt`` →
+      ``"java"``
+    * ``*.csproj`` / ``*.cs`` → ``"dotnet"``
+    * ``Gemfile`` / ``*.rb`` → ``"ruby"``
     * ``*.swift`` → ``"swift"``
-    * ``*.sln`` / ``*.vcxproj`` → ``"cpp"`` (lowest precedence)
-    * ``CMakeLists.txt`` → ``"cpp"`` (lowest precedence)
+    * ``CMakeLists.txt`` / ``*.sln`` / ``*.vcxproj`` / ``*.cpp`` / ... →
+      ``"cpp"`` (lowest manifest precedence)
 
-    Returns ``None`` when no manifest is found.
+    Ties are broken deterministically by language name (alphabetical) so the
+    result is stable; in practice manifest weights make ties between
+    distinct manifests impossible. Returns ``None`` when no signal is found.
     """
-    if (cwd / "pyproject.toml").exists() or (cwd / "setup.py").exists():
-        return "python"
-    if (cwd / "package.json").exists():
-        return "nodejs"
-    if (cwd / "Cargo.toml").exists():
-        return "rust"
-    if (cwd / "go.mod").exists():
-        return "go"
-    if (cwd / "pom.xml").exists() or (cwd / "build.gradle").exists():
-        return "java"
-    if list(cwd.glob("*.csproj")):
-        return "dotnet"
-    if (cwd / "Gemfile").exists():
-        return "ruby"
-    if list(cwd.glob("*.swift")):
-        return "swift"
-    # v0.39.0 (Cluster A2): C++/CMake at the LOWEST precedence. A .NET
-    # solution also carries a ``*.sln``, and Python/Node repos may sit
-    # alongside a CMake tree — both must keep winning, so these checks
-    # come last, just before the final ``return None``.
-    if list(cwd.glob("*.sln")) or list(cwd.glob("*.vcxproj")):
-        return "cpp"
-    if (cwd / "CMakeLists.txt").exists():
-        return "cpp"
-    return None
+    scores = _score_languages(cwd)
+    if not scores:
+        return None
+    # max() picks the highest score; tie-break alphabetically for determinism.
+    return max(scores, key=lambda lang: (scores[lang], _neg_key(lang)))
 
 
 def detect_toolchain(cwd: Path) -> str | None:
@@ -83,28 +225,48 @@ def detect_toolchain(cwd: Path) -> str | None:
     }
     if language is None:
         return None
-    # For java, prefer gradle when build.gradle is present.
-    if language == "java" and (cwd / "build.gradle").exists():
+    # For java, prefer gradle when ANY gradle marker is present (Groovy or
+    # Kotlin DSL, settings file, or the wrapper). pom.xml-only stays maven.
+    if language == "java" and _has_gradle_marker(cwd):
         return "gradle"
     return _toolchain_map.get(language)
 
 
-# v0.39.0 (Cluster A2): languages whose tests AutoDev can actually build
-# and run in-environment. A *detected* language outside this set (e.g.
-# ``"cpp"``, which requires a configured native toolchain we don't drive)
-# means "tests are not runnable here" → the huge-repo profile / runtime
-# fallback can soft-pass an infra-class capture failure rather than treat
-# it as a code defect. Kept deliberately separate from ``detect_language``
-# so ``"cpp"`` stays useful for indexing / sparse logic.
+def _has_gradle_marker(cwd: Path) -> bool:
+    """True when *cwd* carries any Gradle build marker (root-level)."""
+    return any(
+        (cwd / marker).exists()
+        for marker in (
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "gradlew",
+        )
+    )
+
+
+# v1.0 (Phase 2, WS2-3 coordination): languages whose tests AutoDev can
+# actually BUILD AND RUN in-environment. A *detected* language outside this
+# set means "tests are not runnable here" → the huge-repo profile / runtime
+# fallback degrades LOUD (no_test_coverage / skipped_toolchain_missing)
+# rather than silently soft-passing an infra-class capture failure.
+#
+# FIRST-CLASS = {python, nodejs, go, rust, java}. These have working runners
+# in :mod:`qa.test_runner` (pytest / npm / cargo / go) and java is wired as a
+# coordinated first-class target.
+#
+# REMOVED in v1.0: ``dotnet`` / ``ruby`` / ``swift``. They have NO runner in
+# :mod:`qa.test_runner` (it returns the "no test runner configured" skip),
+# so keeping them here let a real test-capture failure look like a clean
+# soft-pass. They now correctly fall through to :func:`is_repo_unbuildable`
+# → degrade-loud. ``cpp`` was never in this set for the same reason.
 RUNNABLE_TEST_LANGUAGES = {
     "python",
     "nodejs",
     "rust",
     "go",
     "java",
-    "dotnet",
-    "ruby",
-    "swift",
 }
 
 
@@ -112,7 +274,8 @@ def is_repo_unbuildable(cwd: Path) -> bool:
     """True when AutoDev cannot build/run this repo's tests in-environment.
 
     Returns ``True`` when there is no detected language, or the detected
-    language is outside :data:`RUNNABLE_TEST_LANGUAGES` (e.g. ``"cpp"``).
+    language is outside :data:`RUNNABLE_TEST_LANGUAGES` (e.g. ``"cpp"``,
+    ``"dotnet"``, ``"ruby"``, ``"swift"``).
     """
     lang = detect_language(cwd)
     return lang is None or lang not in RUNNABLE_TEST_LANGUAGES
