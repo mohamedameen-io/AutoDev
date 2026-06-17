@@ -43,6 +43,7 @@ from tournament import (
     TournamentConfig,
 )
 from tournament.effort import resolve_role_effort
+from tournament.prompts import build_developer_prompt
 from tournament.timeouts import resolve_role_timeout_s
 
 
@@ -224,7 +225,7 @@ class _CoderRunner:
 
         developer_prompt = "\n\n---\n".join(
             [
-                developer_spec.prompt.strip(),
+                build_developer_prompt(developer_spec.prompt),
                 developer_env.render_as_task_message(),
             ]
         )

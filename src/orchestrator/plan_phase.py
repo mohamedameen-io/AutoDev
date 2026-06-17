@@ -623,6 +623,139 @@ async def _advise_task_decomposition(
         )
 
 
+# v1.0 B1: manifest/lockfile paths that signal a new external dependency being
+# added. Any task touching these files is flagged as a potential over-engineering
+# smell so retrospectives can inspect whether the necessity ladder was applied.
+_DEPENDENCY_MANIFEST_PATTERNS: tuple[str, ...] = (
+    "requirements.txt",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "Pipfile",
+    "Cargo.toml",
+    "Cargo.lock",
+    "go.mod",
+    "go.sum",
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "build.gradle",
+    "pom.xml",
+    "*.gemspec",
+    "Gemfile",
+    "Gemfile.lock",
+)
+
+# Number of *new* files (files_new) in a single task that constitutes a
+# structural bloat smell — the architect may be spinning up abstractions that
+# could live as inline helpers. Set to 6 (coarse proxy) to avoid alert
+# fatigue: a normal task with module + test + types = 3 new files would
+# fire at threshold=3, which causes noise on most real plans.
+_NEW_FILE_BLOAT_THRESHOLD: int = 6
+
+
+async def _advise_over_engineering(
+    orch: "Orchestrator", plan: Plan
+) -> None:
+    """v1.0 (B1): post-parse over-engineering advisory.
+
+    Scans the final approved plan for two structural smells:
+
+    1. **Dependency manifest touch** — a task lists a manifest or lockfile
+       (``requirements.txt``, ``Cargo.toml``, ``package.json``, etc.) in its
+       ``files`` or ``files_new`` list, signalling that a new external package
+       is being added. This *may* be entirely justified, but should be
+       cross-checked against the necessity ladder.
+
+    2. **New-file bloat** — a task creates 3 or more brand-new files. A high
+       new-file count often means abstractions that could be collocated or
+       inlined were given their own modules.
+
+    Purely observational: NEVER mutates or rejects the plan, NEVER changes
+    control flow, and NEVER raises (the entire body is wrapped defensively).
+    Fires on all repos (unlike decomposition advisory which gates on
+    ``is_huge``).
+    """
+    try:
+        for phase in plan.phases:
+            for task in getattr(phase, "tasks", []) or []:
+                all_files = list(task.files or []) + list(task.files_new or [])
+
+                # Smell 1: dependency manifest
+                dep_matches: list[str] = []
+                for f in all_files:
+                    basename = f.split("/")[-1] if "/" in f else f
+                    for pattern in _DEPENDENCY_MANIFEST_PATTERNS:
+                        if pattern.startswith("*"):
+                            if basename.endswith(pattern[1:]):
+                                dep_matches.append(f)
+                                break
+                        else:
+                            if basename == pattern or f == pattern:
+                                dep_matches.append(f)
+                                break
+
+                if dep_matches:
+                    logger.warning(
+                        "plan_phase.over_engineering_advisory",
+                        smell="dependency_manifest",
+                        task_id=task.id,
+                        manifests=dep_matches,
+                    )
+                    try:
+                        await orch.plan_manager.ledger_append(
+                            op="over_engineering_advisory",
+                            payload={
+                                "task_id": task.id,
+                                "smell": "dependency_manifest",
+                                "source": "planner_advisory",
+                                "attempt": 0,
+                                "manifests": dep_matches,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "plan_phase.ledger_append_failed",
+                            op="over_engineering_advisory",
+                            err=str(exc),
+                        )
+
+                # Smell 2: new-file bloat
+                new_file_count = len(task.files_new or [])
+                if new_file_count >= _NEW_FILE_BLOAT_THRESHOLD:
+                    logger.warning(
+                        "plan_phase.over_engineering_advisory",
+                        smell="new_file_bloat",
+                        task_id=task.id,
+                        new_file_count=new_file_count,
+                        new_files=(task.files_new or [])[:10],
+                    )
+                    try:
+                        await orch.plan_manager.ledger_append(
+                            op="over_engineering_advisory",
+                            payload={
+                                "task_id": task.id,
+                                "smell": "new_file_bloat",
+                                "source": "planner_advisory",
+                                "attempt": 0,
+                                "new_file_count": new_file_count,
+                                "new_files": (task.files_new or [])[:10],
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "plan_phase.ledger_append_failed",
+                            op="over_engineering_advisory",
+                            err=str(exc),
+                        )
+    except Exception as exc:  # noqa: BLE001
+        # Advisory must never break the plan phase.
+        logger.warning(
+            "plan_phase.over_engineering_advisory_failed", err=str(exc)
+        )
+
+
 async def _auto_skip_empty_tasks(
     orch: "Orchestrator", plan: Plan
 ) -> Plan:
@@ -1411,6 +1544,9 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         # the final approved plan, just before it's committed to the ledger.
         # Advisory only — never mutates/rejects the plan or raises.
         await _advise_task_decomposition(orch, plan, cwd)
+        # v1.0 (B1): over-engineering advisory — checks for dep-manifest
+        # touches and new-file bloat. Advisory only; never gates the plan.
+        await _advise_over_engineering(orch, plan)
         await orch.plan_manager.init_plan(plan)
         logger.info(
             "plan_phase.approved",

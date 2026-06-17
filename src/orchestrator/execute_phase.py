@@ -72,6 +72,7 @@ from tournament.errors import (
     AuthenticationFailedError,
     InfrastructureCircuitOpenError,
 )
+from tournament.prompts import build_developer_prompt
 from tournament.task_overrides import (
     resolve_task_max_turns,
     resolve_task_timeout_s,
@@ -6708,7 +6709,14 @@ async def delegate(
     spec = orch.registry.get(role)
     if spec is None:
         raise AutodevError(f"role {role!r} not in registry")
-    parts: list[str] = [spec.prompt.strip()]
+    # v1.0 B1: inject necessity ladder into the developer (coder) prompt so
+    # the code-writing role applies the same laziness gate as the architect.
+    # build_developer_prompt() is the single definition of the injection
+    # contract shared with _CoderRunner.run in impl_tournament_runner.py.
+    base_prompt = spec.prompt.strip()
+    if role == "developer":
+        base_prompt = build_developer_prompt(spec.prompt)
+    parts: list[str] = [base_prompt]
     parts.append("\n\n---\n")
     parts.append(envelope.render_as_task_message())
     if extra_context:

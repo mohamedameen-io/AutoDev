@@ -40,6 +40,7 @@ from tournament.core import (
 from tournament.prompts import (
     ARCHITECT_B_SYSTEM,
     CRITIC_SYSTEM,
+    NECESSITY_LADDER_GUIDANCE,
     SYNTHESIZER_SYSTEM,
 )
 from tournament.util import _limit
@@ -165,7 +166,7 @@ PROBLEMS FOUND:
 Describe a change DIRECTION that addresses these problems. You don't have
 to produce a diff — just describe, in 2-6 short bullet points, what should
 change and why. Each bullet must name a problem it fixes. Keep it concrete
-and actionable (a coder will implement your direction)."""
+and actionable (a coder will implement your direction).""" + NECESSITY_LADDER_GUIDANCE
 
 
 _SYNTHESIZER_PROMPT_IMPL = """ORIGINAL TASK:

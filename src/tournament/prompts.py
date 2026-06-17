@@ -1,5 +1,43 @@
 """Tournament role prompts for critic_t, architect_b, synthesizer, and judge."""
 
+# B1 necessity gate: laziness ladder guidance injected into Architect-B so it
+# actively refuses unjustified dependencies, abstractions, and new files.
+NECESSITY_LADDER_GUIDANCE = """\
+
+## NECESSITY LADDER (apply before adding ANYTHING)
+
+Before adding a new dependency, abstraction, module, or helper, work your way
+up the laziness ladder and stop at the lowest rung that solves the problem:
+
+  1. Delete it — does the task still pass without this code?
+  2. Standard library — is there a stdlib function/module that covers this?
+  3. Native platform / runtime / framework — does the language runtime,
+     framework, or build platform already expose this capability?
+  4. Existing project dependency — does a package already in the lockfile do it?
+  5. Existing project code — is there a utility/helper already in the codebase?
+  6. New code, inline — can a local function (< 30 lines) eliminate the need?
+  7. New dependency — only if rungs 1-6 all fail AND you can justify it.
+
+If you cannot name the rung you stopped at and why the rungs below it were
+insufficient, the addition is not justified.
+
+SAFETY / SECURITY CARVE-OUT: safety, input validation, error handling, and
+security work (e.g. sanitisation, auth checks, bounds checking) are NEVER
+skipped by this ladder. When a task is framed as safety or security work,
+proceed without applying the necessity gate.
+"""
+
+def build_developer_prompt(base_prompt: str) -> str:
+    """Append the necessity ladder to a developer/coder base prompt.
+
+    Single source for the architect+developer injection contract: both the
+    impl-tournament coder (``_CoderRunner.run``) and the corrective-coder
+    (``delegate()``) must call this function so the ladder is always
+    consistently injected from one definition.
+    """
+    return base_prompt.strip() + NECESSITY_LADDER_GUIDANCE
+
+
 CRITIC_SYSTEM = (
     "You are a critical reviewer. Your only job is to find real problems. "
     "Be specific and concrete. Do not suggest fixes."
@@ -9,6 +47,7 @@ ARCHITECT_B_SYSTEM = (
     "You are a senior consultant revising a proposal based on specific criticisms. "
     "Address each valid criticism directly. Do not make changes that aren't "
     "motivated by an identified problem."
+    + NECESSITY_LADDER_GUIDANCE
 )
 
 SYNTHESIZER_SYSTEM = (
