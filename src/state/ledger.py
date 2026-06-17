@@ -666,6 +666,24 @@ LedgerOp = Literal[
     # source at all) does NOT emit this op — that stays the legit ``no_source``
     # pass. Replay is a forensic no-op, tolerated even before any ``init_plan``.
     "language_unsupported",
+    # v1.0 B1: planner-side over-engineering/tech-debt advisory. Emitted by
+    # ``plan_phase._advise_over_engineering`` after the plan is parsed. Audit-
+    # only — NEVER mutates plan state (the plan is NOT rejected or modified
+    # in response). Payload shape:
+    # ``{task_id: str, smell: str, source: "planner_advisory",
+    #   attempt: int, ...smell-specific fields...}``
+    # where ``smell`` is ``"dependency_manifest"`` or ``"new_file_bloat"``.
+    # Replay is a forensic no-op.
+    "over_engineering_advisory",
+    # v1.0 B2: reviewer-side over-engineering/tech-debt advisory. Emitted by
+    # ``orchestrator.phase_review_runner._emit_reviewer_advisory`` after the
+    # phase-review tournament completes. Audit-only — NEVER mutates plan state,
+    # NEVER changes the tournament verdict, and NEVER blocks execution. The
+    # recording is best-effort: a failure to append this op is swallowed so the
+    # verdict path is unaffected. Payload shape:
+    # ``{phase_id: str, note: str, source: "reviewer_advisory"}``.
+    # Replay is a forensic no-op.
+    "reviewer_over_engineering_advisory",
 ]
 
 
@@ -1314,6 +1332,19 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # op is order-independent on replay, mirroring the other dispatch-time
         # audit ops above.
         "language_unsupported",
+        # v1.0 B1: planner-side over-engineering advisory. Audit-only — fired
+        # by ``plan_phase._advise_over_engineering`` after the plan is parsed.
+        # NEVER mutates plan state; replay is a forensic no-op. Tolerated even
+        # when plan is None so the op is order-independent on replay (it fires
+        # right after plan parsing, before the ``init_plan`` op in some code
+        # paths). Payload: ``{task_id, smell, source, attempt, ...}``.
+        "over_engineering_advisory",
+        # v1.0 B2: reviewer-side over-engineering advisory. Audit-only — fired
+        # by ``phase_review_runner._emit_reviewer_advisory`` after the phase-
+        # review tournament completes. NEVER mutates plan state or changes the
+        # verdict; replay is a forensic no-op. Payload:
+        # ``{phase_id, note, source}``.
+        "reviewer_over_engineering_advisory",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

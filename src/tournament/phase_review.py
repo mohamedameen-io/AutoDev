@@ -26,11 +26,16 @@ in :mod:`orchestrator.phase_review_runner`.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from autologging import get_logger
 from state.schemas import AcceptanceCriterion
 from tournament.util import _limit
+
+
+logger = get_logger(__name__)
 
 
 VariantLabel = Literal["A", "B", "AB"]
@@ -105,7 +110,18 @@ phase-level acceptance criteria. Focus on:
 - Missing tests, missing files, half-finished refactors
 - Cross-cutting concerns the implementation glossed over
 
-Do NOT propose fixes. Just enumerate the problems."""
+Do NOT propose fixes. Just enumerate the problems.
+
+After your problem list, include an OPTIONAL section using this EXACT marker:
+
+OVER_ENGINEERING_ADVISORY: <one or two sentences>
+
+Use this section to note any over-engineering, unnecessary complexity, or
+tech-debt you observed (e.g. abstraction layers that add no value, new
+dependencies that could be avoided, boilerplate that duplicates existing
+utilities). This note is PURELY ADVISORY and NON-BLOCKING — it does NOT
+change the verdict and must not change whether you accept or reject the phase.
+If you have nothing to flag, omit the section entirely."""
 
 
 _ARCHITECT_B_PROMPT_PHASE_REVIEW = """ORIGINAL TASK (phase intent):
@@ -448,8 +464,51 @@ def _fmt_files(files: list[str]) -> str:
     return ", ".join(files[:6]) + f", ... (+{len(files) - 6} more)"
 
 
+# ── Advisory note extraction ──────────────────────────────────────────────
+
+
+# Matches "OVER_ENGINEERING_ADVISORY:" only at the start of a line (possibly
+# preceded by horizontal whitespace) and captures everything that follows on
+# that line AND any immediately following non-blank lines (until the first
+# blank line or EOF).  The ``(?m)`` flag makes ``^`` match at line boundaries
+# so a marker embedded mid-sentence (e.g. "...not an OVER_ENGINEERING_ADVISORY:
+# per se...") does NOT spuriously capture.
+_ADVISORY_PATTERN = re.compile(
+    r"(?m)^\s*OVER_ENGINEERING_ADVISORY:\s*(.*?)(?:\n\n|\Z)",
+    re.DOTALL,
+)
+
+
+def parse_critic_advisory_note(critic_text: str) -> str | None:
+    """v1.0 B2: extract the optional over-engineering advisory from critic output.
+
+    The critic prompt instructs the LLM to end its response with an optional
+    ``OVER_ENGINEERING_ADVISORY:`` section. This function parses that section
+    and returns the trimmed note text, or ``None`` when the section is absent
+    or empty.
+
+    This is a best-effort parser — it never raises. Malformed or missing
+    sections return ``None``.
+    """
+    try:
+        # Append a blank line so the regex terminator always triggers at EOF.
+        m = _ADVISORY_PATTERN.search(critic_text + "\n\n")
+        if m is None:
+            return None
+        note = m.group(1).strip()
+        return note if note else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "parse_critic_advisory_note.failed",
+            err=str(exc),
+            critic_text_len=len(critic_text) if isinstance(critic_text, str) else -1,
+        )
+        return None
+
+
 __all__ = [
     "PhaseReviewBundle",
     "VariantLabel",
     "_PhaseReviewContentHandler",
+    "parse_critic_advisory_note",
 ]

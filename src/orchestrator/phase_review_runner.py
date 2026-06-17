@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from adapters.git_utils import _git_diff_range, extract_files_from_diff
@@ -53,6 +54,7 @@ from tournament import (
 )
 from tournament.effort import resolve_role_effort
 from tournament.llm import _TEXT_ONLY_NO_TOOL_ROLES
+from tournament.phase_review import parse_critic_advisory_note
 from tournament.timeouts import resolve_role_timeout_s
 
 
@@ -99,6 +101,81 @@ class PhaseReviewOutcome:
     accept_phase: bool
     corrective_direction: str | None
     history: list[PassResult]
+
+
+def _load_critic_text(artifact_dir: Path) -> str | None:
+    """v1.0 B2: best-effort load of the most-recent critic artifact.
+
+    Scans ``artifact_dir/pass_NN/critic.md`` from the highest pass number
+    downward and returns the text of the first file found. Returns ``None``
+    when the directory does not exist or contains no critic files. Never
+    raises.
+    """
+    try:
+        if not artifact_dir.exists():
+            return None
+        # Collect all pass dirs in descending order (last pass first).
+        # Sort by extracted integer (mirrors TournamentArtifactStore._scan_incumbent_pass_nums)
+        # so pass_10 sorts after pass_9, not before pass_2 as lexicographic order would give.
+        def _pass_num(d: Path) -> int:
+            try:
+                return int(d.name.removeprefix("pass_"))
+            except ValueError:
+                return -1
+
+        pass_dirs = sorted(
+            [d for d in artifact_dir.iterdir() if d.is_dir() and d.name.startswith("pass_")],
+            key=_pass_num,
+            reverse=True,
+        )
+        for pass_dir in pass_dirs:
+            critic_path = pass_dir / "critic.md"
+            if critic_path.exists():
+                return critic_path.read_text(encoding="utf-8")
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _emit_reviewer_advisory(
+    orch: "Orchestrator",
+    phase: "Phase",
+    critic_text: str,
+) -> None:
+    """v1.0 B2: best-effort over-engineering advisory from the reviewer.
+
+    Parses the optional ``OVER_ENGINEERING_ADVISORY:`` section from the
+    critic's output and appends a ``reviewer_over_engineering_advisory``
+    ledger op. Purely observational — NEVER mutates plan state, NEVER
+    changes the tournament verdict, NEVER raises.
+    """
+    try:
+        note = parse_critic_advisory_note(critic_text)
+        if not note:
+            return
+        logger.info(
+            "phase_review_runner.reviewer_advisory",
+            phase_id=phase.id,
+            note_chars=len(note),
+        )
+        try:
+            await orch.plan_manager.ledger_append(
+                op="reviewer_over_engineering_advisory",
+                payload={
+                    "phase_id": phase.id,
+                    "note": note,
+                    "source": "reviewer_advisory",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "phase_review_runner.reviewer_advisory_ledger_failed",
+                err=str(exc),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "phase_review_runner.reviewer_advisory_failed", err=str(exc)
+        )
 
 
 def _phase_review_tournament_id(spec_hash: str, phase_id: str) -> str:
@@ -393,6 +470,21 @@ async def run_phase_review_tournament(
     final_bundle, history = await tournament.run(
         task_prompt=spec_md, initial=initial_bundle
     )
+
+    # v1.0 B2: best-effort reviewer over-engineering advisory. Reads the last
+    # critic artifact from disk and emits a non-blocking ledger note when the
+    # critic included an OVER_ENGINEERING_ADVISORY: section. Any failure here
+    # is swallowed so the verdict path is NEVER affected.
+    try:
+        critic_text = _load_critic_text(artifact_dir)
+        if critic_text is not None:
+            await _emit_reviewer_advisory(orch, phase, critic_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "phase_review_runner.reviewer_advisory_outer_failed",
+            phase_id=phase.id,
+            err=str(exc),
+        )
 
     winner_label: WinnerLabelLit = (
         history[-1].meta.get("effective_winner", history[-1].winner)
