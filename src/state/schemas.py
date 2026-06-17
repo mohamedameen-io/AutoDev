@@ -503,6 +503,19 @@ class ReviewEvidence(_BaseEvidence):
     output_text: str = ""
     # v0.31.0 (Phase 1.2): see ``CoderEvidence.raw_response``.
     raw_response: str | None = None
+    # Phase 1A R7 (STABLE-RELEASE-GATE): INFRA soft-pass marker. Set
+    # ``True`` ONLY when this APPROVED verdict is a soft-pass for an
+    # infrastructural reason (the *reviewer* exhausted its turn budget so
+    # the developer diff was accepted WITHOUT a genuine reviewer verdict),
+    # NOT a real reviewer APPROVED. The approved-on-exhaustion completion
+    # gate (:func:`orchestrator.execute_phase._maybe_accept_approved_on_exhaustion`)
+    # REFUSES to auto-complete a turn-exhausted task on a soft-passed
+    # APPROVED — only a GENUINE (``soft_passed`` None/False) APPROVED may
+    # complete. A real reviewer APPROVED leaves this ``None``. Optional with
+    # a ``None`` default for backward compatibility with evidence files
+    # written before this field existed (they deserialise as genuine).
+    soft_passed: bool | None = None
+    soft_pass_reason: str | None = None
 
 
 class TestEvidence(_BaseEvidence):

@@ -5171,6 +5171,18 @@ async def _execute_one(
                         issues=issues,
                         output_text=review_result_text,
                         raw_response=review_result_text,
+                        # Phase 1A R7: stamp the INFRA soft-pass marker so
+                        # this APPROVED is schema-DISTINCT from a genuine
+                        # reviewer APPROVED. The approved-on-exhaustion
+                        # completion gate
+                        # (``_maybe_accept_approved_on_exhaustion``) REFUSES
+                        # to auto-complete a turn-exhausted task on a
+                        # soft-passed verdict — only a genuine APPROVED may
+                        # complete. Without this marker the infra soft-pass
+                        # was indistinguishable from a real APPROVED and
+                        # silently certified an unreviewed diff as done.
+                        soft_passed=True,
+                        soft_pass_reason="reviewer_infra_softpass",
                     )
                     await write_evidence(orch.cwd, task.id, review_ev)
             # v0.31.0 (Phase 1.3): a genuine MALFORMED (the reviewer did NOT
@@ -7700,9 +7712,12 @@ async def _maybe_accept_approved_on_exhaustion(
        (:data:`_TURN_EXHAUSTION_SUBTYPES`). A semantic NEEDS_CHANGES /
        REJECTED retry, a parse error, an auth/transport failure, etc. is
        NOT accepted — those must still block.
-    2. A reviewer verdict of ``APPROVED`` is on record for this task's
-       artifact (``{task_id}-review.json``). Any other verdict (or no
-       review evidence at all) is NOT accepted.
+    2. A GENUINE reviewer verdict of ``APPROVED`` is on record for this
+       task's artifact (``{task_id}-review.json``). Any other verdict (or no
+       review evidence at all) is NOT accepted. An INFRA soft-pass APPROVED
+       — one stamped ``soft_passed=True`` because the *reviewer* itself
+       exhausted its turns and the diff was accepted WITHOUT a real verdict
+       — is REFUSED (R7); completing on it would certify an unreviewed diff.
     3. The current (turn-exhausted) developer attempt produced no diff —
        ``developer_result.diff`` is empty / whitespace-only. This is the
        reliable signal: a turn-exhausted attempt emits no patch, and an
@@ -7735,6 +7750,31 @@ async def _maybe_accept_approved_on_exhaustion(
     # Only an APPROVED verdict sticks. NEEDS_CHANGES / REJECTED / MALFORMED
     # (or no review evidence) → no-op, fall through to retry/escalate.
     if review_ev is None or getattr(review_ev, "verdict", None) != "APPROVED":
+        return None
+
+    # Phase 1A R7 (STABLE-RELEASE-GATE): a turn-exhausted task may
+    # auto-complete ONLY on a GENUINE reviewer APPROVED — never on an INFRA
+    # soft-pass APPROVED (one stamped ``soft_passed=True`` because the
+    # *reviewer* itself ran out of turns and the diff was accepted WITHOUT a
+    # real verdict; see the reviewer infra soft-pass site above). Completing
+    # on a soft-passed verdict would certify an UNREVIEWED diff as done. The
+    # refusal is observable, not silent: emit a typed breadcrumb so the
+    # bypass attempt is visible in the logs, then fall through to the
+    # unchanged retry/escalate ladder.
+    if getattr(review_ev, "soft_passed", False):
+        logger.warning(
+            "execute_phase.refused_softpass_completion_on_exhaustion",
+            task_id=task.id,
+            subtype=subtype,
+            verdict="APPROVED",
+            soft_pass_reason=getattr(review_ev, "soft_pass_reason", None),
+            note=(
+                "APPROVED ReviewEvidence is an INFRA soft-pass "
+                "(soft_passed=True), not a genuine reviewer verdict; "
+                "REFUSING to auto-complete a turn-exhausted task on it — "
+                "falling through to retry/escalate (R7)."
+            ),
+        )
         return None
 
     # The current (turn-exhausted) attempt must carry no diff — an empty
