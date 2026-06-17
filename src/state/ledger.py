@@ -628,6 +628,11 @@ LedgerOp = Literal[
     "blocker_escalated",
     "resolution_chosen",
     "resolution_outcome",
+    # WS3-silent-degrade: KB-consult outage at the ``consult_knowledge`` rung.
+    # Audit-only; payload ``{task_id, failure_class, err}``. The resolver declines
+    # (no recovery) and refunds the per-blocker cycle, so a KB outage never burns
+    # the bounded recovery budget. Replay no-op.
+    "resolver_kb_failed",
     # Phase 1A Step 1 (RECOVERY-CONTRACT §7.1): the conflict-escalation critic's
     # merge-strategy DECISION. Audit-only — NEVER mutates plan state (the chosen
     # branch's terminal block, if any, applies via ``block_task`` →
@@ -1011,8 +1016,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         "resolution_chosen",
         "resolution_outcome",
         "conflict_critic_decision",
+        "resolver_kb_failed",
     ):
         # ADR-0047: audit-only breadcrumbs for the Universal Blocker Resolver.
+        # WS3-silent-degrade: ``resolver_kb_failed`` records a KB-consult outage
+        # at the ``consult_knowledge`` rung (KB starvation) — audit-only, never
+        # mutates plan state (the resolver simply declines and the per-blocker
+        # cycle is refunded by ``_maybe_resolve_blocker``).
         # Phase 1A Step 1 adds ``conflict_critic_decision`` (the conflict
         # critic's merge-strategy choice) to the same audit-only set — it never
         # mutates plan state; the chosen branch's terminal block (if any)

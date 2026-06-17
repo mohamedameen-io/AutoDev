@@ -47,9 +47,13 @@ async def run_tests(
 ) -> GateResult:
     """Run the test suite appropriate for *language* (auto-detected when ``None``).
 
-    When *paths* is given (repo-relative changed files), the Python suite is
-    scoped to the changed tests (or a bounded default); otherwise the full
-    default suite runs.
+    When *paths* is given (repo-relative changed files), the suite is diff-scoped
+    to the changed packages/files for every first-class runner — python (changed
+    tests / bounded default), nodejs (changed test files via ``npm test -- …``),
+    rust (changed crates via ``cargo test -p …``), and go (changed packages via
+    ``go test ./pkg/...``). WS2-18: these multi-language runners used to drop
+    *paths* silently and always run the whole suite. ``paths=None`` (and an empty
+    no-git-signal scope) still runs the full default suite for back-compat.
 
     Returns a :class:`GateResult` with ``passed=True`` on success or when the
     test runner is not available.
@@ -83,7 +87,7 @@ async def run_tests(
             ),
             metrics={"unsupported_language": True, "language": lang},
         )
-    return await runner(cwd, timeout_s=timeout_s)  # type: ignore[operator]
+    return await runner(cwd, timeout_s=timeout_s, paths=paths)  # type: ignore[operator]
 
 
 def _is_test_path(p: Path) -> bool:
@@ -91,6 +95,30 @@ def _is_test_path(p: Path) -> bool:
     if p.suffix == ".py" and (p.name.startswith("test_") or p.name.endswith("_test.py")):
         return True
     return "tests" in p.parts
+
+
+def _should_scope(cwd: Path, paths: list[Path] | None) -> bool:
+    """True when a diff-scoped selection should be derived from *paths*.
+
+    WS2-18: the nodejs/rust/go runners used to drop *paths* silently and always
+    run the whole suite. They now scope to the changed packages/files, mirroring
+    ``_run_pytest``'s contract:
+
+    * ``paths is None`` (legacy) → whole suite (return ``False``).
+    * ``paths == []`` in a NON-git repo → no git signal, NOT a clean diff; a
+      scoped subset would be vacuous (scope 0 files → run nothing → false
+      green), so fall back to the whole suite (return ``False``). Mirrors the
+      WS2-14 guard in ``_run_pytest``.
+    * otherwise → derive a diff-scoped selection (return ``True``). A git repo
+      with a genuinely empty diff yields ``paths=[]`` *with* a git signal and is
+      handled by the per-language selectors (no source-language files changed →
+      whole-suite fall-through, never a vacuous empty scope).
+    """
+    if paths is None:
+        return False
+    if not paths and not _has_git_signal(cwd):
+        return False
+    return True
 
 
 def _has_git_signal(cwd: Path) -> bool:
@@ -290,9 +318,49 @@ async def _run_pytest(
     )
 
 
-async def _run_npm_test(cwd: Path, *, timeout_s: float) -> GateResult:
+_NODE_TEST_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+
+
+def _is_node_test_path(p: Path) -> bool:
+    """True when *p* looks like a JS/TS test/spec module or lives under ``test(s)/``.
+
+    Recognises the cross-framework conventions jest/mocha/vitest/ava share:
+    ``*.test.<ext>``, ``*.spec.<ext>``, and files under a ``test``/``tests``/
+    ``__tests__`` directory.
+    """
+    if p.suffix in _NODE_TEST_EXTS:
+        stem = p.name[: -len(p.suffix)]
+        if stem.endswith((".test", ".spec")):
+            return True
+    return bool({"test", "tests", "__tests__"} & set(p.parts))
+
+
+def _npm_test_args(cwd: Path, paths: list[Path] | None) -> list[str]:
+    """Build the ``npm test`` argv, diff-scoped to changed test files if given.
+
+    Test files are forwarded to the underlying runner (jest/mocha/vitest/…) as
+    positional filters via the npm ``--`` separator: ``npm test -- <files>``.
+    Only changed test files that exist on disk are forwarded — a changed test
+    not yet materialized in this worktree would make the runner error on a
+    missing path. When *paths* yields no usable changed test files we keep the
+    whole suite (back-compat; never a vacuous empty scope).
+    """
+    if not _should_scope(cwd, paths):
+        return ["npm", "test"]
+    assert paths is not None
+    test_files = [
+        str(p) for p in paths if _is_node_test_path(p) and (cwd / p).is_file()
+    ]
+    if not test_files:
+        return ["npm", "test"]
+    return ["npm", "test", "--", *test_files]
+
+
+async def _run_npm_test(
+    cwd: Path, *, timeout_s: float, paths: list[Path] | None = None
+) -> GateResult:
     return await _run_subprocess(
-        ["npm", "test"],
+        _npm_test_args(cwd, paths),
         cwd,
         timeout_s=timeout_s,
         tool_name="npm test",
@@ -300,14 +368,98 @@ async def _run_npm_test(cwd: Path, *, timeout_s: float) -> GateResult:
     )
 
 
-async def _run_cargo_test(cwd: Path, *, timeout_s: float) -> GateResult:
+def _cargo_crate_for(cwd: Path, rel: Path) -> str | None:
+    """Return the cargo crate name owning changed file *rel*, or ``None``.
+
+    Walks up from *rel*'s directory to the first ancestor (within *cwd*) holding
+    a ``Cargo.toml`` with a ``[package] name = "…"`` entry. A virtual-workspace
+    manifest (``[workspace]`` with no ``[package]``) is skipped so we keep
+    walking toward the real member crate.
+    """
+    parent = (cwd / rel).parent
+    try:
+        parent.relative_to(cwd)
+    except ValueError:
+        return None
+    current = parent
+    while True:
+        manifest = current / "Cargo.toml"
+        if manifest.is_file():
+            name = _cargo_package_name(manifest)
+            if name is not None:
+                return name
+        if current == cwd:
+            return None
+        current = current.parent
+
+
+_CARGO_PKG_NAME = re.compile(r'^\s*name\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def _cargo_package_name(manifest: Path) -> str | None:
+    """Extract ``[package] name`` from a ``Cargo.toml``, or ``None`` if absent.
+
+    Only the ``[package]`` table's ``name`` is honoured; a virtual-workspace
+    manifest (``[workspace]`` with no ``[package]``) returns ``None``.
+    """
+    try:
+        text = manifest.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    in_package = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_package = stripped == "[package]"
+            continue
+        if in_package:
+            m = _CARGO_PKG_NAME.match(line)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _cargo_test_args(cwd: Path, paths: list[Path] | None) -> list[str]:
+    """Build the ``cargo test`` argv, diff-scoped to changed crates if given.
+
+    Whole-suite default (``paths is None`` or no git signal) keeps
+    ``cargo test --workspace`` (WS2-10: ``--workspace`` runs every member
+    crate's tests and is a harmless no-op on a single-package crate). When a
+    diff scope IS provided, each changed ``.rs`` file's owning crate is selected
+    via ``-p <crate>``; ``--workspace`` is dropped so the run is genuinely
+    narrowed. If no crate can be resolved (no ``.rs`` changed, or no
+    ``[package]`` manifest found) we keep the whole ``--workspace`` suite.
+    """
+    if not _should_scope(cwd, paths):
+        return ["cargo", "test", "--workspace"]
+    assert paths is not None
+    crates: list[str] = []
+    for p in paths:
+        if p.suffix != ".rs":
+            continue
+        crate = _cargo_crate_for(cwd, p)
+        if crate is not None and crate not in crates:
+            crates.append(crate)
+    if not crates:
+        return ["cargo", "test", "--workspace"]
+    args = ["cargo", "test"]
+    for crate in crates:
+        args += ["-p", crate]
+    return args
+
+
+async def _run_cargo_test(
+    cwd: Path, *, timeout_s: float, paths: list[Path] | None = None
+) -> GateResult:
     # WS2-10: ``--workspace`` runs every member crate's tests. Without it a
     # workspace-ROOT repo (a *virtual* manifest: ``[workspace]`` with no
     # ``[package]``) false-fails because the root has no tests of its own.
     # ``--workspace`` is a harmless no-op on a single-package crate, so it is
     # always added rather than gated on manifest sniffing.
+    # WS2-18: when a diff scope is provided, narrow to changed crates with
+    # ``-p <crate>`` instead of running the whole workspace.
     return await _run_subprocess(
-        ["cargo", "test", "--workspace"],
+        _cargo_test_args(cwd, paths),
         cwd,
         timeout_s=timeout_s,
         tool_name="cargo test",
@@ -315,9 +467,37 @@ async def _run_cargo_test(cwd: Path, *, timeout_s: float) -> GateResult:
     )
 
 
-async def _run_go_test(cwd: Path, *, timeout_s: float) -> GateResult:
+def _go_test_args(cwd: Path, paths: list[Path] | None) -> list[str]:
+    """Build the ``go test`` argv, diff-scoped to changed packages if given.
+
+    Whole-suite default (``paths is None`` or no git signal) keeps
+    ``go test ./...``. With a diff scope, each changed ``.go`` file's package
+    directory becomes a ``./dir/...`` selector (the package root itself maps to
+    ``./...``). When no ``.go`` file changed we keep the whole ``./...`` suite
+    (never a vacuous empty scope).
+    """
+    if not _should_scope(cwd, paths):
+        return ["go", "test", "./..."]
+    assert paths is not None
+    pkgs: list[str] = []
+    for p in paths:
+        if p.suffix != ".go":
+            continue
+        parent = p.parent
+        # Repo-relative dir → "./dir/..."; the module root maps to "./...".
+        selector = "./..." if parent in (Path("."), Path("")) else f"./{parent.as_posix()}/..."
+        if selector not in pkgs:
+            pkgs.append(selector)
+    if not pkgs:
+        return ["go", "test", "./..."]
+    return ["go", "test", *pkgs]
+
+
+async def _run_go_test(
+    cwd: Path, *, timeout_s: float, paths: list[Path] | None = None
+) -> GateResult:
     return await _run_subprocess(
-        ["go", "test", "./..."],
+        _go_test_args(cwd, paths),
         cwd,
         timeout_s=timeout_s,
         tool_name="go test",
@@ -346,10 +526,16 @@ def _java_test_command(cwd: Path) -> tuple[list[str], str]:
     return (["mvn", "-q", "test"], "mvn test")
 
 
-async def _run_java_test(cwd: Path, *, timeout_s: float) -> GateResult:
+async def _run_java_test(
+    cwd: Path, *, timeout_s: float, paths: list[Path] | None = None
+) -> GateResult:
     # WS2-3: java is first-class. Maven surefire ("Tests run: N, …") and Gradle
     # ("N tests completed") run-counts are recognised by the shared classifier,
     # so a non-empty java scope that runs 0 tests fails LOUD (no_test_coverage).
+    # WS2-18: ``paths`` is accepted for a uniform runner dispatch but java
+    # diff-scoping (per-module ``-pl`` / ``--tests`` selection) is NOT in scope
+    # here; the whole-module suite still runs (back-compat).
+    del paths
     args, tool_name = _java_test_command(cwd)
     return await _run_subprocess(
         args,

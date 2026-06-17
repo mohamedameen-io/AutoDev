@@ -11,7 +11,11 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from adapters.base import NetworkProbeFailure, PlatformAdapter
+from adapters.base import (
+    AdapterCapabilities,
+    NetworkProbeFailure,
+    PlatformAdapter,
+)
 from adapters.git_utils import (
     _diff_files,
     _git_diff_with_untracked,
@@ -153,6 +157,13 @@ class ClaudeCodeAdapter(PlatformAdapter):
     """Adapter backed by the `claude -p` binary."""
 
     name = "claude_code"
+
+    # WS3 (stabilization-v1): the Claude CLI enforces the allow-list via
+    # ``--allowed-tools`` (see ``_build_command``: ``None`` omits the flag,
+    # ``[]`` passes an empty allow-list, a populated list passes the
+    # comma-joined value). Tool-scoping is therefore REAL here — callers
+    # that require scoping for correctness can dispatch to this adapter.
+    capabilities = AdapterCapabilities(supports_tool_scoping=True)
 
     def __init__(self, binary: str = "claude") -> None:
         self.binary = binary

@@ -127,6 +127,20 @@ def _next_rung(tried: list[str], ladder: list[ResolutionAction]) -> ResolutionAc
     return ladder[-1]
 
 
+def _budget_dedupe_key(ctx: BlockerContext) -> str:
+    """Stable shared-cap key for budget-widening dedupe (WS1-guardrail-double).
+
+    ``GUARDRAIL_EXCEEDED`` has TWO independent budget-widening mechanisms: this
+    resolver's ``escalate_budget`` rung and the in-loop
+    :class:`~orchestrator.budget_escalation.BudgetEscalationTracker` (keyed on
+    ``(task_id, role)``). Without a shared key they widen the SAME guardrail
+    budget twice per cycle. The resolver rung carries this key + ``defer_to_tracker``
+    so the actual turn/timeout widening is owned by the single tracker — the cap
+    is shared, widened once per cycle, not compounded.
+    """
+    return f"{ctx.task_id or '-'}:{ctx.failing_role or '-'}:{ctx.failure_class}"
+
+
 def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
     """Ladder-aware fast-path map for KNOWN failure classes.
 
@@ -138,13 +152,15 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
     Policy (one ladder per known class; the final rung is always a terminal
     ``ask_human`` so the ladder cannot run off the end):
 
-      * ``guardrail_exceeded``    -> escalate_budget -> ask_human
+      * ``guardrail_exceeded``    -> escalate_budget (defer_to_tracker; shared
+        budget_dedupe_key so the budget is widened once per cycle) -> ask_human
       * ``test_diagnosis_*``      -> consult_knowledge -> retry_with_changes -> ask_human
       * ``worker_exception``      -> retry_with_changes -> ask_human
       * ``conflict_*``            -> re_architect -> ask_human
       * ``worktree_apply_failed`` -> repair_environment -> ask_human
       * ``phase_degraded``        -> repair_environment -> ask_human  (the DOA conversion)
-      * ``soft_blocker``          -> consult_knowledge -> ask_human
+      * ``soft_blocker``          -> consult_knowledge (no_immediate_reescalate;
+        min_cycle_gap so the re-enable can't churn in the same cycle) -> ask_human
       * ``dag_invalid`` /
         ``cross_phase_dag_invalid`` -> re_plan -> ask_human
       * ``edit_scope_violation``  -> narrow_scope -> re_plan -> ask_human
@@ -182,6 +198,16 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
                     "guardrail/decision-cost budget exhausted: widen the cap once "
                     "before giving up so a near-complete task can finish."
                 ),
+                # WS1-guardrail-double-budget-widen: the in-loop
+                # ``BudgetEscalationTracker`` already widens the turn/timeout
+                # budget for this (task, role) on the re-run this rung triggers.
+                # If the resolver ALSO widened independently the same guardrail
+                # budget would be bumped TWICE per cycle. ``defer_to_tracker``
+                # cedes the actual widening to that single tracker, and
+                # ``budget_dedupe_key`` is the shared cap key so both paths
+                # coordinate to one widening per cycle.
+                defer_to_tracker=True,
+                budget_dedupe_key=_budget_dedupe_key(ctx),
             ),
             _act(
                 "ask_human",
@@ -360,6 +386,17 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
                     "soft-blocker handoff rung reached: consult past-failure memory "
                     "for a known unblock before escalating to a human."
                 ),
+                # WS1-soft-blocker-single-cycle-churn: a soft-blocker
+                # consult_knowledge re-enable resets the task's retry budget and
+                # transitions it back to in_progress. If the re-enabled task
+                # immediately re-soft-blocks it would re-escalate in the SAME
+                # cycle (the per-blocker cycle budget hasn't advanced yet),
+                # producing single-cycle churn. ``no_immediate_reescalate`` tells
+                # the call site to consume the cycle budget before re-engaging,
+                # and ``min_cycle_gap`` is the minimum number of cycles that must
+                # pass before this blocker may escalate again.
+                no_immediate_reescalate=True,
+                min_cycle_gap=1,
             ),
             _act(
                 "ask_human",

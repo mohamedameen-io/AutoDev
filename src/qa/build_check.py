@@ -20,6 +20,7 @@ from pathlib import Path
 from plugins.registry import GateResult
 from qa._scan_filter import collect_scan_files
 from qa.detect import detect_language
+from qa.env import resolve_tool
 
 
 # WS2-11: the orchestrator normally overrides this via
@@ -109,6 +110,41 @@ async def _run_subprocess(
     return GateResult(passed=False, details=f"{tool_name} build check failed:\n{combined}")
 
 
+def _resolve_target_python(cwd: Path) -> list[str]:
+    """Return the argv prefix of the *target* repo's Python interpreter.
+
+    WS2-21: compiling the target repo with AutoDev's OWN ``sys.executable`` is a
+    version-mismatch trap — AutoDev runs on (say) 3.13 while the target pins
+    3.9, so 3.9-valid syntax (or 3.13-removed stdlib) makes ``py_compile``
+    FALSE-FAIL the build gate on otherwise-clean code. Resolve the *target's*
+    interpreter instead.
+
+    Cascade (first match wins):
+
+    * ``<cwd>/.venv/bin/python3`` / ``<cwd>/.venv/bin/python`` — the repo's own
+      virtualenv interpreter (direct, no PATH guesswork).
+    * :func:`qa.env.resolve_tool` for ``python3`` then ``python`` — this also
+      surfaces uv/poetry-managed interpreters (``uv run python3 -m …``) and any
+      ``.venv/bin/python*`` it finds. ``resolve_tool`` returns the *bare*
+      ``[tool]`` as its last-resort fallback; that is NOT a target-specific
+      resolution (it would shell out to whatever ``python``/``python3`` is on
+      PATH, defeating the point), so we ignore the bare form and keep cascading.
+    * ``sys.executable`` — only when nothing target-specific resolves (a repo
+      with no venv / no lockfile manager): AutoDev's interpreter is the best
+      available, matching the legacy behaviour for that case.
+    """
+    for direct in (".venv/bin/python3", ".venv/bin/python"):
+        candidate = cwd / direct
+        if candidate.exists():
+            return [str(candidate)]
+    for tool in ("python3", "python"):
+        argv = resolve_tool(cwd, tool)
+        # Skip the bare ``[tool]`` last-resort — only accept a managed/venv form.
+        if argv != [tool]:
+            return argv
+    return [sys.executable]
+
+
 async def _run_python_build(
     cwd: Path, *, paths: list[Path] | None = None, timeout_s: float
 ) -> GateResult:
@@ -117,15 +153,18 @@ async def _run_python_build(
     G7: submodule trees, ``.git``/``.git/modules``, vendored/cache dirs, and
     generated stubs (``*_pb2.py`` …) are excluded.
     S2: when *paths* is non-``None`` only those files are compiled.
+    WS2-21: compiled with the *target* repo's interpreter (see
+    :func:`_resolve_target_python`), not AutoDev's ``sys.executable``.
     """
     py_files = [str(p) for p in collect_scan_files(cwd, (".py",), paths=paths)]
     if not py_files:
         return GateResult(passed=True, details="no .py files found")
 
+    interpreter = _resolve_target_python(cwd)
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
-                sys.executable,
+                *interpreter,
                 "-m",
                 "py_compile",
                 *py_files,

@@ -1932,8 +1932,31 @@ async def _apply_resolution(
             from orchestrator import blocker_resolver as _br
 
             summary = await _br.consult_knowledge(orch, ctx)  # type: ignore[arg-type]
-        except Exception:  # noqa: BLE001
-            summary = ""
+        except Exception as exc:  # noqa: BLE001
+            # WS3-silent-degrade (should-fix): KB STARVATION. The consult raised
+            # — previously we swallowed it to ``summary = ""`` and STILL retried,
+            # burning a resolver cycle on an information-free re-dispatch (the
+            # exact "KB starvation silently degrades into a blind retry" failure
+            # mode). Emit a typed ``resolver_kb_failed`` breadcrumb and DECLINE
+            # (return None). The caller (``_maybe_resolve_blocker``) recognises a
+            # declined ``consult_knowledge`` and REFUNDS the cycle, so a KB
+            # outage does not consume the bounded recovery budget.
+            try:
+                await orch.plan_manager.ledger_append(
+                    op="resolver_kb_failed",
+                    payload={
+                        "task_id": task.id,
+                        "failure_class": getattr(ctx, "failure_class", None),
+                        "err": str(exc)[:300],
+                    },
+                )
+            except Exception as crumb_exc:  # noqa: BLE001 — crumb best-effort
+                logger.warning(
+                    "execute_phase.ledger_append_failed",
+                    op="resolver_kb_failed",
+                    err=str(crumb_exc),
+                )
+            return None
         note = (
             f"consult_knowledge — prior failures:\n{summary[:800]}"
             if summary
@@ -2114,6 +2137,15 @@ async def _maybe_resolve_blocker(
         recovered = None
 
     act_name = getattr(action, "action", "fall_through")
+
+    # WS3-silent-degrade (should-fix): a ``consult_knowledge`` that DECLINED
+    # (returned None) means the KB consult failed (starvation) — it produced no
+    # recovery and emitted ``resolver_kb_failed``. A KB outage must not eat the
+    # bounded per-(task, failure_class) recovery budget, so REFUND the cycle that
+    # was reserved up-front. Scoped narrowly: only consult_knowledge, only on
+    # decline; every acting/declining-by-design path keeps consuming its cycle.
+    if act_name == "consult_knowledge" and recovered is None:
+        counts[guard_key] = max(0, counts.get(guard_key, 1) - 1)
     if recovered is not None:
         outcome = "recovered"
     elif act_name == "ask_human":
@@ -2554,12 +2586,23 @@ async def run_execute_phase(
     # promoted to coded first — preventing the reaper from reverting a
     # task whose work actually completed (D-3 finding from the
     # 2026-05-09 Unity stall).
+    # WS3-silent-degrade (should-fix): reconcile + reap are SAFETY NETS that
+    # repair FSM state BEFORE any dispatch. A failure here means the plan state
+    # is in an unknown shape — silently continuing risked the dispatcher either
+    # reverting a task whose work actually completed (the reconcile gap) or
+    # stranding wedged orphan tasks the pending-only filter cannot pick up (the
+    # reap gap). A swallowed warning let the run proceed on corrupt state. These
+    # are now HARD failures: log at ERROR and re-raise so the run aborts loudly
+    # instead of degrading into a half-repaired state.
     try:
         await orch.plan_manager.reconcile_evidence_vs_ledger()
-    except Exception as exc:  # noqa: BLE001 — log + continue
-        logger.warning(
+    except Exception as exc:
+        logger.error(
             "execute_phase.reconcile_evidence_failed", err=str(exc)
         )
+        raise AutodevError(
+            f"reconcile_evidence_vs_ledger failed before dispatch: {exc}"
+        ) from exc
 
     # v0.22.2 B1: reap orphan in-flight tasks before any dispatch. An
     # interrupted run leaves tasks frozen in non-terminal-non-pending
@@ -2576,8 +2619,11 @@ async def run_execute_phase(
                 count=len(reaped),
                 task_ids=reaped,
             )
-    except Exception as exc:  # noqa: BLE001 — log + continue; do not block run
-        logger.warning("execute_phase.reap_orphans_failed", err=str(exc))
+    except Exception as exc:
+        logger.error("execute_phase.reap_orphans_failed", err=str(exc))
+        raise AutodevError(
+            f"reap_orphans failed before dispatch: {exc}"
+        ) from exc
 
     # v0.11.0: DAG-aware worker pool over all phases.
     plan = await orch.plan_manager.load()
@@ -4829,6 +4875,44 @@ async def _execute_one(
                 )
                 if _accepted is not None:
                     return _accepted
+                # WS1-budget-exhaustion-absorbed-by-ladder (should-fix): the
+                # turn-budget escalation tracker returns a SYNTHETIC
+                # ``error_max_turns_escalation_exhausted`` AgentResult once the
+                # per-(task, role) escalation ladder is fully spent (see the
+                # ``is_exhausted`` short-circuit in ``delegate``). That synthetic
+                # terminal must NOT re-enter the discard/stuck ladder as a
+                # ``WORKER_EXCEPTION`` — doing so burns yet another retry slot on
+                # a task whose budget is already proven exhausted (the agent
+                # would just re-hit the same cap). It is a clean GUARDRAIL
+                # exhaustion, so terminate it through the single block chokepoint
+                # with ``GUARDRAIL_EXCEEDED`` (whose resolver rung is the
+                # budget-/cap-aware path), unless ``_maybe_accept_approved_on_
+                # exhaustion`` already salvaged an approved empty-diff above.
+                if (
+                    developer_result.subtype
+                    == "error_max_turns_escalation_exhausted"
+                ):
+                    _budget_exc = GuardrailExceededError(
+                        developer_result.error
+                        or "budget escalation ladder exhausted"
+                    )
+                    _budget_meta = _build_guardrail_block_meta(
+                        orch=orch, task_id=task.id, exc=_budget_exc
+                    )
+                    # A spent escalation ladder is a terminal escalation: autonomous
+                    # recovery budget is exhausted and the task needs human
+                    # attention. Stamp ``escalated`` so this matches the contract
+                    # the legacy ladder path produced (the task is blocked AND
+                    # escalated), only WITHOUT burning extra retry slots first.
+                    _budget_meta["escalated"] = True
+                    task = await block_task(
+                        orch,
+                        task,
+                        failure_class=_fcls.GUARDRAIL_EXCEEDED,
+                        raw_error=str(_budget_exc),
+                        meta=_budget_meta,
+                    )
+                    return task
                 # v0.39.0 (Cluster C2c): runtime under-decomposition
                 # telemetry. Best-effort, purely observational — never
                 # changes control flow (falls through to the existing
@@ -5790,9 +5874,40 @@ async def _execute_one(
             # MODE and its RESOLUTION directive determines the next
             # step (rebase-and-retry / abandon-task / rewrite).
             if worktree_mgr is not None and worktree is not None:
-                applied = await _apply_with_conflict_escalation(
-                    orch, task, worktree, worktree_mgr
-                )
+                # WS1-worktree-apply-failed-dead (should-fix): a NON-conflict
+                # apply fault (the worktree vanished, a git index lock, a
+                # ``git apply``/merge-abort failure, etc.) raises ``WorktreeError``
+                # from somewhere the conflict-escalation machinery cannot contain
+                # — so it escapes ``_apply_with_conflict_escalation`` instead of
+                # resolving to a CONFLICT_* class. Before this guard such faults
+                # collapsed into the generic worker-exception handler as
+                # ``WORKER_EXCEPTION``, which is why ``WORKTREE_APPLY_FAILED`` had a
+                # taxonomy entry + a ``repair_environment`` resolver rung but ZERO
+                # producers — the rung never fired. Catch the escaping
+                # ``WorktreeError`` HERE and terminate through the single block
+                # chokepoint with the real class so its environment-repair rung is
+                # actually reachable. Genuine merge conflicts still terminate as
+                # CONFLICT_3WAY_FAILED / CONFLICT_ABANDON inside the helper.
+                try:
+                    applied = await _apply_with_conflict_escalation(
+                        orch, task, worktree, worktree_mgr
+                    )
+                except WorktreeError as exc:
+                    logger.warning(
+                        "execute_phase.worktree_apply_failed",
+                        task_id=task.id,
+                        err=str(exc),
+                    )
+                    task = await block_task(
+                        orch,
+                        task,
+                        failure_class=_fcls.WORKTREE_APPLY_FAILED,
+                        raw_error=f"worktree_apply_failed: {exc}",
+                        meta={
+                            "blocked_reason": f"worktree_apply_failed: {exc}",
+                        },
+                    )
+                    return task
                 if not applied:
                     return await orch.plan_manager.get_task(task.id) or task
 
@@ -6023,7 +6138,6 @@ async def _try_retry_or_escalate(
     """
     from orchestrator.escalation_ladder import next_step
     from orchestrator.knowledge_lookup import lookup_recent_failures
-    from orchestrator.repetition_recovery import choose_recovery_action
     from state.knowledge import TournamentEvent
 
     # v0.25.1 Bug #4: enforce the configured minimum retry interval
@@ -6147,28 +6261,23 @@ async def _try_retry_or_escalate(
                 err=str(exc),
             )
 
-    # v0.32.0 Phase 4.4: pick a recovery action so the ledger captures
-    # *why* the retry path is going to dispatch what it dispatches.
-    # The action does not currently override the ladder's choice (the
-    # ladder is the source of truth for the next dispatch rung); it is
-    # an audit-only annotation that lets forensics reconstruct the
-    # policy decision. Future work can route ``increase_scope`` /
-    # ``re_architect`` / ``do_nothing`` to dedicated paths once the
-    # corresponding dispatch sites mature.
-    qa_gates_passed = bool(getattr(task, "qa_gates_passed", False))
-    chosen_action = choose_recovery_action(
-        discard_count=stuck_state.discard_count,
-        pivot_count=stuck_state.pivot_count,
-        architect_count=stuck_state.architect_count,
-        qa_gates_passed=qa_gates_passed,
-        repetition_loop_detected=repetition_loop_detected,
-    )
+    # WS1-recovery-action-dead-annotation (should-fix): the
+    # ``choose_recovery_action`` policy was a DEAD PARALLEL decision — its
+    # ``RecoveryAction`` literal was computed and stamped into the ledger but
+    # NEVER dispatched (the ``step`` from ``next_step`` is, and always was, the
+    # sole source of truth for the next rung). Carrying a second, never-consulted
+    # decision alongside the real one only widened the recovery surface and made
+    # the audit trail lie about what drove dispatch. We REMOVE the phantom
+    # computation. The ``recovery_action_chosen`` op is retained (a gate test —
+    # ``test_recovery_step4_resolver_before_ladder`` — asserts its presence and
+    # ordering vs the resolver), but its ``action`` now records the REAL ladder
+    # decision (``step``) so the breadcrumb is honest rather than parallel.
     try:
         await orch.plan_manager.ledger_append(
             op="recovery_action_chosen",
             payload={
                 "task_id": task.id,
-                "action": chosen_action,
+                "action": step,
                 "reason": reason[:200],
                 "next_step": step,
             },
