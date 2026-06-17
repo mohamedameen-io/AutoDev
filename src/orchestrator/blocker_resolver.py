@@ -196,6 +196,41 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
                 ),
             ),
         ]
+    elif cls == fc.OVERSIZED_INPUT:
+        # RECOVERY-CONTRACT §7 Step 8 (the A4 root cause): the role (esp.
+        # ``critic_t``) hit ``error_max_turns`` because its prompt was
+        # OVERSIZED — it burned its turns digesting context bloat. The remedy
+        # is to BOUND the input (truncate / decompose / re-dispatch with reduced
+        # scope), NOT to widen the turn budget. ``escalate_budget`` is the WRONG
+        # direction here, so it is deliberately absent from this ladder; we use
+        # ``narrow_scope`` with a ``direction="bound_input"`` so the call site
+        # re-dispatches the same task against a smaller prompt rather than the
+        # same bloat with more turns.
+        ladder = [
+            _act(
+                "narrow_scope",
+                rationale=(
+                    "the role exhausted its turn budget on an OVERSIZED prompt "
+                    "(context-window bloat): bound the input — truncate / "
+                    "decompose / re-dispatch with reduced scope. Granting more "
+                    "turns is the wrong direction (it just re-reads the bloat)."
+                ),
+                direction="bound_input",
+            ),
+            _act(
+                "ask_human",
+                rationale=(
+                    "the input is still oversized after a bounding pass; it "
+                    "cannot be mechanically reduced enough to fit — ask the "
+                    "operator to decompose the task or raise the model's context."
+                ),
+                question=(
+                    "A role keeps exhausting its turns on an oversized prompt "
+                    "even after bounding the input. Should this task be split "
+                    "into smaller units, or does it need a larger-context model?"
+                ),
+            ),
+        ]
     elif cls in (fc.TEST_DIAGNOSIS_HARDFAIL, fc.TEST_DIAGNOSIS_NO_SIGNAL):
         ladder = [
             _act(

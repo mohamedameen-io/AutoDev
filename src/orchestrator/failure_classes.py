@@ -35,6 +35,15 @@ CONFLICT_REWRITE_CAP_EXCEEDED = "conflict_rewrite_cap_exceeded"
 # Guardrail exhaustion (decision-cost / turn budget overruns).
 GUARDRAIL_EXCEEDED = "guardrail_exceeded"
 
+# Oversized input (context-window bloat). RECOVERY-CONTRACT §7 Step 8 / the A4
+# root cause: a role (esp. ``critic_t``) fed an oversized prompt burns turns
+# reading tools/context and hits ``error_max_turns``. Today ``budget_escalation``
+# then grants it MORE turns — the WRONG direction. This class routes such a
+# failure to a BOUND_INPUT recovery (truncate / decompose / re-dispatch with
+# reduced scope) and explicitly does NOT escalate turns. It is task-local
+# (re-dispatch the same task with a smaller prompt), so it is NOT structural.
+OVERSIZED_INPUT = "oversized_input"
+
 # Test-diagnosis terminal signals.
 TEST_DIAGNOSIS_HARDFAIL = "test_diagnosis_hardfail"
 TEST_DIAGNOSIS_NO_SIGNAL = "test_diagnosis_no_signal"
@@ -81,6 +90,7 @@ FailureClass = Literal[
     "conflict_abandon",
     "conflict_rewrite_cap_exceeded",
     "guardrail_exceeded",
+    "oversized_input",
     "test_diagnosis_hardfail",
     "test_diagnosis_no_signal",
     "worker_exception",
@@ -104,6 +114,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     CONFLICT_ABANDON,
     CONFLICT_REWRITE_CAP_EXCEEDED,
     GUARDRAIL_EXCEEDED,
+    OVERSIZED_INPUT,
     TEST_DIAGNOSIS_HARDFAIL,
     TEST_DIAGNOSIS_NO_SIGNAL,
     WORKER_EXCEPTION,
@@ -144,11 +155,36 @@ def is_known(raw: str | None) -> bool:
     return raw is not None and raw in ALL_FAILURE_CLASSES and raw != UNKNOWN
 
 
+def classify_max_turns_failure(prompt_len: int, threshold: int) -> str:
+    """Classify an ``error_max_turns`` failure by the size of its input prompt.
+
+    RECOVERY-CONTRACT §7 Step 8 / the A4 root cause. A role that exhausts its
+    turn budget did so for one of two reasons:
+
+    * the prompt was a normal size and the task legitimately needs more runway
+      (``GUARDRAIL_EXCEEDED`` — the existing budget-escalation ladder is the
+      right remedy: grant more turns); or
+    * the prompt was *oversized* — the agent burned its turns reading
+      tools/context to digest the bloat and never got to the real work
+      (``OVERSIZED_INPUT`` — the remedy is to BOUND the input, NOT to grant more
+      turns; more turns just burn more budget on the same bloat).
+
+    ``prompt_len`` is the character length of the dispatched prompt (the real
+    size source — :attr:`adapters.types.AgentInvocation.prompt`). ``threshold``
+    is the inclusive char cutoff (``cfg.budget_escalation.oversized_input_char_threshold``).
+    The boundary is inclusive: ``prompt_len >= threshold`` is oversized.
+    """
+    if prompt_len >= threshold:
+        return OVERSIZED_INPUT
+    return GUARDRAIL_EXCEEDED
+
+
 __all__ = [
     "FailureClass",
     "ALL_FAILURE_CLASSES",
     "STRUCTURAL_FAILURE_CLASSES",
     "classify",
+    "classify_max_turns_failure",
     "is_known",
     # Constants
     "DAG_INVALID",
@@ -158,6 +194,7 @@ __all__ = [
     "CONFLICT_ABANDON",
     "CONFLICT_REWRITE_CAP_EXCEEDED",
     "GUARDRAIL_EXCEEDED",
+    "OVERSIZED_INPUT",
     "TEST_DIAGNOSIS_HARDFAIL",
     "TEST_DIAGNOSIS_NO_SIGNAL",
     "WORKER_EXCEPTION",

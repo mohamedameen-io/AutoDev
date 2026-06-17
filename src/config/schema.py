@@ -976,6 +976,16 @@ class BudgetEscalationConfig(BaseModel):
 
     max_turns_ceiling: int = Field(default=250, ge=1)
     timeout_s_ceiling: int = Field(default=3600, ge=1)
+    # RECOVERY-CONTRACT §7 Step 8 (the A4 root cause): inclusive char-length
+    # cutoff above which an ``error_max_turns`` failure is classified as
+    # ``OVERSIZED_INPUT`` rather than ``GUARDRAIL_EXCEEDED``. An oversized-input
+    # cause routes to BOUND_INPUT (re-dispatch with reduced scope) and does NOT
+    # widen the turn budget — granting more turns just burns budget re-reading
+    # the same bloat. The 200_000-char default ≈ ~50K tokens, a deliberately
+    # high floor so only genuine context-window bloat trips it (a normal
+    # developer/reviewer prompt is far smaller). Set higher to disable in
+    # practice; set lower to bound aggressively on a constrained model.
+    oversized_input_char_threshold: int = Field(default=200_000, ge=1)
 
 
 class AdaptersConfig(BaseModel):

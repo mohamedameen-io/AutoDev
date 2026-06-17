@@ -192,6 +192,14 @@ class BudgetEscalationTracker:
 
     max_escalations: int = MAX_ESCALATIONS
     _counters: dict[tuple[str, str], int] = field(default_factory=dict)
+    # RECOVERY-CONTRACT §7 Step 8: per-(scope_id, role) "the last max-turns
+    # failure was caused by an OVERSIZED prompt" flag. When set, the
+    # ``delegate()`` budget gate SKIPS turn escalation for that pair (granting
+    # more turns is the wrong direction — the fix is to bound the input). The
+    # flag is set/cleared in lockstep with the counter by ``record_result``: an
+    # oversized ``error_max_turns`` sets it; any other subtype (success or
+    # different failure) clears it.
+    _oversized: set[tuple[str, str]] = field(default_factory=set)
 
     # Diagnostic surfaced when the escalation ladder is exhausted. Kept
     # as a class constant so tests and the surrounding orchestrator code
@@ -218,6 +226,17 @@ class BudgetEscalationTracker:
         dispatch a fourth attempt.
         """
         return self._counters.get((scope_id, role), 0) > self.max_escalations
+
+    def is_oversized(self, scope_id: str, role: str) -> bool:
+        """Return True when the last ``error_max_turns`` for this pair was caused
+        by an OVERSIZED prompt (RECOVERY-CONTRACT §7 Step 8).
+
+        The ``delegate()`` budget gate consults this BEFORE the next dispatch: a
+        ``True`` result means "do NOT widen turns — the remedy is to bound the
+        input, not to grant more budget." Cleared on any non-oversized result by
+        :meth:`record_result`.
+        """
+        return (scope_id, role) in self._oversized
 
     def escalate_for(
         self,
@@ -251,7 +270,14 @@ class BudgetEscalationTracker:
             timeout_s_ceiling=timeout_s_ceiling,
         )
 
-    def record_result(self, scope_id: str, role: str, subtype: str | None) -> None:
+    def record_result(
+        self,
+        scope_id: str,
+        role: str,
+        subtype: str | None,
+        *,
+        oversized: bool = False,
+    ) -> None:
         """Update the counter based on the adapter result's ``subtype``.
 
         ``error_max_turns`` increments; anything else (including success
@@ -259,13 +285,28 @@ class BudgetEscalationTracker:
         ``(scope_id, role)``. Other-failure subtypes deliberately reset
         the counter — the policy only escalates for *consecutive*
         ``error_max_turns``.
+
+        RECOVERY-CONTRACT §7 Step 8: ``oversized`` records whether THIS
+        ``error_max_turns`` was caused by an oversized prompt (computed at the
+        call site via :func:`failure_classes.classify_max_turns_failure`). An
+        oversized max-turns sets the per-pair oversized flag so the next
+        dispatch's budget gate skips turn escalation (BOUND_INPUT, not more
+        turns). The flag is cleared on any non-oversized result — including a
+        *non*-oversized ``error_max_turns`` (the cause changed back to a normal
+        budget exhaustion, which SHOULD escalate). ``oversized`` is ignored when
+        ``subtype != "error_max_turns"``.
         """
         key = (scope_id, role)
         if subtype == "error_max_turns":
             self._counters[key] = self._counters.get(key, 0) + 1
+            if oversized:
+                self._oversized.add(key)
+            else:
+                self._oversized.discard(key)
         else:
             # Reset on success OR on any non-max-turns failure subtype.
             self._counters.pop(key, None)
+            self._oversized.discard(key)
 
     def record_failure(
         self, scope_id: str, role: str, subtype: str | None
@@ -288,10 +329,12 @@ class BudgetEscalationTracker:
         :meth:`record_result` handle the reset implicitly.
         """
         self._counters.pop((scope_id, role), None)
+        self._oversized.discard((scope_id, role))
 
     def reset_all(self) -> None:
         """Clear every counter. Useful for tests; not used in production."""
         self._counters.clear()
+        self._oversized.clear()
 
     @classmethod
     def rehydrate_from_ledger(cls, cwd: Path) -> "BudgetEscalationTracker":

@@ -6942,9 +6942,44 @@ async def delegate(
                 subtype="error_max_turns_escalation_exhausted",
             )
 
-        _escalation_attempt = _budget_tracker.current_attempt(
-            envelope.task_id, role
-        )
+        # RECOVERY-CONTRACT §7 Step 8 (the A4 root cause): the LAST
+        # ``error_max_turns`` for this (task, role) was caused by an OVERSIZED
+        # prompt. Granting MORE turns is the wrong direction — the agent would
+        # just burn the extra budget re-reading the same bloat. SKIP the
+        # escalation (keep the BASE budget); the BOUND_INPUT resolver ladder is
+        # responsible for reducing the input on the next attempt. The normal
+        # (non-oversized) escalation ladder below is untouched.
+        if _budget_tracker.is_oversized(envelope.task_id, role):
+            _skip_payload = {
+                "task_id": envelope.task_id,
+                "role": role,
+                "max_turns": _prior_max_turns,
+                "reason": "oversized_input",
+            }
+            if getattr(orch, "plan_manager", None) is not None:
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="budget_escalation_skipped",
+                        payload=_skip_payload,
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort breadcrumb
+                    logger.warning(
+                        "orchestrator.budget_escalation_skipped",
+                        err=str(exc),
+                        **_skip_payload,
+                    )
+            else:
+                logger.warning(
+                    "orchestrator.budget_escalation_skipped",
+                    **_skip_payload,
+                )
+            _ = BudgetEscalationTracker
+            # Fall through with max_turns / timeout_s left at the base values.
+            _escalation_attempt = 0
+        else:
+            _escalation_attempt = _budget_tracker.current_attempt(
+                envelope.task_id, role
+            )
         if _escalation_attempt > 0:
             _new_max_turns, _new_timeout_s = escalate_budget(
                 _prior_max_turns,
@@ -7079,7 +7114,56 @@ async def delegate(
     # clears the counter. ``getattr`` keeps backward compat with the
     # older orchestrator stubs used by some unit tests.
     if _budget_tracker is not None and envelope.task_id:
-        _budget_tracker.record_result(envelope.task_id, role, result.subtype)
+        # RECOVERY-CONTRACT §7 Step 8 (the A4 root cause): an ``error_max_turns``
+        # failure is OVERSIZED_INPUT (not the normal guardrail exhaustion) when
+        # the dispatched prompt is too big — the agent burned its turns reading
+        # tools/context to digest the bloat. Classify by the REAL size source
+        # (``len(inv.prompt)`` — what the adapter actually saw) against the
+        # operator-tunable threshold, mark the per-(task, role) oversized flag,
+        # and emit a typed escalation breadcrumb. The flag makes the NEXT
+        # dispatch's budget gate skip turn escalation (BOUND_INPUT, not more
+        # turns). A non-oversized max-turns leaves the flag clear → normal
+        # escalation ladder still applies.
+        _oversized = False
+        if result.subtype == "error_max_turns":
+            _ovr_cfg = getattr(orch.cfg, "budget_escalation", None)
+            _ovr_threshold = (
+                getattr(_ovr_cfg, "oversized_input_char_threshold", None)
+                if _ovr_cfg is not None
+                else None
+            )
+            if _ovr_threshold is not None:
+                _max_turns_class = _fcls.classify_max_turns_failure(
+                    prompt_len=len(inv.prompt),
+                    threshold=int(_ovr_threshold),
+                )
+                _oversized = _max_turns_class == _fcls.OVERSIZED_INPUT
+                if _oversized and getattr(orch, "plan_manager", None) is not None:
+                    # Typed breadcrumb so post-mortems can see the bound-input
+                    # routing (and the F1d invariant sees a pre-block escalation
+                    # op). Best-effort — a ledger hiccup MUST NOT mask dispatch.
+                    try:
+                        await orch.plan_manager.ledger_append(
+                            op="blocker_escalated",
+                            payload={
+                                "task_id": envelope.task_id,
+                                "phase_id": None,
+                                "failure_class": _fcls.OVERSIZED_INPUT,
+                                "failing_role": role,
+                                "prompt_len": len(inv.prompt),
+                                "threshold": int(_ovr_threshold),
+                                "source": "delegate.oversized_input",
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 — forensics only
+                        logger.warning(
+                            "execute_phase.oversized_input_ledger_failed",
+                            task_id=envelope.task_id,
+                            err=str(exc),
+                        )
+        _budget_tracker.record_result(
+            envelope.task_id, role, result.subtype, oversized=_oversized
+        )
         # RECOVERY-CONTRACT §7 Step 2 (gate R4): persist the NEW counter value
         # so the per-(task_id, role) escalation ladder survives ``autodev
         # resume`` (last-value-wins via a ``budget_cycle`` ledger op). The

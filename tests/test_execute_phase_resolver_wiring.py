@@ -307,7 +307,7 @@ def test_wired_failure_classes_are_known() -> None:
     # Non-class members of the failure_classes public API that may be reached via
     # an alias attribute access (functions, not taxonomy constants). These are the
     # ONLY attribute names exempt from the "must be a constant" rule.
-    api_members = {"classify", "is_known"}
+    api_members = {"classify", "classify_max_turns_failure", "is_known"}
 
     src_root = Path(fc.__file__).resolve().parent.parent  # .../src
 
