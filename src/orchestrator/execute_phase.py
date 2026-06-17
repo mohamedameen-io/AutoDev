@@ -3687,6 +3687,64 @@ async def _execute_one_worker(
             if isinstance(exc, InfrastructureCircuitOpenError)
             else _halt_reason_prefix(exc)
         )
+        # Phase 1A Step 7 (RECOVERY-CONTRACT §7 Step 7, gate R6): CONSULT the
+        # resolver on the dominant quarantine path so a ``blocker_escalated``
+        # escalation op precedes the quarantine transition. Pre-Step-7 this
+        # path bypassed the resolver entirely — divergent from the architect-
+        # consult infra path (``:1525``), which DID route through the resolver.
+        # The consult is FIRST (before the Step-1 ``resolution_outcome``
+        # breadcrumb and the ``quarantined`` stamp) so the ledger ordering is:
+        #   blocker_escalated → resolution_chosen → resolution_outcome →
+        #   update_task_status(quarantined).
+        # For BOTH AuthenticationFailedError and InfrastructureCircuitOpenError
+        # we use ``INFRA_CIRCUIT_OPEN`` as the failure_class: the resolver's
+        # deterministic action for that class is ``fall_through`` (the legacy
+        # quarantine is INTENTIONAL — ``blocker_resolver.py:165``), so
+        # ``_apply_resolution`` returns None → ``recovered is None`` → we fall
+        # through to the EXISTING quarantine stamp unchanged. We do NOT invent
+        # an auth failure class (out of scope) and we do NOT call ``block_task``
+        # here — that would commit ``"blocked"`` (terminal), but quarantined
+        # must stay resumable / non-terminal so ``Orchestrator.resume()`` picks
+        # it up. Best-effort: the resolver must NEVER mask the original typed
+        # exception, so if ``_maybe_resolve_blocker`` raises we log + continue
+        # to the quarantine stamp. When ``AUTODEV_RESOLVER_DISABLED`` is set
+        # (the suite default) ``_maybe_resolve_blocker`` is a no-op returning
+        # None → this path is byte-identical to pre-Step-7.
+        try:
+            recovered = await _maybe_resolve_blocker(
+                orch,
+                task,
+                failure_class=_fcls.INFRA_CIRCUIT_OPEN,
+                raw_error=str(exc),
+                failing_role=None,
+                phase_id=task.phase_id,
+            )
+            # INFRA_CIRCUIT_OPEN → fall_through → ``recovered`` is None by
+            # construction; the assertion documents the invariant without
+            # changing control flow (we fall through to the quarantine stamp
+            # regardless, and recovery on this class is intentionally a no-op).
+            if recovered is not None:  # pragma: no cover - defensive
+                logger.info(
+                    "execute_phase.quarantine_resolver_recovered_unexpected",
+                    task_id=task.id,
+                    note=(
+                        "INFRA_CIRCUIT_OPEN is expected to fall_through; "
+                        "preserving quarantine semantics regardless"
+                    ),
+                )
+        except Exception as exc4:  # noqa: BLE001 — never mask the original
+            logger.warning(
+                "execute_phase.quarantine_resolver_consult_failed",
+                task_id=task.id,
+                err=str(exc4),
+            )
+        # Phase 1A Step 1 (kept): the quarantine-DECISION ``resolution_outcome``
+        # breadcrumb (``quarantine_pending_operator``). This is distinct from
+        # any ``resolution_outcome`` the resolver consult above emits for its
+        # own ``fall_through`` — that records the RESOLVER's outcome, this one
+        # records the QUARANTINE decision. We keep exactly ONE quarantine
+        # ``resolution_outcome`` (this one); the resolver's fall_through outcome
+        # is a separate, semantically-different audit row.
         try:
             from state.ledger import append_entry as _append_entry
             from state.lockfile import plan_lock as _plan_lock
