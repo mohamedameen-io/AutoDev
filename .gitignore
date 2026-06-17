@@ -75,3 +75,7 @@ autoreason_results
 
 # Environment variables
 .env
+
+# Phase-4 P6 (task_009) generated 50k-file filler — synthesised by
+# generate_filler.py before a run and deleted after; never committed.
+benchmarks/tasks/v1/task_009_py_50k_scale/repo/filler/

@@ -1,0 +1,10 @@
+{
+  "language": "python",
+  "difficulty": "medium",
+  "expected_minutes": 8,
+  "license": "MIT",
+  "origin": "synthetic",
+  "task_type": "refactor",
+  "behavior_preserving": true,
+  "description": "Extract the triplicated _valid_email() from users.py/orders.py/contacts.py into a single shared helper; behaviour must be unchanged."
+}

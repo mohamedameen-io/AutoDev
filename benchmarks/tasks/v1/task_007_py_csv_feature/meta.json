@@ -1,0 +1,9 @@
+{
+  "language": "python",
+  "difficulty": "easy",
+  "expected_minutes": 5,
+  "license": "MIT",
+  "origin": "synthetic",
+  "task_type": "feature",
+  "description": "Add a new to_csv(rows) function that serialises a list of dict rows to a CSV string (a feature, not a bug fix)."
+}

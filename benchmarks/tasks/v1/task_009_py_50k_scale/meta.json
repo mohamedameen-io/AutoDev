@@ -1,0 +1,8 @@
+{
+  "language": "python",
+  "difficulty": "medium",
+  "expected_minutes": 6,
+  "license": "MIT",
+  "origin": "synthetic",
+  "description": "Fix percentage() in core/calc.py to multiply by 100 (it returns a raw fraction). The repo is large (~50k modules); the bug is only in core/calc.py."
+}
