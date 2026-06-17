@@ -7,7 +7,12 @@ override). A bare ``if inv.allowed_tools:`` drops ``[]`` and silently grants
 ALL tools — exactly the bug this module pins down.
 
 - claude_code: ``None`` omits ``--allowed-tools``; ``["Read","Edit"]`` passes
-  ``Read,Edit``; ``[]`` passes the flag with an empty allow-list (``""``).
+  ``Read,Edit`` (an auto-approve list). ``[]`` — the text-only "no tools"
+  intent — DISABLES tools via the AVAILABILITY flag ``--tools ""``, NOT the
+  permission-only no-op ``--allowed-tools ""``. Phase-4 A4 field finding:
+  ``--allowed-tools ""`` does NOT remove tools (a Bash-triggering prompt still
+  ran Bash under it, ``permission_denials=[]``); ``--tools ""`` does (the model
+  has no tool to call). See ``results/phase4/A4-microprobe.json``.
 - cursor: there is NO ``--allowed-tools`` mechanism; the adapter only warns.
   ``[]`` (no-tools intent) must surface the same warning as a non-empty list
   instead of being silently swallowed.
@@ -59,17 +64,25 @@ def test_claude_non_empty_passes_comma_joined() -> None:
     assert cmd[idx + 1] == "Read,Edit"
 
 
-def test_claude_empty_list_passes_empty_allow_list() -> None:
-    """``allowed_tools=[]`` → explicit no-tools → flag present with ``""``.
+def test_claude_empty_list_disables_tools_via_tools_flag() -> None:
+    """``allowed_tools=[]`` → text-only "no tools" → ``--tools ""`` (availability).
 
-    This is the case that FAILS pre-fix: today ``if inv.allowed_tools:`` is
-    falsy for ``[]`` so the flag is omitted and Claude gets ALL tools.
+    Phase-4 A4 field finding (``results/phase4/A4-microprobe.json``):
+    ``--allowed-tools ""`` is permission-only and a NO-OP for availability — a
+    Bash-triggering prompt still executed Bash under it (``permission_denials``
+    empty). The real disable is the ``--tools`` flag: ``--tools ""`` removes all
+    built-in tools so the model has nothing to call (verified: 0 ``tool_use``).
+    So ``[]`` MUST render ``--tools ""`` and MUST NOT render the no-op
+    ``--allowed-tools ""`` (which would leave critic_t/synthesizer with all
+    tools and break the S1 bounded-critic guarantee).
     """
     adapter = ClaudeCodeAdapter()
     cmd = adapter._build_command(_make_inv(allowed_tools=[]))
-    assert "--allowed-tools" in cmd
-    idx = cmd.index("--allowed-tools")
+    assert "--tools" in cmd
+    idx = cmd.index("--tools")
     assert cmd[idx + 1] == ""
+    # The permission-only no-op must NOT be emitted for the empty (no-tools) case.
+    assert "--allowed-tools" not in cmd
 
 
 # ---------------------------------------------------------------------------
