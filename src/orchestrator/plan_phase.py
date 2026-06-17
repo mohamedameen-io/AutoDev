@@ -668,7 +668,7 @@ async def _advise_over_engineering(
        is being added. This *may* be entirely justified, but should be
        cross-checked against the necessity ladder.
 
-    2. **New-file bloat** — a task creates 3 or more brand-new files. A high
+    2. **New-file bloat** — a task creates 6 or more brand-new files. A high
        new-file count often means abstractions that could be collocated or
        inlined were given their own modules.
 

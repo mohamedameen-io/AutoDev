@@ -1,8 +1,10 @@
 """Tests for the B1 necessity ladder in tournament prompts.
 
-``ARCHITECT_B_SYSTEM`` and ``_ARCHITECT_B_PROMPT_IMPL`` must both contain
-the necessity-ladder guidance so the tournament consultant refuses to
-add unjustified dependencies or abstractions.
+``ARCHITECT_B_SYSTEM`` must contain the necessity-ladder guidance so the
+tournament consultant refuses to add unjustified dependencies or
+abstractions.  The ladder is injected via the system prompt exactly once;
+``_ARCHITECT_B_PROMPT_IMPL`` (the user-turn template) must NOT duplicate it
+to avoid sending the ~20-line ladder twice per call.
 
 The *assembled* developer prompt (the actual string the coder runs with,
 constructed in ``_CoderRunner.run`` and ``delegate()``) must also contain
@@ -57,34 +59,30 @@ def test_architect_b_system_contains_safety_carve_out() -> None:
     )
 
 
-def test_architect_b_prompt_impl_contains_necessity_ladder() -> None:
-    """_ARCHITECT_B_PROMPT_IMPL must also contain the necessity-ladder content."""
-    # Import lazily to avoid circular import issues at module level.
+def test_architect_b_system_delivers_ladder_once_not_via_user_prompt() -> None:
+    """The necessity ladder must reach impl architect_b via ARCHITECT_B_SYSTEM only.
+
+    The ladder is ~20 lines; injecting it in both system and user prompts
+    wastes tokens and can dilute instruction-following.  The system prompt
+    is the canonical injection site; the user-turn template
+    (_ARCHITECT_B_PROMPT_IMPL) must NOT duplicate it.
+
+    Invariant: ARCHITECT_B_SYSTEM contains the ladder (already asserted above);
+    _ARCHITECT_B_PROMPT_IMPL does NOT contain the ladder marker 'standard library'.
+    """
     from tournament.impl_tournament import _ARCHITECT_B_PROMPT_IMPL  # type: ignore[attr-defined]
 
-    text = _ARCHITECT_B_PROMPT_IMPL.lower()
-    assert "standard library" in text, (
-        "_ARCHITECT_B_PROMPT_IMPL must mention 'standard library'."
-    )
-    assert "platform" in text or "runtime" in text or "framework" in text, (
-        "_ARCHITECT_B_PROMPT_IMPL must contain the native platform/runtime/framework rung."
-    )
-    assert "existing" in text, (
-        "_ARCHITECT_B_PROMPT_IMPL must reference 'existing'."
-    )
-    assert "dependency" in text or "dependencies" in text, (
-        "_ARCHITECT_B_PROMPT_IMPL must mention 'dependency'."
+    # The system prompt must still carry the ladder (asserted separately above).
+    assert "standard library" in ARCHITECT_B_SYSTEM.lower(), (
+        "ARCHITECT_B_SYSTEM must still contain the necessity ladder "
+        "(the impl architect_b receives it exactly once via system)."
     )
 
-
-def test_architect_b_prompt_impl_contains_safety_carve_out() -> None:
-    """_ARCHITECT_B_PROMPT_IMPL must include the safety/security carve-out."""
-    from tournament.impl_tournament import _ARCHITECT_B_PROMPT_IMPL  # type: ignore[attr-defined]
-
-    text = _ARCHITECT_B_PROMPT_IMPL.lower()
-    has_safety = "safety" in text or "security" in text
-    assert has_safety, (
-        "_ARCHITECT_B_PROMPT_IMPL must contain the safety/security carve-out."
+    # The user-turn template must NOT duplicate it.
+    assert "standard library" not in _ARCHITECT_B_PROMPT_IMPL.lower(), (
+        "_ARCHITECT_B_PROMPT_IMPL must NOT contain the necessity ladder — "
+        "architect_b already receives it via ARCHITECT_B_SYSTEM (system prompt). "
+        "Duplication wastes tokens and dilutes instruction-following."
     )
 
 

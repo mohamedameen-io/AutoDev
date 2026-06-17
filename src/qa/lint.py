@@ -24,6 +24,9 @@ output are environment failures, not code violations.  These are now classified
 as ``severity="warn"`` (``passed=True``) so the pipeline continues and the
 issue is surfaced as a non-blocking advisory.  Genuine lint violations
 (non-zero exit without any setup-error signal) remain ``severity="block"``.
+Note: the ESLint config-absent and tool-env-error cases are intentional
+exceptions to the "unconditional passed=False on tool errors" rule — they
+degrade to skip/warn rather than block, by design.
 """
 
 from __future__ import annotations

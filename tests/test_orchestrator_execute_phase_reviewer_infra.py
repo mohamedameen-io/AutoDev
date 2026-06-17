@@ -547,3 +547,161 @@ async def test_approved_exhausted_diff_check_raises_blocks_task(
         f"expected blocked_reason to contain 'worktree_diff_check_failed', got {result.blocked_reason!r} — "
         "the A4 WORKTREE_DIFF_CHECK_FAILED class must be stamped in blocked_reason when diff-check raises"
     )
+
+
+# ---------------------------------------------------------------------------
+# M-2: accurate diff_empty telemetry in the ledger breadcrumb
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_accepted_approved_on_exhaustion_breadcrumb_diff_empty_false_when_applied(
+    tmp_path: Path,
+) -> None:
+    """Ledger breadcrumb must report diff_empty=False when a non-empty diff was applied.
+
+    Pre-fix: the breadcrumb hardcoded ``diff_empty: True`` even when a prior
+    approved worktree diff was applied to main (the apply path in A4).
+    Post-fix: the breadcrumb reflects the ACTUAL worktree state.
+    """
+    task_id = "0.1"
+
+    await write_evidence(
+        tmp_path,
+        task_id,
+        ReviewEvidence(
+            task_id=task_id,
+            verdict="APPROVED",
+            issues=[],
+            output_text="VERDICT: APPROVED",
+            raw_response="VERDICT: APPROVED",
+        ),
+    )
+
+    orch = await _make_orch_r7(tmp_path)
+    await orch.plan_manager.update_task_status(task_id, "in_progress")
+    task = await orch.plan_manager.get_task(task_id)
+    assert task is not None
+
+    exhausted_result = fail(
+        "budget escalation exhausted",
+        subtype="error_max_turns_escalation_exhausted",
+    )
+
+    # Non-empty worktree diff → apply path fires.
+    mock_wt_mgr = MagicMock()
+    mock_wt_mgr.get_diff_vs_base = AsyncMock(
+        return_value=(
+            "diff --git a/math.py b/math.py\n"
+            "+def multiply(a, b): return a * b\n"
+        )
+    )
+    mock_worktree = tmp_path / "worktree"
+
+    async def _fake_apply(orch_arg, task_arg, wt_arg, wt_mgr_arg):  # type: ignore[return]
+        return True  # applied successfully
+
+    # Capture ledger_append calls so we can inspect the payload.
+    ledger_calls: list[dict] = []
+    _orig_ledger_append = orch.plan_manager.ledger_append
+
+    async def _spy_ledger_append(op: str, payload: dict) -> None:  # type: ignore[return]
+        ledger_calls.append({"op": op, "payload": payload})
+        return await _orig_ledger_append(op=op, payload=payload)
+
+    orch.plan_manager.ledger_append = _spy_ledger_append  # type: ignore[method-assign]
+
+    with patch.object(ep, "_apply_with_conflict_escalation", _fake_apply):
+        result = await ep._maybe_accept_approved_on_exhaustion(
+            orch,
+            task,
+            exhausted_result,
+            worktree=mock_worktree,
+            worktree_mgr=mock_wt_mgr,
+        )
+
+    got_status = result.status if result is not None else None
+    assert result is not None and result.status == "complete", (
+        f"expected complete task, got status {got_status!r}"
+    )
+
+    # Find the accepted_approved_on_exhaustion breadcrumb.
+    breadcrumbs = [
+        c for c in ledger_calls
+        if c["op"] == "accepted_approved_on_exhaustion"
+    ]
+    assert breadcrumbs, "no accepted_approved_on_exhaustion ledger breadcrumb found"
+    payload = breadcrumbs[-1]["payload"]
+    assert payload.get("diff_empty") is False, (
+        f"breadcrumb must report diff_empty=False when a non-empty diff was applied; "
+        f"got diff_empty={payload.get('diff_empty')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_accepted_approved_on_exhaustion_breadcrumb_diff_empty_true_when_clean(
+    tmp_path: Path,
+) -> None:
+    """Ledger breadcrumb must report diff_empty=True for a clean worktree (no-op path)."""
+    task_id = "0.1"
+
+    await write_evidence(
+        tmp_path,
+        task_id,
+        ReviewEvidence(
+            task_id=task_id,
+            verdict="APPROVED",
+            issues=[],
+            output_text="VERDICT: APPROVED",
+            raw_response="VERDICT: APPROVED",
+        ),
+    )
+
+    orch = await _make_orch_r7(tmp_path)
+    await orch.plan_manager.update_task_status(task_id, "in_progress")
+    task = await orch.plan_manager.get_task(task_id)
+    assert task is not None
+
+    exhausted_result = fail(
+        "budget escalation exhausted",
+        subtype="error_max_turns_escalation_exhausted",
+    )
+
+    # Clean worktree → no apply.
+    mock_wt_mgr = MagicMock()
+    mock_wt_mgr.get_diff_vs_base = AsyncMock(return_value="")
+    mock_worktree = tmp_path / "worktree"
+
+    ledger_calls: list[dict] = []
+    _orig_ledger_append = orch.plan_manager.ledger_append
+
+    async def _spy_ledger_append(op: str, payload: dict) -> None:  # type: ignore[return]
+        ledger_calls.append({"op": op, "payload": payload})
+        return await _orig_ledger_append(op=op, payload=payload)
+
+    orch.plan_manager.ledger_append = _spy_ledger_append  # type: ignore[method-assign]
+
+    async def _fake_apply(orch_arg, task_arg, wt_arg, wt_mgr_arg):  # type: ignore[return]
+        return True
+
+    with patch.object(ep, "_apply_with_conflict_escalation", _fake_apply):
+        result = await ep._maybe_accept_approved_on_exhaustion(
+            orch,
+            task,
+            exhausted_result,
+            worktree=mock_worktree,
+            worktree_mgr=mock_wt_mgr,
+        )
+
+    assert result is not None and result.status == "complete"
+
+    breadcrumbs = [
+        c for c in ledger_calls
+        if c["op"] == "accepted_approved_on_exhaustion"
+    ]
+    assert breadcrumbs, "no accepted_approved_on_exhaustion ledger breadcrumb found"
+    payload = breadcrumbs[-1]["payload"]
+    assert payload.get("diff_empty") is True, (
+        f"breadcrumb must report diff_empty=True for a clean worktree; "
+        f"got diff_empty={payload.get('diff_empty')!r}"
+    )

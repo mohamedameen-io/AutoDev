@@ -8039,13 +8039,9 @@ async def _maybe_accept_approved_on_exhaustion(
     if in_hand_diff is not None and in_hand_diff.strip():
         return None
 
-    logger.warning(
-        "execute_phase.accepted_approved_on_exhaustion",
-        task_id=task.id,
-        subtype=subtype,
-        verdict="APPROVED",
-        diff_empty=True,
-    )
+    # worktree_diff is resolved below (inside the worktree apply block); a
+    # None here means no worktree manager was provided → effectively empty.
+    worktree_diff: str | None = None
 
     # Apply any prior successful attempt's changes from the worktree to
     # main before marking complete. When this function fires, the worktree
@@ -8109,6 +8105,17 @@ async def _maybe_accept_approved_on_exhaustion(
                 # _apply_with_conflict_escalation.
                 return await orch.plan_manager.get_task(task.id) or task
 
+    # Emit the acceptance breadcrumb now that we know whether the worktree
+    # diff was empty (no prior changes) or non-empty (applied above).
+    _actual_diff_empty = worktree_diff is None or not worktree_diff.strip()
+    logger.warning(
+        "execute_phase.accepted_approved_on_exhaustion",
+        task_id=task.id,
+        subtype=subtype,
+        verdict="APPROVED",
+        diff_empty=_actual_diff_empty,
+    )
+
     # Audit-only ledger breadcrumb. Best-effort — a ledger failure here
     # MUST NOT mask the completion the operator needs.
     if getattr(orch, "plan_manager", None) is not None:
@@ -8119,7 +8126,7 @@ async def _maybe_accept_approved_on_exhaustion(
                     "task_id": task.id,
                     "verdict": "APPROVED",
                     "subtype": subtype or "unknown",
-                    "diff_empty": True,
+                    "diff_empty": _actual_diff_empty,
                 },
             )
         except Exception as exc:  # noqa: BLE001 — best-effort breadcrumb
