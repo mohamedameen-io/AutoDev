@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .scorer import (
+    diff_since_commit,
     extract_diff_from_ledger,
     iter_task_dirs,
     score_task_with_patch,
@@ -142,13 +143,21 @@ def _git(args: Sequence[str], *, cwd: Path) -> _SubprocessResult:
     return _run(["git", *args], cwd=cwd, timeout=60)
 
 
-def _init_git_repo(repo_dir: Path) -> None:
+def _init_git_repo(repo_dir: Path) -> str:
+    """Initialise a git repo at the broken initial state and return its SHA.
+
+    The returned SHA is the *baseline* the run is scored against: diffing it to
+    the final worktree state recovers a fix even when AutoDev commits it (the
+    P1 false-FAIL fix).
+    """
     _git(["init", "-q", "-b", "main"], cwd=repo_dir)
     # Local-only identity so the commit succeeds in any environment.
     _git(["config", "user.email", "benchmark@autodev.local"], cwd=repo_dir)
     _git(["config", "user.name", "AutoDev Benchmark"], cwd=repo_dir)
     _git(["add", "."], cwd=repo_dir)
     _git(["commit", "-q", "-m", "initial"], cwd=repo_dir)
+    head = _git(["rev-parse", "HEAD"], cwd=repo_dir)
+    return head.stdout.strip() if head.returncode == 0 else "HEAD"
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +169,27 @@ def _git_diff_head(repo_dir: Path) -> str:
     """Capture ``git diff HEAD`` for a repo (uncommitted + committed-since)."""
     res = _run(["git", "diff", "HEAD"], cwd=repo_dir, timeout=60)
     return res.stdout if res.returncode == 0 else ""
+
+
+def _is_behavior_preserving(meta: dict) -> bool:
+    """Return True if a task is behaviour-preserving (a refactor).
+
+    Such tasks pass their ``test_command.sh`` with NO change, so they need a
+    structural-change assertion to avoid a vacuous PASS (field finding P5).
+    Recognised meta.json conventions (any one suffices):
+
+    - ``"task_type": "refactor"`` (or ``"category": "refactor"``);
+    - ``"behavior_preserving": true`` / ``"behaviour_preserving": true``.
+    """
+    type_keys = ("task_type", "category", "kind")
+    for key in type_keys:
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip().lower() == "refactor":
+            return True
+    for key in ("behavior_preserving", "behaviour_preserving"):
+        if meta.get(key) is True:
+            return True
+    return False
 
 
 def _diff_size(text: str) -> int:
@@ -225,12 +255,21 @@ def run_task(
             tmp_root = workdir_root
             tmp_root.mkdir(parents=True, exist_ok=True)
 
-        # Step 1: copy repo → fresh git repo.
+        # Read meta to learn whether this is a behaviour-preserving (refactor)
+        # task — those need a structural-change assertion, not test-only scoring.
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        require_structural_change = _is_behavior_preserving(meta)
+
+        # Step 1: copy repo → fresh git repo. Capture the broken baseline commit
+        # so a fix can be recovered even when AutoDev commits it (P1 fix).
         agent_repo = tmp_root / "agent_repo"
         if agent_repo.exists():
             shutil.rmtree(agent_repo)
         shutil.copytree(task_dir / "repo", agent_repo)
-        _init_git_repo(agent_repo)
+        initial_commit = _init_git_repo(agent_repo)
 
         # Step 2: invoke autodev init/plan/execute.
         autodev_failed_reason: str | None = None
@@ -259,10 +298,17 @@ def run_task(
                 break
 
         # Step 3: extract the agent's diff.
+        #
+        # Precedence: an explicit ledger diff (when present) → the commit-based
+        # initial→final diff (recovers a COMMITTED fix; the P1 fix) → a plain
+        # `git diff HEAD` as a last resort. AutoDev commits its fixes, so the
+        # commit-based diff is the load-bearing path; `git diff HEAD` alone
+        # would false-FAIL every committed fix.
         ledger_diff = extract_diff_from_ledger(
             agent_repo / ".autodev" / "plan-ledger.jsonl"
         )
-        agent_diff = ledger_diff or _git_diff_head(agent_repo)
+        commit_diff = diff_since_commit(agent_repo, initial_commit)
+        agent_diff = ledger_diff or commit_diff or _git_diff_head(agent_repo)
 
         # Step 4: ground truth + diff size delta (best-effort metric).
         gt_path = task_dir / "ground_truth.patch"
@@ -276,6 +322,7 @@ def run_task(
             "diff_size_lines": agent_size,
             "ground_truth_diff_size_lines": gt_size,
             "diff_size_delta_lines": agent_size - gt_size,
+            "behavior_preserving": require_structural_change,
         }
 
         # Step 5: score in a fresh copy (so we don't conflate agent's
@@ -287,7 +334,10 @@ def run_task(
             agent_diff,
             workdir=score_dir,
             test_timeout_seconds=test_timeout_seconds,
+            require_structural_change=require_structural_change,
         )
+        if score.structural_change is not None:
+            secondary["structural_change"] = score.structural_change
 
         if score.passed:
             status = "PASS"

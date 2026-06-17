@@ -46,8 +46,26 @@ logger = get_logger()
 
 _EVIDENCE_TASK_ID = "plan-framing"
 
+# WS2-17 taxonomy. The two BUG classes (``local_defect`` /
+# ``realized_design_failure``) drive the design-altitude tournament and the
+# conservatism gate; ``local_defect`` is also the skeptical/fail-safe default.
+# The three WORK-TYPE classes are NEW exits for feature / refactor / greenfield
+# work that previously got mislabelled as ``local_defect``: on the non-design
+# path these are preserved verbatim (a gated bug-class still collapses to the
+# conservative ``local_defect`` — see the ``else`` branch in run_framing_phase).
+_WORK_TYPE_CLASSES = ("feature", "refactor", "greenfield")
+
+# WS2-17: the taxonomy is no longer binary+bug-shaped. The two original BUG
+# classes (``local_defect`` / ``realized_design_failure``) stay, and three
+# WORK-TYPE classes are added so feature / refactor / greenfield specs exit
+# framing correctly labelled instead of being forced to ``local_defect``. The
+# alternation is ordered longest-first so e.g. ``realized_design_failure`` wins
+# over a hypothetical prefix; word-class strings are disjoint here so order is
+# not load-bearing, but keep it explicit.
 _CLASSIFICATION_RE = re.compile(
-    r"CLASSIFICATION:\s*(local_defect|realized_design_failure)", re.IGNORECASE
+    r"CLASSIFICATION:\s*"
+    r"(realized_design_failure|local_defect|feature|refactor|greenfield)",
+    re.IGNORECASE,
 )
 _CONFIDENCE_RE = re.compile(r"CONFIDENCE:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
 
@@ -74,6 +92,63 @@ class AltitudeDecision:
 def _check_framing_disabled() -> bool:
     """Honor the ``AUTODEV_FRAMING_DISABLED=1`` kill-switch (mirrors AUTODEV_INDEX_DISABLED)."""
     return os.environ.get("AUTODEV_FRAMING_DISABLED", "").strip() == "1"
+
+
+# Scale thresholds (S4 framing-side). The scale agent (intake_phase) is the
+# producer of ``is_large`` and always sets it, so the authoritative ``is_large``
+# branch below short-circuits in the real pipeline. These thresholds only feed
+# the DEFENSIVE fallback for a partial ``scale_context`` (raw shape but no
+# ``is_large``); kept aligned with the producer's contract
+# (``depth_max > 8`` OR ``avg_file_size_bytes > 50_000``) so the fallback can
+# never disagree with the producer were it ever reached.
+_SCALE_DEPTH_THRESHOLD = 8
+_SCALE_AVG_FILE_BYTES_THRESHOLD = 50_000
+
+
+def _scale_is_large(scale_context: dict | None) -> bool:
+    """Read the (parallel) scale agent's ``scale_context`` (S4 framing-side).
+
+    Consumed shape (must match the scale agent)::
+
+        {'is_large': bool, 'depth_max': int, 'avg_file_size_bytes': int}
+
+    ``is_large`` is authoritative when present; otherwise the raw shape signals
+    are used as a fallback so a partial dict still works. Absent / non-dict /
+    empty ``scale_context`` returns ``False`` — fully backward compatible (the
+    altitude stays exactly as it was before this field existed).
+    """
+    if not isinstance(scale_context, dict) or not scale_context:
+        return False
+    flag = scale_context.get("is_large")
+    if isinstance(flag, bool):
+        return flag
+    depth = scale_context.get("depth_max")
+    avg = scale_context.get("avg_file_size_bytes")
+    large = False
+    if isinstance(depth, int) and depth > _SCALE_DEPTH_THRESHOLD:
+        large = True
+    if isinstance(avg, int) and avg > _SCALE_AVG_FILE_BYTES_THRESHOLD:
+        large = True
+    return large
+
+
+def _scale_aware_approach() -> SolutionApproach:
+    """A component-level (NOT local_patch) approach for large repos (S4).
+
+    When the scale agent signals a large repo, framing must NOT force the lowest
+    altitude. This is the conservative non-local default: one altitude above
+    ``local_patch`` so a large-repo change is not pinned to a single function.
+    """
+    return SolutionApproach(
+        name="scale_aware_component",
+        altitude="component_refactor",
+        summary="Component-scoped change sized to a large repository.",
+        eliminates_failure_class=False,
+        primary_tradeoff="Wider than a one-line patch; scoped to the affected component.",
+        primary_risk="Touches more than one file within the component boundary.",
+        integration_surface=[],
+        est_blast_radius="single component",
+    )
 
 
 def _local_patch_approach() -> SolutionApproach:
@@ -444,12 +519,24 @@ async def run_framing_phase(
     candidate_digest: CandidateDigest | None,
     spec_hash: str,
     diagnosis_signals: object | None = None,
+    scale_context: dict | None = None,
 ) -> AltitudeDecision | None:
     """Classify the defect and select an altitude (ADR-0044).
 
     Returns ``None`` when disabled (kill-switch / config). Otherwise returns an
     :class:`AltitudeDecision`. Deterministic-on-resume: re-reads ``plan-framing``
     evidence FIRST and skips the classifier with zero LLM calls.
+
+    S4 (framing-side): ``scale_context`` is the (parallel) scale agent's repo
+    shape, threaded in from the intake/enricher output. Consumed shape (must
+    match the scale agent)::
+
+        {'is_large': bool, 'depth_max': int, 'avg_file_size_bytes': int}
+
+    When scale signals are HIGH and the classifier did not already select a
+    design altitude, framing does NOT force the lowest (``local_patch``)
+    altitude — it picks a component-level default instead. Absent / non-dict
+    ``scale_context`` is fully backward compatible (behaves as before).
 
     ADR-0046 integration: ``diagnosis_signals`` is an optional
     :class:`orchestrator.diagnosis_phase.DiagnosisOutcome` (typed loosely as
@@ -547,7 +634,11 @@ async def run_framing_phase(
             chosen = _local_patch_approach()
             approaches = [chosen]
             final_classification: Literal[
-                "local_defect", "realized_design_failure"
+                "local_defect",
+                "realized_design_failure",
+                "feature",
+                "refactor",
+                "greenfield",
             ] = "local_defect"
             is_design = False
             logger.info("framing_phase.local_defect_path", reason="parse_degraded")
@@ -582,10 +673,41 @@ async def run_framing_phase(
                 chosen=chosen.name,
             )
     else:
-        chosen = _local_patch_approach()
+        # Non-design path. WS2-17: preserve the classifier's WORK-TYPE class
+        # (feature / refactor / greenfield) instead of forcing ``local_defect``
+        # — work-type specs must exit framing correctly labelled. The BUG
+        # classes stay conservative: a ``realized_design_failure`` that reached
+        # this branch was GATED (low confidence / no structural signal), so it
+        # must collapse to the conservative ``local_defect`` default — NOT
+        # persist the ungated raw class. Anything unrecognised also defaults to
+        # ``local_defect``.
+        if classification in _WORK_TYPE_CLASSES:
+            final_classification = classification  # type: ignore[assignment]
+        else:
+            final_classification = "local_defect"
+        # S4 (framing-side): do NOT unconditionally pick the lowest altitude
+        # when the scale agent signals a large repo. A large repo gets a
+        # component-level default; small / absent scale stays local_patch
+        # (fully backward compatible).
+        large = _scale_is_large(scale_context)
+        if large:
+            chosen = _scale_aware_approach()
+            signals_fired = signals_fired + ["scale_large_altitude_raised"]
+            logger.info(
+                "framing_phase.scale_aware_altitude",
+                classification=final_classification,
+                altitude=chosen.altitude,
+                scale_is_large=True,
+            )
+        else:
+            chosen = _local_patch_approach()
         approaches = [chosen]
-        final_classification = "local_defect"
-        logger.info("framing_phase.local_defect_path", confidence=confidence)
+        logger.info(
+            "framing_phase.local_defect_path",
+            confidence=confidence,
+            classification=final_classification,
+            scale_is_large=large,
+        )
 
     # 7. Persist evidence BEFORE returning (crash-safety).
     ev = FramingEvidence(

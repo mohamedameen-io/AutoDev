@@ -100,6 +100,7 @@ def _qa_cfg_only_syntax() -> object:
         code_size = False
         lint_timeout_s = 120.0
         test_timeout_s = 600.0
+        build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
 
     class Cfg:
         qa_gates = QAGates()

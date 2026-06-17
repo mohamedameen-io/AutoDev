@@ -93,6 +93,22 @@ def _is_test_path(p: Path) -> bool:
     return "tests" in p.parts
 
 
+def _has_git_signal(cwd: Path) -> bool:
+    """True iff *cwd* is a git repo (has a ``.git`` entry).
+
+    WS2-14: the changed-file scope handed to the test gate is derived from a
+    *git* diff. A NON-git in-place repo therefore yields an EMPTY scope
+    (``paths=[]``) that means "no git signal", NOT "a clean git repo with no
+    changes". The two must be distinguished: when there is no git signal we
+    fall back to the full suite rather than running a vacuous empty-scoped
+    subset. Mirrors ``orchestrator.execute_phase._is_git_repo``.
+    """
+    try:
+        return (cwd / ".git").exists()
+    except OSError:
+        return False
+
+
 # Affirmative "ran nothing" tokens emitted by the runners on a zero-test run
 # that *still exits 0*. Detection is affirmative on purpose: we only fail loud
 # when the output positively says it ran/collected nothing. Unrecognised or
@@ -245,6 +261,15 @@ async def _run_pytest(
 
     if paths is None:
         targets: list[str] = []
+    elif not paths and not _has_git_signal(cwd):
+        # WS2-14: empty scope (``paths=[]``) in a NON-git in-place repo means
+        # "no git signal", NOT "a clean git repo with no changes". The git diff
+        # is simply unavailable here, so a diff-scoped subset would be VACUOUS
+        # (scope to 0 files → run nothing → false green). Fall back to the FULL
+        # suite (``targets=[]`` → bare ``pytest -q``). A git repo with an empty
+        # diff (clean tree) still hits the legitimate "no python changes" pass
+        # in the ``else`` branch below.
+        targets = []
     else:
         changed_tests = [str(p) for p in paths if _is_test_path(p)]
         if changed_tests:

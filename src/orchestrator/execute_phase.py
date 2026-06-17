@@ -8212,7 +8212,7 @@ async def _run_qa_gates(
     gates: list[tuple[str, bool, Callable[[], Awaitable[GateResult]]]] = [
         ("syntax_check", cfg.syntax_check, lambda: run_syntax_check(cwd, language)),
         ("lint", cfg.lint, lambda: run_lint(cwd, language, paths=secretscan_paths, timeout_s=cfg.lint_timeout_s)),
-        ("build_check", cfg.build_check, lambda: run_build_check(cwd, language)),
+        ("build_check", cfg.build_check, lambda: run_build_check(cwd, language, timeout_s=cfg.build_check_timeout_s)),
         ("test_runner", cfg.test_runner, lambda: run_tests(cwd, paths=secretscan_paths, timeout_s=cfg.test_timeout_s)),
         (
             "secretscan",

@@ -57,6 +57,15 @@ _EVIDENCE_TASK_ID = "plan-intake"
 # Bound the enriched spec so a runaway enricher cannot bloat spec.md / evidence.
 _MAX_SPEC_CHARS = 24_000
 
+# WS-SCALE-01 (gate S4): "large repo" thresholds for the scale_context that
+# intake surfaces from the repo_probe snapshot. A repo is large iff it is deep
+# (``depth_max > 8`` — heavy navigation cost) OR its files are big on average
+# (``avg_file_size_bytes > 50_000`` — context-window pressure per read). These
+# are independent of repo_probe's own ``is_huge`` (file-count / total-bytes),
+# which framing also consumes; ``is_large`` targets the per-file/depth shape.
+_LARGE_DEPTH_THRESHOLD = 8
+_LARGE_AVG_FILE_BYTES_THRESHOLD = 50_000
+
 # A ```questions field line, leading whitespace + optional ``-`` bullet stripped.
 _Q_FIELD_RE = re.compile(r"^\s*-?\s*([a-z_]+):\s*(.*)$")
 # A field line that STARTS a new question record (anchored on ``id:``).
@@ -81,6 +90,11 @@ class IntakeOutcome:
     assumptions: list[str] = field(default_factory=list)
     degraded: bool = False
     passthrough: bool = False
+    # WS-SCALE-01 (gate S4): repo-scale signals READ from the orchestrator's
+    # :class:`~runtime.repo_probe.RepoCapacity` snapshot and surfaced for
+    # downstream framing. Always populated (every path computes it); carries at
+    # least ``{'is_large','depth_max','avg_file_size_bytes'}``.
+    scale_context: dict[str, object] = field(default_factory=dict)
 
 
 def _check_intake_disabled() -> bool:
@@ -91,6 +105,59 @@ def _check_intake_disabled() -> bool:
 def _spec_hash(text: str) -> str:
     """Compute the locked spec_hash (mirrors ``plan_phase._spec_hash``)."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _build_scale_context(capacity: object) -> dict[str, object]:
+    """WS-SCALE-01 (gate S4): derive ``scale_context`` from a repo_probe snapshot.
+
+    Reads the shape signals computed by :func:`runtime.repo_probe.probe_repo`
+    (``depth_max`` / ``avg_file_size_bytes`` / ``largest_dir`` / …) — historically
+    NOTHING outside ``repo_probe`` consumed them, so "scale-aware" was vacuous.
+    This is the production-side wiring: the intake phase surfaces them on its
+    output so the downstream framing phase can size its strategy.
+
+    ``is_large`` is True iff the repo is DEEP (``depth_max > 8``) OR its files are
+    big on average (``avg_file_size_bytes > 50_000``). Duck-typed on *capacity*
+    (typed ``object`` to avoid a hard import); missing attributes degrade to 0 so
+    a malformed snapshot yields ``is_large=False`` rather than raising.
+
+    Coordinated contract (with the framing agent): the dict carries at least
+    ``{'is_large','depth_max','avg_file_size_bytes'}``; the additional keys are
+    additive and harmless to consumers that ignore them.
+    """
+    depth_max = int(getattr(capacity, "depth_max", 0) or 0)
+    avg_file_size_bytes = int(getattr(capacity, "avg_file_size_bytes", 0) or 0)
+    is_large = (
+        depth_max > _LARGE_DEPTH_THRESHOLD
+        or avg_file_size_bytes > _LARGE_AVG_FILE_BYTES_THRESHOLD
+    )
+    return {
+        "is_large": is_large,
+        "depth_max": depth_max,
+        "avg_file_size_bytes": avg_file_size_bytes,
+        # Additive signals (framing may ignore them; useful for sparse-checkout
+        # / navigation tuning). All READ from the same probe snapshot.
+        "file_count": int(getattr(capacity, "file_count", 0) or 0),
+        "total_bytes": int(getattr(capacity, "total_bytes", 0) or 0),
+        "is_huge": bool(getattr(capacity, "is_huge", False)),
+        "largest_dir": str(getattr(capacity, "largest_dir", "") or ""),
+    }
+
+
+def _scale_context_for(orch: "Orchestrator") -> dict[str, object]:
+    """Read ``orch.repo_capacity`` and build the scale_context (fail-safe).
+
+    The repo probe is lazy + cached on the orchestrator; any failure degrades to
+    an empty-but-typed scale_context (``is_large=False``) so intake NEVER blocks
+    planning on a probe hiccup.
+    """
+    try:
+        return _build_scale_context(orch.repo_capacity)
+    except Exception as exc:  # noqa: BLE001 - scale wiring must never block intake
+        logger.warning("intake_phase.scale_context_failed", err=str(exc))
+        return _build_scale_context(
+            None  # duck-typed: all getattrs default → is_large False
+        )
 
 
 def _render_context(envelope_context: dict[str, str], action: str) -> str:
@@ -295,6 +362,9 @@ def _outcome_from_evidence(ev: IntakeEvidence) -> IntakeOutcome:
         assumptions=list(ev.assumptions),
         degraded=False,
         passthrough=not ev.gathered and not ev.questions,
+        # WS-SCALE-01: the persisted scale_context wins on resume (0 re-probe),
+        # so resumed runs see the SAME scale signal the original run locked in.
+        scale_context=dict(ev.scale_context),
     )
 
 
@@ -325,6 +395,7 @@ async def _persist(
     answers: list[ClarifyingAnswer],
     assumptions: list[str],
     spec_hash: str,
+    scale_context: dict[str, object],
 ) -> None:
     """Write the IntakeEvidence bundle (crash-safe) BEFORE the outcome is returned."""
     ev = IntakeEvidence(
@@ -339,6 +410,7 @@ async def _persist(
         locked_spec_hash=spec_hash,
         sources_used=list(orch.cfg.intake.sources),
         excluded_globs=list(orch.cfg.intake.exclude_globs),
+        scale_context=dict(scale_context),
     )
     await write_evidence(orch.cwd, _EVIDENCE_TASK_ID, ev)
 
@@ -352,6 +424,11 @@ async def _run_intake_phase_inner(
     fail-safe degrade. Separated so the wrapper stays a thin try/except.
     """
     cwd = orch.cwd
+
+    # WS-SCALE-01 (gate S4): read the repo_probe scale signals ONCE and surface
+    # them on every outcome (pass-through AND gap path). Computed up-front so the
+    # downstream framing phase always receives a populated scale_context.
+    scale_context = _scale_context_for(orch)
 
     # 1. ASSESS — deterministic, cheap. No gaps ⇒ pass-through fast path.
     gaps = assess(intent)
@@ -371,11 +448,20 @@ async def _run_intake_phase_inner(
             answers=[],
             assumptions=[],
             spec_hash=spec_hash,
+            scale_context=scale_context,
         )
         await _ledger(orch, "spec_locked", {"spec_hash": spec_hash})
-        logger.info("intake_phase.passthrough", spec_hash=spec_hash)
+        logger.info(
+            "intake_phase.passthrough",
+            spec_hash=spec_hash,
+            is_large=scale_context.get("is_large"),
+        )
         return IntakeOutcome(
-            spec=intent, spec_hash=spec_hash, assumptions=[], passthrough=True
+            spec=intent,
+            spec_hash=spec_hash,
+            assumptions=[],
+            passthrough=True,
+            scale_context=scale_context,
         )
 
     # 2. GATHER — non-LLM external + reuse the explorer pass (never raises).
@@ -446,6 +532,7 @@ async def _run_intake_phase_inner(
         answers=answers,
         assumptions=assumptions,
         spec_hash=spec_hash,
+        scale_context=scale_context,
     )
     await _ledger(orch, "spec_locked", {"spec_hash": spec_hash})
     logger.info(
@@ -454,9 +541,14 @@ async def _run_intake_phase_inner(
         n_facts=len(facts),
         n_questions=len(questions),
         n_assumptions=len(assumptions),
+        is_large=scale_context.get("is_large"),
     )
     return IntakeOutcome(
-        spec=locked, spec_hash=spec_hash, assumptions=assumptions, passthrough=False
+        spec=locked,
+        spec_hash=spec_hash,
+        assumptions=assumptions,
+        passthrough=False,
+        scale_context=scale_context,
     )
 
 
@@ -477,10 +569,15 @@ async def run_intake_phase(
     cwd = orch.cwd
 
     # 1. Enable / kill-switch — degrade to the raw intent (no lock side-effects).
+    # WS-SCALE-01: still surface the scale_context so a disabled-intake run does
+    # not starve downstream framing of the repo-scale signal.
     if not orch.cfg.intake.enabled or _check_intake_disabled():
         logger.info("intake_phase.disabled")
         return IntakeOutcome(
-            spec=intent, spec_hash=_spec_hash(intent), degraded=True
+            spec=intent,
+            spec_hash=_spec_hash(intent),
+            degraded=True,
+            scale_context=_scale_context_for(orch),
         )
 
     # 2. Resume re-read FIRST — before assess and before any dispatch.
@@ -504,7 +601,10 @@ async def run_intake_phase(
         except Exception:  # noqa: BLE001
             pass
         return IntakeOutcome(
-            spec=intent, spec_hash=_spec_hash(intent), degraded=True
+            spec=intent,
+            spec_hash=_spec_hash(intent),
+            degraded=True,
+            scale_context=_scale_context_for(orch),
         )
 
 

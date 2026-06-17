@@ -21,7 +21,11 @@ from plugins.registry import GateResult
 from qa.detect import detect_language
 
 
-_DEFAULT_TIMEOUT_S = 60
+# WS2-11: the orchestrator normally overrides this via
+# ``cfg.qa_gates.build_check_timeout_s`` (threaded into ``run_build_check``).
+# The default floor is 120s — the legacy 60s could not finish a COLD cargo/Go
+# build (dependency fetch + first compile) and false-blocked on timeout.
+_DEFAULT_TIMEOUT_S = 120
 
 
 async def run_build_check(

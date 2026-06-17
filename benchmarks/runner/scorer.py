@@ -67,13 +67,20 @@ def apply_patch_to_repo(repo_dir: Path, patch_text: str) -> PatchApplyResult:
 
 @dataclass(frozen=True)
 class ScoreResult:
-    """Outcome of running a task's ``test_command.sh`` after a patch."""
+    """Outcome of running a task's ``test_command.sh`` after a patch.
+
+    ``structural_change`` is the verdict of the behaviour-preserving guard:
+      - ``None``  — the guard was not requested (default bugfix scoring);
+      - ``True``  — a non-empty change was supplied (refactor is real);
+      - ``False`` — an empty change was supplied (vacuous "refactor").
+    """
 
     passed: bool
     exit_code: int
     apply_error: str | None
     stdout_tail: str
     stderr_tail: str
+    structural_change: bool | None = None
 
 
 def _tail(text: str, max_chars: int = 4000) -> str:
@@ -82,12 +89,43 @@ def _tail(text: str, max_chars: int = 4000) -> str:
     return "...<truncated>...\n" + text[-max_chars:]
 
 
+def _iter_repo_files(root: Path) -> dict[str, bytes]:
+    """Map ``relpath -> file bytes`` for a repo, ignoring derived/VCS noise.
+
+    Compiled caches and ``.git`` are excluded so two logically-identical trees
+    compare equal regardless of bytecode artefacts.
+    """
+    skip_dirs = {".git", "__pycache__", ".autodev", ".claude", ".cursor"}
+    out: dict[str, bytes] = {}
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel_parts = path.relative_to(root).parts
+        if any(part in skip_dirs for part in rel_parts):
+            continue
+        if path.suffix == ".pyc":
+            continue
+        out["/".join(rel_parts)] = path.read_bytes()
+    return out
+
+
+def _trees_differ(a: Path, b: Path) -> bool:
+    """Return True if the source trees ``a`` and ``b`` differ in any file.
+
+    Used by the behaviour-preserving (refactor) guard: a non-empty patch that
+    nets to no change (whitespace-only, re-write to identical content) leaves
+    the two trees equal — that is a vacuous "refactor" and must FAIL.
+    """
+    return _iter_repo_files(a) != _iter_repo_files(b)
+
+
 def score_task_with_patch(
     task_dir: Path,
     patch_text: str,
     *,
     workdir: Path,
     test_timeout_seconds: int = 120,
+    require_structural_change: bool = False,
 ) -> ScoreResult:
     """Reset the task repo into ``workdir`` and verify ``patch_text``.
 
@@ -95,10 +133,32 @@ def score_task_with_patch(
       ``workdir/repo/`` — fresh copy of ``task_dir/repo/`` with the patch
       applied (if applicable). The caller is responsible for cleaning up
       ``workdir``.
+
+    ``require_structural_change`` is for behaviour-preserving (refactor) tasks:
+    such tasks pass their ``test_command.sh`` even with no change, so a test-only
+    verdict would *vacuously* PASS a no-op. When set, an empty ``patch_text`` is
+    a hard FAIL (``structural_change=False``) and the test is not even run; a
+    non-empty patch records ``structural_change=True`` before the test runs.
     """
     src_repo = task_dir / "repo"
     if not src_repo.is_dir():
         raise FileNotFoundError(f"task repo missing: {src_repo}")
+
+    has_change = bool(patch_text and patch_text.strip())
+
+    # Structural-change guard (refactor tasks), part 1: a behaviour-preserving
+    # change must actually CHANGE something. A strictly-empty patch is the
+    # clearest no-op — reject it before running the test so a vacuous "refactor"
+    # cannot pass on test exit code alone (field finding P5).
+    if require_structural_change and not has_change:
+        return ScoreResult(
+            passed=False,
+            exit_code=-1,
+            apply_error="no structural change (behaviour-preserving task)",
+            stdout_tail="",
+            stderr_tail="",
+            structural_change=False,
+        )
 
     fresh_repo = workdir / "repo"
     if fresh_repo.exists():
@@ -113,7 +173,27 @@ def score_task_with_patch(
             apply_error=apply.error,
             stdout_tail="",
             stderr_tail=_tail(apply.stderr),
+            structural_change=False if require_structural_change else None,
         )
+
+    # Structural-change guard, part 2: verify the patched repo actually DIFFERS
+    # from the source. A non-empty patch can still net to a no-op (whitespace
+    # the apply collapsed, a re-write to identical content) — comparing the
+    # applied tree to the source is what makes the guard non-vacuous.
+    structural_change: bool | None
+    if require_structural_change:
+        structural_change = _trees_differ(src_repo, fresh_repo)
+        if not structural_change:
+            return ScoreResult(
+                passed=False,
+                exit_code=-1,
+                apply_error="no structural change (behaviour-preserving task)",
+                stdout_tail="",
+                stderr_tail="",
+                structural_change=False,
+            )
+    else:
+        structural_change = None
 
     test_cmd = task_dir / "test_command.sh"
     if not test_cmd.is_file():
@@ -140,6 +220,7 @@ def score_task_with_patch(
             apply_error=f"test_command timed out after {test_timeout_seconds}s",
             stdout_tail=_tail(exc.stdout or ""),
             stderr_tail=_tail(exc.stderr or ""),
+            structural_change=structural_change,
         )
 
     return ScoreResult(
@@ -148,7 +229,47 @@ def score_task_with_patch(
         apply_error=None,
         stdout_tail=_tail(proc.stdout),
         stderr_tail=_tail(proc.stderr),
+        structural_change=structural_change,
     )
+
+
+# ---------------------------------------------------------------------------
+# Commit-based diff capture (P1 fix)
+# ---------------------------------------------------------------------------
+
+
+# Scaffolding written by agents that is NOT part of the candidate fix and must
+# never count toward (or be applied as) the scored diff.
+DEFAULT_EXCLUDED_DIRS: tuple[str, ...] = (".autodev", ".claude", ".cursor")
+
+
+def diff_since_commit(
+    repo_dir: Path,
+    base_commit: str,
+    *,
+    exclude_dirs: Iterable[str] = DEFAULT_EXCLUDED_DIRS,
+) -> str:
+    """Diff ``base_commit`` → the current worktree, excluding scaffolding dirs.
+
+    AutoDev *commits* its fix, so ``git diff HEAD`` (uncommitted-only) is empty
+    for a committed change and false-FAILs the task (field finding P1). Diffing
+    from the broken baseline commit recovers a committed OR uncommitted fix.
+
+    The diff is taken against the worktree (not ``HEAD``) so a fix that is part
+    committed / part staged / part dirty is captured in full. Excluded dirs
+    (``.autodev``/``.claude``/``.cursor``) are removed via git pathspecs so
+    agent scaffolding is never mistaken for the candidate fix.
+    """
+    pathspecs = [f":(exclude){d}" for d in exclude_dirs]
+    proc = subprocess.run(
+        ["git", "diff", base_commit, "--", ".", *pathspecs],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout
 
 
 # ---------------------------------------------------------------------------

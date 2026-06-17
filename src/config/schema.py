@@ -766,6 +766,12 @@ class QAGatesConfig(BaseModel):
     # target's env (uv run / .venv); 120s is a safe ceiling. Threaded into
     # ``run_lint(timeout_s=...)``.
     lint_timeout_s: float = 120.0
+    # WS2-11: configurable build/typecheck-gate wall-clock timeout (seconds).
+    # The legacy hardcoded 60s (``build_check._DEFAULT_TIMEOUT_S``) could not
+    # finish a COLD cargo/Go build (dependency fetch + first compile), so the
+    # gate timed out and false-blocked. 120s is a safe floor; bump higher for
+    # large native projects. Threaded into ``run_build_check(timeout_s=...)``.
+    build_check_timeout_s: float = 120.0
 
 
 class GuardrailsConfig(BaseModel):

@@ -114,6 +114,7 @@ async def test_code_size_gate_dispatched_when_enabled(
             mutation_test_threshold = 0.7
             lint_timeout_s = 120.0
             test_timeout_s = 600.0
+            build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
             code_size = True
             code_size_baseline_enabled = False
             code_size_thresholds = StrictThresholds()
@@ -195,6 +196,7 @@ async def test_code_size_gate_skipped_when_disabled(
             mutation_test_threshold = 0.7
             lint_timeout_s = 120.0
             test_timeout_s = 600.0
+            build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
             code_size = False  # default
             code_size_baseline_enabled = False
             code_size_thresholds = None
