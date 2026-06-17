@@ -48,9 +48,12 @@ REQUIRED_TASK_IDS = {
 }
 
 
-def test_v1_corpus_contains_all_five_tasks():
+def test_v1_corpus_contains_required_tasks():
+    """The 5 canonical v1 tasks must always be present; the corpus MAY include
+    additional fixtures (e.g. the Phase-4 field-probe tasks task_006–009)."""
     discovered = {t.name for t in discover_tasks(DEFAULT_TASKS_ROOT)}
-    assert discovered == REQUIRED_TASK_IDS
+    missing = REQUIRED_TASK_IDS - discovered
+    assert not missing, f"missing required tasks: {sorted(missing)}"
 
 
 def test_task_metadata_validation():
@@ -263,6 +266,57 @@ def test_runner_respects_timeout(tmp_path: Path):
     assert "timed out" in result.error
     # We should have aborted on the very first call rather than continuing.
     assert result.secondary["invocations"] == 1
+
+
+def test_runner_invokes_plan_with_spec_text_not_dashspec(tmp_path: Path):
+    """Harness drives the REAL CLI: ``plan <spec text> --assume-defaults``.
+
+    Regression guard for the Phase-4 field finding: the historical
+    ``["plan", "--spec", <path>]`` invocation made click exit 2 (unknown
+    option) in <1s — autodev never planned. ``plan`` takes the intent/spec as a
+    POSITIONAL arg (there is no ``--spec`` flag); ``--assume-defaults`` keeps
+    headless intake from hanging on a clarifying question.
+    """
+    task_dir = DEFAULT_TASKS_ROOT / "task_001_py_typeerror"
+    spec_text = (task_dir / "spec.md").read_text(encoding="utf-8")
+    seen: list[list[str]] = []
+
+    def stub(args, cwd, timeout):
+        seen.append(list(args))
+        return _SubprocessResult(
+            returncode=0, stdout="", stderr="", timed_out=False, elapsed_seconds=0.01
+        )
+
+    run_task(task_dir, autodev_invoker=stub, workdir_root=tmp_path)
+    plan_calls = [c for c in seen if c and c[0] == "plan"]
+    assert len(plan_calls) == 1, seen
+    pc = plan_calls[0]
+    assert "--spec" not in pc  # the dead flag is gone
+    assert spec_text in pc  # the spec TEXT is the positional intent
+    assert "--assume-defaults" in pc  # headless intake never hangs
+
+
+def test_runner_captures_autodev_failure_output(tmp_path: Path):
+    """A failing autodev command's stderr/stdout is surfaced in ``secondary``
+    so a probe's results JSON is self-diagnosing (no manual re-run needed)."""
+    task_dir = DEFAULT_TASKS_ROOT / "task_001_py_typeerror"
+
+    def stub(args, cwd, timeout):
+        if args and args[0] == "plan":
+            return _SubprocessResult(
+                returncode=2,
+                stdout="usage: autodev plan ...",
+                stderr="Error: No such option: --spec",
+                timed_out=False,
+                elapsed_seconds=0.01,
+            )
+        return _SubprocessResult(
+            returncode=0, stdout="", stderr="", timed_out=False, elapsed_seconds=0.01
+        )
+
+    result = run_task(task_dir, autodev_invoker=stub, workdir_root=tmp_path)
+    assert "exited 2" in (result.error or "")
+    assert "No such option" in result.secondary.get("autodev_fail_stderr_tail", "")
 
 
 # ---------------------------------------------------------------------------

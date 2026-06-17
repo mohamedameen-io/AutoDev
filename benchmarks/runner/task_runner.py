@@ -205,6 +205,41 @@ def _diff_size(text: str) -> int:
     return n
 
 
+# Benchmark hygiene: the lint QA gate is environment-fragile on minimal,
+# config-less fixtures. ``qa/lint._run_eslint`` shells out to ``npx eslint .``
+# which FETCHES ESLint v10 and hard-errors ("couldn't find eslint.config.js")
+# on a repo with no lint config — a setup signal, not a code defect. The agent
+# cannot fix that by editing source, so it drives an unwinnable retry loop ->
+# block (Phase-4 P1 field finding). The benchmark scores DELIVERY via
+# ``test_command.sh``; lint compliance is orthogonal and the WS-4 acceptance /
+# field gates do not involve lint. Opt-in via ``AUTODEV_BENCH_DISABLE_LINT=1``
+# (default OFF — committed behaviour unchanged).
+_DISABLE_LINT_ENV = "AUTODEV_BENCH_DISABLE_LINT"
+
+
+def _maybe_relax_env_fragile_gates(agent_repo: Path) -> None:
+    """Turn off the lint QA gate in the freshly-``init``-ed config when
+    ``AUTODEV_BENCH_DISABLE_LINT`` is set (best-effort; no-op otherwise)."""
+    if not os.environ.get(_DISABLE_LINT_ENV):
+        return
+    cfg_path = agent_repo / ".autodev" / "config.json"
+    if not cfg_path.is_file():
+        return
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    gates = cfg.get("qa_gates")
+    if not isinstance(gates, dict):
+        gates = {}
+        cfg["qa_gates"] = gates
+    gates["lint"] = False
+    try:
+        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Per-task entry point
 # ---------------------------------------------------------------------------
@@ -272,30 +307,47 @@ def run_task(
         initial_commit = _init_git_repo(agent_repo)
 
         # Step 2: invoke autodev init/plan/execute.
+        #
+        # ``plan`` takes the intent/spec as a POSITIONAL argument (click:
+        # ``plan [OPTIONS] INTENT``); there is NO ``--spec`` flag — the spec
+        # TEXT *is* the intent (the plan phase writes it to ``.autodev/spec.md``).
+        # The historical ``["plan", "--spec", <path>]`` invocation made click
+        # exit 2 (unknown option) in <1s, before any planning ran. We pass the
+        # spec file's CONTENTS as the intent and ``--assume-defaults`` so headless
+        # intake applies recommended defaults instead of hanging on a question.
+        spec_text = spec_path.read_text(encoding="utf-8")
         autodev_failed_reason: str | None = None
         autodev_calls: list[tuple[str, int, float]] = []
-        for args in (
-            ["init"],
-            ["plan", "--spec", str(spec_path)],
-            ["execute"],
+        autodev_fail_stdout = ""
+        autodev_fail_stderr = ""
+        for args, label in (
+            (["init"], "init"),
+            (
+                ["plan", spec_text, "--assume-defaults"],
+                f"plan <spec:{len(spec_text)}c> --assume-defaults",
+            ),
+            (["execute"], "execute"),
         ):
             res = invoker(args, agent_repo, autodev_timeout_seconds)
             invocations += 1
             cumulative_wall += res.elapsed_seconds
-            autodev_calls.append(
-                (" ".join(args), res.returncode, round(res.elapsed_seconds, 3))
-            )
+            autodev_calls.append((label, res.returncode, round(res.elapsed_seconds, 3)))
             if res.timed_out:
                 autodev_failed_reason = (
-                    f"autodev {' '.join(args)} timed out after "
-                    f"{autodev_timeout_seconds}s"
+                    f"autodev {label} timed out after {autodev_timeout_seconds}s"
                 )
+                autodev_fail_stdout = res.stdout[-2000:]
+                autodev_fail_stderr = res.stderr[-2000:]
                 break
             if res.returncode != 0:
-                autodev_failed_reason = (
-                    f"autodev {' '.join(args)} exited {res.returncode}"
-                )
+                autodev_failed_reason = f"autodev {label} exited {res.returncode}"
+                autodev_fail_stdout = res.stdout[-2000:]
+                autodev_fail_stderr = res.stderr[-2000:]
                 break
+            # init just wrote .autodev/config.json — optionally relax the
+            # environment-fragile lint gate before plan/execute run.
+            if label == "init":
+                _maybe_relax_env_fragile_gates(agent_repo)
 
         # Step 3: extract the agent's diff.
         #
@@ -324,6 +376,12 @@ def run_task(
             "diff_size_delta_lines": agent_size - gt_size,
             "behavior_preserving": require_structural_change,
         }
+        # Surface the failing autodev command's output so a probe JSON is
+        # self-diagnosing (no manual re-run needed to see WHY autodev failed).
+        if autodev_fail_stdout:
+            secondary["autodev_fail_stdout_tail"] = autodev_fail_stdout
+        if autodev_fail_stderr:
+            secondary["autodev_fail_stderr_tail"] = autodev_fail_stderr
 
         # Step 5: score in a fresh copy (so we don't conflate agent's
         # uncommitted changes with our patch application).
