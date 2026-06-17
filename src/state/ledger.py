@@ -645,6 +645,22 @@ LedgerOp = Literal[
     # corruption stays loud); this op records WHERE. Payload:
     # ``{task_id, failure_class, raw_error, err}``. Replay is a forensic no-op.
     "block_path_plan_uninitialized",
+    # Gate-closer A (G6): the QA-gate dispatch detected an UNSUPPORTED language
+    # — ``detect_language`` returned ``None`` while the repo carries source, OR
+    # a recognised-but-NON-RUNNABLE language (e.g. ``elixir`` / ``dotnet`` /
+    # ``ruby`` / ``swift`` / ``cpp``; not in ``qa.detect.RUNNABLE_TEST_LANGUAGES``).
+    # Without this op the unsupported case was INVISIBLE: every per-language gate
+    # vacuously soft-passed ("language not detected, skipping") and the dispatch
+    # returned the all-clear. The op makes the degrade-loud decision auditable.
+    # Audit-only — it NEVER mutates plan state (the task-status transition, if
+    # any, flows through the regular ``update_task_status`` op emitted alongside
+    # by the retry/escalate FSM that consumes the blocking detail string).
+    # Payload shape: ``{language: str | None, reason: str, has_source: bool}``
+    # where ``language`` is the detected non-runnable language or ``None`` for
+    # "no recognised signal but source present". A genuinely-empty repo (no
+    # source at all) does NOT emit this op — that stays the legit ``no_source``
+    # pass. Replay is a forensic no-op, tolerated even before any ``init_plan``.
+    "language_unsupported",
 ]
 
 
@@ -1281,6 +1297,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # forensic no-op (and is tolerated even when plan is None, since this op
         # is precisely the empty-ledger case).
         "block_path_plan_uninitialized",
+        # Gate-closer A (G6): unsupported-language QA-gate-dispatch breadcrumb.
+        # Audit-only — never mutates plan state (the blocking detail it pairs
+        # with flows through the regular retry/escalate path's
+        # ``update_task_status`` op). Tolerated even when plan is None so the
+        # op is order-independent on replay, mirroring the other dispatch-time
+        # audit ops above.
+        "language_unsupported",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

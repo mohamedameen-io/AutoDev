@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from plugins.registry import GateResult
+from qa._scan_filter import collect_scan_files
 from qa.detect import detect_language
 
 
@@ -32,19 +33,35 @@ async def run_build_check(
     cwd: Path,
     language: str | None = None,
     *,
+    paths: list[Path] | None = None,
     timeout_s: float = _DEFAULT_TIMEOUT_S,
 ) -> GateResult:
     """Run the appropriate build/typecheck for *language* (auto-detected when ``None``).
 
     Returns a :class:`GateResult` with ``passed=True`` on success or when the
     tool is not available.
+
+    G7 (submodule + generated exclude): the Python compile step no longer
+    descends into submodule trees (parsed from ``.gitmodules``), ``.git`` /
+    ``.git/modules`` internals, vendored/cache dirs, or generated stubs
+    (``*_pb2.py`` …) — a syntax error in any of those must not block an
+    unrelated fix.
+
+    S2 / WS2-16 (diff-scoping): when *paths* (repo-relative changed files) is
+    given, the Python compile step is scoped to those files instead of the
+    whole tree (O(diff) instead of O(repo)). Generated files are skipped even
+    when explicitly listed. ``paths=None`` preserves whole-tree behavior. The
+    subprocess-based builds (rust/go/npm/tsc) are project-wide by nature and
+    ignore *paths*; the parameter is accepted uniformly for caller back-compat.
     """
     lang = language or detect_language(cwd)
     if lang is None:
         return GateResult(passed=True, details="language not detected, skipping build check")
 
+    if lang == "python":
+        return await _run_python_build(cwd, paths=paths, timeout_s=timeout_s)
+
     runners: dict[str, object] = {
-        "python": _run_python_build,
         "nodejs": _run_nodejs_build,
         "rust": _run_cargo_check,
         "go": _run_go_build,
@@ -92,13 +109,16 @@ async def _run_subprocess(
     return GateResult(passed=False, details=f"{tool_name} build check failed:\n{combined}")
 
 
-async def _run_python_build(cwd: Path, *, timeout_s: float) -> GateResult:
-    """Compile all .py files; try mypy if available."""
-    py_files = [
-        str(p)
-        for p in cwd.rglob("*.py")
-        if ".venv" not in p.parts and "__pycache__" not in p.parts
-    ]
+async def _run_python_build(
+    cwd: Path, *, paths: list[Path] | None = None, timeout_s: float
+) -> GateResult:
+    """Compile all .py files (or the diff-scoped subset when *paths* is given).
+
+    G7: submodule trees, ``.git``/``.git/modules``, vendored/cache dirs, and
+    generated stubs (``*_pb2.py`` …) are excluded.
+    S2: when *paths* is non-``None`` only those files are compiled.
+    """
+    py_files = [str(p) for p in collect_scan_files(cwd, (".py",), paths=paths)]
     if not py_files:
         return GateResult(passed=True, details="no .py files found")
 

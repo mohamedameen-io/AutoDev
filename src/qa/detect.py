@@ -25,8 +25,9 @@ coarser vocabulary.
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from runtime.repo_probe import iter_repo_files
 
@@ -114,6 +115,60 @@ _MANIFEST_GLOBS: tuple[tuple[str, str, int], ...] = (
 )
 
 
+# G7-detect: a submodule path declaration in ``.gitmodules`` looks like
+# ``path = vendor/sub`` (leading whitespace + ``path`` key). The host repo's
+# language must reflect the HOST tree only — a checked-out submodule's working
+# tree (its own ``package.json`` / ``*.ts`` / ``Cargo.toml`` ...) is FOREIGN
+# and must not flip the host's weighted scan. ``git ls-files`` already shields
+# git repos (a submodule appears as a single gitlink, not its contents), but
+# the ``os.walk`` fallback in :func:`runtime.repo_probe.iter_repo_files`
+# descends into the submodule working tree, so we must exclude those subtrees
+# explicitly here.
+_GITMODULES_PATH_RE = re.compile(r"^\s*path\s*=\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _submodule_prefixes(cwd: Path) -> tuple[tuple[str, ...], ...]:
+    """Return submodule path prefixes (posix parts) to exclude from the scan.
+
+    Sources:
+
+    * ``.gitmodules`` — every ``path = <dir>`` declaration (the host repo's
+      authoritative manifest of which subtrees are foreign submodules).
+    * ``.git/modules`` — git's internal submodule object/work store. Belt-and-
+      suspenders: the ``os.walk`` fallback already skips ``.git`` via
+      :data:`runtime.repo_probe._SKIP_DIRS`, but the git fast-path lists
+      tracked files only, so this prefix is harmless there and defends any
+      non-standard walk.
+
+    Returns a tuple of path-part tuples (e.g. ``(("vendor", "sub"),)``) so the
+    caller can do a cheap prefix-match against each scanned file's relative
+    parts. An unreadable / absent ``.gitmodules`` yields the ``.git/modules``
+    prefix only.
+    """
+    prefixes: list[tuple[str, ...]] = [(".git", "modules")]
+    gitmodules = cwd / ".gitmodules"
+    try:
+        text = gitmodules.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return tuple(prefixes)
+    for raw in _GITMODULES_PATH_RE.findall(text):
+        rel = raw.strip().strip("/")
+        if not rel:
+            continue
+        parts = tuple(p for p in PurePosixPath(rel).parts if p not in (".", ""))
+        if parts:
+            prefixes.append(parts)
+    return tuple(prefixes)
+
+
+def _under_prefix(parts: tuple[str, ...], prefixes: tuple[tuple[str, ...], ...]) -> bool:
+    """True when *parts* (a relative file's path parts) sits under any prefix."""
+    for pref in prefixes:
+        if len(parts) >= len(pref) and parts[: len(pref)] == pref:
+            return True
+    return False
+
+
 def _score_languages(cwd: Path) -> dict[str, float]:
     """Return a ``{detection-language: weight}`` map for the repo at *cwd*.
 
@@ -121,13 +176,27 @@ def _score_languages(cwd: Path) -> dict[str, float]:
     per-file source-extension signals (volume-based), scanning the whole
     tree so monorepo subdir manifests are seen too. An empty map means no
     known signal was found.
+
+    G7-detect: git submodule subtrees (declared in ``.gitmodules``, plus
+    ``.git/modules``) are EXCLUDED so a submodule's foreign manifests /
+    sources cannot flip the HOST repo's detected language.
     """
     scores: dict[str, float] = defaultdict(float)
+
+    submodule_prefixes = _submodule_prefixes(cwd)
 
     # Manifest + source-extension signals, in a single pass over the tree.
     seen_manifests: set[str] = set()
     seen_globs: set[str] = set()
     for fp in iter_repo_files(cwd):
+        # G7-detect: skip files that live under a declared submodule subtree.
+        if submodule_prefixes:
+            try:
+                rel_parts = fp.relative_to(cwd).parts
+            except ValueError:
+                rel_parts = fp.parts
+            if _under_prefix(rel_parts, submodule_prefixes):
+                continue
         name = fp.name
         # 1) Manifest signal (one-shot per manifest kind, anywhere in tree).
         info = _MANIFEST_WEIGHTS.get(name)
@@ -281,9 +350,117 @@ def is_repo_unbuildable(cwd: Path) -> bool:
     return lang is None or lang not in RUNNABLE_TEST_LANGUAGES
 
 
+# Gate-closer A (G6): source-code file extensions BEYOND the detection
+# vocabulary in :data:`_EXTENSION_WEIGHTS`. Their presence (with NO recognised
+# language) means the repo carries *source we cannot detect/run* — an
+# unsupported language (e.g. Elixir / Scala / Haskell / PHP / Dart / ...), as
+# opposed to a genuinely-empty repo (docs / config only). Used by
+# :func:`repo_has_source` to distinguish the two so the QA-gate dispatch can
+# degrade LOUD for the former while keeping the legit ``no_source`` pass for
+# the latter. Kept lowercase, leading-dot, matched against ``Path.suffix``.
+_EXTRA_SOURCE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".ex", ".exs",          # elixir
+        ".erl", ".hrl",         # erlang
+        ".scala", ".sc",        # scala
+        ".clj", ".cljs", ".cljc",  # clojure
+        ".hs", ".lhs",          # haskell
+        ".ml", ".mli",          # ocaml
+        ".fs", ".fsx", ".fsi",  # f#
+        ".dart",                # dart
+        ".php",                 # php
+        ".pl", ".pm",           # perl
+        ".lua",                 # lua
+        ".r", ".jl",            # r / julia
+        ".groovy",              # groovy (non-gradle)
+        ".elm",                 # elm
+        ".nim",                 # nim
+        ".zig",                 # zig
+        ".cr",                  # crystal
+        ".vala",                # vala
+        ".d",                   # d
+        ".m", ".mm",            # objective-c
+        ".sh", ".bash", ".zsh", ".fish",  # shell
+        ".sql",                 # sql
+    }
+)
+
+
+def repo_has_source(cwd: Path) -> bool:
+    """True when the repo at *cwd* carries ANY recognisable source/manifest.
+
+    "Source" = a file whose extension is a detection-vocabulary source ext
+    (:data:`_EXTENSION_WEIGHTS`), an *extra* source ext
+    (:data:`_EXTRA_SOURCE_EXTENSIONS`, e.g. ``.ex`` / ``.scala``), OR a known
+    manifest (:data:`_MANIFEST_WEIGHTS` / :data:`_MANIFEST_GLOBS`). A repo with
+    only README / config / licence files (no source, no manifest) is
+    *source-free* → the legit ``no_source`` pass; a repo with ``.ex`` files but
+    no detected language is *unsupported* → degrade LOUD.
+
+    Git submodule subtrees (declared in ``.gitmodules`` / ``.git/modules``) are
+    excluded, mirroring :func:`_score_languages`, so a submodule's source never
+    makes an otherwise-empty host look like it carries source.
+    """
+    submodule_prefixes = _submodule_prefixes(cwd)
+    manifest_names = set(_MANIFEST_WEIGHTS)
+    glob_exts = {pattern[1:] for pattern, _lang, _w in _MANIFEST_GLOBS}
+    source_exts = set(_EXTENSION_WEIGHTS) | _EXTRA_SOURCE_EXTENSIONS
+    for fp in iter_repo_files(cwd):
+        if submodule_prefixes:
+            try:
+                rel_parts = fp.relative_to(cwd).parts
+            except ValueError:
+                rel_parts = fp.parts
+            if _under_prefix(rel_parts, submodule_prefixes):
+                continue
+        if fp.name in manifest_names:
+            return True
+        suffix = fp.suffix.lower()
+        if suffix in source_exts or suffix in glob_exts:
+            return True
+    return False
+
+
+def classify_language_support(cwd: Path) -> tuple[str, str | None, str]:
+    """Classify the QA-runnability of the repo at *cwd* for the gate dispatch.
+
+    Returns a ``(status, language, reason)`` triple:
+
+    * ``("runnable", lang, "")`` — a first-class RUNNABLE language was detected
+      (gates run normally).
+    * ``("no_source", None, reason)`` — no detected language AND no source at
+      all (genuinely-empty repo → legit ``no_source`` pass).
+    * ``("unsupported", lang_or_None, reason)`` — the repo carries source but
+      the language is undetectable (``lang=None``) OR is recognised-but-NOT
+      runnable (``lang`` ∈ {cpp, dotnet, ruby, swift, ...}). The dispatch must
+      degrade LOUD for this case and emit a ``language_unsupported`` ledger op.
+    """
+    lang = detect_language(cwd)
+    if lang is not None and lang in RUNNABLE_TEST_LANGUAGES:
+        return ("runnable", lang, "")
+    if lang is None:
+        if repo_has_source(cwd):
+            return (
+                "unsupported",
+                None,
+                "no recognised language but repo carries source files "
+                "(unsupported language — QA gates cannot run)",
+            )
+        return ("no_source", None, "no source files / no recognised language")
+    # Detected a language, but it is not RUNNABLE in-environment.
+    return (
+        "unsupported",
+        lang,
+        f"detected language={lang!r} has no runnable QA toolchain "
+        "in-environment (non-runnable language)",
+    )
+
+
 __all__ = [
     "RUNNABLE_TEST_LANGUAGES",
+    "classify_language_support",
     "detect_language",
     "detect_toolchain",
     "is_repo_unbuildable",
+    "repo_has_source",
 ]

@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from plugins.registry import GateResult
+from qa._scan_filter import collect_scan_files
 from qa.detect import detect_language
 
 
@@ -25,21 +26,32 @@ async def run_syntax_check(
     cwd: Path,
     language: str | None = None,
     *,
+    paths: list[Path] | None = None,
     timeout_s: float = _DEFAULT_TIMEOUT_S,
 ) -> GateResult:
     """Run a syntax check appropriate for *language* (auto-detected when ``None``).
 
     Returns a :class:`GateResult` with ``passed=True`` on success or when the
     required tool is not available (graceful degradation).
+
+    G7 (submodule + generated exclude): the file walk excludes submodule trees
+    (parsed from ``.gitmodules``), ``.git`` / ``.git/modules`` internals,
+    vendored/cache dirs, and generated stubs (``*_pb2.py`` …) — a syntax error
+    in any of those must not block an unrelated fix.
+
+    S2 / WS2-16 (diff-scoping): when *paths* (repo-relative changed files) is
+    given, the scan is scoped to those files instead of the whole tree
+    (O(diff) instead of O(repo)). Generated files are skipped even when
+    explicitly listed. ``paths=None`` preserves whole-tree behavior.
     """
     lang = language or detect_language(cwd)
     if lang is None:
         return GateResult(passed=True, details="language not detected, skipping syntax check")
 
     if lang == "python":
-        return await _python_syntax_check(cwd, timeout_s=timeout_s)
+        return await _python_syntax_check(cwd, paths=paths, timeout_s=timeout_s)
     if lang == "nodejs":
-        return await _nodejs_syntax_check(cwd, timeout_s=timeout_s)
+        return await _nodejs_syntax_check(cwd, paths=paths, timeout_s=timeout_s)
     # For other languages, skip gracefully — dedicated gates handle them.
     return GateResult(passed=True, details=f"no syntax checker for language={lang!r}, skipping")
 
@@ -66,14 +78,20 @@ def _batch_files(files: list[str], max_count: int, max_bytes: int) -> list[list[
     return batches
 
 
-async def _python_syntax_check(cwd: Path, *, timeout_s: float) -> GateResult:
+async def _python_syntax_check(
+    cwd: Path, *, paths: list[Path] | None = None, timeout_s: float
+) -> GateResult:
     """Compile all .py files under *cwd* using ``python -m py_compile``.
 
     Files are split into batches of at most :data:`_PY_COMPILE_BATCH_SIZE`
     entries (or :data:`_PY_COMPILE_BATCH_BYTES` of total path length) to stay
     within the OS ``ARG_MAX`` limit on large projects.
+
+    G7: submodule trees, ``.git``/``.git/modules``, vendored/cache dirs, and
+    generated stubs (``*_pb2.py`` …) are excluded.
+    S2: when *paths* is non-``None`` only those files are compiled.
     """
-    py_files = [str(p) for p in cwd.rglob("*.py") if ".venv" not in p.parts and "__pycache__" not in p.parts]
+    py_files = [str(p) for p in collect_scan_files(cwd, (".py",), paths=paths)]
     if not py_files:
         return GateResult(passed=True, details="no .py files found")
 
@@ -114,19 +132,19 @@ _NODE_JS_EXTS = (".js", ".mjs", ".cjs")
 # TypeScript / JSX extensions that ``node --check`` CANNOT parse (it rejects
 # valid type annotations and JSX) — these need a TS-aware compiler.
 _TS_EXTS = (".ts", ".tsx", ".jsx", ".mts", ".cts")
-_EXCLUDED_DIR_PARTS = ("node_modules", ".venv")
 
 
-def _collect_node_files(cwd: Path, exts: tuple[str, ...]) -> list[str]:
-    """Return source files under *cwd* whose suffix is in *exts*, skipping vendored dirs."""
-    out: list[str] = []
-    for ext in exts:
-        out.extend(
-            str(p)
-            for p in cwd.rglob(f"*{ext}")
-            if not any(part in _EXCLUDED_DIR_PARTS for part in p.parts)
-        )
-    return out
+def _collect_node_files(
+    cwd: Path, exts: tuple[str, ...], *, paths: list[Path] | None = None
+) -> list[str]:
+    """Return source files under *cwd* whose suffix is in *exts*.
+
+    G7: submodule trees, ``.git``/``.git/modules``, vendored/cache dirs, and
+    generated stubs are excluded via the shared filter.
+    S2: when *paths* is non-``None`` only those files (matching *exts*) are
+    returned.
+    """
+    return [str(p) for p in collect_scan_files(cwd, exts, paths=paths)]
 
 
 def _resolve_tsc(cwd: Path) -> list[str] | None:
@@ -147,7 +165,9 @@ def _resolve_tsc(cwd: Path) -> list[str] | None:
     return None
 
 
-async def _nodejs_syntax_check(cwd: Path, *, timeout_s: float) -> GateResult:
+async def _nodejs_syntax_check(
+    cwd: Path, *, paths: list[Path] | None = None, timeout_s: float
+) -> GateResult:
     """Syntax-check a Node/TypeScript project.
 
     Plain JavaScript (``.js``/``.mjs``/``.cjs``) is parsed with ``node --check``.
@@ -161,8 +181,8 @@ async def _nodejs_syntax_check(cwd: Path, *, timeout_s: float) -> GateResult:
     but no ``tsc`` is resolvable the gate degrades LOUD (``passed=False`` with a
     ``skipped_toolchain_missing`` signal) rather than vacuous-passing.
     """
-    js_files = _collect_node_files(cwd, _NODE_JS_EXTS)
-    ts_files = _collect_node_files(cwd, _TS_EXTS)
+    js_files = _collect_node_files(cwd, _NODE_JS_EXTS, paths=paths)
+    ts_files = _collect_node_files(cwd, _TS_EXTS, paths=paths)
 
     if not js_files and not ts_files:
         return GateResult(passed=True, details="no JS/TS files found")

@@ -8152,6 +8152,44 @@ async def _run_qa_gates(
     cwd = cwd_override if cwd_override is not None else orch.cwd
     language = detect_language(cwd)
 
+    # Gate-closer A (G6): an UNSUPPORTED language must NOT vacuously soft-pass.
+    # Without this guard, ``detect_language`` returning ``None`` (with source)
+    # or a recognised-but-NON-RUNNABLE language (cpp / dotnet / ruby / swift /
+    # ...) let every per-language gate return ``passed=True`` ("language not
+    # detected, skipping") — a silent clean bill of health for a repo whose
+    # tests AutoDev cannot run. ``classify_language_support`` distinguishes that
+    # case from a genuinely-empty repo (no source → legit ``no_source`` pass):
+    # only the unsupported-with-source / non-runnable case emits a typed
+    # ``language_unsupported`` ledger op and degrades LOUD (returns the
+    # diagnostic as the blocking detail). The empty-repo case falls through to
+    # the normal gate loop, which legitimately soft-passes.
+    from qa.detect import classify_language_support
+
+    support_status, support_lang, support_reason = classify_language_support(cwd)
+    if support_status == "unsupported":
+        try:
+            await orch.plan_manager.ledger_append(
+                op="language_unsupported",
+                payload={
+                    "language": support_lang,
+                    "reason": support_reason,
+                    "has_source": True,
+                },
+            )
+        except Exception as crumb_exc:  # noqa: BLE001 - crumb must not mask gate
+            logger.warning(
+                "execute_phase.ledger_append_failed",
+                op="language_unsupported",
+                err=str(crumb_exc),
+            )
+        logger.warning(
+            "execute_phase.qa_gate_language_unsupported",
+            task_id=getattr(task, "id", None),
+            language=support_lang,
+            reason=support_reason,
+        )
+        return f"language_unsupported: {support_reason}"
+
     # v0.27.0 (audit §6): fail-closed when a diff-producing task ships a
     # malformed diff body. Investigation tasks (``produces_diff=False``)
     # legitimately have no diff — treat their unparseable diff as the
