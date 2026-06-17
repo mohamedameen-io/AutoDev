@@ -862,6 +862,12 @@ class WorktreeManager:
             await _run_git(self._main, ["checkout", "--", *_targets])
 
         # Pre-flight: ``git apply --check`` so we fail fast on conflicts.
+        # NOTE: with ``--3way``, ``git apply --check`` is NON-authoritative —
+        # it returns rc=0 even on genuine conflicts (applies a tentative merge).
+        # The AUTHORITATIVE failure signal is the real ``git apply --3way
+        # --index`` rc below; the A2 auto-3way reconciliation path relies on
+        # this distinction to let spurious conflicts through while still
+        # raising loudly on genuine ones.
         check_rc, _, check_err = await _run_git(
             self._main,
             check_args,

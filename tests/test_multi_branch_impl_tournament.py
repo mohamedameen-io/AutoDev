@@ -304,3 +304,81 @@ def test_render_for_diff_synthesis_zero_diffs_raises() -> None:
     h = ImplContentHandler()
     with pytest.raises(ValueError):
         h.render_for_diff_synthesis(task_prompt="x", diffs=[])
+
+
+# ---------------------------------------------------------------------------
+# A2 (reproduce-first): the meta-merge NEVER emits conflict_3way_failed.
+#
+# The plan's hypothesis was that meta-merging COLLIDING candidate diffs is what
+# turns a trivial fix into a blocking conflict. These tests confirm the
+# OPPOSITE: every meta-merge failure path is caught and degraded to the
+# strongest survivor's own diff. ``conflict_3way_failed`` is raised by exactly
+# one site — ``_apply_with_conflict_escalation`` (apply-to-main of the per-task
+# worktree diff), which the multi-branch runner's discarded result never
+# touches. See ``tests/test_impl_tournament_spurious_conflict_a2.py``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_meta_merge_colliding_diffs_degrades_to_winner_not_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Colliding candidate diffs + unparseable synth → degrade to winner.
+
+    Two candidates edit the SAME file in conflicting ways (a naive textual
+    meta-merge WOULD collide). The synthesizer returns prose with no diff
+    block, so ``_extract_diff_block`` yields "". The meta-merge MUST fall
+    back to ``_fallback_strongest_survivor`` (the longest survivor diff,
+    label ``AB``, ``notes='meta-merge-fallback'``) — it must NOT raise and
+    must NOT route into any conflict_3way path.
+    """
+    orch = _make_orch(tmp_path)
+    await _init_plan(orch)
+    task = _make_task()
+    initial = _make_initial_bundle()
+
+    # Synthesizer returns prose only — no parseable diff block. Drive the
+    # "no_diff_block" degrade branch deterministically by forcing the
+    # extractor to find nothing (the StubAdapter already returns a
+    # benign synth response; the extractor result is what gates the path).
+    monkeypatch.setattr(itr, "_extract_diff_block", lambda _t: "")
+
+    colliding = [
+        "diff --git a/x.py b/x.py\n@@ -1 +1 @@\n-old\n+candidate-A-much-longer-winning-diff\n",
+        "diff --git a/x.py b/x.py\n@@ -1 +1 @@\n-old\n+B\n",
+    ]
+
+    out = await itr._impl_meta_merge_via_diff_synthesis(
+        orch, task, initial, colliding
+    )
+
+    # Graceful degrade to the strongest (longest) survivor — no raise.
+    assert out.notes == "meta-merge-fallback"
+    assert out.variant_label == "AB"
+    assert "candidate-A-much-longer-winning-diff" in (out.diff or "")
+
+
+@pytest.mark.asyncio
+async def test_meta_merge_synth_raises_degrades_to_winner_not_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Synthesizer call raising → degrade to strongest survivor, never raise."""
+    orch = _make_orch(tmp_path)
+    await _init_plan(orch)
+    task = _make_task()
+    initial = _make_initial_bundle()
+
+    async def _boom(*_a: Any, **_kw: Any) -> str:
+        raise RuntimeError("synthesizer exploded")
+
+    # Patch the AdapterLLMClient.call used inside the meta-merge.
+    monkeypatch.setattr(itr.AdapterLLMClient, "call", _boom, raising=True)
+
+    diffs = [
+        "diff --git a/x.py b/x.py\n@@ -1 +1 @@\n-old\n+WINNER-longest-survivor-diff\n",
+        "diff --git a/x.py b/x.py\n@@ -1 +1 @@\n-old\n+short\n",
+    ]
+    out = await itr._impl_meta_merge_via_diff_synthesis(orch, task, initial, diffs)
+
+    assert out.notes == "meta-merge-fallback"
+    assert "WINNER-longest-survivor-diff" in (out.diff or "")

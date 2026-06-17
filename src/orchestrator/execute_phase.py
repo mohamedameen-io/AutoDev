@@ -2353,6 +2353,58 @@ async def _apply_with_conflict_escalation(
                 err=str(exc),
             )
 
+            # A2 (Finding #2): spurious ``conflict_3way_failed`` on trivial
+            # fixes. The ONLY emitter of ``conflict_3way_failed`` is the
+            # critic-gated 3-way retry below — but the plain ``git apply``
+            # tried first is brittle: when main has advanced under the task
+            # (a sibling committed via commit-per-task) the stale-base diff's
+            # hunk context no longer matches main verbatim and plain apply
+            # fails for INDEPENDENT, perfectly-mergeable edits. Today that
+            # failure routes UNCONDITIONALLY through the critic LLM, and
+            # ``--3way`` is only attempted if the critic happens to return
+            # ``rebase-and-retry``; an over-cautious ``abandon-task`` /
+            # ``rewrite`` verdict (or a flaky critic) spuriously blocks a
+            # diff that ``--3way`` would apply cleanly. Reproduced in
+            # tests/test_impl_tournament_spurious_conflict_a2.py.
+            #
+            # Fix: attempt the 3-way apply automatically BEFORE consulting
+            # the critic, reusing the SAME ``apply_patch_to_main(three_way=
+            # True)`` path. ``--3way`` rebuilds the merge base from the diff's
+            # blob OIDs, so independent edits reconcile cleanly while a
+            # GENUINE conflict (overlapping edits on the same lines) still
+            # raises ``WorktreeError`` from the real ``git apply --3way``
+            # (rc != 0 on conflict markers) — we then fall through to the
+            # existing critic escalation, which can still terminate as
+            # ``conflict_3way_failed``. So real conflicts still fail loud and
+            # main is never left with silently-applied conflict markers; only
+            # the spurious "main moved, edits don't overlap" case is rescued.
+            try:
+                await worktree_mgr.apply_patch_to_main(
+                    worktree,
+                    base_ref="HEAD",
+                    three_way=True,
+                    commit_message=commit_msg,
+                )
+                logger.info(
+                    "execute_phase.conflict_resolved_auto_3way",
+                    task_id=task.id,
+                )
+                return True
+            except WorktreeError as exc_auto3:
+                logger.info(
+                    "execute_phase.auto_3way_failed_escalating",
+                    task_id=task.id,
+                    err=str(exc_auto3),
+                )
+                # A failed 3-way can leave the main tree in a partial /
+                # merge-in-progress state (conflict markers / staged hunks).
+                # Restore a clean tree BEFORE the critic round so the critic's
+                # ``get_diff_vs_base`` sees the worktree's real diff and the
+                # next plain/3-way retry starts from a clean main — idempotent
+                # and never masks the underlying conflict (mirrors the cleanup
+                # the genuine-conflict branch already does).
+                await worktree_mgr.abort_failed_apply(targets=list(task.files))
+
             try:
                 conflict_diff = await worktree_mgr.get_diff_vs_base(worktree)
             except WorktreeError:

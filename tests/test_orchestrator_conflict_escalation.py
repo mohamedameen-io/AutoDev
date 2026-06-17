@@ -291,6 +291,13 @@ class FakeWorktreeMgr:
         self._rewrite_succeeds_round = rewrite_succeeds_round
         self.apply_calls: list[tuple[bool, int]] = []  # (three_way, attempt_idx)
         self.attempt = 0
+        # A2: the conflict-escalation helper now auto-attempts a ``--3way``
+        # apply the moment a plain apply fails (BEFORE the critic). 3-way
+        # attempts are a distinct mechanism from plain-apply *rewrite rounds*,
+        # so they must NOT consume the ``rewrite_succeeds_round`` counter —
+        # otherwise inserting the auto-3way step would silently shift which
+        # plain attempt "succeeds". Count plain attempts separately.
+        self.plain_attempt = 0
 
     async def apply_patch_to_main(
         self,
@@ -307,18 +314,21 @@ class FakeWorktreeMgr:
             if self._three_way_succeeds:
                 return
             raise WorktreeError("3way apply also failed")
-        # First attempt: optionally fail.
-        if self.attempt == 1:
+        self.plain_attempt += 1
+        # First plain attempt: optionally fail.
+        if self.plain_attempt == 1:
             if self._apply_fail_first:
                 raise WorktreeError("first apply failed (conflict)")
             return
-        # Subsequent attempts (rewrite round retries): succeed on the
-        # configured round count. ``rewrite_succeeds_round`` is the
-        # number of rewrite rounds before success (1 = succeed after
-        # 1 rewrite, i.e. attempt 2).
-        if self.attempt >= self._rewrite_succeeds_round + 1:
+        # Subsequent plain attempts (rewrite round retries): succeed on the
+        # configured round count. ``rewrite_succeeds_round`` is the number
+        # of rewrite rounds before success (1 = succeed after 1 rewrite,
+        # i.e. the 2nd plain attempt).
+        if self.plain_attempt >= self._rewrite_succeeds_round + 1:
             return
-        raise WorktreeError(f"apply attempt {self.attempt} still conflicts")
+        raise WorktreeError(
+            f"apply attempt {self.plain_attempt} still conflicts"
+        )
 
     async def get_diff_vs_base(self, worktree, base_ref: str = "HEAD") -> str:
         return "diff --git a/foo b/foo\n+conflict\n"
@@ -334,7 +344,12 @@ class FakeWorktreeMgr:
 async def test_apply_with_conflict_escalation_rebase_and_retry(
     tmp_path: Path,
 ) -> None:
-    """rebase-and-retry directive triggers a three_way=True apply."""
+    """A plain-apply conflict is auto-retried with three_way=True.
+
+    A2: the 3-way retry now fires automatically the moment a plain apply
+    fails, BEFORE the critic. A reconcilable conflict therefore applies via
+    ``--3way`` and the helper returns success without a critic round.
+    """
     pm = PlanManager(tmp_path, session_id="s1")
     await pm.init_plan(
         _mk_plan([Task(id="1.1", phase_id="1", title="t", description="d")])
@@ -349,7 +364,7 @@ async def test_apply_with_conflict_escalation_rebase_and_retry(
         orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
     )
     assert success is True
-    # First call was non-3way (conflict); second was 3way.
+    # First call was non-3way (conflict); second was the auto-3way retry.
     assert fake_wm.apply_calls[0] == (False, 1)
     assert fake_wm.apply_calls[1] == (True, 2)
 
@@ -366,7 +381,11 @@ async def test_apply_with_conflict_escalation_abandon(tmp_path: Path) -> None:
     task = (await pm.get_task("1.1")) or pytest.fail()
     await pm.update_task_status("1.1", "in_progress")
 
-    fake_wm = FakeWorktreeMgr(apply_fail_first=True)
+    # A2: the critic is only consulted on a GENUINE conflict — i.e. when the
+    # auto-3way apply ALSO fails. Model that here (``three_way_succeeds=
+    # False``) so the abandon branch is reachable; a reconcilable conflict
+    # would now apply via auto-3way and never reach the critic.
+    fake_wm = FakeWorktreeMgr(apply_fail_first=True, three_way_succeeds=False)
     success = await ep._apply_with_conflict_escalation(
         orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
     )
@@ -392,14 +411,19 @@ async def test_apply_with_conflict_escalation_rewrite_succeeds(
     task = (await pm.get_task("1.1")) or pytest.fail()
     await pm.update_task_status("1.1", "in_progress")
 
+    # A2: genuine conflict (auto-3way fails) so the critic rewrite branch is
+    # reached; the developer rewrites and the next PLAIN apply succeeds.
     fake_wm = FakeWorktreeMgr(
-        apply_fail_first=True, rewrite_succeeds_round=1
+        apply_fail_first=True,
+        three_way_succeeds=False,
+        rewrite_succeeds_round=1,
     )
     success = await ep._apply_with_conflict_escalation(
         orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
     )
     assert success is True
-    # Three apply attempts: initial conflict, rewrite-loop retry succeeds.
+    # Multiple apply attempts: initial plain conflict, auto-3way (fails),
+    # then the post-rewrite plain retry succeeds.
     assert len(fake_wm.apply_calls) >= 2
 
 
@@ -417,9 +441,12 @@ async def test_apply_with_conflict_escalation_rewrite_cap_exceeded(
     task = (await pm.get_task("1.1")) or pytest.fail()
     await pm.update_task_status("1.1", "in_progress")
 
-    # Rewrite succeeds on round 99 (never within cap).
+    # A2: genuine conflict (auto-3way also fails) so the critic rewrite loop
+    # is reached. Rewrite "succeeds" on plain round 99 (never within cap).
     fake_wm = FakeWorktreeMgr(
-        apply_fail_first=True, rewrite_succeeds_round=99
+        apply_fail_first=True,
+        three_way_succeeds=False,
+        rewrite_succeeds_round=99,
     )
     success = await ep._apply_with_conflict_escalation(
         orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
