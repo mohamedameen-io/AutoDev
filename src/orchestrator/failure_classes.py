@@ -75,6 +75,12 @@ SOFT_BLOCKER = "soft_blocker"
 # Worktree apply failure (patch could not be applied to the working tree).
 WORKTREE_APPLY_FAILED = "worktree_apply_failed"
 
+# Worktree diff-check failure (could not determine whether the worktree holds
+# unapplied changes — e.g. the worktree was removed, or git raised). Blocking
+# here is safe-fail: we cannot know whether approved changes exist, so we must
+# not silently complete the task (the exact silent-loss class A4 prevents).
+WORKTREE_DIFF_CHECK_FAILED = "worktree_diff_check_failed"
+
 # --- Phase-degrade classes (intake/diagnosis/framing convert silent degrade) --
 PHASE_DEGRADED = "phase_degraded"
 
@@ -102,6 +108,7 @@ FailureClass = Literal[
     "infra_circuit_open",
     "soft_blocker",
     "worktree_apply_failed",
+    "worktree_diff_check_failed",
     "phase_degraded",
     "unknown",
 ]
@@ -126,6 +133,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     INFRA_CIRCUIT_OPEN,
     SOFT_BLOCKER,
     WORKTREE_APPLY_FAILED,
+    WORKTREE_DIFF_CHECK_FAILED,
     PHASE_DEGRADED,
     UNKNOWN,
 )
@@ -206,6 +214,7 @@ __all__ = [
     "INFRA_CIRCUIT_OPEN",
     "SOFT_BLOCKER",
     "WORKTREE_APPLY_FAILED",
+    "WORKTREE_DIFF_CHECK_FAILED",
     "PHASE_DEGRADED",
     "UNKNOWN",
 ]

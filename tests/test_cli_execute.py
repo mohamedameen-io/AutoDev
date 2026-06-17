@@ -242,6 +242,61 @@ def test_execute_with_task_id(tmp_path: Path) -> None:
     mock_orch.execute.assert_awaited_once_with(task_id="1.1")
 
 
+def test_delivered_approved_finalization_exits_0(tmp_path: Path) -> None:
+    """Delivered+APPROVED finalization path exits 0 (NOT 1 or 2).
+
+    This is the core A4 requirement: when the orchestrator finalizes a task
+    via the delivered+approved path (_maybe_accept_approved_on_exhaustion
+    marks it complete), the CLI MUST exit 0.
+
+    The test stubs the orchestrator's execute() to return a task list that
+    includes a ``complete`` task — the exact output state produced by
+    _maybe_accept_approved_on_exhaustion after flushing the approved diff to
+    main. No PhaseStuckError is raised (the task is terminal), and no
+    AutodevError is raised (the run succeeded), so the CLI must exit 0.
+
+    Regression guard: pre-A4 this path raised PhaseStuckError (→ exit 1) or
+    AutodevError (→ exit 2), silently losing the approved fix.
+    """
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config(cwd)
+
+        # Task returned by the orchestrator after approved-on-exhaustion
+        # finalization: status is "complete" (the terminal state
+        # _maybe_accept_approved_on_exhaustion walks to).
+        delivered_and_finalized = Task(
+            id="0.1",
+            phase_id="0",
+            title="Confirm something",
+            description="Research task",
+            status="complete",
+            retry_count=0,
+            escalated=False,
+        )
+
+        with (
+            patch("cli.commands.execute.get_adapter") as mock_get_adapter,
+            patch("cli.commands.execute.Orchestrator") as mock_orch_cls,
+        ):
+            mock_adapter = MagicMock()
+            mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
+
+            mock_orch = MagicMock()
+            # execute() returns the finalized task (complete) — NO exception raised.
+            mock_orch.execute = AsyncMock(return_value=[delivered_and_finalized])
+            mock_orch_cls.return_value = mock_orch
+
+            result = runner.invoke(cli, ["execute"], catch_exceptions=False)
+
+    assert result.exit_code == 0, (
+        f"delivered+approved finalization must exit 0, got {result.exit_code}; "
+        f"output: {result.output!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Direct _render_execute_summary tests
 # ---------------------------------------------------------------------------

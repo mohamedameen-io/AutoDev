@@ -110,6 +110,9 @@ def test_blocker_key_no_task_id_uses_dash() -> None:
         # worktree_apply_failed: repair_environment -> ask_human
         (fc.WORKTREE_APPLY_FAILED, [], "repair_environment"),
         (fc.WORKTREE_APPLY_FAILED, ["repair_environment"], "ask_human"),
+        # worktree_diff_check_failed: repair_environment -> ask_human
+        (fc.WORKTREE_DIFF_CHECK_FAILED, [], "repair_environment"),
+        (fc.WORKTREE_DIFF_CHECK_FAILED, ["repair_environment"], "ask_human"),
         # phase_degraded: repair_environment -> ask_human (the DOA conversion)
         (fc.PHASE_DEGRADED, [], "repair_environment"),
         (fc.PHASE_DEGRADED, ["repair_environment"], "ask_human"),

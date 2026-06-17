@@ -475,3 +475,75 @@ async def test_approved_exhausted_empty_worktree_skips_apply(
     assert not apply_called, (
         "_apply_with_conflict_escalation was called despite empty worktree diff"
     )
+
+
+@pytest.mark.asyncio
+async def test_approved_exhausted_diff_check_raises_blocks_task(
+    tmp_path: Path,
+) -> None:
+    """When get_diff_vs_base RAISES, the task must be BLOCKED (not completed).
+
+    Rationale: if we cannot determine whether there is an unapplied diff in
+    the worktree, silently completing the task risks discarding approved
+    changes — the exact class of silent loss A4 exists to prevent. The safe
+    response is to block loud so a human can inspect.
+
+    This test pins: exception from get_diff_vs_base → task.status == "blocked"
+    (NOT "complete").
+    """
+    task_id = "0.1"
+
+    # Seed a genuine APPROVED verdict on disk (required for the gate to fire).
+    await write_evidence(
+        tmp_path,
+        task_id,
+        ReviewEvidence(
+            task_id=task_id,
+            verdict="APPROVED",
+            issues=[],
+            output_text="VERDICT: APPROVED",
+            raw_response="VERDICT: APPROVED",
+        ),
+    )
+
+    orch = await _make_orch_r7(tmp_path)
+    await orch.plan_manager.update_task_status(task_id, "in_progress")
+    task = await orch.plan_manager.get_task(task_id)
+    assert task is not None
+
+    # The current developer attempt is turn-exhausted and produced no diff.
+    exhausted_result = fail(
+        "budget escalation exhausted",
+        subtype="error_max_turns_escalation_exhausted",
+    )
+
+    # get_diff_vs_base raises — we cannot determine the worktree state.
+    mock_wt_mgr = MagicMock()
+    mock_wt_mgr.get_diff_vs_base = AsyncMock(
+        side_effect=RuntimeError("worktree gone / git error")
+    )
+    mock_worktree = tmp_path / "worktree"
+
+    result = await ep._maybe_accept_approved_on_exhaustion(
+        orch,
+        task,
+        exhausted_result,
+        worktree=mock_worktree,
+        worktree_mgr=mock_wt_mgr,
+    )
+
+    # The function must return a task (not None — None means "no-op, fall
+    # through to retry/escalate", which is also wrong here), and that task
+    # must be BLOCKED, not complete.
+    assert result is not None, (
+        "_maybe_accept_approved_on_exhaustion returned None (fell through to "
+        "retry) when get_diff_vs_base raised — expected BLOCKED task"
+    )
+    assert result.status == "blocked", (
+        f"expected status 'blocked' when diff-check raises, got {result.status!r} — "
+        "task was silently completed without knowing whether approved changes exist"
+    )
+    assert result.blocked_reason is not None and "worktree_diff_check_failed" in result.blocked_reason, (
+        f"expected blocked_reason to contain 'worktree_diff_check_failed', got {result.blocked_reason!r} — "
+        "the A4 WORKTREE_DIFF_CHECK_FAILED class must be stamped in blocked_reason when diff-check raises"
+    )

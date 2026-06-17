@@ -1987,6 +1987,7 @@ _FAILURE_CLASS_TO_ROLE: dict[str, str] = {
     _fcls.QA_GATE_FAILED: "developer",
     _fcls.EDIT_SCOPE_VIOLATION: "developer",
     _fcls.WORKTREE_APPLY_FAILED: "developer",
+    _fcls.WORKTREE_DIFF_CHECK_FAILED: "developer",
     _fcls.TESTS_FAILED: "developer",
     _fcls.REVIEW_REJECTED: "reviewer",
     _fcls.REVIEW_MALFORMED: "reviewer",
@@ -2324,6 +2325,12 @@ async def _apply_with_conflict_escalation(
     abandoned. On ``False`` the caller transitions the task to
     ``blocked`` (caller-side update_task_status, this helper records
     the blocked reason via the worker contract).
+
+    **Error contract**: this function swallows all ``WorktreeError``
+    exceptions internally and signals failure via a ``False`` return — it
+    does NOT propagate ``WorktreeError`` to callers. The ``except
+    WorktreeError`` guard at call sites is a deliberate defensive net
+    against a future contract change, not a currently-reachable path.
 
     Branches on the critic's RESOLUTION directive:
 
@@ -8047,12 +8054,27 @@ async def _maybe_accept_approved_on_exhaustion(
         try:
             worktree_diff = await worktree_mgr.get_diff_vs_base(worktree)
         except Exception as exc:  # noqa: BLE001
-            worktree_diff = ""
-            logger.warning(
+            # We CANNOT determine whether the worktree holds unapplied
+            # approved changes.  Silently completing the task here risks
+            # discarding those changes — the exact silent-loss class A4
+            # exists to prevent.  Block loud so a human can inspect.
+            logger.error(
                 "execute_phase.accept_approved_on_exhaustion.diff_check_failed",
                 task_id=task.id,
                 err=str(exc),
+                note=(
+                    "cannot determine worktree diff — BLOCKING task "
+                    "rather than silently completing (safe-fail)"
+                ),
             )
+            task = await block_task(
+                orch,
+                task,
+                failure_class=_fcls.WORKTREE_DIFF_CHECK_FAILED,
+                raw_error=f"worktree_diff_check_failed: {exc}",
+                meta={"blocked_reason": f"worktree_diff_check_failed: {exc}"},
+            )
+            return task
         if worktree_diff.strip():
             # Worktree has prior approved changes — apply to main before
             # completing. A conflict or apply failure blocks the task (the
@@ -8066,6 +8088,11 @@ async def _maybe_accept_approved_on_exhaustion(
                     orch, task, worktree, worktree_mgr
                 )
             except WorktreeError as exc:
+                # Deliberate defensive guard: _apply_with_conflict_escalation
+                # currently swallows all WorktreeError internally and signals
+                # failure via a False return (see its docstring). This clause
+                # is NOT a currently-reachable path — it exists as a safety
+                # net in case that internal contract changes in the future.
                 task = await block_task(
                     orch,
                     task,
@@ -8099,9 +8126,8 @@ async def _maybe_accept_approved_on_exhaustion(
                 err=str(exc),
             )
 
-    # Mark complete. An empty diff integrates as a no-op, so there is
-    # nothing to apply to main — the reviewer already certified the
-    # empty diff as structurally correct. The task is ``in_progress`` at
+    # Mark complete. At this point the diff was either empty (no-op) or
+    # already applied to main above. The task is ``in_progress`` at
     # this point (set at dispatch and reset on every retry), and the FSM
     # forbids a direct ``in_progress -> complete`` edge, so walk the
     # canonical happy-path pipeline states the approved artifact would

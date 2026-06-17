@@ -157,8 +157,9 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
       * ``test_diagnosis_*``      -> consult_knowledge -> retry_with_changes -> ask_human
       * ``worker_exception``      -> retry_with_changes -> ask_human
       * ``conflict_*``            -> re_architect -> ask_human
-      * ``worktree_apply_failed`` -> repair_environment -> ask_human
-      * ``phase_degraded``        -> repair_environment -> ask_human  (the DOA conversion)
+      * ``worktree_apply_failed``      -> repair_environment -> ask_human
+      * ``worktree_diff_check_failed`` -> repair_environment -> ask_human
+      * ``phase_degraded``             -> repair_environment -> ask_human  (the DOA conversion)
       * ``soft_blocker``          -> consult_knowledge (no_immediate_reescalate;
         min_cycle_gap so the re-enable can't churn in the same cycle) -> ask_human
       * ``dag_invalid`` /
@@ -351,6 +352,31 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
                 question=(
                     "A patch will not apply even after resetting the worktree. The "
                     "base is likely diverged — how should the tree be reconciled?"
+                ),
+            ),
+        ]
+    elif cls == fc.WORKTREE_DIFF_CHECK_FAILED:
+        # A failed diff-check means git/worktree state is unreadable — treat
+        # it as an environment problem (same root cause as apply failures) and
+        # walk the same deterministic ladder: repair first, then escalate to a
+        # human if the environment still cannot be read after repair.
+        ladder = [
+            _act(
+                "repair_environment",
+                rationale=(
+                    "worktree diff-check failed: the git state cannot be read; "
+                    "rebuild/reset the worktree to restore a readable base."
+                ),
+            ),
+            _act(
+                "ask_human",
+                rationale=(
+                    "the diff-check still fails after an environment repair; "
+                    "the worktree is in an irrecoverable state — ask the operator."
+                ),
+                question=(
+                    "A worktree diff-check failed even after resetting the environment. "
+                    "The git state appears irrecoverable — how should this be resolved?"
                 ),
             ),
         ]
