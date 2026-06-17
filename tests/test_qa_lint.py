@@ -76,6 +76,10 @@ async def test_lint_timeout(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_lint_nodejs(tmp_path: Path) -> None:
+    # stabilization-v1: _run_eslint now pre-checks for an eslint config and
+    # skips when none is found (no-config → passed=True without calling the
+    # subprocess).  Create a config so the subprocess path is exercised.
+    (tmp_path / "eslint.config.js").write_text("export default [];\n", encoding="utf-8")
     proc = _make_proc(0)
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_lint(tmp_path, language="nodejs")
