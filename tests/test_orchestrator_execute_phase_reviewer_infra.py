@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -32,14 +33,17 @@ from adapters.types import AgentResult
 from agents import build_registry
 from config.defaults import default_config
 from orchestrator import Orchestrator
+from orchestrator import execute_phase as ep
+from state.evidence import write_evidence
 from state.schemas import (
     AcceptanceCriterion,
     Phase,
     Plan,
+    ReviewEvidence,
     Task,
 )
 
-from stub_adapter import StubAdapter, ok
+from stub_adapter import StubAdapter, fail, ok
 
 
 def _iso() -> str:
@@ -261,4 +265,213 @@ async def test_genuine_malformed_non_exhaustion_routes_to_format_retry(
     assert ev["verdict"] == "APPROVED"
     assert not any(
         "reviewer_infra_softpass" in issue for issue in ev.get("issues", [])
+    )
+
+
+# ---------------------------------------------------------------------------
+# A4: worktree diff is applied before completion on approved-but-exhausted path
+# ---------------------------------------------------------------------------
+
+
+def _mk_plan_r7() -> Plan:
+    return Plan(
+        plan_id="p-exec-infra-r7",
+        spec_hash="d",
+        phases=[
+            Phase(
+                id="0",
+                title="Research",
+                tasks=[
+                    Task(
+                        id="0.1",
+                        phase_id="0",
+                        title="Confirm something",
+                        description="Investigate.",
+                        files=["math.py"],
+                        acceptance=[
+                            AcceptanceCriterion(
+                                id="ac-1", description="findings confirmed"
+                            ),
+                        ],
+                    ),
+                ],
+            )
+        ],
+        created_at=_mk_plan().created_at,
+        updated_at=_mk_plan().updated_at,
+    )
+
+
+async def _make_orch_r7(cwd: Path) -> Orchestrator:
+    cfg = default_config()
+    cfg.tournaments.plan.enabled = False
+    cfg.tournaments.impl.enabled = False
+    cfg.tournaments.review_tournament_enabled = False
+    registry = build_registry(cfg)
+    adapter = StubAdapter({})
+    orch = Orchestrator(
+        cwd=cwd,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id="sess-exec-infra-r7",
+    )
+    await orch.plan_manager.init_plan(_mk_plan_r7())
+    return orch
+
+
+@pytest.mark.asyncio
+async def test_approved_exhausted_worktree_diff_applied_to_main(
+    tmp_path: Path,
+) -> None:
+    """APPROVED+exhausted: worktree diff from a prior attempt must be applied.
+
+    Scenario:
+      1. A prior developer attempt succeeded and left changes in the worktree
+         (simulated: APPROVED ReviewEvidence already on disk, non-empty diff
+         in the worktree).
+      2. The current (turn-exhausted) developer attempt produced no diff.
+      3. _maybe_accept_approved_on_exhaustion fires.
+      4. The function MUST call _apply_with_conflict_escalation to flush the
+         worktree's prior diff to main before marking the task complete.
+
+    Bug (pre-fix): worktree diff was silently discarded.
+    Fix: apply before complete when worktree holds uncommitted changes.
+    """
+    task_id = "0.1"
+
+    # Seed a genuine APPROVED verdict on disk.
+    await write_evidence(
+        tmp_path,
+        task_id,
+        ReviewEvidence(
+            task_id=task_id,
+            verdict="APPROVED",
+            issues=[],
+            output_text="VERDICT: APPROVED",
+            raw_response="VERDICT: APPROVED",
+        ),
+    )
+
+    orch = await _make_orch_r7(tmp_path)
+    await orch.plan_manager.update_task_status(task_id, "in_progress")
+    task = await orch.plan_manager.get_task(task_id)
+    assert task is not None
+
+    # The current developer attempt is turn-exhausted and produced no diff.
+    exhausted_result = fail(
+        "budget escalation exhausted",
+        subtype="error_max_turns_escalation_exhausted",
+    )
+
+    # Build a mock WorktreeManager whose get_diff_vs_base returns a non-empty
+    # diff (simulating a prior successful attempt's uncommitted changes).
+    mock_wt_mgr = MagicMock()
+    mock_wt_mgr.get_diff_vs_base = AsyncMock(
+        return_value=(
+            "diff --git a/math.py b/math.py\n"
+            "--- a/math.py\n"
+            "+++ b/math.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+def subtract(a, b): return a - b\n"
+        )
+    )
+    mock_worktree = tmp_path / "worktree"
+
+    # Patch _apply_with_conflict_escalation at the module level so we can
+    # assert it was called (the real one requires a live git repo).
+    apply_called: list[bool] = []
+
+    async def _fake_apply(
+        orch_arg, task_arg, wt_arg, wt_mgr_arg
+    ):  # type: ignore[return]
+        apply_called.append(True)
+        return True  # applied successfully
+
+    with patch.object(ep, "_apply_with_conflict_escalation", _fake_apply):
+        result = await ep._maybe_accept_approved_on_exhaustion(
+            orch,
+            task,
+            exhausted_result,
+            worktree=mock_worktree,
+            worktree_mgr=mock_wt_mgr,
+        )
+
+    # The task must have completed.
+    assert result is not None, "expected completed task, got None"
+    assert result.status == "complete", (
+        f"expected complete, got {result.status!r}"
+    )
+
+    # The apply must have been called to flush the prior diff.
+    assert apply_called, (
+        "_apply_with_conflict_escalation was NOT called — "
+        "prior worktree diff was silently discarded (bug A4)"
+    )
+
+    # get_diff_vs_base was called to check the worktree state.
+    mock_wt_mgr.get_diff_vs_base.assert_awaited_once_with(mock_worktree)
+
+
+@pytest.mark.asyncio
+async def test_approved_exhausted_empty_worktree_skips_apply(
+    tmp_path: Path,
+) -> None:
+    """When the worktree has NO uncommitted changes, apply is skipped.
+
+    This covers the common case: a research task whose correct output is an
+    empty diff (no files changed). The worktree is clean, so _apply_with_
+    conflict_escalation should NOT be called — the existing no-op completion
+    path is correct.
+    """
+    task_id = "0.1"
+
+    await write_evidence(
+        tmp_path,
+        task_id,
+        ReviewEvidence(
+            task_id=task_id,
+            verdict="APPROVED",
+            issues=[],
+            output_text="VERDICT: APPROVED",
+            raw_response="VERDICT: APPROVED",
+        ),
+    )
+
+    orch = await _make_orch_r7(tmp_path)
+    await orch.plan_manager.update_task_status(task_id, "in_progress")
+    task = await orch.plan_manager.get_task(task_id)
+    assert task is not None
+
+    exhausted_result = fail(
+        "budget escalation exhausted",
+        subtype="error_max_turns_escalation_exhausted",
+    )
+
+    # Worktree is clean: get_diff_vs_base returns empty string.
+    mock_wt_mgr = MagicMock()
+    mock_wt_mgr.get_diff_vs_base = AsyncMock(return_value="")
+    mock_worktree = tmp_path / "worktree"
+
+    apply_called: list[bool] = []
+
+    async def _fake_apply(orch_arg, task_arg, wt_arg, wt_mgr_arg):  # type: ignore[return]
+        apply_called.append(True)
+        return True
+
+    with patch.object(ep, "_apply_with_conflict_escalation", _fake_apply):
+        result = await ep._maybe_accept_approved_on_exhaustion(
+            orch,
+            task,
+            exhausted_result,
+            worktree=mock_worktree,
+            worktree_mgr=mock_wt_mgr,
+        )
+
+    assert result is not None
+    assert result.status == "complete"
+
+    # Apply must NOT have been called for a clean worktree.
+    assert not apply_called, (
+        "_apply_with_conflict_escalation was called despite empty worktree diff"
     )

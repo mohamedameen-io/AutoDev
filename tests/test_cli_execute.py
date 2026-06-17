@@ -13,7 +13,7 @@ from cli import cli
 from cli.commands.execute import _render_execute_summary
 from config.defaults import default_config
 from config.loader import save_config
-from errors import AutodevError
+from errors import AutodevError, PhaseStuckError
 from state.schemas import Task
 
 
@@ -166,6 +166,41 @@ def test_execute_autodev_error_exits_2(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "execute failed" in result.output
+
+
+def test_execute_phase_stuck_error_exits_1(tmp_path: Path) -> None:
+    """PhaseStuckError exits 1 (interrupted), not 2 (genuine failure).
+
+    A PhaseStuckError means the run was interrupted and tasks are wedged —
+    the operator should resume, not treat this as a broken plan/adapter.
+    Exit 1 distinguishes "interrupted run" from "genuine failure" (exit 2).
+    """
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as raw_cwd:
+        cwd = Path(raw_cwd)
+        _write_config(cwd)
+
+        with (
+            patch("cli.commands.execute.get_adapter") as mock_get_adapter,
+            patch("cli.commands.execute.Orchestrator") as mock_orch_cls,
+        ):
+            mock_adapter = MagicMock()
+            mock_adapter.healthcheck = AsyncMock(return_value=(True, "ok"))
+            mock_get_adapter.return_value = (mock_adapter, {"platform": "claude_code"})
+
+            mock_orch = MagicMock()
+            mock_orch.execute = AsyncMock(
+                side_effect=PhaseStuckError("phase-1", ["1.1"])
+            )
+            mock_orch_cls.return_value = mock_orch
+
+            result = runner.invoke(cli, ["execute"])
+
+    assert result.exit_code == 1, (
+        f"expected exit 1 for PhaseStuckError, got {result.exit_code}; "
+        f"output: {result.output!r}"
+    )
+    assert "interrupted" in result.output
 
 
 def test_execute_with_task_id(tmp_path: Path) -> None:

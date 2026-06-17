@@ -4924,7 +4924,11 @@ async def _execute_one(
                 # non-approved / non-empty-diff task, so this never masks a
                 # real failure.
                 _accepted = await _maybe_accept_approved_on_exhaustion(
-                    orch, task, developer_result
+                    orch,
+                    task,
+                    developer_result,
+                    worktree=worktree,
+                    worktree_mgr=worktree_mgr,
                 )
                 if _accepted is not None:
                     return _accepted
@@ -7917,6 +7921,9 @@ async def _maybe_accept_approved_on_exhaustion(
     orch: "Orchestrator",
     task: "Task",
     developer_result: "AgentResult",
+    *,
+    worktree: "Path | None" = None,
+    worktree_mgr: "WorktreeManager | None" = None,
 ) -> "Task | None":
     """Tier J: accept an APPROVED-but-turn-exhausted task instead of blocking.
 
@@ -7952,6 +7959,15 @@ async def _maybe_accept_approved_on_exhaustion(
        apply step. A non-empty in-hand diff is deliberately NOT auto-
        accepted here (applying an un-reviewed partial diff would be
        unsafe); it falls through to the unchanged path.
+
+    When ``worktree`` and ``worktree_mgr`` are supplied the function also
+    checks whether the worktree holds uncommitted changes from a prior
+    successful attempt (the scenario where attempt N wrote a diff, the
+    reviewer APPROVED, but attempt N+1 then turn-exhausted with no new
+    diff). In that case the prior approved changes are applied to main
+    before the task is marked complete — otherwise the ``finally`` block
+    in ``_execute_one`` removes the worktree and those changes are
+    silently discarded.
 
     Idempotent: marking the task ``complete`` is the terminal transition,
     so a re-entry (e.g. resume) re-reads the same APPROVED evidence and
@@ -8020,6 +8036,49 @@ async def _maybe_accept_approved_on_exhaustion(
         verdict="APPROVED",
         diff_empty=True,
     )
+
+    # Apply any prior successful attempt's changes from the worktree to
+    # main before marking complete. When this function fires, the worktree
+    # may hold changes from a prior attempt that passed review (the current
+    # exhausted attempt produced no diff). Without this apply, those changes
+    # are silently discarded when the worktree is cleaned up in the finally
+    # block of _execute_one.
+    if worktree_mgr is not None and worktree is not None:
+        try:
+            worktree_diff = await worktree_mgr.get_diff_vs_base(worktree)
+        except Exception as exc:  # noqa: BLE001
+            worktree_diff = ""
+            logger.warning(
+                "execute_phase.accept_approved_on_exhaustion.diff_check_failed",
+                task_id=task.id,
+                err=str(exc),
+            )
+        if worktree_diff.strip():
+            # Worktree has prior approved changes — apply to main before
+            # completing. A conflict or apply failure blocks the task (the
+            # caller must not silently complete on unapplied changes).
+            logger.info(
+                "execute_phase.accept_approved_on_exhaustion.applying_prior_diff",
+                task_id=task.id,
+            )
+            try:
+                applied = await _apply_with_conflict_escalation(
+                    orch, task, worktree, worktree_mgr
+                )
+            except WorktreeError as exc:
+                task = await block_task(
+                    orch,
+                    task,
+                    failure_class=_fcls.WORKTREE_APPLY_FAILED,
+                    raw_error=f"worktree_apply_failed: {exc}",
+                    meta={"blocked_reason": f"worktree_apply_failed: {exc}"},
+                )
+                return task
+            if not applied:
+                # Conflict → task already blocked by
+                # _apply_with_conflict_escalation.
+                return await orch.plan_manager.get_task(task.id) or task
+
     # Audit-only ledger breadcrumb. Best-effort — a ledger failure here
     # MUST NOT mask the completion the operator needs.
     if getattr(orch, "plan_manager", None) is not None:
