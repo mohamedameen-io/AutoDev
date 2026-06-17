@@ -81,11 +81,16 @@ def sum_invocation_cost(cwd: Path, after_seq: int = 0) -> float:
     Returns 0.0 when the ledger is missing / unreadable (best-effort). When
     ``after_seq`` is 0 the whole ledger is summed (useful for an all-runs
     total / tests).
+
+    Emits a debug log with ``ops_count`` (number of invocation_cost ops
+    considered in the window) to aid post-hoc diagnosis when cost is 0.0.
     """
     lp = ledger_path(cwd)
     if not lp.exists():
+        log.debug("run_summary.cost_sum_no_ledger", after_seq=after_seq)
         return 0.0
     total = 0.0
+    ops_count = 0
     try:
         with lp.open("r", encoding="utf-8") as fh:
             for line in fh:
@@ -101,6 +106,7 @@ def sum_invocation_cost(cwd: Path, after_seq: int = 0) -> float:
                 seq = rec.get("seq")
                 if isinstance(seq, int) and seq <= after_seq:
                     continue
+                ops_count += 1
                 payload = rec.get("payload") or {}
                 try:
                     total += float(payload.get("cost_usd", 0.0) or 0.0)
@@ -109,6 +115,12 @@ def sum_invocation_cost(cwd: Path, after_seq: int = 0) -> float:
     except OSError as exc:
         log.warning("run_summary.cost_sum_read_failed", err=str(exc))
         return 0.0
+    log.debug(
+        "run_summary.cost_sum",
+        after_seq=after_seq,
+        ops_count=ops_count,
+        total_usd=round(total, 6),
+    )
     return total
 
 

@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 from io import StringIO
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 from rich.console import Console
 
+from adapters.base import PlatformAdapter
+from adapters.types import AgentInvocation, AgentResult
 from cli import cli
 from cli.commands.execute import _render_execute_summary
 from config.defaults import default_config
 from config.loader import save_config
 from errors import AutodevError, PhaseStuckError
+from orchestrator import Orchestrator
+from state.run_summary import current_ledger_seq, sum_invocation_cost
 from state.schemas import Task
 
 
@@ -295,6 +301,71 @@ def test_delivered_approved_finalization_exits_0(tmp_path: Path) -> None:
         f"delivered+approved finalization must exit 0, got {result.exit_code}; "
         f"output: {result.output!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# A5 — execute-phase cost telemetry (watermark + run-summary)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_phase_cost_recorded_non_zero(tmp_path: Path) -> None:
+    """Execute-phase cost is non-zero when the adapter returns a real cost.
+
+    This is the A5 regression test: the execute-phase run-summary MUST record
+    cost_usd > 0.0 when the CostRecordingAdapter observes invocations with
+    non-zero cost. The test wires up the real CostRecordingAdapter (via
+    Orchestrator) but stubs orch.execute() so the adapter cost arrives via
+    the ledger op rather than a real LLM call.
+
+    Failure mode guarded against: if plan-ledger.jsonl is absent / wiped at
+    summary time (e.g. pre-A1-fix git-clean bug), sum_invocation_cost returns
+    0.0 and this test turns RED.
+    """
+    class _CostAdapter(PlatformAdapter):
+        name = "cost-test"
+
+        async def init_workspace(self, cwd, agents):  # type: ignore[no-untyped-def]
+            return None
+
+        async def execute(self, inv: AgentInvocation) -> AgentResult:
+            return AgentResult(success=True, text="ok", duration_s=1.0, cost_usd=0.123)
+
+        async def healthcheck(self):  # type: ignore[no-untyped-def]
+            return (True, "ok")
+
+    cfg = default_config()
+    orch = Orchestrator(
+        cwd=tmp_path,
+        cfg=cfg,
+        adapter=_CostAdapter(),
+        registry={},
+        session_id="sess-a5-test",
+    )
+
+    async def _drive() -> None:
+        # Simulate plan-phase ops already in the ledger before execute starts.
+        await orch.plan_manager.ledger_append(op="init_plan", payload={})
+        await orch.adapter.execute(AgentInvocation(role="planner", prompt="p", cwd=tmp_path))
+
+        # Watermark: captured at execute.py entry, after plan, before execute.
+        start_seq = current_ledger_seq(tmp_path)
+        assert start_seq >= 2, f"start_seq={start_seq} — plan ops must be present"
+
+        # Execute phase invocations (2 × 0.123 = 0.246).
+        await orch.adapter.execute(AgentInvocation(role="developer", prompt="d", cwd=tmp_path))
+        await orch.adapter.execute(AgentInvocation(role="judge", prompt="j", cwd=tmp_path))
+
+        # Confirm only execute-window ops are summed.
+        cost = sum_invocation_cost(tmp_path, after_seq=start_seq)
+        assert cost == pytest.approx(0.246), (
+            f"expected 0.246 for two execute invocations, got {cost!r}; "
+            "if cost is 0.0 the ledger was absent or wiped (A1-style regression)"
+        )
+
+    asyncio.run(_drive())
+
+    # The whole-ledger sum includes plan + execute: 1 + 2 = 3 × 0.123 = 0.369.
+    assert sum_invocation_cost(tmp_path) == pytest.approx(0.369)
 
 
 # ---------------------------------------------------------------------------

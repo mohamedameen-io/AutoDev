@@ -110,6 +110,49 @@ def test_sum_invocation_cost_missing_ledger_is_zero(tmp_path: Path) -> None:
     assert sum_invocation_cost(tmp_path) == pytest.approx(0.0)
 
 
+def test_sum_invocation_cost_execute_window_watermark(tmp_path: Path) -> None:
+    """Execute-phase watermark correctly isolates execute costs from plan costs.
+
+    This mirrors the real execute.py flow:
+      1. Plan phase writes invocation_cost ops (seq 1..N).
+      2. execute.py calls current_ledger_seq() → start_seq = N.
+      3. Execute phase writes further invocation_cost ops (seq N+1+).
+      4. sum_invocation_cost(cwd, after_seq=N) must return ONLY execute costs.
+
+    Confirms the STRICT seq > after_seq boundary is correct and that the
+    watermark captures plan-phase costs without double-counting.
+    """
+    plan_ops = [
+        {"seq": i, "op": "invocation_cost", "payload": {"cost_usd": 0.10}}
+        for i in range(1, 6)  # seq 1..5: plan phase, total 0.50
+    ]
+    execute_ops = [
+        {"seq": 6, "op": "adapter_selected", "payload": {}},
+        {"seq": 7, "op": "invocation_cost", "payload": {"cost_usd": 0.20}},
+        {"seq": 8, "op": "invocation_cost", "payload": {"cost_usd": 0.30}},
+    ]
+
+    # Start from the plan→execute boundary: watermark captured after plan, before execute.
+    _write_ledger(tmp_path, plan_ops)
+    start_seq = current_ledger_seq(tmp_path)
+    assert start_seq == 5  # plan phase watermark
+
+    # Append execute ops (simulates ops written during orch.execute()).
+    lp = tmp_path / ".autodev" / "plan-ledger.jsonl"
+    with lp.open("a", encoding="utf-8") as fh:
+        for rec in execute_ops:
+            fh.write(json.dumps(rec) + "\n")
+
+    # sum with watermark: only ops with seq > 5 are included → 0.20 + 0.30.
+    assert sum_invocation_cost(tmp_path, after_seq=start_seq) == pytest.approx(0.50)
+
+    # sum without watermark: all five plan ops + two execute ops → 0.50 + 0.50.
+    assert sum_invocation_cost(tmp_path) == pytest.approx(1.00)
+
+    # Watermark equal to last seq → zero (no ops after).
+    assert sum_invocation_cost(tmp_path, after_seq=8) == pytest.approx(0.0)
+
+
 def test_current_ledger_seq(tmp_path: Path) -> None:
     assert current_ledger_seq(tmp_path) == 0
     _write_ledger(
