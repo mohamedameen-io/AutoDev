@@ -6772,13 +6772,16 @@ async def delegate(
     spec = orch.registry.get(role)
     if spec is None:
         raise AutodevError(f"role {role!r} not in registry")
-    # v1.0 B1: inject necessity ladder into the developer (coder) prompt so
+    # v1.0 B1/B3: inject necessity ladder into the developer (coder) prompt so
     # the code-writing role applies the same laziness gate as the architect.
+    # B3 modulates intensity via user_complexity (low→lite, high/max→deeper).
     # build_developer_prompt() is the single definition of the injection
     # contract shared with _CoderRunner.run in impl_tournament_runner.py.
     base_prompt = spec.prompt.strip()
     if role == "developer":
-        base_prompt = build_developer_prompt(spec.prompt)
+        base_prompt = build_developer_prompt(
+            spec.prompt, user_complexity=orch.cfg.user_complexity
+        )
     parts: list[str] = [base_prompt]
     parts.append("\n\n---\n")
     parts.append(envelope.render_as_task_message())

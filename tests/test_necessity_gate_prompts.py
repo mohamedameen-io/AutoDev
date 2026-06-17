@@ -99,10 +99,15 @@ def test_architect_b_prompt_impl_contains_safety_carve_out() -> None:
 def _assembled_developer_prompt() -> str:
     """Reproduce the assembly performed in ``_CoderRunner.run`` and ``delegate()``.
 
-    Both sites call ``build_developer_prompt(spec.prompt)`` where ``spec.prompt``
-    is the rendered developer.md (with frontmatter stripped and ``{{...}}``
-    placeholders substituted). Using the shared helper here ensures this test
-    stays in sync with both production injection sites.
+    Both production sites call
+    ``build_developer_prompt(spec.prompt, user_complexity=orch.cfg.user_complexity)``
+    where ``spec.prompt`` is the rendered developer.md (with frontmatter stripped
+    and ``{{...}}`` placeholders substituted).
+
+    This helper intentionally omits ``user_complexity`` so it defaults to
+    ``"medium"``, which produces no intensity text — isolating the B1 necessity-
+    ladder content without the effort-modulation layer.  Using the shared helper
+    ensures this test stays in sync with both production injection sites.
     """
     raw = load_prompt("developer")
     rendered = render_prompt(raw, {"QA_RETRY_LIMIT": "3", "TOOLS": "(none)"})

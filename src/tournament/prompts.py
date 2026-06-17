@@ -1,5 +1,7 @@
 """Tournament role prompts for critic_t, architect_b, synthesizer, and judge."""
 
+from tournament.effort import UserComplexity, effort_intensity_guidance
+
 # B1 necessity gate: laziness ladder guidance injected into Architect-B so it
 # actively refuses unjustified dependencies, abstractions, and new files.
 NECESSITY_LADDER_GUIDANCE = """\
@@ -27,15 +29,31 @@ skipped by this ladder. When a task is framed as safety or security work,
 proceed without applying the necessity gate.
 """
 
-def build_developer_prompt(base_prompt: str) -> str:
-    """Append the necessity ladder to a developer/coder base prompt.
+def build_developer_prompt(
+    base_prompt: str,
+    user_complexity: "UserComplexity | None" = None,
+) -> str:
+    """Append the necessity ladder (+ effort-modulated intensity) to a developer prompt.
 
     Single source for the architect+developer injection contract: both the
     impl-tournament coder (``_CoderRunner.run``) and the corrective-coder
     (``delegate()``) must call this function so the ladder is always
     consistently injected from one definition.
+
+    B3: ``user_complexity`` modulates the intensity of the necessity ladder:
+
+    - ``"low"``    → lite: minimal-change bias, suppress speculative work.
+    - ``"medium"`` → standard baseline (no extra text added).
+    - ``"high"``   → deeper-work allowed in touched files.
+    - ``"max"``    → same as ``"high"``.
+    - ``None``     → treated as ``"medium"`` (backward-compatible default).
+
+    NON-NEGOTIABLE: the safety/validation/security carve-out in
+    ``NECESSITY_LADDER_GUIDANCE`` is present at EVERY intensity level.
+    Low/"lite" effort is never an excuse to skip safety or security work.
     """
-    return base_prompt.strip() + NECESSITY_LADDER_GUIDANCE
+    intensity = effort_intensity_guidance(user_complexity or "medium")
+    return base_prompt.strip() + NECESSITY_LADDER_GUIDANCE + intensity
 
 
 CRITIC_SYSTEM = (

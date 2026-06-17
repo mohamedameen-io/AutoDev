@@ -225,7 +225,12 @@ class _CoderRunner:
 
         developer_prompt = "\n\n---\n".join(
             [
-                build_developer_prompt(developer_spec.prompt),
+                # B3: pass user_complexity so intensity is modulated
+                # (low→lite/minimal, high/max→deeper-work allowed).
+                build_developer_prompt(
+                    developer_spec.prompt,
+                    user_complexity=orch.cfg.user_complexity,
+                ),
                 developer_env.render_as_task_message(),
             ]
         )
