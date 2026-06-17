@@ -953,6 +953,20 @@ class WorktreeManager:
         untracked files, which is still safe because ``reset --hard``
         already restored every tracked file to ``HEAD``.
 
+        A1 (Finding #1): the repo-wide ``git clean`` ALWAYS excludes AutoDev's
+        own state directory (``.autodev/``, normally untracked in the target
+        repo). Without this exclude, a corrective task synthesized by
+        ``corrective_parser.parse_corrective_direction`` — which carries
+        ``files=[]`` — drove the repo-wide path (empty ``targets``) and the
+        ``git clean -fd`` DELETED ``.autodev/plan-ledger.jsonl`` out from under
+        the live ``PlanManager``. The next ``block_task`` →
+        ``update_task_status("blocked")`` → ``_load_sync()`` then read an empty
+        ledger and raised ``"no plan initialized; call init_plan first"`` — the
+        field-observed worker_exception that silently killed delivery on the
+        conflict→re_architect→corrective→block path. AutoDev's run-state is
+        never a legitimate ``git clean`` target, so excluding it is always
+        correct (the scoped path is unaffected — it only cleans ``targets``).
+
         Never raises: a cleanup failure here must not mask the underlying
         apply failure the caller is already handling. Errors are logged and
         swallowed.
@@ -989,7 +1003,20 @@ class WorktreeManager:
         # Remove untracked files the partial apply may have created. Scope
         # to the attempted targets when known so unrelated untracked state
         # (e.g. a developer's scratch file elsewhere) is untouched.
+        #
+        # A1: ALWAYS exclude AutoDev's own state dir from the clean. On the
+        # repo-wide path (empty ``targets`` — the corrective-task shape, since
+        # ``parse_corrective_direction`` produces tasks with ``files=[]``) an
+        # un-excluded ``git clean -fd`` deleted the untracked
+        # ``.autodev/plan-ledger.jsonl``, wiping the live plan and surfacing as
+        # the spurious ``"no plan initialized"`` block. The exclude is harmless
+        # on the scoped path (which lists explicit ``targets`` and never
+        # ``.autodev``) and on a repo where ``.autodev`` is somehow tracked
+        # (``git clean`` ignores tracked files regardless).
         clean_args = ["clean", "-fd"]
+        autodev_excludes = self._git_clean_autodev_excludes()
+        for exclude in autodev_excludes:
+            clean_args.extend(["-e", exclude])
         scoped = [t for t in (targets or []) if t]
         if scoped:
             clean_args.append("--")
@@ -1004,7 +1031,42 @@ class WorktreeManager:
             self._log.info(
                 "worktree.abort_failed_apply.cleaned",
                 scoped=bool(scoped),
+                autodev_protected=bool(autodev_excludes),
             )
+
+    def _git_clean_autodev_excludes(self) -> list[str]:
+        """Return ``git clean -e`` pathspec(s) protecting AutoDev's state dir.
+
+        A1 safety net: the per-repo ``.autodev/`` directory (ledger, snapshot,
+        evidence, tournaments) is normally UNTRACKED in the target repo, so a
+        repo-wide ``git clean -fd`` would delete it — destroying the live plan
+        mid-run. This computes the exclude pathspec relative to the main repo
+        root. Returns the canonical ``.autodev`` (the standard layout) plus, if
+        ``self._autodev_root`` lives under the main repo at a non-standard
+        location, that relative path too. Empty only when the autodev root is
+        OUTSIDE the repo (then ``git clean`` can't reach it anyway).
+
+        The canonical ``AUTODEV_DIR`` exclude is deliberately BROAD (un-anchored,
+        so ``git clean -e`` protects a ``.autodev/`` wherever it sits in the
+        tree). Protecting AutoDev's live run-state is always the safe direction,
+        so this is NOT narrowed to a root-anchored ``/.autodev`` — that would
+        stop protecting non-standard ``_autodev_root`` layouts.
+        """
+        from state.paths import AUTODEV_DIR
+
+        excludes: list[str] = [AUTODEV_DIR]
+        try:
+            rel = self._autodev_root.resolve().relative_to(self._main.resolve())
+            rel_str = rel.as_posix()
+            # ``rel_str == "."`` means the autodev root IS the main repo root;
+            # appending ``-e .`` would be a meaningless (and confusing) no-op.
+            if rel_str not in (".", "") and rel_str not in excludes:
+                excludes.append(rel_str)
+        except (ValueError, OSError):
+            # autodev_root is outside the repo (or unresolvable) — the
+            # canonical ``.autodev`` exclude is the only relevant guard.
+            pass
+        return excludes
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────

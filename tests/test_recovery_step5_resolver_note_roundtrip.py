@@ -254,3 +254,150 @@ async def test_block_task_on_uninitialized_plan_breadcrumbs_then_raises(
     assert "block_path_plan_uninitialized" in ops, (
         f"guard did not emit the attributable breadcrumb (ops={ops})"
     )
+
+
+@pytest.mark.asyncio
+async def test_block_task_transient_no_plan_reload_retry_recovers(
+    tmp_path: Path,
+) -> None:
+    """A1 secondary-guard SUCCESS branch (blocker_guard.py ~130-148): when the
+    FIRST terminal ``update_task_status('blocked')`` trips a TRANSIENT "no plan
+    initialized" but the ledger is still readable, the reload-retry must land the
+    block.
+
+    This pins the reload-RETURNS-A-PLAN branch — the sibling test above only
+    exercises the reload-returns-None (breadcrumb + re-raise) path. We simulate a
+    transient empty read by wrapping ``update_task_status`` so the FIRST call
+    raises ``PlanConcurrentModificationError("no plan initialized; ...")`` (before
+    writing any ledger entry) and every later call delegates to the REAL method.
+    ``block_task`` then: commit#1 raises → ``load()`` probe succeeds (plan intact)
+    → retry commit#2 delegates → lands the single ``blocked`` transition.
+
+    Asserts the success contract: no exception propagates, EXACTLY ONE ``blocked``
+    transition is committed, and NO ``block_path_plan_uninitialized`` breadcrumb
+    is emitted (the transient was recovered, not a genuine loss).
+
+    Non-vacuity: if the retry branch were removed, commit#1's raise would fall
+    straight through to the breadcrumb + re-raise — the assertions below
+    (no-raise, breadcrumb-absent) would FAIL. The companion
+    ``..._raises_if_retry_branch_removed`` test pins that explicitly.
+    """
+    orch = await _build_orch(tmp_path, session="reload-retry-ok")
+    plan = await orch.plan_manager.load()
+    assert plan is not None
+    task = plan.phases[0].tasks[0]
+    # Valid pre-state for a ``blocked`` transition.
+    task = await orch.plan_manager.update_task_status(task.id, "in_progress")
+
+    pm = orch.plan_manager
+    real_update = pm.update_task_status
+    calls = {"n": 0}
+
+    async def _flaky_update(task_id, status, meta=None):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Transient empty read: raise BEFORE any ledger append, exactly as
+            # ``_load_sync() is None`` does at plan_manager.py:342.
+            raise PlanConcurrentModificationError(
+                "no plan initialized; call init_plan first"
+            )
+        return await real_update(task_id, status, meta=meta)
+
+    import os
+
+    os.environ["AUTODEV_RESOLVER_DISABLED"] = "1"
+    pm.update_task_status = _flaky_update  # type: ignore[method-assign]
+    try:
+        result = await block_task(
+            orch,
+            task,
+            failure_class=_fcls.CONFLICT_3WAY_FAILED,
+            raw_error="three-way merge could not be resolved",
+        )
+    finally:
+        pm.update_task_status = real_update  # type: ignore[method-assign]
+        os.environ.pop("AUTODEV_RESOLVER_DISABLED", None)
+
+    # 1) No exception propagated AND the returned task is actually blocked.
+    assert result is not None and getattr(result, "status", None) == "blocked", (
+        f"reload-retry did not land the block (status={getattr(result, 'status', None)})"
+    )
+    # The flaky wrapper was hit once and the retry delegated once (>= 2 calls).
+    assert calls["n"] >= 2, f"expected a reload-retry, only {calls['n']} commit attempt(s)"
+
+    entries = ledger_mod.read_entries(tmp_path)
+    # 2) EXACTLY ONE blocked transition was committed (the retry, not a double).
+    blocked = [
+        e
+        for e in entries
+        if e.op == "update_task_status" and e.payload.get("status") == "blocked"
+    ]
+    assert len(blocked) == 1, (
+        f"expected exactly one 'blocked' transition, found {len(blocked)}: "
+        f"{[e.payload for e in blocked]}"
+    )
+    # 3) The transient was RECOVERED — no missing-ledger breadcrumb emitted.
+    ops = [e.op for e in entries]
+    assert "block_path_plan_uninitialized" not in ops, (
+        "reload-retry recovered the transient, so NO block_path_plan_uninitialized "
+        f"breadcrumb should be emitted (ops={ops})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_block_task_transient_no_plan_raises_if_retry_branch_removed(
+    tmp_path: Path,
+) -> None:
+    """Non-vacuity guard for the success-branch test above.
+
+    Reproduces what ``block_task`` WOULD do if the reload-retry branch were
+    deleted: a single terminal commit that raises a transient "no plan
+    initialized" with the ledger STILL readable. Without the retry, the raise
+    must surface as a breadcrumb + re-raise (the existing Part-4 contract). This
+    proves the success-branch test is non-vacuous: its no-raise / no-breadcrumb
+    assertions are only satisfiable BECAUSE the retry branch exists.
+
+    We exercise the deleted-branch behaviour by making EVERY
+    ``update_task_status`` call raise the transient (so even a retry would fail),
+    which is observationally identical to "no retry attempted" for the guard's
+    breadcrumb+raise contract.
+    """
+    orch = await _build_orch(tmp_path, session="reload-retry-novac")
+    plan = await orch.plan_manager.load()
+    assert plan is not None
+    task = plan.phases[0].tasks[0]
+    task = await orch.plan_manager.update_task_status(task.id, "in_progress")
+
+    pm = orch.plan_manager
+    real_update = pm.update_task_status
+
+    async def _always_no_plan(task_id, status, meta=None):  # noqa: ANN001
+        raise PlanConcurrentModificationError(
+            "no plan initialized; call init_plan first"
+        )
+
+    import os
+
+    os.environ["AUTODEV_RESOLVER_DISABLED"] = "1"
+    pm.update_task_status = _always_no_plan  # type: ignore[method-assign]
+    try:
+        with pytest.raises(
+            PlanConcurrentModificationError, match="no plan initialized"
+        ):
+            await block_task(
+                orch,
+                task,
+                failure_class=_fcls.CONFLICT_3WAY_FAILED,
+                raw_error="three-way merge could not be resolved",
+            )
+    finally:
+        pm.update_task_status = real_update  # type: ignore[method-assign]
+        os.environ.pop("AUTODEV_RESOLVER_DISABLED", None)
+
+    # The breadcrumb fires because the retry could not recover (ledger readable
+    # but the commit keeps failing) — the exact behaviour the success branch
+    # AVOIDS, confirming the success-branch assertions are load-bearing.
+    ops = [e.op for e in ledger_mod.read_entries(tmp_path)]
+    assert "block_path_plan_uninitialized" in ops, (
+        f"expected the missing-ledger breadcrumb on unrecoverable transient (ops={ops})"
+    )

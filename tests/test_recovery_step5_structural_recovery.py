@@ -45,6 +45,8 @@ from orchestrator import Orchestrator
 from orchestrator import execute_phase as ep
 from orchestrator import failure_classes as _fcls
 from orchestrator.corrective_parser import parse_corrective_direction
+from orchestrator.worktree import WorktreeManager
+from state import ledger as _ledger_mod
 from state.plan_manager import PlanManager
 from state.schemas import (
     AcceptanceCriterion,
@@ -340,4 +342,196 @@ async def test_supplied_structured_direction_is_preserved(
     assert len(corrective) == 2, (
         f"supplied structured direction not used verbatim: "
         f"{[t.title for t in corrective]} (base was {base})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A1 (Finding #1) — the corrective-retry "no plan initialized" delivery blocker.
+#
+# Confirmed mechanism (reproduce-first): a corrective task synthesized by
+# ``parse_corrective_direction`` is created with ``files=[]`` (the parser never
+# sets ``Task.files``; see corrective_parser.py:99-108 and the
+# ``files defaults to []`` Pydantic field). When that corrective task hits a
+# 3-way merge conflict, ``_apply_with_conflict_escalation`` calls
+# ``worktree_mgr.abort_failed_apply(targets=list(task.files))`` with an EMPTY
+# list → ``abort_failed_apply`` falls through to a REPO-WIDE ``git clean -fd``
+# (worktree.py:992-997) which DELETES the untracked main-repo ``.autodev/``
+# directory (ledger + snapshot). The very next ``block_task`` →
+# ``update_task_status("blocked")`` → ``PlanManager._load_sync()`` then reads an
+# empty ledger → raises ``PlanConcurrentModificationError("no plan
+# initialized; call init_plan first")`` → the field-observed worker_exception /
+# ``block_path_plan_uninitialized``.
+#
+# This is the deterministic repro the field analysis ("not reproducible
+# deterministically") was missing: it only fires on the corrective-retry path
+# because ONLY corrective tasks carry ``files=[]`` (the architect's original
+# tasks declare real files, so their ``abort_failed_apply`` is path-scoped and
+# never touches ``.autodev/``).
+# ---------------------------------------------------------------------------
+
+
+async def _build_orch_with_conflicting_worktree(
+    repo: Path, *, session: str, task: Task
+) -> tuple[Orchestrator, WorktreeManager, Path]:
+    """Build a REAL orchestrator + a per-task worktree whose diff genuinely
+    CONFLICTS with main HEAD, so the production 3-way-merge-fails path runs the
+    REAL ``WorktreeManager.abort_failed_apply``.
+
+    The conflict is real (no mocked git): we edit ``math_utils.py`` line 2 in
+    the worktree, then edit the SAME line differently in main and commit, so
+    both ``git apply`` and ``git apply --3way`` to main fail.
+    """
+    cfg = _make_cfg()
+    registry = build_registry(cfg)
+    # The conflict critic chooses ``rebase-and-retry`` so the 3-way apply path
+    # fires (and then fails), driving ``abort_failed_apply``.
+    adapter = StubAdapter(
+        {
+            "explorer": ok("ok"),
+            "developer": ok("dev"),
+            "critic_sounding_board": ok("RESOLUTION: rebase-and-retry\n"),
+        }
+    )
+    orch = Orchestrator(
+        cwd=repo,
+        cfg=cfg,
+        adapter=adapter,
+        registry=registry,
+        session_id=f"{session}-exec",
+    )
+
+    tdir = repo / ".autodev" / "tournaments" / f"conf-{task.id}"
+    wm = WorktreeManager(repo, tdir)
+    worktree = await wm.create_per_task(task.id, base_ref="HEAD")
+
+    # Worktree edit: change line 2 of math_utils.py → produces a diff.
+    (worktree / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b + 1  # worktree change\n"
+    )
+
+    # Main edit on the SAME line, committed, so the worktree diff no longer
+    # applies cleanly AND the 3-way base context is gone → both applies fail.
+    (repo / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b + 2  # main change\n"
+    )
+    subprocess.run(["git", "add", "math_utils.py"], cwd=str(repo), check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "main diverges"], cwd=str(repo), check=True
+    )
+
+    return orch, wm, worktree
+
+
+@pytest.mark.asyncio
+async def test_corrective_retry_conflict_does_not_wipe_plan(
+    tmp_path: Path,
+) -> None:
+    """A1 RED→GREEN: a corrective task (``files=[]``) whose 3-way merge fails
+    must NOT lose its plan to a repo-wide ``git clean -fd``.
+
+    Drives the REAL ``_apply_with_conflict_escalation`` with the REAL
+    ``WorktreeManager`` and a genuine merge conflict. The corrective task has
+    ``files=[]`` exactly as ``parse_corrective_direction`` produces them.
+
+    BEFORE the fix (RED): ``abort_failed_apply([])`` runs a repo-wide
+    ``git clean -fd``, deletes ``.autodev/``, and the terminal ``block_task``
+    raises "no plan initialized" — surfacing as a ``block_path_plan_uninitialized``
+    ledger breadcrumb (when the ledger dir is recreated by the breadcrumb path)
+    or an outright raise. AFTER the fix: the plan ledger SURVIVES, the corrective
+    task reaches a real terminal ``blocked`` state, and NO
+    ``block_path_plan_uninitialized`` op is emitted.
+    """
+    repo = tmp_path / "repo-a1"
+    repo.mkdir()
+    _git_init(repo)
+
+    # Seed a plan whose phase holds the ORIGINAL task plus a CORRECTIVE task
+    # (origin=phase_review_corrective, files=[]) — the shape the resolver's
+    # conflict→re_architect path appends. We drive the corrective task directly.
+    plan = Plan(
+        plan_id="p-a1",
+        spec_hash="0123456789abcdef",
+        phases=[
+            Phase(
+                id="1",
+                title="Setup",
+                tasks=[
+                    Task(
+                        id="1.1",
+                        phase_id="1",
+                        title="Add the widget factory",
+                        description="d1",
+                        files=["math_utils.py"],
+                        complexity="medium",
+                    ),
+                    # Corrective task: NO files (matches parse_corrective_direction).
+                    Task(
+                        id="1.c2",
+                        phase_id="1",
+                        title="Re-implement as smaller non-overlapping changes",
+                        description="corrective",
+                        complexity="medium",
+                        assigned_agent="developer",
+                        metadata={"origin": "phase_review_corrective"},
+                    ),
+                ],
+                acceptance=[AcceptanceCriterion(id="ph-1", description="ok")],
+            ),
+        ],
+        created_at=_iso(),
+        updated_at=_iso(),
+        complexity="medium",
+    )
+    pm = PlanManager(repo, session_id="a1-init")
+    await pm.init_plan(plan)
+
+    ledger_file = repo / ".autodev" / "plan-ledger.jsonl"
+    assert ledger_file.exists(), "precondition: plan ledger must exist"
+
+    corrective = (await pm.get_task("1.c2")) or pytest.fail("corrective missing")
+    assert corrective.files == [], "repro precondition: corrective has empty files"
+
+    orch, wm, worktree = await _build_orch_with_conflicting_worktree(
+        repo, session="a1", task=corrective
+    )
+    # Drive the corrective task into the conflict-escalation path.
+    await orch.plan_manager.update_task_status("1.c2", "in_progress")
+
+    applied = await ep._apply_with_conflict_escalation(
+        orch, corrective, worktree, wm
+    )
+
+    # The 3-way merge MUST have failed (the conflict is real).
+    assert applied is False, "expected the 3-way apply to fail on a real conflict"
+
+    # CORE ASSERTION (the bug): the plan ledger must SURVIVE the conflict-recovery
+    # git ops. Pre-fix the repo-wide ``git clean -fd`` deletes it.
+    assert ledger_file.exists(), (
+        "REGRESSION/BUG: conflict-recovery wiped the main-repo plan ledger "
+        "(.autodev/plan-ledger.jsonl) — the corrective-retry 'no plan "
+        "initialized' delivery blocker"
+    )
+
+    # The corrective task reached a REAL terminal state against a LOADED plan.
+    # With the resolver enabled, ``block_task`` routes through the resolver,
+    # which recovers the conflict (``re_architect`` → ``skipped`` + a new
+    # corrective sub-task) rather than blocking — both ``blocked`` and
+    # ``skipped`` are legitimate terminals reached against a LOADED plan. The
+    # delivery blocker was the task DYING on "no plan initialized" instead of
+    # reaching ANY real terminal; that is what must no longer happen.
+    reloaded = await orch.plan_manager.load()
+    assert reloaded is not None, "plan unexpectedly None after conflict recovery"
+    ct = next(
+        (t for t in reloaded.phases[0].tasks if t.id == "1.c2"), None
+    )
+    assert ct is not None and ct.status in ("blocked", "skipped"), (
+        f"corrective task did not reach a real terminal state against a loaded "
+        f"plan: {getattr(ct, 'status', None)}"
+    )
+
+    # The field signature must be ABSENT: no spurious "no plan initialized".
+    ops = [e.op for e in _ledger_mod.read_entries(repo)]
+    assert "block_path_plan_uninitialized" not in ops, (
+        "the corrective-retry block raised 'no plan initialized' "
+        f"(block_path_plan_uninitialized emitted); ledger ops={ops}"
     )
