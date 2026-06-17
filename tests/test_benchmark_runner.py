@@ -17,6 +17,8 @@ import pytest
 
 from benchmarks.runner.run_benchmark import (
     DEFAULT_TASKS_ROOT,
+    _emit,
+    _json_default,
     build_results_doc,
     main,
 )
@@ -410,3 +412,98 @@ def test_build_results_doc_shape():
     }
     assert len(doc["results"]) == 2
     assert doc["results"][1]["apply_error"] == "empty diff"
+
+
+# ---------------------------------------------------------------------------
+# Bytes-safety: _emit must never crash on non-serialisable values
+# ---------------------------------------------------------------------------
+
+
+def test_emit_with_bytes_in_secondary_does_not_raise(tmp_path: Path):
+    """A result doc that contains a bytes value (e.g. from a timed-out
+    subprocess) must be serialisable without raising TypeError.
+
+    This is the regression test for the crash:
+        TypeError: Object of type bytes is not JSON serializable
+    raised when a failing task's captured output was stored as bytes.
+    """
+    doc = build_results_doc(
+        [
+            TaskResult(
+                task_id="t1",
+                status="FAIL",
+                secondary={
+                    "autodev_fail_stdout_tail": b"boom\xff",   # bytes with non-UTF8
+                    "autodev_fail_stderr_tail": b"error msg",
+                },
+                error="autodev plan exited 2",
+            ),
+        ],
+        autodev_version="dev",
+        platform="claude_code",
+    )
+    # Must not raise — emit to a temp file
+    out_path = tmp_path / "results.json"
+    _emit(doc, str(out_path))  # would crash before the fix
+
+    # The output must be valid JSON
+    parsed = json.loads(out_path.read_text(encoding="utf-8"))
+    secondary = parsed["results"][0]["secondary"]
+    # bytes decoded to str in the output
+    assert isinstance(secondary["autodev_fail_stdout_tail"], str)
+    assert "boom" in secondary["autodev_fail_stdout_tail"]
+    assert isinstance(secondary["autodev_fail_stderr_tail"], str)
+    assert "error msg" in secondary["autodev_fail_stderr_tail"]
+
+
+def test_json_default_decodes_bytes_to_str():
+    """_json_default must decode bytes to str using utf-8 with error replacement."""
+    assert _json_default(b"hello") == "hello"
+    assert _json_default(b"\xff\xfe") == "��"  # replacement chars
+
+
+def test_json_default_falls_back_to_repr_for_unknown_types():
+    """_json_default falls back to repr() for any other non-serialisable type."""
+    result = _json_default(object())
+    assert isinstance(result, str)
+    assert "object" in result
+
+
+def test_runner_timeout_stores_str_not_bytes(tmp_path: Path):
+    """When autodev times out, the captured stdout/stderr must be str (not bytes)
+    in the result's secondary dict — so _emit can serialise without error.
+
+    This is the primary source fix: _run() decodes TimeoutExpired.stdout/.stderr
+    (which Python leaves as bytes even with text=True) at capture time.
+    """
+    task_dir = DEFAULT_TASKS_ROOT / "task_001_py_typeerror"
+
+    def stub(args, cwd, timeout):
+        # Simulate a timeout on the plan step with bytes-like captured output.
+        return _SubprocessResult(
+            returncode=-1,
+            stdout="plan output as str",   # _run decodes before returning
+            stderr="plan stderr as str",
+            timed_out=True,
+            elapsed_seconds=float(timeout),
+        )
+
+    result = run_task(
+        task_dir,
+        autodev_invoker=stub,
+        autodev_timeout_seconds=1,
+        workdir_root=tmp_path,
+    )
+    assert result.status == "FAIL"
+    assert "timed out" in (result.error or "")
+    # The secondary values surfaced by the failure-output capture must be str.
+    stdout_tail = result.secondary.get("autodev_fail_stdout_tail", "")
+    stderr_tail = result.secondary.get("autodev_fail_stderr_tail", "")
+    assert isinstance(stdout_tail, str), f"expected str, got {type(stdout_tail)}"
+    assert isinstance(stderr_tail, str), f"expected str, got {type(stderr_tail)}"
+    # Confirm the whole result doc is JSON-serialisable (end-to-end sanity).
+    doc = build_results_doc([result], autodev_version="dev", platform="claude_code")
+    out_path = tmp_path / "results.json"
+    _emit(doc, str(out_path))  # must not raise
+    parsed = json.loads(out_path.read_text(encoding="utf-8"))
+    assert parsed["results"][0]["status"] == "FAIL"

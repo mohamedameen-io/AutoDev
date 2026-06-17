@@ -123,10 +123,18 @@ def _run(
             env=env,
         )
     except subprocess.TimeoutExpired as exc:
+        # TimeoutExpired.stdout/.stderr are bytes even when text=True was
+        # requested (Python captures them before decoding on timeout).  Decode
+        # here so the result fields are always str and JSON-serialisable.
+        def _decode(v: bytes | str | None) -> str:
+            if isinstance(v, bytes):
+                return v.decode("utf-8", errors="replace")
+            return v or ""
+
         return _SubprocessResult(
             returncode=-1,
-            stdout=exc.stdout or "",
-            stderr=exc.stderr or "",
+            stdout=_decode(exc.stdout),
+            stderr=_decode(exc.stderr),
             timed_out=True,
             elapsed_seconds=time.perf_counter() - start,
         )

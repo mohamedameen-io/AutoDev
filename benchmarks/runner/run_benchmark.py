@@ -128,8 +128,17 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _json_default(obj: object) -> str:
+    """Fallback serialiser for json.dumps: coerce bytes → str, anything else
+    to its repr so result emission never crashes on a stray non-serialisable
+    value (defensive net — the real fix is decoding bytes at capture time)."""
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    return repr(obj)
+
+
 def _emit(doc: dict, dest: str) -> None:
-    payload = json.dumps(doc, indent=2, sort_keys=False)
+    payload = json.dumps(doc, indent=2, sort_keys=False, default=_json_default)
     if dest == "-":
         print(payload)
     else:
