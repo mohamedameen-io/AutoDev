@@ -4887,8 +4887,16 @@ async def _execute_one(
             # Step 3: auto-gates (syntax/lint/build/test_runner/secretscan).
             # v0.13.0: pass developer_result so secretscan can scope to the
             # diff (skip pre-existing repo state).
+            # WS2-5 (G3): the developer's diff lives in the per-task WORKTREE,
+            # not in orch.cwd (the pre-change MAIN repo). Thread the worktree
+            # path so the gates verify the CHANGED tree. ``worktree`` is None
+            # on the legacy in-place path (no isolation), in which case the
+            # gates fall back to orch.cwd exactly as before.
             gate_failure = await _run_qa_gates(
-                orch, task, developer_result=developer_result
+                orch,
+                task,
+                developer_result=developer_result,
+                cwd_override=worktree,
             )
             if gate_failure is not None:
                 logger.warning(
@@ -8060,6 +8068,8 @@ async def _run_qa_gates(
     orch: "Orchestrator",
     task: "Task",
     developer_result: AgentResult | None = None,
+    *,
+    cwd_override: Path | None = None,
 ) -> str | None:
     """Run enabled QA gates. Returns the first failure detail string, or None if all pass.
 
@@ -8074,12 +8084,22 @@ async def _run_qa_gates(
     severity="info"`` are surfaced via :func:`_surface_warning` and the
     gate dispatch continues. Existing gates that don't set ``severity``
     inherit the "block" default — pre-v0.22.0 behavior is preserved.
+
+    WS2-5 (G3): ``cwd_override`` is the per-task WORKTREE path. When the
+    task runs under worktree isolation the developer's diff is materialized
+    there — NOT in ``orch.cwd`` (the pre-change MAIN repo). The syntax /
+    lint / build / test / secretscan / hallucination gates must therefore
+    scan the worktree, or they vacuously PASS against a clean main while the
+    actual changed tree is broken (a silent wrong-pass). ``None`` (the
+    legacy default — single-task CLI, non-git tests) preserves the
+    in-place ``orch.cwd`` behavior. Only the cwd the gates *see* changes;
+    diff-scope path computation and all other logic are untouched.
     """
     from errors import DiffParseError
     from plugins.registry import QAContext
 
     cfg = orch.cfg.qa_gates
-    cwd = orch.cwd
+    cwd = cwd_override if cwd_override is not None else orch.cwd
     language = detect_language(cwd)
 
     # v0.27.0 (audit §6): fail-closed when a diff-producing task ships a
@@ -8162,7 +8182,15 @@ async def _run_qa_gates(
                 extra_skip_dirs=getattr(
                     cfg, "hallucination_guard_skip_dirs", None
                 ),
-                allowlist=_hallucination_allowlist_for(cwd),
+                # WS2-5 (G3): the allowlist is keyed off the repo's language
+                # profile, which is identical for main and the worktree. Look
+                # it up against ``orch.cwd`` (the canonical AutoDev state dir)
+                # — NOT the gate ``cwd``. ``_hallucination_allowlist_for``
+                # persists ``.autodev/language_profile.json`` as a side effect;
+                # writing it into the worktree would pollute the task diff
+                # (e.g. an "already exists" apply-to-main conflict). The gate's
+                # symbol SCAN still runs against the worktree ``cwd`` above.
+                allowlist=_hallucination_allowlist_for(orch.cwd),
                 sparse_mode=_hallucination_sparse_mode_for(orch, cfg),
                 task_id=task.id,
                 cfg=cfg,

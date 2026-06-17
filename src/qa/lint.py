@@ -3,8 +3,11 @@
 Runs the detected linter for the project and returns a
 :class:`~plugins.registry.GateResult`.
 
-Graceful degradation: if the linter binary is not installed, the gate passes
-with an informational message.
+Toolchain-absent degrade-LOUD (WS2-6)
+-------------------------------------
+A missing linter binary is *unknown*, not *clean*. When the linter is absent
+(``FileNotFoundError``) this gate now returns ``passed=False`` with a
+``skipped_toolchain_missing`` signal instead of silently passing.
 """
 
 from __future__ import annotations
@@ -73,7 +76,15 @@ async def _run_subprocess(
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except FileNotFoundError:
-        return GateResult(passed=True, details=f"{tool_name} not found, skipping lint")
+        # WS2-6: degrade loud — a missing linter is unknown, not clean.
+        return GateResult(
+            passed=False,
+            details=(
+                f"{tool_name} not installed: lint toolchain missing "
+                "(skipped_toolchain_missing)"
+            ),
+            metrics={"skipped_toolchain_missing": True, "tool": tool_name},
+        )
     except asyncio.TimeoutError:
         return GateResult(passed=False, details=f"{tool_name} lint timed out")
 

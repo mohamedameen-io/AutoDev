@@ -126,6 +126,16 @@ class TournamentConfig:
     # the tournament does roughly 2× the work of the legacy single-pass
     # promotion.
     promotion_grade_enabled: bool = False
+    # WS2-1 (Group B): holdout-set gate. When True AND the tournament is
+    # constructed with ``holdout_cwd`` + ``holdout_baseline_commit``, the
+    # ``repeated → promotion_eligible`` transition actually RUNS the baseline
+    # holdout tests (``tournament.holdout.run_holdout_tests``) and gates the
+    # rung on the result — a failing or found-nothing holdout blocks
+    # promotion. Off by default: legacy/synthetic callers without a real repo
+    # context behave exactly as before (the "holdout-equivalent step" stays a
+    # synthetic clear). Requires ``promotion_grade_enabled=True`` to have any
+    # effect, since the ladder itself is the consumer.
+    holdout_enabled: bool = False
     # v0.18.0 C3: optional list of specialist judge roles. ``None`` (default)
     # preserves the legacy ``["judge"] * num_judges`` cohort. When set, each
     # entry becomes a judge with that role's prompt — the list length wins
@@ -579,11 +589,23 @@ class Tournament(Generic[T]):
         rng: random.Random | None = None,
         judge_plugins: list[Any] | None = None,
         voting_strategy: Any | None = None,
+        holdout_cwd: Path | None = None,
+        holdout_baseline_commit: str | None = None,
     ) -> None:
         self.handler = handler
         self.client = client
         self.cfg = cfg
         self.artifact_dir = artifact_dir
+        # WS2-1 (Group B): holdout-set gate context. When both are present and
+        # ``cfg.holdout_enabled`` is True, the ``repeated → eligible`` rung
+        # runs the real baseline holdout and gates promotion on the result.
+        # ``last_holdout_result`` is the engagement witness — None until the
+        # holdout actually fires.
+        self.holdout_cwd = holdout_cwd
+        self.holdout_baseline_commit = holdout_baseline_commit
+        from tournament.holdout import HoldoutResult
+
+        self.last_holdout_result: HoldoutResult | None = None
         self.rng = rng if rng is not None else random.Random()
         self.store = TournamentArtifactStore(artifact_dir)
         self.log = get_logger(component="tournament", artifact_dir=str(artifact_dir))
@@ -670,6 +692,79 @@ class Tournament(Generic[T]):
             return "promotion_eligible"
         # Unrecognized prior (legacy data) — anchor at the bottom rung.
         return "dev_best"
+
+    async def _next_grade_for_non_a_win_async(self) -> str:
+        """Holdout-gated wrapper around :meth:`_next_grade_for_non_a_win`.
+
+        WS2-1 (Group B): the legacy sync method advances ``repeated →
+        promotion_eligible`` on a synthetic ``judges-confirmed`` clear — the
+        "holdout-equivalent step" was never an *actual* holdout run, leaving
+        :mod:`tournament.holdout` dead code. This wrapper closes that gap: at
+        the ``repeated → eligible`` transition, when ``cfg.holdout_enabled`` is
+        set and a real repo context (``holdout_cwd`` + ``holdout_baseline_commit``)
+        is available, it RUNS the baseline holdout tests and feeds the result
+        into :func:`promotion.decide`. The holdout result becomes load-bearing:
+
+          * holdout passed → promote to ``promotion_eligible`` as before.
+          * holdout failed / found-nothing → ``decide`` returns ``no_change``;
+            the rung holds at ``repeated`` (no promotion).
+
+        ``self.last_holdout_result`` is set as the engagement witness so the
+        caller (and tests) can confirm the holdout actually fired rather than
+        being silently skipped.
+
+        When holdout is disabled or no repo context is supplied, this is a
+        thin pass-through to the sync ladder — byte-identical legacy behavior.
+        """
+        candidate = self._next_grade_for_non_a_win()
+
+        if candidate != "promotion_eligible":
+            return candidate
+        # Only the repeated → eligible transition is the holdout-equivalent
+        # step. A re-affirmation of an already-terminal ``promotion_eligible``
+        # incumbent (prior == "promotion_eligible") is not re-gated.
+        prior = self.store.latest_incumbent_grade()
+        if prior != "repeated":
+            return candidate
+        if not getattr(self.cfg, "holdout_enabled", False):
+            return candidate
+        if self.holdout_cwd is None or self.holdout_baseline_commit is None:
+            self.log.info(
+                "tournament.holdout_skipped",
+                reason="no repo context (holdout_cwd/baseline_commit missing)",
+            )
+            return candidate
+
+        from plugins.registry import GateResult
+        from tournament.holdout import extract_baseline_tests, run_holdout_tests
+        from tournament.promotion import decide
+
+        baseline_paths = await extract_baseline_tests(
+            self.holdout_cwd, self.holdout_baseline_commit
+        )
+        holdout = await run_holdout_tests(self.holdout_cwd, baseline_paths)
+        self.last_holdout_result = holdout
+        self.log.info(
+            "tournament.holdout_run",
+            test_count=holdout.test_count,
+            failure_count=holdout.failure_count,
+            passed=holdout.passed,
+            failure_summary=holdout.failure_summary[:500],
+        )
+
+        decision = decide(
+            grade="repeated",
+            gate_results=[GateResult(passed=True, details="judges-confirmed")],
+            holdout_result=holdout,
+        )
+        if decision.action != "promote_to_eligible":
+            # Holdout blocked promotion — hold at the repeated rung.
+            self.log.warning(
+                "tournament.holdout_blocked_promotion",
+                reason=decision.reason,
+            )
+            return "repeated"
+        return "promotion_eligible"
 
     async def maybe_resize_semaphore(self, observed_rss_mb: float | None) -> None:
         """Ratchet the in-flight subprocess cap DOWN if memory pressure
@@ -893,7 +988,7 @@ class Tournament(Generic[T]):
                 # When disabled, the legacy default (``dev_best``) is
                 # written so the sidecar artifact is always present
                 # regardless of feature gating.
-                grade_to_write = self._next_grade_for_non_a_win()
+                grade_to_write = await self._next_grade_for_non_a_win_async()
                 self.store.write_incumbent_after(
                     pass_num,
                     self.handler.render_as_markdown(incumbent),

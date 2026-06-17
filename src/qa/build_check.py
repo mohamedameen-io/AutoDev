@@ -3,8 +3,12 @@
 Runs the detected build or type-check tool for the project and returns a
 :class:`~plugins.registry.GateResult`.
 
-Graceful degradation: if the required tool is not installed, the gate passes
-with an informational message.
+Toolchain-absent degrade-LOUD (WS2-6)
+-------------------------------------
+A missing build toolchain is *unknown*, not *clean*. When the build binary is
+absent (``FileNotFoundError``) this gate now returns ``passed=False`` with a
+``skipped_toolchain_missing`` signal instead of silently passing — so the
+resolver treats it as blocking rather than a vacuous green.
 """
 
 from __future__ import annotations
@@ -66,7 +70,15 @@ async def _run_subprocess(
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except FileNotFoundError:
-        return GateResult(passed=True, details=f"{tool_name} not found, skipping build check")
+        # WS2-6: degrade loud — a missing build toolchain is unknown, not clean.
+        return GateResult(
+            passed=False,
+            details=(
+                f"{tool_name} not installed: build toolchain missing "
+                "(skipped_toolchain_missing)"
+            ),
+            metrics={"skipped_toolchain_missing": True, "tool": tool_name},
+        )
     except asyncio.TimeoutError:
         return GateResult(passed=False, details=f"{tool_name} build check timed out")
 
@@ -101,7 +113,16 @@ async def _run_python_build(cwd: Path, *, timeout_s: float) -> GateResult:
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except FileNotFoundError:
-        return GateResult(passed=True, details="python not found, skipping build check")
+        # WS2-6: the Python interpreter / py_compile is unavailable → degrade
+        # loud rather than silently green.
+        return GateResult(
+            passed=False,
+            details=(
+                "python not installed: build toolchain missing "
+                "(skipped_toolchain_missing)"
+            ),
+            metrics={"skipped_toolchain_missing": True, "tool": "python"},
+        )
     except asyncio.TimeoutError:
         return GateResult(passed=False, details="python build check timed out")
 

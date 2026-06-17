@@ -34,6 +34,61 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TEST_DIR = "tests"
 _PYTEST_TIMEOUT_S = 300
 
+# Per-language test-discovery conventions. The holdout was historically
+# pytest-only (``test_*.py`` / ``*_test.py``); a polyglot autonomous agent
+# regresses Go/Rust/TS repos blind without these. Discovery is filename- or
+# content-based (no toolchain invocation), so it degrades gracefully when the
+# language's test runner isn't installed.
+#
+#   python : test_*.py / *_test.py  (existing pytest discovery rules)
+#   go     : *_test.go              (``go test`` convention)
+#   ts/js  : *.test.ts / *.test.tsx / *.test.js / *.spec.ts / *.spec.js
+#   rust   : any .rs file containing a ``#[test]`` attribute
+#
+# Directories that never hold first-party tests are pruned to keep discovery
+# cheap and to avoid counting vendored dependencies as "baseline tests".
+_PRUNE_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        "node_modules",
+        "target",  # rust build dir
+        "vendor",  # go vendored deps
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        "dist",
+        "build",
+    }
+)
+
+_RUST_TEST_ATTR_RE = re.compile(r"#\[\s*test\s*\]")
+
+
+def _is_python_test(name: str) -> bool:
+    return name.endswith(".py") and (
+        name.startswith("test_") or name.endswith("_test.py")
+    )
+
+
+def _is_go_test(name: str) -> bool:
+    return name.endswith("_test.go")
+
+
+def _is_ts_test(name: str) -> bool:
+    return name.endswith(
+        (
+            ".test.ts",
+            ".test.tsx",
+            ".test.js",
+            ".test.jsx",
+            ".spec.ts",
+            ".spec.tsx",
+            ".spec.js",
+            ".spec.jsx",
+        )
+    )
+
 
 @dataclass(frozen=True)
 class HoldoutResult:
@@ -93,15 +148,118 @@ async def extract_baseline_tests(
         path = line.strip()
         if not path:
             continue
-        # Restrict to .py test files; common pytest discovery rules.
-        if not path.endswith(".py"):
-            continue
-        if not (
-            Path(path).name.startswith("test_") or Path(path).name.endswith("_test.py")
-        ):
-            continue
-        out.add(path)
+        # Per-language test discovery (not pytest-only): python test_*.py /
+        # *_test.py, go *_test.go, ts/js *.test.* / *.spec.*. Rust #[test]
+        # discovery is content-based and lives in :func:`discover_holdout_scope`
+        # (git ls-tree only yields names, not bodies).
+        name = Path(path).name
+        if _is_python_test(name) or _is_go_test(name) or _is_ts_test(name):
+            out.add(path)
     return out
+
+
+def _walk_files(root: Path) -> "list[Path]":
+    """Yield all files under *root*, pruning known non-source directories."""
+    out: list[Path] = []
+    for path in root.rglob("*"):
+        if any(part in _PRUNE_DIRS for part in path.relative_to(root).parts):
+            continue
+        if path.is_file():
+            out.append(path)
+    return out
+
+
+def discover_tests_per_language(root: Path) -> dict[str, set[str]]:
+    """Discover test files under *root* grouped by language.
+
+    Per-language discovery (NOT pytest-only):
+
+      * ``python``: ``test_*.py`` / ``*_test.py``
+      * ``go``: ``*_test.go``
+      * ``ts``: ``*.test.ts`` / ``*.spec.ts`` (+ tsx/js/jsx variants)
+      * ``rust``: any ``.rs`` file containing a ``#[test]`` attribute
+
+    Returns repo-relative POSIX paths keyed by language. Empty languages are
+    omitted. Filename-based for python/go/ts (cheap); content-based for rust
+    (``#[test]`` can live in any module).
+    """
+    by_lang: dict[str, set[str]] = {}
+    for f in _walk_files(root):
+        rel = f.relative_to(root).as_posix()
+        name = f.name
+        if _is_python_test(name):
+            by_lang.setdefault("python", set()).add(rel)
+        elif _is_go_test(name):
+            by_lang.setdefault("go", set()).add(rel)
+        elif _is_ts_test(name):
+            by_lang.setdefault("ts", set()).add(rel)
+        elif name.endswith(".rs"):
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if _RUST_TEST_ATTR_RE.search(text):
+                by_lang.setdefault("rust", set()).add(rel)
+    return by_lang
+
+
+# Source-file extensions that mean "this scope contains real code worth
+# regression-testing". Used by the non-vacuity check: a scope with source but
+# ZERO discovered tests is a found-nothing-so-pass bug, not a vacuous pass.
+_SOURCE_EXTS: frozenset[str] = frozenset(
+    {".py", ".go", ".rs", ".ts", ".tsx", ".js", ".jsx", ".java", ".kt", ".rb"}
+)
+
+
+def _scope_has_source(root: Path) -> bool:
+    for f in _walk_files(root):
+        if f.suffix in _SOURCE_EXTS:
+            return True
+    return False
+
+
+async def discover_holdout_scope(root: Path) -> HoldoutResult:
+    """Discover holdout tests under *root*; fail LOUD on found-nothing.
+
+    Non-vacuity contract (mirrors Group A's no-silent-dead-end signal):
+
+      * Tests discovered (any language) → ``passed=True`` with the discovered
+        ``test_count`` (this is a discovery probe, not an execution run).
+      * NO tests discovered but the scope DOES contain source files →
+        ``passed=False`` with a loud diagnostic. A gate that finds nothing in
+        a non-empty scope must NOT silently pass — that is the canonical
+        "the tool didn't actually run" failure mode.
+      * Genuinely empty scope (no source, no tests) → vacuous ``passed=True``;
+        an empty repo has nothing to regress.
+    """
+    by_lang = discover_tests_per_language(root)
+    total = sum(len(v) for v in by_lang.values())
+    if total > 0:
+        langs = ",".join(sorted(by_lang))
+        return HoldoutResult(
+            passed=True,
+            test_count=total,
+            failure_count=0,
+            failure_summary=f"discovered {total} test file(s) [{langs}]",
+        )
+    if _scope_has_source(root):
+        # NON-VACUITY: source present, zero tests → loud, do not silent-pass.
+        return HoldoutResult(
+            passed=False,
+            test_count=0,
+            failure_count=0,
+            failure_summary=(
+                "holdout found NO tests in a non-empty scope "
+                "(source files present, 0 test files discovered) — "
+                "refusing to silently pass"
+            ),
+        )
+    return HoldoutResult(
+        passed=True,
+        test_count=0,
+        failure_count=0,
+        failure_summary="empty scope — no source, no tests (vacuous pass)",
+    )
 
 
 _PYTEST_SUMMARY_RE = re.compile(
@@ -217,6 +375,8 @@ async def run_holdout_tests(
 
 __all__ = [
     "HoldoutResult",
+    "discover_holdout_scope",
+    "discover_tests_per_language",
     "extract_baseline_tests",
     "run_holdout_tests",
 ]

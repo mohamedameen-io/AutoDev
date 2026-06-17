@@ -79,10 +79,15 @@ async def test_run_tests_go(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_run_tests_tool_not_found(tmp_path: Path) -> None:
+    # WS2-6 golden-baseline shift: an absent test runner used to silently pass
+    # (passed=True, "not found, skipping tests"). A missing toolchain is
+    # *unknown*, not *clean* — the gate now degrades LOUD so the resolver
+    # treats it as blocking rather than a vacuous green.
     with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
         result = await run_tests(tmp_path, language="python")
-    assert result.passed
-    assert "not found" in result.details
+    assert not result.passed
+    assert "not installed" in result.details
+    assert result.metrics.get("skipped_toolchain_missing") is True
 
 
 @pytest.mark.asyncio
