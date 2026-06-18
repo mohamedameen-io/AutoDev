@@ -1325,6 +1325,39 @@ class AutodevConfig(BaseModel):
     # older than 2.25. Default False — sparse-checkout speeds up huge
     # repos but breaks tasks that need files outside the declared scope.
     worktree_sparse_checkout_enabled: bool = False
+    # F-4 (field-finding): apply-time edit-scope enforcement policy. The
+    # apply-time gate in :meth:`WorktreeManager.apply_patch_to_main` checks
+    # the developer's ACTUAL worktree diff against the resolved edit-scope
+    # (``phase.edit_scope or plan.edit_scope`` UNION the task's own
+    # ``files`` / ``files_new`` / ``extended_scope``). For its entire
+    # history the gate was DORMANT in the execute flow — all three
+    # ``_apply_with_conflict_escalation`` call sites pass no scope — so a
+    # developer diff that strayed outside the declared scope was never
+    # caught at apply time (only the declaration-level pre-flight in
+    # ``dag.collect_edit_scope_violations`` ran, and it checks the
+    # ARCHITECT's ``task.files`` declaration, not the real diff).
+    #
+    # Default ``"warn"`` (advisory, NON-blocking): legitimate flows
+    # routinely edit beyond the declared ``task.files`` — new helper files
+    # land in ``task.files_new``; corrective tasks are minted with EMPTY
+    # ``files``; ``task.files`` is an architect declaration never reconciled
+    # against the real diff. A ``"block"`` default would manufacture
+    # failures on correct refactors/correctives, so activation is WARN-first
+    # behind this flag, and the effective scope INCLUDES ``files_new`` /
+    # ``extended_scope`` to minimise false warnings. When the resolved+union
+    # scope is EMPTY (e.g. an empty-``files`` corrective on a repo with no
+    # declared edit_scope) the check is skipped entirely (legacy whole-repo
+    # no-op) so empty-scope flows are never blocked.
+    #
+    #   * ``"off"``   — gate skipped (the pre-F-4 behaviour).
+    #   * ``"warn"``  — compute out-of-scope files, LOG
+    #     ``execute_phase.edit_scope_apply_violation`` + append a
+    #     best-effort ``edit_scope_apply_violation`` ledger breadcrumb,
+    #     then APPLY anyway (does NOT block).
+    #   * ``"block"`` — pass the effective scope to the apply gate, which
+    #     raises :class:`orchestrator.dag.EditScopeViolation` before any
+    #     ``git apply`` runs (main is never half-patched).
+    enforce_apply_time_edit_scope: Literal["off", "warn", "block"] = "warn"
     # v0.34.0 B2: when a sparse worktree edits a C/C++ source file, also
     # admit ``*.h``/``*.hpp``/``*.hh``/``*.hxx`` siblings in the same
     # directory so the QA gates retain include-chain context for symbol

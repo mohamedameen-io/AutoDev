@@ -712,6 +712,18 @@ LedgerOp = Literal[
     # ``{spec_hash, branch_index, budget_s, elapsed_s, passes_completed,
     #   tournament_id, reason}``.
     "plan_phase_wall_budget_exceeded",
+    # F-4 (field-finding): apply-time edit-scope WARN breadcrumb. Emitted by
+    # ``orchestrator.execute_phase._apply_with_conflict_escalation`` when the
+    # ``enforce_apply_time_edit_scope`` policy is ``"warn"`` and the
+    # developer's worktree diff touches a file outside the resolved
+    # effective scope. Audit-only — purely advisory: the diff is STILL
+    # applied (warn mode never blocks), so this op NEVER mutates plan state.
+    # Best-effort: a failure to append it is swallowed so apply is never
+    # derailed. Replay is a forensic no-op, tolerated even when plan is None.
+    # Payload shape:
+    # ``{task_id: str, out_of_scope_files: list[str], effective_scope:
+    #   list[str], policy: "warn"}``.
+    "edit_scope_apply_violation",
 ]
 
 
@@ -1386,6 +1398,14 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # phase and may precede ``init_plan``, mirroring the other plan-phase
         # dispatch-time audit ops above.
         "plan_phase_wall_budget_exceeded",
+        # F-4 (field-finding): apply-time edit-scope WARN breadcrumb. Audit-
+        # only — warn mode applies the diff regardless, so this op NEVER
+        # mutates plan state; replay is a forensic no-op. Tolerated even when
+        # plan is None (mirrors the other execute-time advisory ops), though
+        # in practice it fires during execute with the plan already
+        # persisted. Payload: ``{task_id, out_of_scope_files,
+        # effective_scope, policy}``.
+        "edit_scope_apply_violation",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

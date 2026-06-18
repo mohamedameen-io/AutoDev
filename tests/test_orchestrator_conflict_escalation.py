@@ -502,3 +502,296 @@ async def test_apply_with_conflict_escalation_clean_apply_no_critic(
     )
     assert success is True
     assert orch._captured["prompts"] == []  # no critic call
+
+
+# ---------------------------------------------------------------------------
+# F-4: apply-time edit-scope enforcement (off | warn | block). The effective
+# scope is computed IN-HELPER as (phase.edit_scope or plan.edit_scope) UNION
+# (task.files + task.files_new + task.extended_scope); empty → no check. The
+# diff's target files are pulled via the manager's ``get_diff_vs_base`` +
+# ``extract_files_from_diff`` and checked with ``dag.is_in_scope``.
+# ---------------------------------------------------------------------------
+
+
+class ScopeFakeWorktreeMgr(FakeWorktreeMgr):
+    """FakeWorktreeMgr whose diff target paths are configurable.
+
+    ``apply_patch_to_main`` records whether ``edit_scope`` was forwarded so
+    block-mode (effective scope passed) vs off/warn-mode (None passed) can be
+    distinguished — and it raises ``EditScopeViolation`` like the real gate
+    when a forwarded scope excludes a diff path, so block-mode is end-to-end.
+    """
+
+    def __init__(self, diff_files: list[str], **kw: Any) -> None:
+        super().__init__(**kw)
+        self._diff_files = diff_files
+        # (three_way, attempt_idx, edit_scope) for each apply call.
+        self.scope_apply_calls: list[tuple[bool, int, list[str] | None]] = []
+
+    async def get_diff_vs_base(self, worktree: Any, base_ref: str = "HEAD") -> str:
+        return "".join(
+            f"diff --git a/{f} b/{f}\n--- a/{f}\n+++ b/{f}\n@@ -0,0 +1 @@\n+x\n"
+            for f in self._diff_files
+        )
+
+    async def apply_patch_to_main(  # type: ignore[override]
+        self,
+        worktree: Any,
+        base_ref: str = "HEAD",
+        three_way: bool = False,
+        edit_scope: list[str] | None = None,
+        commit_message: str | None = None,
+    ) -> None:
+        self.attempt += 1
+        self.scope_apply_calls.append((three_way, self.attempt, edit_scope))
+        # Mirror the real gate: a forwarded scope excluding any diff path
+        # raises BEFORE the apply lands (block mode).
+        if edit_scope:
+            from orchestrator.dag import EditScopeViolation, is_in_scope
+
+            for fp in self._diff_files:
+                if not is_in_scope(fp, edit_scope):
+                    raise EditScopeViolation(
+                        f"diff hunk targets out-of-scope file {fp!r}; "
+                        f"resolved edit_scope = {edit_scope!r}"
+                    )
+        # Clean apply otherwise (no conflict modelled here).
+        return None
+
+
+def _mk_plan_scoped(tasks: list[Task], plan_scope: list[str]) -> Plan:
+    return Plan(
+        plan_id="p-scope",
+        spec_hash="cafe",
+        phases=[Phase(id="1", title="conflict", tasks=tasks)],
+        edit_scope=plan_scope,
+        created_at=_iso(),
+        updated_at=_iso(),
+    )
+
+
+def _read_ledger_ops(tmp_path: Path) -> list[str]:
+    import json
+
+    from state.ledger import ledger_path
+
+    lp = ledger_path(tmp_path)
+    if not lp.exists():
+        return []
+    return [json.loads(line)["op"] for line in lp.read_text().splitlines() if line.strip()]
+
+
+@pytest.mark.asyncio
+async def test_apply_scope_off_skips_check(tmp_path: Path) -> None:
+    """policy=off: no scope check, no warn — edit_scope=None forwarded."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan_scoped(
+            [Task(id="1.1", phase_id="1", title="t", description="d", files=["src/a.py"])],
+            plan_scope=["src"],
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch.cfg.enforce_apply_time_edit_scope = "off"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    # Diff touches an out-of-scope file, but policy=off → no warn, applies.
+    fake_wm = ScopeFakeWorktreeMgr(diff_files=["docs/out.md"], apply_fail_first=False)
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is True
+    # No edit_scope forwarded (None), and no warn ledger op.
+    assert all(scope is None for _, _, scope in fake_wm.scope_apply_calls)
+    assert "edit_scope_apply_violation" not in _read_ledger_ops(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_apply_scope_warn_logs_and_applies(tmp_path: Path) -> None:
+    """policy=warn: out-of-scope file LOGS + ledger breadcrumb, STILL applies."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan_scoped(
+            [Task(id="1.1", phase_id="1", title="t", description="d", files=["src/a.py"])],
+            plan_scope=["src"],
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch.cfg.enforce_apply_time_edit_scope = "warn"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    fake_wm = ScopeFakeWorktreeMgr(diff_files=["docs/out.md"], apply_fail_first=False)
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    # WARN never blocks: the diff applies.
+    assert success is True
+    # Apply was called with edit_scope=None (warn does not gate the apply).
+    assert any(scope is None for _, _, scope in fake_wm.scope_apply_calls)
+    # A best-effort ledger breadcrumb was appended.
+    assert "edit_scope_apply_violation" in _read_ledger_ops(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_apply_scope_warn_no_warn_when_declared_files_only(
+    tmp_path: Path,
+) -> None:
+    """A task editing ONLY its declared ``files`` must NOT warn, even if those
+    files lie outside the plan/phase edit_scope (the union includes them)."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan_scoped(
+            [
+                Task(
+                    id="1.1",
+                    phase_id="1",
+                    title="t",
+                    description="d",
+                    files=["lib/helper.py"],  # outside plan_scope=["src"]
+                )
+            ],
+            plan_scope=["src"],
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch.cfg.enforce_apply_time_edit_scope = "warn"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    # Diff touches exactly the declared file.
+    fake_wm = ScopeFakeWorktreeMgr(diff_files=["lib/helper.py"], apply_fail_first=False)
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is True
+    assert "edit_scope_apply_violation" not in _read_ledger_ops(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_apply_scope_warn_no_warn_when_files_new(tmp_path: Path) -> None:
+    """A task creating a file declared in ``files_new`` must NOT warn."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan_scoped(
+            [
+                Task(
+                    id="1.1",
+                    phase_id="1",
+                    title="t",
+                    description="d",
+                    files=["src/a.py"],
+                    files_new=["src/new_helper.py"],
+                )
+            ],
+            plan_scope=["src"],
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch.cfg.enforce_apply_time_edit_scope = "warn"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    fake_wm = ScopeFakeWorktreeMgr(
+        diff_files=["src/a.py", "src/new_helper.py"], apply_fail_first=False
+    )
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is True
+    assert "edit_scope_apply_violation" not in _read_ledger_ops(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_apply_scope_warn_empty_scope_is_noop(tmp_path: Path) -> None:
+    """Empty effective scope (no plan/phase scope AND empty task files) →
+    no check, no warn (legacy whole-repo no-op). This is what keeps an
+    empty-``files`` corrective from being warned/blocked."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        # No plan edit_scope, task has EMPTY files (corrective-task shape).
+        _mk_plan_scoped(
+            [Task(id="1.1", phase_id="1", title="t", description="d")],
+            plan_scope=[],
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch.cfg.enforce_apply_time_edit_scope = "warn"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    fake_wm = ScopeFakeWorktreeMgr(diff_files=["anywhere/x.py"], apply_fail_first=False)
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is True
+    # Empty scope → edit_scope=None forwarded, no warn.
+    assert all(scope is None for _, _, scope in fake_wm.scope_apply_calls)
+    assert "edit_scope_apply_violation" not in _read_ledger_ops(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_apply_scope_block_raises_and_blocks_task(tmp_path: Path) -> None:
+    """policy=block: an out-of-scope diff forwards the effective scope to the
+    apply gate, which raises EditScopeViolation. The helper catches it and
+    blocks the task directly (a scope violation is a deliberate policy block,
+    NOT a recoverable merge conflict — no critic round)."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan_scoped(
+            [Task(id="1.1", phase_id="1", title="t", description="d", files=["src/a.py"])],
+            plan_scope=["src"],
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch.cfg.enforce_apply_time_edit_scope = "block"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    # Out-of-scope diff: the forwarded scope (incl. "src") excludes
+    # docs/out.md → the gate raises on the FIRST plain apply. No conflict is
+    # modelled (apply_fail_first=False); the EditScopeViolation is what stops
+    # the apply, not a WorktreeError.
+    fake_wm = ScopeFakeWorktreeMgr(
+        diff_files=["docs/out.md"],
+        apply_fail_first=False,
+    )
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is False
+    t = await pm.get_task("1.1")
+    assert t is not None and t.status == "blocked"
+    assert t.blocked_reason and "edit_scope_apply_violation" in t.blocked_reason
+    # The critic was NOT consulted (direct block).
+    assert orch._captured["prompts"] == []
+    # The apply call forwarded the effective (non-None) scope including "src".
+    assert any(
+        scope is not None and "src" in scope
+        for _, _, scope in fake_wm.scope_apply_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_apply_scope_block_in_scope_applies_cleanly(tmp_path: Path) -> None:
+    """policy=block: an IN-scope diff passes the gate and applies normally."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(
+        _mk_plan_scoped(
+            [Task(id="1.1", phase_id="1", title="t", description="d", files=["src/a.py"])],
+            plan_scope=["src"],
+        )
+    )
+    orch = _make_orch(tmp_path, pm)
+    orch.cfg.enforce_apply_time_edit_scope = "block"
+    task = (await pm.get_task("1.1")) or pytest.fail()
+    await pm.update_task_status("1.1", "in_progress")
+
+    fake_wm = ScopeFakeWorktreeMgr(diff_files=["src/a.py"], apply_fail_first=False)
+    success = await ep._apply_with_conflict_escalation(
+        orch, task, tmp_path / "wt", fake_wm  # type: ignore[arg-type]
+    )
+    assert success is True
+    t = await pm.get_task("1.1")
+    assert t is not None and t.status != "blocked"

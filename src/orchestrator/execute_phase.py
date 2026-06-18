@@ -2531,6 +2531,150 @@ async def _credit_injected_lessons_for_task(
 _CONFLICT_REWRITE_RETRY_CAP = 2
 
 
+async def _resolve_apply_time_edit_scope(
+    orch: "Orchestrator", task: Task
+) -> list[str]:
+    """F-4: resolve the EFFECTIVE apply-time edit scope for ``task``.
+
+    The scope is the resolved plan/phase scope — ``phase.edit_scope`` for
+    the task's phase, falling back to ``plan.edit_scope`` — UNION the task's
+    OWN claimed paths (``files`` + ``files_new`` + ``extended_scope``),
+    deduplicated and order-stable. The union matters: legitimate flows edit
+    beyond the architect-declared plan/phase scope — new helper files land in
+    ``files_new`` and a task's declared ``files`` may themselves sit outside
+    a coarse plan scope — so folding them in keeps a correct task from being
+    warned/blocked.
+
+    Returns ``[]`` (the legacy whole-repo sentinel) when neither a resolved
+    plan/phase scope NOR any task-claimed path exists — e.g. an empty-
+    ``files`` corrective on a repo with no declared ``edit_scope``. The
+    caller treats an empty result as "skip the check entirely", which is
+    exactly what stops empty-scope correctives from being warned/blocked.
+
+    Mirrors the resolver shape used for sparse-checkout cone resolution in
+    :func:`run_execute_phase` (``phase.edit_scope or plan.edit_scope`` then a
+    fall-through to the task's own files), kept in-helper so no
+    ``edit_scope=`` kwarg is threaded through the ``apply_patch_to_main``
+    call sites (which would break the ``FakeWorktreeMgr`` test stub).
+    """
+    resolved: list[str] = []
+    try:
+        plan = await orch.plan_manager.load()
+    except Exception:  # noqa: BLE001 — scope resolution is best-effort
+        plan = None
+    if plan is not None:
+        for _ph in plan.phases:
+            if _ph.id == task.phase_id:
+                resolved = (
+                    list(_ph.edit_scope)
+                    if _ph.edit_scope is not None
+                    else list(plan.edit_scope)
+                )
+                break
+        else:
+            resolved = list(plan.edit_scope)
+
+    # UNION the task's own claimed paths so legitimately-touched files
+    # (declared ``files``, new files in ``files_new``, and ``extended_scope``)
+    # are always in scope.
+    union: list[str] = list(resolved)
+    for p in (
+        list(getattr(task, "files", []) or [])
+        + list(getattr(task, "files_new", []) or [])
+        + list(getattr(task, "extended_scope", []) or [])
+    ):
+        if isinstance(p, str) and p.strip():
+            union.append(p)
+
+    # Dedup, order-stable.
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in union:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+async def _warn_apply_time_edit_scope(
+    orch: "Orchestrator",
+    task: Task,
+    worktree: Path,
+    worktree_mgr: "WorktreeManager",
+    effective_scope: list[str],
+) -> None:
+    """F-4 WARN: advisory, NON-blocking apply-time edit-scope check.
+
+    Computes the worktree diff (via the manager's ``get_diff_vs_base``),
+    extracts the changed files, and checks each against ``effective_scope``
+    using :func:`orchestrator.dag.is_in_scope`. For any out-of-scope file it
+    logs a structured ``execute_phase.edit_scope_apply_violation`` event and
+    appends a best-effort, NON-BLOCKING ``edit_scope_apply_violation`` ledger
+    breadcrumb (mirroring the ``conflict_critic_decision`` pattern). It does
+    NOT block — the caller applies the diff regardless. Any failure here is
+    swallowed so the advisory never derails a legitimate apply.
+
+    The caller guarantees ``effective_scope`` is non-empty (an empty scope is
+    the whole-repo no-op and is filtered out upstream).
+    """
+    from adapters.git_utils import extract_files_from_diff
+    from orchestrator.dag import is_in_scope
+
+    try:
+        diff_text = await worktree_mgr.get_diff_vs_base(worktree)
+    except Exception as exc:  # noqa: BLE001 — best-effort advisory
+        logger.warning(
+            "execute_phase.edit_scope_apply_warn_diff_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return
+
+    files_in_diff = extract_files_from_diff(diff_text or "")
+    out_of_scope = [
+        fp for fp in files_in_diff if not is_in_scope(fp, effective_scope)
+    ]
+    if not out_of_scope:
+        return
+
+    logger.warning(
+        "execute_phase.edit_scope_apply_violation",
+        task_id=task.id,
+        out_of_scope_files=out_of_scope,
+        effective_scope=effective_scope,
+        policy="warn",
+    )
+
+    # Best-effort ledger breadcrumb — observability only, NEVER blocks.
+    try:
+        from state.ledger import append_entry as _append_entry
+        from state.lockfile import plan_lock as _plan_lock
+
+        async with _plan_lock(
+            orch.cwd,
+            timeout_s=getattr(orch.plan_manager, "_lock_timeout_s", 30.0),
+        ):
+            await _append_entry(
+                orch.cwd,
+                op="edit_scope_apply_violation",
+                payload={
+                    "task_id": task.id,
+                    "out_of_scope_files": out_of_scope,
+                    "effective_scope": effective_scope,
+                    "policy": "warn",
+                },
+                session_id=getattr(
+                    orch.plan_manager, "_session_id", orch.session_id
+                ),
+            )
+    except Exception as exc_led:  # noqa: BLE001 — best-effort breadcrumb
+        logger.warning(
+            "execute_phase.edit_scope_apply_violation_emit_failed",
+            task_id=task.id,
+            err=str(exc_led),
+        )
+
+
 async def _apply_with_conflict_escalation(
     orch: "Orchestrator",
     task: Task,
@@ -2562,16 +2706,80 @@ async def _apply_with_conflict_escalation(
     The cap of two rewrite rounds prevents critic-developer ping-pong
     on pathological cases.
     """
+    from orchestrator.dag import EditScopeViolation
+
     rewrite_rounds = 0
     # v0.25.1 Bug #2: persistent integration. Commit per task so the next
     # task's per-task worktree (created at HEAD) sees prior tasks' changes.
     commit_msg = f"autodev: task {task.id} ({task.title})"
+
+    # F-4: compute the apply-time edit-scope ONCE, in-helper (NOT a threaded
+    # call-site kwarg — that would break the FakeWorktreeMgr stub which does
+    # not accept ``edit_scope``). The effective scope is the resolved
+    # plan/phase scope UNION the task's own claimed files; an EMPTY result
+    # means "whole repo" (legacy no-op) which is what keeps empty-``files``
+    # correctives from being warned/blocked. ``apply_scope`` is the value
+    # forwarded to the apply gate: only ``block`` mode forwards it (so the
+    # gate raises); ``off``/``warn`` forward ``None`` (gate skipped) and warn
+    # performs its OWN advisory check below.
+    _policy = getattr(orch.cfg, "enforce_apply_time_edit_scope", "warn")
+    effective_scope = await _resolve_apply_time_edit_scope(orch, task)
+    apply_scope: list[str] | None = (
+        effective_scope if _policy == "block" and effective_scope else None
+    )
+    # Only block mode forwards a scope to the apply gate. ``off``/``warn``
+    # call the apply with the LEGACY signature (no ``edit_scope`` kwarg) so
+    # the in-tree ``FakeWorktreeMgr`` stub — which does not accept it — is
+    # never broken. ``**_scope_kw`` is empty unless block mode resolved a
+    # non-empty scope.
+    _scope_kw: dict[str, Any] = (
+        {"edit_scope": apply_scope} if apply_scope else {}
+    )
+    # F-4 WARN: advisory, NON-blocking. Compute the violating files ourselves
+    # (the apply still runs WITHOUT a scope gate). Done once, before the
+    # first apply attempt, so a clean apply is still audited.
+    if _policy == "warn" and effective_scope:
+        await _warn_apply_time_edit_scope(
+            orch, task, worktree, worktree_mgr, effective_scope
+        )
+
     while True:
         try:
             await worktree_mgr.apply_patch_to_main(
-                worktree, base_ref="HEAD", commit_message=commit_msg
+                worktree,
+                base_ref="HEAD",
+                commit_message=commit_msg,
+                **_scope_kw,
             )
             return True
+        except EditScopeViolation as exc_scope:
+            # F-4 BLOCK mode: the apply-time gate (fed ``apply_scope``)
+            # rejected an out-of-scope diff hunk BEFORE any ``git apply`` ran
+            # — main is untouched. A scope violation is a deliberate POLICY
+            # block, NOT a recoverable merge conflict, so terminate the task
+            # directly via the single block chokepoint (no critic escalation,
+            # no 3-way retry — the gate is unconditional and would re-raise).
+            # Only reachable in ``block`` mode (``apply_scope`` is None for
+            # off/warn, so the gate is skipped). The structured WARN log /
+            # ledger breadcrumb already fired upstream when policy=warn; here
+            # the block itself is the audit trail.
+            logger.warning(
+                "execute_phase.edit_scope_apply_blocked",
+                task_id=task.id,
+                err=str(exc_scope),
+            )
+            await block_task(
+                orch,
+                task,
+                failure_class=_fcls.EDIT_SCOPE_VIOLATION,
+                raw_error=f"edit_scope_apply_violation: {exc_scope}",
+                meta={
+                    "blocked_reason": (
+                        f"edit_scope_apply_violation: {exc_scope}"
+                    )
+                },
+            )
+            return False
         except WorktreeError as exc:
             logger.warning(
                 "execute_phase.apply_patch_conflict",
@@ -2610,6 +2818,7 @@ async def _apply_with_conflict_escalation(
                     base_ref="HEAD",
                     three_way=True,
                     commit_message=commit_msg,
+                    **_scope_kw,
                 )
                 logger.info(
                     "execute_phase.conflict_resolved_auto_3way",
@@ -2691,6 +2900,7 @@ async def _apply_with_conflict_escalation(
                         base_ref="HEAD",
                         three_way=True,
                         commit_message=commit_msg,
+                        **_scope_kw,
                     )
                     logger.info(
                         "execute_phase.conflict_resolved_3way",
