@@ -14,6 +14,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Generic, Literal, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, Field
@@ -182,6 +183,27 @@ class TournamentConfig:
     review_convergence_k: int = 2
     review_max_rounds: int = 5
     review_judge_roles: list[str] | None = None
+    # F-7 (field-finding): cumulative wall-clock budget (seconds) for the
+    # ENTIRE tournament pass loop. ``None`` (default) → OFF → byte-identical
+    # legacy behavior (no deadline; the loop runs to ``max_rounds`` or
+    # convergence). When > 0, :meth:`Tournament.run` records a clock reading
+    # at run-entry and checks elapsed BETWEEN passes (cheap; never mid-call).
+    # On breach it writes the best on-disk incumbent (``final_output.md``)
+    # and raises :class:`~errors.TournamentError` carrying the marker
+    # ``plan_phase_wall_budget_exceeded`` — so the existing plan-phase
+    # salvage path (which catches ``TournamentError`` and recovers the
+    # latest ``incumbent_after_NN.md``) fires instead of churning to an
+    # opaque external SIGKILL ("timed out after Ns" with no autodev reason).
+    # Set this BELOW an external/benchmark per-command timeout to make the
+    # plan phase fail LOUD (with an attributable reason) before being killed.
+    # Analog of F-2's ``corrective_nonconvergent_ceiling``.
+    wall_budget_s: float | None = None
+    # F-7: injectable monotonic clock for the wall-budget check. Defaults to
+    # ``time.monotonic`` in production; tests inject a fake clock that
+    # advances deterministically so the ceiling can be exercised without
+    # real sleeps. NOT a dataclass-comparable field's concern — only read,
+    # never serialized.
+    clock: Callable[[], float] = time.monotonic
 
 
 class PassResult(BaseModel):
@@ -920,6 +942,14 @@ class Tournament(Generic[T]):
 
         history: list[PassResult] = []
 
+        # F-7: record the cumulative wall-clock start ONCE at plan-phase entry.
+        # The between-pass budget check (inside the loop below) measures
+        # elapsed against this. ``None`` budget → the check is a no-op, so this
+        # reading is unused and the path is byte-identical legacy behavior.
+        wall_budget_s = getattr(self.cfg, "wall_budget_s", None)
+        clock: Callable[[], float] = getattr(self.cfg, "clock", time.monotonic)
+        wall_start = clock()
+
         # If we resumed with an A-win streak already meeting convergence,
         # short-circuit before the loop body. (Equivalent to the "already
         # completed" path but reached via partial state rather than
@@ -932,6 +962,41 @@ class Tournament(Generic[T]):
             return incumbent, history
 
         for pass_num in range(start_pass, self.cfg.max_rounds + 1):
+            # F-7: cumulative wall-clock ceiling (fail-loud). Checked BETWEEN
+            # passes only (here, at the top of each iteration — never mid-call),
+            # so it's cheap and can never interrupt an in-flight LLM call. When
+            # the operator has set ``wall_budget_s`` (default None → skipped)
+            # and cumulative elapsed exceeds it, we STOP LOUD: persist the best
+            # on-disk incumbent (``final_output.md`` + history) so the existing
+            # plan-phase salvage path can recover it, then raise a
+            # :class:`TournamentError` carrying the greppable, attributable
+            # marker ``plan_phase_wall_budget_exceeded``. This converts an
+            # opaque external SIGKILL ("timed out after Ns") into an
+            # autodev-emitted reason. Mirrors F-2's nonconvergence ceiling.
+            if wall_budget_s is not None and wall_budget_s > 0:
+                elapsed = clock() - wall_start
+                if elapsed > wall_budget_s:
+                    self.log.warning(
+                        "tournament.wall_budget_exceeded",
+                        elapsed_s=round(elapsed, 3),
+                        budget_s=wall_budget_s,
+                        passes_completed=len(history),
+                        next_pass=pass_num,
+                    )
+                    # Persist the best incumbent so salvage has a target. This
+                    # is the same final write the normal exit path makes —
+                    # idempotent and crash-safe (atomic write/rename).
+                    self.store.write_final(
+                        self.handler.render_as_markdown(incumbent), history
+                    )
+                    raise TournamentError(
+                        "plan_phase_wall_budget_exceeded: tournament wall-clock "
+                        f"budget of {wall_budget_s}s exceeded after "
+                        f"{round(elapsed, 1)}s ({len(history)} pass(es) "
+                        "completed); stopping LOUD with the best on-disk "
+                        "incumbent instead of churning to an external timeout."
+                    )
+
             # Pass `partial` only into the first iteration of the resumed pass.
             pass_partial = (
                 resume.partial

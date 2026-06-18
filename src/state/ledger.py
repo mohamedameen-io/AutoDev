@@ -696,6 +696,22 @@ LedgerOp = Literal[
     # ``{phase_id: str, note: str, source: "reviewer_advisory"}``.
     # Replay is a forensic no-op.
     "reviewer_over_engineering_advisory",
+    # F-7 (field-finding): the plan-tournament cumulative WALL-CLOCK ceiling
+    # tripped. Audit-only, LOUD fail-fast breadcrumb — fired by
+    # ``orchestrator.plan_tournament_runner.run_plan_tournament`` when the
+    # tournament loop raises a ``plan_phase_wall_budget_exceeded``
+    # ``TournamentError`` (cumulative elapsed exceeded
+    # ``cfg.guardrails.plan_phase_wall_budget_s``, checked BETWEEN passes).
+    # This is the distinct, greppable attribution for the previously-opaque
+    # "timed out after 2400s" external SIGKILL: the runner emits this op,
+    # then re-raises so the existing plan-phase salvage path recovers the
+    # best on-disk incumbent. Plan state is NOT mutated by this op (the
+    # salvage / fallback flows through the regular plan-phase code paths);
+    # replay treats it as a no-op, and it is tolerated even when plan is
+    # None (it can fire before ``init_plan`` during the plan phase). Payload:
+    # ``{spec_hash, branch_index, budget_s, elapsed_s, passes_completed,
+    #   tournament_id, reason}``.
+    "plan_phase_wall_budget_exceeded",
 ]
 
 
@@ -1362,6 +1378,14 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # verdict; replay is a forensic no-op. Payload:
         # ``{phase_id, note, source}``.
         "reviewer_over_engineering_advisory",
+        # F-7 (field-finding): plan-tournament cumulative wall-clock ceiling
+        # tripped. Audit-only no-op on replay — the runner re-raises a
+        # ``TournamentError`` after emitting this op and the salvage / fallback
+        # flows through the regular plan-phase code paths (no plan mutation
+        # here). Tolerated even when plan is None: the op fires during the plan
+        # phase and may precede ``init_plan``, mirroring the other plan-phase
+        # dispatch-time audit ops above.
+        "plan_phase_wall_budget_exceeded",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.

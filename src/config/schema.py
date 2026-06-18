@@ -817,6 +817,25 @@ class GuardrailsConfig(BaseModel):
     max_duration_s_per_test_repair_task: int | None = None
     max_diff_bytes: int = 5_242_880
     cost_budget_usd_per_plan: float | None = None
+    # F-7 (field-finding): cumulative WALL-CLOCK budget (seconds) for the
+    # plan-tournament pass loop, analog of ``max_corrective_cycles_per_phase``
+    # (F-2) but bounding wall-clock instead of corrective-cycle count. The
+    # plan tournament runs through ``AdapterLLMClient`` which BYPASSES the
+    # guardrail enforcer's pre/post_invocation — so there is NO cumulative
+    # deadline anywhere in the plan-tournament loop. A slow OR wedged plan
+    # phase therefore has no fail-loud bound; it runs to
+    # ``max_rounds × judges × branches`` or until an EXTERNAL SIGKILL,
+    # surfacing as an opaque "timed out after 2400s" with no autodev-emitted
+    # reason. When set (> 0), ``tournament.core.Tournament.run`` checks
+    # cumulative elapsed BETWEEN passes (cheap; never mid-call) and, on
+    # breach, STOPS LOUD with the best on-disk incumbent (the existing
+    # plan-phase salvage path) while emitting the greppable, attributable
+    # ``plan_phase_wall_budget_exceeded`` ledger op. ``None`` (default) =
+    # OFF = byte-identical legacy behavior (no deadline). Set this BELOW an
+    # external / benchmark per-command timeout (e.g. the 2400s
+    # ``max_duration_s_per_task`` subprocess wall) so the plan phase fails
+    # LOUD with a reason BEFORE being killed.
+    plan_phase_wall_budget_s: float | None = None
 
 
 class PRMConfig(BaseModel):

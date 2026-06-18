@@ -22,6 +22,7 @@ import random
 from typing import TYPE_CHECKING
 
 from autologging import get_logger
+from errors import TournamentError
 from orchestrator.huge_repo_overrides import resolve_huge_repo_parallelism
 from orchestrator.plan_parser import extract_complexity
 from runtime.resource_probe import probe_host, resolve_parallelism
@@ -341,6 +342,14 @@ async def run_plan_tournament(
         cwd=orch.cwd,
         cfg=orch.cfg,
     )
+    # F-7: thread the optional plan-phase wall-clock budget into the
+    # tournament loop. ``None`` (default) → OFF → byte-identical legacy
+    # behavior (no cumulative deadline). When set below an external/benchmark
+    # per-command timeout, the loop fails LOUD (emitting
+    # ``plan_phase_wall_budget_exceeded``) BEFORE being SIGKILLed.
+    plan_phase_wall_budget_s = getattr(
+        orch.cfg.guardrails, "plan_phase_wall_budget_s", None
+    )
     tcfg = TournamentConfig(
         num_judges=effective_num_judges,
         convergence_k=cfg.convergence_k,
@@ -351,6 +360,7 @@ async def run_plan_tournament(
         score_stability_max_delta=cfg.score_stability_max_delta,
         winner_stability_window=cfg.winner_stability_window,
         max_plan_lines_growth_ratio=cfg.max_plan_lines_growth_ratio,
+        wall_budget_s=plan_phase_wall_budget_s,
     )
 
     judge_plugins = (
@@ -380,7 +390,27 @@ async def run_plan_tournament(
         max_rounds=tcfg.max_rounds,
     )
 
-    final_md, history = await tournament.run(task_prompt=spec, initial=initial_md)
+    try:
+        final_md, history = await tournament.run(
+            task_prompt=spec, initial=initial_md
+        )
+    except TournamentError as exc:
+        # F-7: the cumulative wall-clock ceiling tripped inside the loop. Emit
+        # the LOUD, attributable ``plan_phase_wall_budget_exceeded`` ledger op
+        # (the greppable reason that replaces an opaque external timeout), then
+        # re-raise so the existing plan-phase salvage path recovers the best
+        # on-disk incumbent. Other ``TournamentError`` shapes (survivor floor,
+        # etc.) propagate unchanged — we only annotate the wall-budget breach.
+        if "plan_phase_wall_budget_exceeded" in str(exc):
+            await _emit_wall_budget_exceeded(
+                orch,
+                tournament_id=tournament_id,
+                spec_hash=spec_hash,
+                branch_index=branch_index,
+                budget_s=plan_phase_wall_budget_s,
+                reason=str(exc),
+            )
+        raise
 
     winner_streak = history[-1].winner if history else None
     logger.info(
@@ -428,6 +458,56 @@ async def run_plan_tournament(
     )
 
     return final_md
+
+
+async def _emit_wall_budget_exceeded(
+    orch: "Orchestrator",
+    *,
+    tournament_id: str,
+    spec_hash: str,
+    branch_index: int | None,
+    budget_s: float | None,
+    reason: str,
+) -> None:
+    """F-7 fail-loud signal: the plan-tournament wall-clock ceiling tripped.
+
+    Emit a LOUD, attributable ``plan_phase_wall_budget_exceeded`` ledger op —
+    the distinct, greppable reason the field analysis needs in place of an
+    opaque "timed out after Ns" external SIGKILL. The caller re-raises the
+    ``TournamentError`` afterwards so the EXISTING plan-phase salvage path
+    recovers the best on-disk incumbent; this breadcrumb does NOT itself
+    mutate plan state.
+
+    Best-effort: a breadcrumb failure must never mask the (re-raised) error.
+    The full breach ``reason`` (which embeds the elapsed_s / budget_s /
+    passes-completed figures) is carried in the payload verbatim; the loop
+    already logged the authoritative STRUCTURED values via the
+    ``tournament.wall_budget_exceeded`` log line at the breach site.
+    """
+    logger.warning(
+        "plan_tournament.wall_budget_exceeded",
+        tournament_id=tournament_id,
+        spec_hash=spec_hash,
+        branch_index=branch_index,
+        budget_s=budget_s,
+    )
+    try:
+        await orch.plan_manager.ledger_append(
+            op="plan_phase_wall_budget_exceeded",
+            payload={
+                "tournament_id": tournament_id,
+                "spec_hash": spec_hash,
+                "branch_index": branch_index,
+                "budget_s": budget_s,
+                "reason": reason,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - breadcrumb best-effort; never mask
+        logger.warning(
+            "plan_tournament.ledger_append_failed",
+            op="plan_phase_wall_budget_exceeded",
+            err=str(exc),
+        )
 
 
 async def _emit_plan_tournament_lessons(
