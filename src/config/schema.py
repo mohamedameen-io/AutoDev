@@ -549,6 +549,20 @@ class ResolverConfig(BaseModel):
     # consumed this many resolver cycles without recovery, the resolver stops
     # recursing and falls through to a bounded ``ask_human`` (loop-safety B5).
     max_cycles_per_blocker: int = Field(default=3, ge=1, le=10)
+    # F-2 (field-finding): PHASE-scoped ceiling on consecutive same-failure-class
+    # corrective regeneration. ``max_cycles_per_blocker`` is keyed per (task_id,
+    # failure_class) and so never bounds the CROSS-corrective-task loop (each
+    # freshly-minted corrective has a NEW id => a fresh per-task counter). This
+    # sibling counter is keyed on the PHASE + failure_class, so corrective-task-id
+    # churn cannot reset it. Once this many consecutive same-class correctives are
+    # minted WITHOUT forward progress, the resolver STOPS minting and declines —
+    # emitting a LOUD, attributable ``corrective_nonconvergent_ceiling`` ledger op
+    # and letting the originating ``block_task`` commit the single terminal block
+    # (instead of churning to the 40-min execute wall). Mirrors
+    # ``max_cycles_per_blocker``'s default (3). Reset on forward progress (a task
+    # in the phase completing) or when a DIFFERENT failure_class occurs (a new
+    # distinct problem is not the same loop, since the counter is per-class).
+    max_corrective_cycles_per_phase: int = Field(default=3, ge=1, le=10)
     # When True, the resolver only engages at terminal recovery rungs or on
     # failure classes the deterministic ladder does not handle (keeps cost ≈ 0
     # for the common, already-recoverable case). When False, the resolver is
@@ -565,6 +579,7 @@ def _default_resolver_cfg() -> "ResolverConfig":
     return ResolverConfig(
         enabled=True,
         max_cycles_per_blocker=3,
+        max_corrective_cycles_per_phase=3,
         fast_path_only_on_known=True,
         model=None,
     )

@@ -1199,6 +1199,108 @@ async def _reset_skip_corrective_counter(
         )
 
 
+# F-2 (field-finding): PHASE-scoped non-convergence ceiling. The per-(task,
+# failure_class) cycle guard in ``_maybe_resolve_blocker`` never bounds the
+# cross-corrective-task loop because each freshly-minted corrective has a NEW id
+# => a fresh per-task counter. These helpers track, per phase + failure_class,
+# the count of CONSECUTIVE same-class correctives minted without forward
+# progress. Keyed on ``Phase.metadata`` (mirrors ``skip_corrective_count``) so
+# corrective-task-id churn cannot reset it. Per-class keying means a DIFFERENT
+# failure_class is a fresh (zero) counter for free.
+_CORRECTIVE_CYCLE_META_PREFIX = "corrective_cycle_count:"
+
+
+def _corrective_cycle_key(failure_class: str) -> str:
+    """Metadata key for the per-phase same-class corrective-cycle counter."""
+    return f"{_CORRECTIVE_CYCLE_META_PREFIX}{failure_class}"
+
+
+async def _corrective_cycle_count(
+    orch: "Orchestrator", *, phase_id: str, failure_class: str
+) -> int:
+    """Read the current per-phase same-class corrective-cycle count (0 if unset
+    or unreadable — fail-open so an unreadable counter never blocks recovery)."""
+    try:
+        plan = await orch.plan_manager.load()
+        if plan is None:
+            return 0
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            return 0
+        return int(
+            (phase.metadata or {}).get(_corrective_cycle_key(failure_class), 0)
+        )
+    except Exception as exc:  # noqa: BLE001 - read must never break the loop
+        logger.warning(
+            "execute_phase.corrective_cycle_count_read_failed",
+            phase_id=phase_id,
+            failure_class=failure_class,
+            err=str(exc),
+        )
+        return 0
+
+
+async def _bump_corrective_cycle_counter(
+    orch: "Orchestrator", *, phase_id: str, failure_class: str
+) -> int:
+    """Increment the per-phase same-class corrective-cycle counter and return the
+    NEW value. Best-effort: a persistence failure logs + returns the pre-bump
+    value rather than masking the mint (the ceiling is advisory loop-safety, not
+    a correctness invariant of the mint itself)."""
+    prior = 0
+    try:
+        prior = await _corrective_cycle_count(
+            orch, phase_id=phase_id, failure_class=failure_class
+        )
+        new_count = prior + 1
+        await orch.plan_manager.update_phase_meta(
+            phase_id,
+            metadata={_corrective_cycle_key(failure_class): new_count},
+        )
+        return new_count
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.corrective_cycle_counter_bump_failed",
+            phase_id=phase_id,
+            failure_class=failure_class,
+            err=str(exc),
+        )
+        return prior
+
+
+async def _reset_corrective_cycle_counters(
+    orch: "Orchestrator", *, phase_id: str
+) -> None:
+    """Reset ALL per-phase same-class corrective-cycle counters to 0 on forward
+    progress (a task in the phase completing). PRESERVES legitimate recovery:
+    once the loop actually delivers, the ceiling budget is replenished so a later
+    same-class conflict gets a full fresh budget rather than tripping on stale
+    history. No-op when no counter is set (avoids a redundant ledger entry on the
+    happy path)."""
+    try:
+        plan = await orch.plan_manager.load()
+        if plan is None:
+            return
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            return
+        meta = phase.metadata or {}
+        stale = {
+            k: 0
+            for k, v in meta.items()
+            if k.startswith(_CORRECTIVE_CYCLE_META_PREFIX) and int(v or 0) != 0
+        }
+        if not stale:
+            return
+        await orch.plan_manager.update_phase_meta(phase_id, metadata=stale)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.corrective_cycle_counter_reset_failed",
+            phase_id=phase_id,
+            err=str(exc),
+        )
+
+
 async def _dispatch_architect_consult(
     orch: "Orchestrator",
     task: Task,
@@ -1754,12 +1856,38 @@ async def _resolver_retry(
 
 
 async def _resolver_corrective(
-    orch: "Orchestrator", task: Task, direction: str
+    orch: "Orchestrator",
+    task: Task,
+    direction: str,
+    *,
+    failure_class: str | None = None,
 ) -> Task | None:
     """Inject corrective sub-tasks from ``direction`` and skip ``task`` (the
     architect-refine pattern). Returns the skipped Task on success, or ``None``
     (caller falls through to its legacy block) when no direction is usable, no
     plan/phase is loadable, or injection fails.
+
+    F-2 (field-finding): when ``failure_class`` is supplied, a PHASE-scoped
+    non-convergence ceiling gates minting BEFORE ``append_corrective_tasks``. Once
+    ``cfg.resolver.max_corrective_cycles_per_phase`` consecutive same-class
+    correctives have been minted WITHOUT forward progress, this STOPS minting and
+    DECLINES (returns ``None``) after emitting a LOUD, attributable
+    ``corrective_nonconvergent_ceiling`` ledger op. Declining means the caller
+    (``_apply_resolution`` → ``_maybe_resolve_blocker`` → the sanctioned
+    ``blocker_guard.block_task`` committer at the originating block site) commits
+    a SINGLE terminal ``blocked`` transition instead of minting yet another
+    colliding corrective — i.e. it fails LOUD-FAST rather than churning to the
+    40-min execute wall. (We deliberately do NOT block from inside this helper: the
+    originating ``block_task`` would then re-commit ``blocked`` on an
+    already-blocked task — an illegal ``blocked→blocked`` FSM edge — so the single
+    sanctioned committer must remain the one at the call site, per the F1d
+    invariant.) This bounds the cross-corrective-task loop the per-(task,
+    failure_class) guard cannot: each freshly-minted corrective has a NEW id, so
+    that guard's counter always resets to 0.
+
+    Legitimate recovery is PRESERVED: the counter is per-class (a DIFFERENT
+    failure_class is a fresh, zero budget) and is reset on forward progress (a task
+    in the phase completing — see :func:`_reset_corrective_cycle_counters`).
     """
     if not direction or not direction.strip():
         return None
@@ -1767,6 +1895,31 @@ async def _resolver_corrective(
         from orchestrator.corrective_parser import parse_corrective_direction
 
         phase_id = task.phase_id
+
+        # F-2 phase-scoped non-convergence ceiling (gate BEFORE minting).
+        if failure_class:
+            ceiling = int(
+                getattr(
+                    getattr(orch.cfg, "resolver", None),
+                    "max_corrective_cycles_per_phase",
+                    3,
+                )
+            )
+            prior_cycles = await _corrective_cycle_count(
+                orch, phase_id=phase_id, failure_class=failure_class
+            )
+            if prior_cycles >= ceiling:
+                await _emit_nonconvergent_ceiling(
+                    orch,
+                    task,
+                    phase_id=phase_id,
+                    failure_class=failure_class,
+                    cycles=prior_cycles,
+                    ceiling=ceiling,
+                )
+                # DECLINE: the originating block_task commits the terminal block.
+                return None
+
         cap = int(getattr(orch.cfg, "max_corrective_tasks_per_phase", 8))
         plan_cap = int(getattr(orch.cfg, "max_corrective_tasks_per_plan", 24))
         plan = await orch.plan_manager.load()
@@ -1791,6 +1944,13 @@ async def _resolver_corrective(
             max_corrective_tasks_per_phase=cap,
             max_corrective_tasks_per_plan=plan_cap,
         )
+        # F-2: count this minted same-class corrective round toward the
+        # phase-scoped ceiling (only when a failure_class is attributed — the
+        # legacy callers that omit it keep their unchanged behavior).
+        if failure_class:
+            await _bump_corrective_cycle_counter(
+                orch, phase_id=phase_id, failure_class=failure_class
+            )
         return await orch.plan_manager.update_task_status(
             task.id,
             "skipped",
@@ -1809,6 +1969,56 @@ async def _resolver_corrective(
             err=str(exc),
         )
         return None
+
+
+async def _emit_nonconvergent_ceiling(
+    orch: "Orchestrator",
+    task: Task,
+    *,
+    phase_id: str,
+    failure_class: str,
+    cycles: int,
+    ceiling: int,
+) -> None:
+    """F-2 fail-loud-fast signal: the phase-scoped non-convergence ceiling tripped.
+
+    Emit a LOUD, attributable ``corrective_nonconvergent_ceiling`` ledger op (the
+    distinct, greppable reason the field analysis needs) WITHOUT committing the
+    block here — the caller declines, so the sanctioned ``block_task`` committer at
+    the originating block site commits the single terminal ``blocked`` transition.
+    Best-effort: a breadcrumb failure must never mask the decline."""
+    reason = (
+        f"corrective_nonconvergent: phase {phase_id} regenerated {cycles} "
+        f"consecutive '{failure_class}' correctives without forward progress "
+        f"(ceiling={ceiling}); re-architecting is not converging — failing fast "
+        f"instead of churning to the execute timeout."
+    )
+    logger.warning(
+        "execute_phase.corrective_nonconvergent_ceiling",
+        task_id=task.id,
+        phase_id=phase_id,
+        failure_class=failure_class,
+        cycles=cycles,
+        ceiling=ceiling,
+    )
+    try:
+        await orch.plan_manager.ledger_append(
+            op="corrective_nonconvergent_ceiling",
+            payload={
+                "task_id": task.id,
+                "phase_id": phase_id,
+                "failure_class": failure_class,
+                "cycles": cycles,
+                "ceiling": ceiling,
+                "reason": reason,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - breadcrumb best-effort; never mask
+        logger.warning(
+            "execute_phase.ledger_append_failed",
+            op="corrective_nonconvergent_ceiling",
+            err=str(exc),
+        )
 
 
 # Step 5 (RECOVERY-CONTRACT §7; gate R3): the structural actions
@@ -1927,7 +2137,16 @@ async def _apply_resolution(
             direction = supplied
         else:
             direction = _synthesize_corrective_direction(task, a, rationale)
-        return await _resolver_corrective(orch, task, direction)
+        # F-2: thread the originating failure_class so ``_resolver_corrective``
+        # can bound CONSECUTIVE same-class corrective regeneration at the
+        # phase-scoped ceiling (the cross-corrective-task loop the per-task guard
+        # cannot see).
+        return await _resolver_corrective(
+            orch,
+            task,
+            direction,
+            failure_class=getattr(ctx, "failure_class", None),
+        )
     if a == "consult_knowledge":
         try:
             from orchestrator import blocker_resolver as _br
@@ -5992,6 +6211,14 @@ async def _execute_one(
                     task_id=task.id,
                     err=str(exc),
                 )
+            # F-2: forward progress — a task in the phase completed, so the
+            # phase-scoped same-class corrective-cycle counters are replenished
+            # (a later same-class conflict gets a full fresh ceiling budget,
+            # preserving legitimate multi-corrective recovery).
+            if task.phase_id:
+                await _reset_corrective_cycle_counters(
+                    orch, phase_id=task.phase_id
+                )
             # v0.35.0 C1 prerequisite: credit every lesson that landed
             # in a prompt for this task with one succeeded_after_count
             # increment. Drain the per-task slice of the correlation
@@ -8164,6 +8391,10 @@ async def _maybe_accept_approved_on_exhaustion(
             task_id=task.id,
             err=str(exc),
         )
+    # F-2: forward progress resets the phase-scoped corrective-cycle counters
+    # (mirrors the happy-path completion tail above).
+    if task.phase_id:
+        await _reset_corrective_cycle_counters(orch, phase_id=task.phase_id)
     return completed
 
 

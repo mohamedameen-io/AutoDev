@@ -507,6 +507,18 @@ LedgerOp = Literal[
     # mutated by this op; the counter itself flows through the regular
     # ``update_phase_meta`` op.
     "skip_corrective_loop_detected",
+    # F-2 (field-finding): phase-scoped NON-CONVERGENCE ceiling tripped. Audit-
+    # only, LOUD fail-fast breadcrumb — fired when a phase has regenerated
+    # ``cfg.resolver.max_corrective_cycles_per_phase`` consecutive same-
+    # ``failure_class`` correctives without forward progress, so the resolver
+    # STOPS minting and declines (the originating ``block_task`` then commits the
+    # single terminal block). This is the distinct, greppable attribution for the
+    # unbounded corrective-regeneration loop that timed hard tasks out at the
+    # 40-min execute wall. Payload: ``{task_id, phase_id, failure_class, cycles,
+    # ceiling, reason}``. Plan state is not mutated by this op (the per-phase
+    # counter flows through ``update_phase_meta``; the block flows through
+    # ``update_task_status``); replay treats it as a no-op.
+    "corrective_nonconvergent_ceiling",
     # v0.38.0 I2 (HK4): ``autodev requeue --capped-phases`` was invoked.
     # Audit-only breadcrumb mirroring the existing ``requeue`` op
     # rationale — the per-task ``status: blocked → pending`` transitions
@@ -1286,6 +1298,11 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # ``update_phase_meta`` op emitted alongside (the
         # ``Phase.metadata["skip_corrective_count"]`` delta).
         "skip_corrective_loop_detected",
+        # F-2 (field-finding): phase-scoped non-convergence ceiling tripped.
+        # Audit-only no-op on replay — the per-phase counter is persisted via the
+        # regular ``update_phase_meta`` op and the terminal block via
+        # ``update_task_status``, both emitted alongside.
+        "corrective_nonconvergent_ceiling",
         # v0.38.0 I2 (HK4): ``autodev requeue --capped-phases`` audit
         # breadcrumb. Replay is a no-op — the per-task transitions live
         # in the ``update_task_status`` ops emitted alongside (one per
