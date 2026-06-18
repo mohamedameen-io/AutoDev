@@ -7804,37 +7804,23 @@ def _developer_envelope(task: Task, extra_issues: list[str]) -> DelegationEnvelo
 # but routinely dominate diff bytes. Skipped wholesale by the chunked
 # envelope so the per-file budget is spent on files a human reviewer
 # would actually want to see.
-_REVIEW_GENERATED_FILE_GLOBS: tuple[str, ...] = (
-    "*.lock",
-    "package-lock.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-    "Cargo.lock",
-    "uv.lock",
-    "poetry.lock",
-    "Gemfile.lock",
-    "composer.lock",
-    "*.min.js",
-    "*.min.css",
+#
+# F-5: the pattern set and predicate now live in ``adapters.git_utils`` as
+# the SINGLE source of truth — the worktree diff source (get_diff_vs_base)
+# reuses the exact same set to filter generated cruft (e.g. regenerated
+# ``__pycache__/*.pyc``) out of the DELIVERED diff. ``_matches_generated_glob``
+# is kept as a re-export so existing callers / tests in this module stay
+# stable; the underlying glob set is ``git_utils.GENERATED_FILE_GLOBS``.
+from adapters.git_utils import (  # noqa: E402
+    matches_generated_glob as _matches_generated_glob,
 )
+
 # Soft byte caps — not hard limits, the chunker rounds at file boundaries.
 _REVIEW_PER_FILE_FULL_BYTES = 2_048  # files ≤ this size pass through whole.
 _REVIEW_PER_FILE_HEAD_BYTES = 1_024  # head slice for oversize files.
 _REVIEW_PER_FILE_TAIL_BYTES = 512  # tail slice for oversize files.
 _REVIEW_TOTAL_ENVELOPE_BYTES = 32_768  # soft cap on the chunked envelope.
 _REVIEW_DIFF_PASSTHROUGH_BYTES = 8_192  # diffs ≤ this size skip chunking.
-
-
-def _matches_generated_glob(path: str) -> bool:
-    """Return True if ``path`` matches any generated/lock file glob."""
-    import fnmatch as _fn
-
-    base = path.rsplit("/", 1)[-1]
-    for pattern in _REVIEW_GENERATED_FILE_GLOBS:
-        if _fn.fnmatch(path, pattern) or _fn.fnmatch(base, pattern):
-            return True
-    # Also skip any path containing a ``__pycache__/`` segment.
-    return "__pycache__/" in path or path.startswith("__pycache__/")
 
 
 def _split_diff_by_file(diff: str) -> list[tuple[str, str]]:
