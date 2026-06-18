@@ -55,6 +55,12 @@ dev = [
     "hypothesis>=6.0",
     "pytest-cov>=4.1",
     "mypy>=1.14",
+    # ruff must be a DECLARED dep: the CI Lint gate (.github/workflows/test.yml,
+    # release.yml) runs `uv run ruff check src tests`, which fails to spawn ruff
+    # on a clean runner if ruff is only on a local PATH / uv-tool. Capped to the
+    # validated 0.15.x so a future rule-adding release can't silently re-break
+    # the gate; bump deliberately + re-verify.
+    "ruff>=0.15.11,<0.16",
     "types-PyYAML>=6.0",
     "types-psutil>=5.9",
 ]
