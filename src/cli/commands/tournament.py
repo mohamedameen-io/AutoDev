@@ -486,6 +486,7 @@ def promote_subcommand(tournament_id: str, pass_num: int | None) -> None:
     PlanManager. This is the manual fallback for the automatic
     on-tournament-error recovery in ``run_plan_phase``.
     """
+    from orchestrator.dependency_inference import repair_phase_edit_scope
     from orchestrator.plan_parser import parse_plan_markdown
     from state.plan_manager import PlanManager
     from tournament.state import TournamentArtifactStore
@@ -535,6 +536,12 @@ def promote_subcommand(tournament_id: str, pass_num: int | None) -> None:
         sys.exit(2)
 
     async def _persist() -> None:
+        # Field-finding F-1: same scope repair that _validate_with_persistent_drop
+        # applies in the normal execute path.  The promote path bypasses
+        # _validate_with_persistent_drop, so we must run it here before
+        # init_plan — otherwise a salvaged plan whose phase edit_scope excludes
+        # a file one of its tasks declares reaches execute with the bug intact.
+        repair_phase_edit_scope(plan.phases, plan_edit_scope=plan.edit_scope)
         pm = PlanManager(cwd, session_id="cli-tournament-promote")
         await pm.init_plan(plan)
 

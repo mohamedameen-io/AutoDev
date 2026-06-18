@@ -627,6 +627,14 @@ def parse_plan_markdown(md: str, *, spec_hash: str = "") -> Plan:
     # in declaration order) so it cannot introduce a cycle.
     infer_plan_dependencies(phases)
 
+    # Field-finding F-1 (edit_scope self-consistency) is repaired NOT here but
+    # at plan-init, AFTER the on-disk drop / empty-scope guard pass
+    # (``orchestrator.plan_phase._validate_with_persistent_drop``). Running the
+    # repair at parse time would pre-populate a phase's ``edit_scope`` with its
+    # task-declared files and thereby mask the empty-scope guard: a phase that
+    # narrows to an on-disk-missing path would no longer go empty after the
+    # drop, so the P0 silent-widen guard could never fire. The repair must see
+    # the post-drop scope, hence its placement downstream of validation.
     now = _iso_now()
     return Plan(
         plan_id=f"plan-{uuid.uuid4().hex[:12]}",

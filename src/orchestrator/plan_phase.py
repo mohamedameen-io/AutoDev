@@ -26,6 +26,7 @@ from adapters.types import AgentInvocation, AgentResult
 from errors import AutodevError, TournamentError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
+from orchestrator.dependency_inference import repair_phase_edit_scope
 from orchestrator.diagnosis_phase import run_diagnosis_phase
 from orchestrator.file_existence_validator import validate_files_exist
 from orchestrator.framing_phase import run_framing_phase
@@ -406,6 +407,28 @@ async def _validate_with_persistent_drop(
                     op="path_validation_resolved_via_plan_global",
                     payload=res,
                 )
+            # Field-finding F-1: make each phase's ``edit_scope``
+            # self-consistent with the concrete files its own tasks declare.
+            # MUST run here — AFTER the on-disk drop / empty-scope guard
+            # above has finalized each phase's scope — so the repair sees the
+            # post-drop scope. Running it at parse time would pre-admit the
+            # task files and mask the empty-scope guard (a phase narrowed to
+            # an on-disk-missing path would no longer go empty after the
+            # drop, defeating the P0 silent-widen guard). Both the initial
+            # validation pass and the tournament-gate re-validation reach
+            # this point. The tournament-promote ``_persist`` path
+            # (``cli.commands.tournament.promote_subcommand``) bypasses this
+            # function and calls ``repair_phase_edit_scope`` directly before
+            # ``init_plan`` — so BOTH routes to ``init_plan`` apply the
+            # repair, and every execute-time consumer (the pre-flight
+            # ``collect_edit_scope_violations``, the sparse-checkout cone, and
+            # the developer-prompt EDIT SCOPE addendum) sees one consistent
+            # scope. The repair is a no-op for whole-repo (empty) scopes and
+            # never admits a file no task declares; the apply-time boundary on
+            # the developer's ACTUAL edits is unchanged.
+            repair_phase_edit_scope(
+                plan.phases, plan_edit_scope=plan.edit_scope
+            )
             return plan
         except PathValidationError as exc:
             key = (exc.raw, exc.reason)
