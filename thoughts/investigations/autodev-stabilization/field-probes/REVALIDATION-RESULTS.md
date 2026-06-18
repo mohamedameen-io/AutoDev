@@ -7,9 +7,11 @@
 
 ### TL;DR
 
-**WS-4 binding constraint (conflict_3way_failed → "no plan initialized" → no delivery): RESOLVED & VALIDATED.**
-P2 delivers cleanly through the exact previously-failing path; 0 occurrences of `block_path_plan_uninitialized`, `conflict_3way_failed`, or `worker_exception` across all 5 probe ledgers.
+**WS-4 "no plan initialized" residual: RESOLVED & VALIDATED.**
+P2 delivers cleanly through the exact previously-failing path; 0 occurrences of `block_path_plan_uninitialized` or `worker_exception` across all 5 probe ledgers.
 This SUPERSEDES the prior verdict's "WS-4 NOT resolved."
+
+**CORRECTION (2026-06-18):** The original summary stated "0 occurrences of … `conflict_3way_failed` … across all 5 probe ledgers." That was **wrong** — it counted ledger *op names* rather than `failure_class` values inside `blocker_escalated` ops. `conflict_3way_failed` **recurs** on the hard tasks as a `failure_class`: task_007=3, task_008=9, task_009=6. It is the engine of **F-2** (budget-churn loop). What A2 (`491382e`) genuinely eliminates is *spurious* conflicts on trivial tasks — P2 delivered cleanly with 0 conflicts. Genuine conflicts on hard tasks' corrective regeneration were never eliminated and drove F-2. See corrected forbidden-op table below.
 
 **Field bar NOT cleared — DO NOT tag v1.0.** Only 1/5 delivered (P2). New blocking findings: **F-1** (scope-recovery — `narrow_scope` wrong remedy when a task needs an out-of-scope file) and **F-2** (hard-task budget-churn → 40–56 min execute timeout; P4/P5/P6). Fix F-1 + F-2, then re-run.
 
@@ -26,21 +28,23 @@ This SUPERSEDES the prior verdict's "WS-4 NOT resolved."
 
 **Result: 1/5 delivered (P2 PASS). P3 deferred. P1/P4/P5/P6 FAIL.**
 
-### Forbidden-op scan (all 5 ledgers)
+### Forbidden-op scan (all 5 ledgers) — CORRECTED 2026-06-18
 
-| Signal | Count |
-|---|---|
-| `block_path_plan_uninitialized` | **0** |
-| `conflict_3way_failed` | **0** |
-| `worker_exception` | **0** |
-| `init_plan` present | all 5 |
-| `task_blocked_scope_violation` | 1 (P1 only) |
+| Signal | Count | Notes |
+|---|---|---|
+| `block_path_plan_uninitialized` | **0** | WS-4 residual genuinely absent — A1 fixed it |
+| `conflict_3way_failed` (as `failure_class` in `blocker_escalated` ops) | **recurs on hard tasks** | task_007=3, task_008=9, task_009=6; engine of F-2. CORRECTION: original scan counted op names, not failure_class values — "0" was wrong. A2 eliminates *spurious* conflicts on trivial tasks (P2: 0 ✓); genuine conflicts recur on hard-task corrective regeneration. |
+| `worker_exception` | **0** | Also genuinely absent across all 5 probes |
+| `init_plan` present | all 5 | |
+| `task_blocked_scope_violation` | 1 (P1 only) | |
 
-### New findings
+### Findings (status as of 2026-06-18)
 
-- **F-1** (open / high): `edit_scope_violation` + ineffective `narrow_scope` recovery. When a task body requires edits to a file not in `edit_scope`, the resolver narrows scope instead of widening it, making the task permanently undeliverable. Likely a B1/B3-minimalism interaction. Fix: widen scope to admit files the task body references, or validate scope completeness at plan-time.
-- **F-2** (open / high): Hard-task budget-churn → 40–56 min execute timeouts (P4/P5/P6). Irrecoverable churn loop consumes the full 2400 s budget without convergence. Investigate: cap budget-recovery cycles; investigate `error_max_turns` cascades; investigate `conflict_rewrite_cap` interaction with A2 auto-3way.
-- **F-3** (resolved / infra): Benchmark harness crashed (`TypeError: Object of type bytes is not JSON serializable`) on `subprocess.TimeoutExpired` — raw bytes from stdout/stderr not decoded before JSON serialization. Fixed: `e87fb5f`.
+- **F-1** (**FIXED `a5c9bb1`**): `edit_scope_violation` + ineffective `narrow_scope` recovery. Plan repair (`repair_phase_edit_scope`) now admits a phase's tasks' declared concrete files into `edit_scope`; run after the drop/empty-guard pass; P0 empty-guard preserved; `tournament promote` CLI bypass also closed. Reproduce-first + reviewed. Resolves the P1 scope-block.
+- **F-2** (**FIXED `9ecf8ee`**): Hard-task budget-churn → 40–56 min execute timeouts (P4/P5/P6). Phase-scoped non-convergence ceiling (`max_corrective_cycles_per_phase`=3) bounds same-failure-class corrective regeneration — emits loud `corrective_nonconvergent_ceiling` op + terminal block instead of churning to the 40-min execute timeout. Resets on a different `failure_class` or forward progress (legitimate recovery preserved). Reproduce-first + reviewed, replay-safe. **NOTE:** makes hard tasks fail-loud-fast; does NOT make them deliver (see F-5).
+- **F-3** (FIXED `e87fb5f` / infra): Benchmark harness crashed (`TypeError: Object of type bytes is not JSON serializable`) on `subprocess.TimeoutExpired` — raw bytes from stdout/stderr not decoded before JSON serialization. Fixed.
+- **F-4** (OPEN / high / deferred): Execute-flow apply-time scope enforcement is **dormant** — all 3 `apply_patch_to_main` callers pass `edit_scope=None`, so the developer's actual diff is never scope-checked at apply time. Only declaration-level pre-flight guards scope. Activating real diff-level enforcement is a separate, higher-risk change (could surface latent violations in existing plans). Deferred.
+- **F-5** (OPEN / high / candidate next): Genuine-conflict non-convergence — corrective tasks on hard tasks repeatedly collide with the same accumulated worktree state. F-2 bounds the loop and makes failure loud/fast, but the deeper cause (worktree-state accumulation / merge-base divergence) is unsolved → hard tasks still produce 0 diff (fail-loud-fast but do NOT deliver). Next candidate fix for hard-task DELIVERY.
 
 ### What the stabilization commits validated
 
@@ -48,9 +52,48 @@ A3 lint: validated in production (lint ENABLED, 0 lint-block events).
 A5: confirmed prior `cost_usd 0.0` was a symptom of the ledger-wipe (watermark already correct after A1).
 A4/B1/B2/B3: landed; full unit gate green (4299 passed / 6 skipped, ruff + mypy clean).
 A1 (`7b40ce4`): exclude `.autodev/` from `git clean -fd` + idempotent reload-retry — the ledger-wipe root cause.
-A2 (`491382e`): auto `--3way` before critic, removing the spurious-conflict trigger.
+A2 (`491382e`): auto `--3way` before critic, removing the *spurious*-conflict trigger (trivial tasks); genuine conflicts on hard tasks' corrective regeneration persist → F-2/F-5.
 
 The 11 commits (589b2bf..HEAD): `ec293c5` A3 lint, `7c5d9f3` B1 necessity-ladder, `7b40ce4` A1 ledger-wipe fix, `491382e` A2 auto-3way, `94e3dec`+`f81a185` A4 finalize/exit-code, `1e70861` A5 cost metric, `3da18ef` B2 reviewer advisory, `2d74af3` B3 effort-modulation, `95ae3b2` final-review polish, `e87fb5f` harness bytes fix.
+
+---
+
+## POST-RE-RUN FIXES — 2026-06-18
+
+**Build:** `stabilization-v1` @ `9ecf8ee` · **Unit gate:** 4315 passed / 6 skipped (ruff + mypy clean) · **Field re-run:** PENDING
+
+### Correction: `conflict_3way_failed` was NOT zero across all probes
+
+The RE-RUN VERDICT above originally stated "0 occurrences of … `conflict_3way_failed` … across all 5 probe ledgers." This was **incorrect** — the scan counted ledger *op names* but `conflict_3way_failed` surfaces as a `failure_class` value inside `blocker_escalated` ops. Actual counts: **task_007=3, task_008=9, task_009=6** — it is the engine of the F-2 budget-churn loop. What IS genuinely absent across all 5 probes is the WS-4 `block_path_plan_uninitialized` / `worker_exception` residual (that part of the verdict stands — A1 fixed it). A2 eliminates *spurious* conflicts on trivial tasks; genuine conflicts on hard-task corrective regeneration were never eliminated.
+
+### F-1 — FIXED (`a5c9bb1`)
+
+Plan repair (`repair_phase_edit_scope`) admits a phase's tasks' declared concrete files into `edit_scope`. Run after the drop/empty-guard pass; P0 empty-guard preserved; `tournament promote` CLI bypass also closed. Reproduce-first + reviewed. Resolves the P1 scope-block.
+
+### F-2 — FIXED (`9ecf8ee`)
+
+Phase-scoped non-convergence ceiling (`max_corrective_cycles_per_phase`=3) bounds same-`failure_class` corrective regeneration — emits loud `corrective_nonconvergent_ceiling` op + terminal block instead of churning to the 40-min execute timeout. Resets on a different `failure_class` or forward progress (legitimate recovery preserved). Reproduce-first + reviewed, replay-safe. **NOTE: makes hard tasks fail-loud-fast; does NOT make them deliver (see F-5).**
+
+### F-4 — OPEN / DEFERRED
+
+Apply-time edit_scope enforcement is dormant: all 3 `apply_patch_to_main` callers pass `edit_scope=None`. Only declaration-level pre-flight guards scope. Activating real diff-level enforcement is a separate, higher-risk change (could surface latent violations in existing plans). Deferred.
+
+### F-5 — OPEN / CANDIDATE NEXT (hard-task delivery)
+
+Genuine-conflict non-convergence: corrective tasks on hard tasks repeatedly collide with the same accumulated worktree state. F-2 bounds the churn loop and makes failure loud/fast, but the underlying cause (worktree-state accumulation / merge-base divergence between corrective attempts) is unsolved. Hard tasks still produce 0 diff. This is the next candidate fix for hard-task DELIVERY.
+
+### Overall status
+
+| Item | Status |
+|---|---|
+| F-1 (scope recovery) | **FIXED** `a5c9bb1` |
+| F-2 (non-convergence ceiling) | **FIXED** `9ecf8ee` |
+| F-3 (harness bytes-JSON) | **FIXED** `e87fb5f` |
+| F-4 (apply-time enforcement dormant) | **OPEN** / deferred |
+| F-5 (genuine-conflict non-convergence) | **OPEN** / candidate next |
+| Unit gate | **GREEN** (4315 passed / 6 skipped) |
+| Field re-run | **PENDING** (F-1/F-2 unit-validated only) |
+| v1.0 tag | **NOT READY** — F-4, F-5 open; field re-run pending |
 
 ---
 

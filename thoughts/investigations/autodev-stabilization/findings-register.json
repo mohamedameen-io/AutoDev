@@ -2626,7 +2626,7 @@
       ],
       "recommendation": "bind corrective/blocker PlanManager to main-repo cwd (or persist plan snapshot into worktree); add conflict->corrective engagement test.",
       "date": "2026-06-17",
-      "rerun_evidence": "P2 delivers (1-line Go defer fix, exit 0, ~11m); 0 block_path_plan_uninitialized, 0 conflict_3way_failed, 0 worker_exception across all 5 probes; A1 7b40ce4 excludes .autodev/ from git clean + idempotent reload-retry; A2 491382e auto-enables --3way before critic, removing spurious-conflict trigger. Prior REPRODUCED verdict superseded.",
+      "rerun_evidence": "P2 delivers (1-line Go defer fix, exit 0, ~11m); 0 block_path_plan_uninitialized, 0 worker_exception across all 5 probes — the WS-4 'no plan initialized' residual (block_path_plan_uninitialized) is genuinely absent. CORRECTION: conflict_3way_failed IS NOT zero across all probes — it is the engine of F-2: task_007=3, task_008=9, task_009=6 occurrences (recurs on hard tasks' corrective regeneration). What A2 (491382e) eliminates is SPURIOUS conflicts on trivial tasks (P2 delivered cleanly, 0 conflicts); genuine conflicts recur on hard-task corrective regeneration → F-2 budget-churn loop. A1 7b40ce4 excludes .autodev/ from git clean + idempotent reload-retry (fixes no-plan-init residual). Prior REPRODUCED verdict superseded on the WS-4 'no plan initialized' question only.",
       "fix_commits": [
         "7b40ce4 (A1 ledger-wipe fix)",
         "491382e (A2 auto-3way)"
@@ -2707,7 +2707,7 @@
       "file_line": "src/orchestrator/execute_phase.py (edit_scope pre-flight) ; src/orchestrator/blocker_resolver.py (narrow_scope)",
       "workstream": "WS-1/scope",
       "subarea": "field-probe",
-      "verdict": "OPEN",
+      "verdict": "FIXED",
       "severity": "high",
       "claim": "Plan internally inconsistent: phase edit_scope=[\"index.js\"] but task 1.2 requires edits to test_index.js (out of scope). Pre-flight edit_scope_violation fires in ~10s. Resolver chose narrow_scope — ineffective because the NEEDED file (test_index.js) is out of scope and cannot be admitted by narrowing. Outcome: task_blocked_scope_violation, no delivery, 0 WS-4 ops. Likely a B1/B3-minimalism interaction where the necessity-ladder restricts scope to the primary fix file but the plan body references a test file the task must also touch.",
       "evidence": "P1 task_002 (JS/bug ts_nullcheck) re-run 2026-06-17: edit_scope_violation pre-flight (~10s execute), resolver=narrow_scope (ineffective), task_blocked_scope_violation, empty diff, ~13m total, 0 WS-4 ops. Prior P1 PASS (same task) used lint-disabled run where this path was not triggered.",
@@ -2717,7 +2717,11 @@
         "P1"
       ],
       "recommendation": "Fix scope recovery: when a task body specifies edits to file F but F is not in edit_scope, the resolver should WIDEN scope (add F) rather than narrow. Alternatively, validate plan scope completeness at plan-time to catch the inconsistency before execute.",
-      "date": "2026-06-17"
+      "date": "2026-06-17",
+      "status": "fixed",
+      "fix_commit": "a5c9bb1",
+      "fix_summary": "plan repair (repair_phase_edit_scope) admits a phase's tasks' declared concrete files into edit_scope; run after the drop/empty-guard pass; P0 empty-guard preserved; tournament promote CLI bypass also closed. Reproduce-first + reviewed. Resolves the P1 scope-block.",
+      "fix_date": "2026-06-18"
     },
     {
       "id": "F-2",
@@ -2725,7 +2729,7 @@
       "file_line": "src/orchestrator/execute_phase.py (budget loop) ; src/orchestrator/blocker_resolver.py (conflict_rewrite_cap)",
       "workstream": "WS-1/convergence",
       "subarea": "field-probe",
-      "verdict": "OPEN",
+      "verdict": "FIXED",
       "severity": "high",
       "claim": "Python feature/refactor/50k-scale tasks (P4/P5/P6) ran for 40-56 minutes each and hit the autodev execute 2400s hard timeout with no diff delivered. Severe churn: P5 had 59 budget cycles, 7 claude error_max_turns, qa_gate_failed (pytest collection errors), and conflict_rewrite_cap_exceeded (A2 critic-rewrite escalation failing LOUD at its cap). P4 had 5 budget-recovery cycles; P6 had 24 budget cycles and 6 tournament rounds. Root cause: tasks that require multiple files or non-trivial reasoning enter an irrecoverable churn loop that consumes the entire budget without converging on a deliverable.",
       "evidence": "P4 task_007 (~51m, 5 recoveries, timed out at 2400s, 0 WS-4 ops); P5 task_008 (~56m, 59 budget cycles, 7 error_max_turns, conflict_rewrite_cap_exceeded, timed out at 2400s, 0 WS-4 ops); P6 task_009 (~43m, 24 budget cycles, 6 tournament rounds, timed out at 2400s, 0 WS-4 ops). S3 50k-scale NOT the driver: plan tournament completed on 50k-file repo, init_plan present — delivery blocked by churn, not by scale.",
@@ -2737,7 +2741,11 @@
         "P6"
       ],
       "recommendation": "Investigate convergence/budget: (1) cap budget-recovery cycles to prevent infinite churn; (2) investigate claude max_turns exhaustion and error_max_turns cascades; (3) investigate conflict_rewrite_cap interaction with A2 auto-3way; (4) add execute timeout headroom or escalate to LOUD failure before timeout.",
-      "date": "2026-06-17"
+      "date": "2026-06-17",
+      "status": "fixed",
+      "fix_commit": "9ecf8ee",
+      "fix_summary": "phase-scoped non-convergence ceiling (max_corrective_cycles_per_phase=3) bounds same-failure-class corrective regeneration — emits loud corrective_nonconvergent_ceiling op + terminal block instead of churning to the 40-min execute timeout. Resets on a different failure_class or forward progress (legitimate recovery preserved). Reproduce-first + reviewed, replay-safe. NOTE: makes hard tasks fail-loud-fast; does NOT make them deliver (see F-5).",
+      "fix_date": "2026-06-18"
     },
     {
       "id": "F-3",
@@ -2758,7 +2766,45 @@
       ],
       "fix_commit": "e87fb5f",
       "date": "2026-06-17"
+    },
+    {
+      "id": "F-4",
+      "title": "F-4: apply-time edit_scope enforcement is DORMANT — apply_patch_to_main callers pass edit_scope=None (OPEN, DEFERRED)",
+      "file_line": "src/orchestrator/execute_phase.py (apply_patch_to_main callers × 3)",
+      "workstream": "WS-1/scope",
+      "subarea": "field-probe",
+      "verdict": "OPEN",
+      "severity": "high",
+      "claim": "The execute-flow apply-time scope enforcement is dormant: all 3 apply_patch_to_main callers pass edit_scope=None, so the developer's actual diff is never scope-checked at apply time. Only the declaration-level pre-flight guards scope. Activating real diff-level enforcement is a separate, higher-risk change that could surface latent violations in existing plans.",
+      "evidence": "Code inspection: apply_patch_to_main call sites × 3 in execute_phase.py all pass edit_scope=None.",
+      "repro_or_probe": "Assert any apply_patch_to_main caller passes a non-None edit_scope; current state: all 3 callers pass None → enforcement is declaration-level only.",
+      "source": "field-probe-rerun-2026-06-17",
+      "field_probes": [],
+      "recommendation": "Activate diff-level edit_scope enforcement in apply_patch_to_main; deferred because it is higher-risk and may surface latent plan violations.",
+      "date": "2026-06-18",
+      "status": "open"
+    },
+    {
+      "id": "F-5",
+      "title": "F-5: genuine-conflict non-convergence on hard tasks — corrective tasks repeatedly collide with accumulated worktree state (OPEN, candidate next)",
+      "file_line": "src/orchestrator/execute_phase.py (impl_tournament / apply_worktree_diff_to_main); src/orchestrator/blocker_resolver.py",
+      "workstream": "WS-1/convergence",
+      "subarea": "field-probe",
+      "verdict": "OPEN",
+      "severity": "high",
+      "claim": "On hard tasks, corrective tasks repeatedly collide with the same accumulated worktree state. F-2 (max_corrective_cycles_per_phase ceiling) bounds the loop and makes failure loud/fast, but the deeper cause — worktree-state accumulation / merge-base divergence — is unsolved. Hard tasks still fail-loud-fast but do NOT deliver. Each new corrective task collides with the same accumulated worktree state that caused the prior conflict.",
+      "evidence": "F-2 investigation: task_007=3, task_008=9, task_009=6 conflict_3way_failed occurrences on hard tasks' corrective regeneration. F-2 ceiling now emits corrective_nonconvergent_ceiling + terminal block instead of churning, but hard tasks still produce 0 diff.",
+      "repro_or_probe": "Run any Python feature/refactor hard task after F-2 fix; assert delivery (not just fail-loud). Currently: ceiling fires, hard tasks fail-loud-fast, 0 diff. Root cause: worktree-state accumulation / merge-base between corrective task attempts.",
+      "source": "field-probe-rerun-2026-06-17",
+      "field_probes": [
+        "P4",
+        "P5",
+        "P6"
+      ],
+      "recommendation": "Investigate and fix worktree-state accumulation: reset merge-base / clean worktree between corrective attempts, or rethink corrective task strategy to avoid re-colliding on accumulated state. This is the next candidate fix for hard-task DELIVERY.",
+      "date": "2026-06-18",
+      "status": "open"
     }
   ],
-  "field_probe_note": "Phase-4 field re-validation 2026-06-17 ROUND 1 (build 8d99742 + stabilization fixes): WS-4 binding constraint REPRODUCED, NOT RESOLVED -> first verdict. --- Phase-4 field RE-RUN 2026-06-17 (build 95ae3b2, HEAD stabilization-v1, all 10 stabilization commits + harness fix e87fb5f): WS-4 binding constraint RESOLVED & VALIDATED (P2 delivers; 0 block_path_plan_uninitialized/conflict_3way_failed/worker_exception across all 5 probes; A1 7b40ce4 + A2 491382e). BUT bar NOT cleared — DO NOT tag v1.0: only 1/5 delivered (P2). New blocking findings: F-1 (edit_scope_violation + ineffective narrow_scope; P1; open), F-2 (hard-task budget-churn -> 40-56min execute timeout; P4/P5/P6; open). F-3 (harness bytes-not-JSON crash on TimeoutExpired; resolved e87fb5f). Next: fix F-1 (scope recovery) + F-2 (convergence/budget), then re-run. See REVALIDATION-RESULTS.md for full scorecard."
+  "field_probe_note": "Phase-4 field re-validation 2026-06-17 ROUND 1 (build 8d99742 + stabilization fixes): WS-4 binding constraint REPRODUCED, NOT RESOLVED -> first verdict. --- Phase-4 field RE-RUN 2026-06-17 (build 95ae3b2, HEAD stabilization-v1, all 10 stabilization commits + harness fix e87fb5f): WS-4 'no plan initialized' residual RESOLVED & VALIDATED (P2 delivers; 0 block_path_plan_uninitialized, 0 worker_exception across all 5 probes; A1 7b40ce4 + A2 491382e). CORRECTION: conflict_3way_failed was NOT zero — it recurs on hard tasks as the engine of F-2 (task_007=3, task_008=9, task_009=6); A2 eliminates spurious conflicts on trivial tasks only. --- POST-RE-RUN FIXES 2026-06-18: F-1 FIXED (a5c9bb1: plan repair admits task-declared files into edit_scope); F-2 FIXED (9ecf8ee: phase-scoped non-convergence ceiling, fail-loud-fast on same-class churn). F-3 remains FIXED (e87fb5f: harness bytes-JSON). NEW OPEN: F-4 (apply-time scope enforcement dormant; deferred), F-5 (genuine-conflict non-convergence; hard tasks fail-loud-fast but still 0 delivery; candidate next). Overall: F-1/F-2 fixed + unit gate green (4315 passed/6 skipped); field re-run PENDING to confirm. v1.0 NOT ready (F-4, F-5 open; field re-run pending). See REVALIDATION-RESULTS.md for full scorecard."
 }
