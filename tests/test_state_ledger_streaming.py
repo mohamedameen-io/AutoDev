@@ -8,7 +8,6 @@ iterator that validates incrementally and yields one entry at a time.
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 from pathlib import Path
 

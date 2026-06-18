@@ -216,7 +216,6 @@ def test_compute_metrics_for_unparseable_file_does_not_crash(
 
 def test_long_functions_field_populated() -> None:
     """A function exceeding the threshold lands in long_functions list."""
-    import textwrap
 
     code = "def long_one():\n" + "    x = 1\n" * 60
     from pathlib import Path

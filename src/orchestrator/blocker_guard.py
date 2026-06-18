@@ -28,6 +28,13 @@ from typing import TYPE_CHECKING
 # single, enforced degrade setter (F1b).
 from orchestrator.blocker_resolver import record_phase_degrade
 
+# All five plan_manager "no plan initialized; call init_plan first" raises are
+# ``PlanConcurrentModificationError`` (plan_manager.py:343/527/600/1330/1474),
+# so the recovery control flow below matches on TYPE *and* signature. If a
+# future plan_manager reword changes the message text, the isinstance gate makes
+# the retry+breadcrumb fail SAFE (skipped) rather than silently mis-firing.
+from errors import PlanConcurrentModificationError
+
 if TYPE_CHECKING:  # pragma: no cover
     from orchestrator import Orchestrator
     from state.schemas import Task
@@ -102,6 +109,69 @@ async def block_task(
         recovered = None
     if recovered is not None and getattr(recovered, "status", None) != "blocked":
         return recovered
-    return await orch.plan_manager.update_task_status(
-        task.id, "blocked", meta=meta or {}
-    )
+    try:
+        return await orch.plan_manager.update_task_status(
+            task.id, "blocked", meta=meta or {}
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A1 (RECOVERY-CONTRACT §7 Part 4) belt-and-suspenders: the PRIMARY fix
+        # for the field-observed ``"no plan initialized"`` on the
+        # conflict→corrective path lives in
+        # ``WorktreeManager.abort_failed_apply`` (it no longer lets a repo-wide
+        # ``git clean -fd`` delete the untracked ``.autodev/`` ledger). This is
+        # an IDEMPOTENT secondary guard ONLY: if the block commit still trips
+        # "no plan initialized" — e.g. a TRANSIENT empty read while another
+        # task's worktree git ops momentarily churn ``.autodev/`` — reload once
+        # and retry the SAME terminal transition. The retry is safe to run
+        # repeatedly (it either lands the single ``blocked`` transition against
+        # the reloaded plan or re-raises with the breadcrumb below); it never
+        # MASKS a genuine ledger loss (a physically-deleted ledger stays None on
+        # reload and the original raise still propagates, attributed).
+        if isinstance(exc, PlanConcurrentModificationError) and (
+            "no plan initialized" in str(exc)
+        ):
+            try:
+                # Probe whether the ledger is readable again; only retry if so.
+                # (A genuinely deleted ledger stays None here and we fall through
+                # to the breadcrumb + original raise — the transient retry never
+                # MASKS a real loss.) The retry's fresh state comes from
+                # ``update_task_status`` itself, which re-reads under the lock.
+                reloaded = await orch.plan_manager.load()
+            except Exception:  # noqa: BLE001 — probe best-effort
+                reloaded = None
+            if reloaded is not None:
+                try:
+                    return await orch.plan_manager.update_task_status(
+                        task.id, "blocked", meta=meta or {}
+                    )
+                except Exception:  # noqa: BLE001 — fall through to breadcrumb
+                    pass
+        # Step 5 (RECOVERY-CONTRACT §7 Part 4) — defensive guard for the
+        # field-observed ``worker_exception: "no plan initialized; call init_plan
+        # first"`` on the conflict→corrective retry path (field-probes P5/P6). If
+        # the terminal block commit fails because the PlanManager's ledger is
+        # unexpectedly empty/absent, the un-guarded raise propagated up the worker
+        # handler and was MISCLASSIFIED as a fresh ``worker_exception`` (masking
+        # the real cause). We catch ONLY that specific "no plan initialized"
+        # signature, emit an attributable breadcrumb so the missing-ledger
+        # condition is never silent, and re-raise so a GENUINE state corruption is
+        # still loud — but now correctly attributed (``block_path.plan_uninitialized``)
+        # rather than surfacing as a spurious worker crash. The root mechanism was
+        # not reproducible deterministically (see report); this guard makes any
+        # recurrence diagnosable instead of self-masking.
+        if isinstance(exc, PlanConcurrentModificationError) and (
+            "no plan initialized" in str(exc)
+        ):
+            try:
+                await orch.plan_manager.ledger_append(
+                    op="block_path_plan_uninitialized",
+                    payload={
+                        "task_id": task.id,
+                        "failure_class": failure_class,
+                        "raw_error": (raw_error or "")[:300],
+                        "err": str(exc)[:300],
+                    },
+                )
+            except Exception:  # noqa: BLE001 - breadcrumb best-effort; never mask
+                pass
+        raise

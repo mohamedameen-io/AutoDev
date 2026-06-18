@@ -14,6 +14,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Generic, Literal, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, Field
@@ -126,6 +127,16 @@ class TournamentConfig:
     # the tournament does roughly 2× the work of the legacy single-pass
     # promotion.
     promotion_grade_enabled: bool = False
+    # WS2-1 (Group B): holdout-set gate. When True AND the tournament is
+    # constructed with ``holdout_cwd`` + ``holdout_baseline_commit``, the
+    # ``repeated → promotion_eligible`` transition actually RUNS the baseline
+    # holdout tests (``tournament.holdout.run_holdout_tests``) and gates the
+    # rung on the result — a failing or found-nothing holdout blocks
+    # promotion. Off by default: legacy/synthetic callers without a real repo
+    # context behave exactly as before (the "holdout-equivalent step" stays a
+    # synthetic clear). Requires ``promotion_grade_enabled=True`` to have any
+    # effect, since the ladder itself is the consumer.
+    holdout_enabled: bool = False
     # v0.18.0 C3: optional list of specialist judge roles. ``None`` (default)
     # preserves the legacy ``["judge"] * num_judges`` cohort. When set, each
     # entry becomes a judge with that role's prompt — the list length wins
@@ -172,6 +183,27 @@ class TournamentConfig:
     review_convergence_k: int = 2
     review_max_rounds: int = 5
     review_judge_roles: list[str] | None = None
+    # F-7 (field-finding): cumulative wall-clock budget (seconds) for the
+    # ENTIRE tournament pass loop. ``None`` (default) → OFF → byte-identical
+    # legacy behavior (no deadline; the loop runs to ``max_rounds`` or
+    # convergence). When > 0, :meth:`Tournament.run` records a clock reading
+    # at run-entry and checks elapsed BETWEEN passes (cheap; never mid-call).
+    # On breach it writes the best on-disk incumbent (``final_output.md``)
+    # and raises :class:`~errors.TournamentError` carrying the marker
+    # ``plan_phase_wall_budget_exceeded`` — so the existing plan-phase
+    # salvage path (which catches ``TournamentError`` and recovers the
+    # latest ``incumbent_after_NN.md``) fires instead of churning to an
+    # opaque external SIGKILL ("timed out after Ns" with no autodev reason).
+    # Set this BELOW an external/benchmark per-command timeout to make the
+    # plan phase fail LOUD (with an attributable reason) before being killed.
+    # Analog of F-2's ``corrective_nonconvergent_ceiling``.
+    wall_budget_s: float | None = None
+    # F-7: injectable monotonic clock for the wall-budget check. Defaults to
+    # ``time.monotonic`` in production; tests inject a fake clock that
+    # advances deterministically so the ceiling can be exercised without
+    # real sleeps. NOT a dataclass-comparable field's concern — only read,
+    # never serialized.
+    clock: Callable[[], float] = time.monotonic
 
 
 class PassResult(BaseModel):
@@ -579,11 +611,23 @@ class Tournament(Generic[T]):
         rng: random.Random | None = None,
         judge_plugins: list[Any] | None = None,
         voting_strategy: Any | None = None,
+        holdout_cwd: Path | None = None,
+        holdout_baseline_commit: str | None = None,
     ) -> None:
         self.handler = handler
         self.client = client
         self.cfg = cfg
         self.artifact_dir = artifact_dir
+        # WS2-1 (Group B): holdout-set gate context. When both are present and
+        # ``cfg.holdout_enabled`` is True, the ``repeated → eligible`` rung
+        # runs the real baseline holdout and gates promotion on the result.
+        # ``last_holdout_result`` is the engagement witness — None until the
+        # holdout actually fires.
+        self.holdout_cwd = holdout_cwd
+        self.holdout_baseline_commit = holdout_baseline_commit
+        from tournament.holdout import HoldoutResult
+
+        self.last_holdout_result: HoldoutResult | None = None
         self.rng = rng if rng is not None else random.Random()
         self.store = TournamentArtifactStore(artifact_dir)
         self.log = get_logger(component="tournament", artifact_dir=str(artifact_dir))
@@ -670,6 +714,79 @@ class Tournament(Generic[T]):
             return "promotion_eligible"
         # Unrecognized prior (legacy data) — anchor at the bottom rung.
         return "dev_best"
+
+    async def _next_grade_for_non_a_win_async(self) -> str:
+        """Holdout-gated wrapper around :meth:`_next_grade_for_non_a_win`.
+
+        WS2-1 (Group B): the legacy sync method advances ``repeated →
+        promotion_eligible`` on a synthetic ``judges-confirmed`` clear — the
+        "holdout-equivalent step" was never an *actual* holdout run, leaving
+        :mod:`tournament.holdout` dead code. This wrapper closes that gap: at
+        the ``repeated → eligible`` transition, when ``cfg.holdout_enabled`` is
+        set and a real repo context (``holdout_cwd`` + ``holdout_baseline_commit``)
+        is available, it RUNS the baseline holdout tests and feeds the result
+        into :func:`promotion.decide`. The holdout result becomes load-bearing:
+
+          * holdout passed → promote to ``promotion_eligible`` as before.
+          * holdout failed / found-nothing → ``decide`` returns ``no_change``;
+            the rung holds at ``repeated`` (no promotion).
+
+        ``self.last_holdout_result`` is set as the engagement witness so the
+        caller (and tests) can confirm the holdout actually fired rather than
+        being silently skipped.
+
+        When holdout is disabled or no repo context is supplied, this is a
+        thin pass-through to the sync ladder — byte-identical legacy behavior.
+        """
+        candidate = self._next_grade_for_non_a_win()
+
+        if candidate != "promotion_eligible":
+            return candidate
+        # Only the repeated → eligible transition is the holdout-equivalent
+        # step. A re-affirmation of an already-terminal ``promotion_eligible``
+        # incumbent (prior == "promotion_eligible") is not re-gated.
+        prior = self.store.latest_incumbent_grade()
+        if prior != "repeated":
+            return candidate
+        if not getattr(self.cfg, "holdout_enabled", False):
+            return candidate
+        if self.holdout_cwd is None or self.holdout_baseline_commit is None:
+            self.log.info(
+                "tournament.holdout_skipped",
+                reason="no repo context (holdout_cwd/baseline_commit missing)",
+            )
+            return candidate
+
+        from plugins.registry import GateResult
+        from tournament.holdout import extract_baseline_tests, run_holdout_tests
+        from tournament.promotion import decide
+
+        baseline_paths = await extract_baseline_tests(
+            self.holdout_cwd, self.holdout_baseline_commit
+        )
+        holdout = await run_holdout_tests(self.holdout_cwd, baseline_paths)
+        self.last_holdout_result = holdout
+        self.log.info(
+            "tournament.holdout_run",
+            test_count=holdout.test_count,
+            failure_count=holdout.failure_count,
+            passed=holdout.passed,
+            failure_summary=holdout.failure_summary[:500],
+        )
+
+        decision = decide(
+            grade="repeated",
+            gate_results=[GateResult(passed=True, details="judges-confirmed")],
+            holdout_result=holdout,
+        )
+        if decision.action != "promote_to_eligible":
+            # Holdout blocked promotion — hold at the repeated rung.
+            self.log.warning(
+                "tournament.holdout_blocked_promotion",
+                reason=decision.reason,
+            )
+            return "repeated"
+        return "promotion_eligible"
 
     async def maybe_resize_semaphore(self, observed_rss_mb: float | None) -> None:
         """Ratchet the in-flight subprocess cap DOWN if memory pressure
@@ -825,6 +942,14 @@ class Tournament(Generic[T]):
 
         history: list[PassResult] = []
 
+        # F-7: record the cumulative wall-clock start ONCE at plan-phase entry.
+        # The between-pass budget check (inside the loop below) measures
+        # elapsed against this. ``None`` budget → the check is a no-op, so this
+        # reading is unused and the path is byte-identical legacy behavior.
+        wall_budget_s = getattr(self.cfg, "wall_budget_s", None)
+        clock: Callable[[], float] = getattr(self.cfg, "clock", time.monotonic)
+        wall_start = clock()
+
         # If we resumed with an A-win streak already meeting convergence,
         # short-circuit before the loop body. (Equivalent to the "already
         # completed" path but reached via partial state rather than
@@ -837,6 +962,41 @@ class Tournament(Generic[T]):
             return incumbent, history
 
         for pass_num in range(start_pass, self.cfg.max_rounds + 1):
+            # F-7: cumulative wall-clock ceiling (fail-loud). Checked BETWEEN
+            # passes only (here, at the top of each iteration — never mid-call),
+            # so it's cheap and can never interrupt an in-flight LLM call. When
+            # the operator has set ``wall_budget_s`` (default None → skipped)
+            # and cumulative elapsed exceeds it, we STOP LOUD: persist the best
+            # on-disk incumbent (``final_output.md`` + history) so the existing
+            # plan-phase salvage path can recover it, then raise a
+            # :class:`TournamentError` carrying the greppable, attributable
+            # marker ``plan_phase_wall_budget_exceeded``. This converts an
+            # opaque external SIGKILL ("timed out after Ns") into an
+            # autodev-emitted reason. Mirrors F-2's nonconvergence ceiling.
+            if wall_budget_s is not None and wall_budget_s > 0:
+                elapsed = clock() - wall_start
+                if elapsed > wall_budget_s:
+                    self.log.warning(
+                        "tournament.wall_budget_exceeded",
+                        elapsed_s=round(elapsed, 3),
+                        budget_s=wall_budget_s,
+                        passes_completed=len(history),
+                        next_pass=pass_num,
+                    )
+                    # Persist the best incumbent so salvage has a target. This
+                    # is the same final write the normal exit path makes —
+                    # idempotent and crash-safe (atomic write/rename).
+                    self.store.write_final(
+                        self.handler.render_as_markdown(incumbent), history
+                    )
+                    raise TournamentError(
+                        "plan_phase_wall_budget_exceeded: tournament wall-clock "
+                        f"budget of {wall_budget_s}s exceeded after "
+                        f"{round(elapsed, 1)}s ({len(history)} pass(es) "
+                        "completed); stopping LOUD with the best on-disk "
+                        "incumbent instead of churning to an external timeout."
+                    )
+
             # Pass `partial` only into the first iteration of the resumed pass.
             pass_partial = (
                 resume.partial
@@ -893,7 +1053,7 @@ class Tournament(Generic[T]):
                 # When disabled, the legacy default (``dev_best``) is
                 # written so the sidecar artifact is always present
                 # regardless of feature gating.
-                grade_to_write = self._next_grade_for_non_a_win()
+                grade_to_write = await self._next_grade_for_non_a_win_async()
                 self.store.write_incumbent_after(
                     pass_num,
                     self.handler.render_as_markdown(incumbent),

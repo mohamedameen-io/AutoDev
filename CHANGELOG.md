@@ -4,6 +4,46 @@ All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
+### v1.0 "any task, any repo" stabilization (release candidate on `stabilization-v1`)
+
+Resolves the stabilization charter (`thoughts/plans/autodev-stabilization-implementation.md`): the build now
+**provably clears the release gate** — every fix ships with an engagement / non-vacuity test whose
+deliberately-broken control turns it **red** (the property Runs 4–6 lacked). All non-`[FIELD]` gates green in CI;
+the `[FIELD]` gates (A4 CLI tool-enforcement, per-language live runners, critic-bounded, 50k-repo) are handed to
+the operator-gated Phase-4 field re-validation (`field-probes/REVALIDATION.md`). Full suite 4125 passed; `ruff
+check src tests` + `mypy src` exit 0 and are enforced CI jobs.
+
+#### Recovery coherence (the empirically-confirmed delivery binding constraint — R1–R7)
+- **The conflict cascade no longer blocks.** `conflict_3way_failed → re_architect → fell_through → blocked` (the
+  universal field failure across feature/refactor/50k-repo probes) is fixed: structural resolver actions
+  (`re_architect`/`re_plan`/`narrow_scope`/`split_task`) now synthesize a **parseable** corrective direction →
+  inject corrective tasks → the task recovers (`skipped`) instead of dead-ending (R3).
+- The resolver is no longer **shadowed** by the legacy ladder: the chokepoint moved **before** `next_step` in
+  `_try_retry_or_escalate`, receiving the **real** `failure_class` (not `UNKNOWN`) (R2/R3, gate R3 keystone).
+- Resume-safe per-agent budget (`budget_cycle` ledger op + rehydrate) (R4); terminal breadcrumb completeness —
+  every `blocked`/`quarantined` preceded by one typed decision op (R1); quarantine/infra routes through the
+  resolver (R6); the F1d invariant now also covers direct `t.status="blocked"` assigns + variable-routed calls
+  (R5); the approved-on-exhaustion path rejects an **infra soft-pass** completion (R7); `OVERSIZED_INPUT` class +
+  budget no longer grants *more* turns on context bloat (BOUND_INPUT).
+
+#### No silent wrong-pass (G1–G3) / generality (G4–G7)
+- Non-vacuous test gate (0 tests in a non-empty scope → fail-loud, 3-way-distinct), toolchain-absent
+  degrade-loud, QA gates verify the **worktree** (not the pre-change tree), holdout **wired** into the tournament,
+  reproduce-gate fails loud on unreadable evidence.
+- Weighted polyglot/monorepo language detection + gradle-kts; first-class Java runners (Maven/Gradle) + cargo
+  `--workspace` + TS syntax globs; dotnet/ruby/swift degrade-loud; `language_unsupported` ledger op; submodule +
+  generated-tree exclusion from detection and gating.
+
+#### Task-type / scale / trust-infra (N1–N5, S2–S4)
+- `is_bug_fix` word-anchored (features no longer misrouted to bug-diagnosis); framing taxonomy gains
+  feature/refactor/greenfield (a feature is framed as a feature); `repo_probe` scale signals wired into intake →
+  framing altitude (S4); non-git full-suite fallback (S3); configurable `build_check_timeout_s` (S2); determinism
+  gate (N5); benchmark-harness scores AutoDev's committed fix + refactor structural-change (so Phase 4 scores
+  correctly).
+- Trust infrastructure: `STUB_STRICT` strict-mode, an unmocked intake→diagnosis→framing→execute e2e test, the
+  failure-class AST wiring gate (all `_fcls.*` sites), and the behavioral release-preflight (`preflight_v100`
+  runs `pytest -m resolver_enabled`, fails on 0-collected) wired into release CI.
+
 ## [0.42.1] - 2026-06-16
 
 Make the v0.42.0 features **actually engage in the field**. The Run-5 gate

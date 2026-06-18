@@ -9,6 +9,34 @@ on:
       - main
 
 jobs:
+  # N1 (closes WS3-ruff-mypy-gate-missing-from-ci, WS3-mypy-concrete-errors):
+  # an ENFORCED static gate. ``ruff check src tests`` and ``mypy src`` both run
+  # and FAIL the job on any error. A PR that adds a new unused import (F401) to
+  # src/ fails here inherently, because ruff runs over src/ — this is not a
+  # presence grep, it is the real linter executing on the changed tree.
+  lint:
+    name: Lint (ruff + mypy) — enforced
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: ruff check (src + tests) — fails on any lint error
+        run: uv run ruff check src tests
+
+      - name: mypy (src) — fails on any type error
+        run: uv run mypy src
+
   test:
     name: Run pytest
     runs-on: ubuntu-latest

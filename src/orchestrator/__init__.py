@@ -246,9 +246,17 @@ class Orchestrator:
         # ``result.subtype``. Owned by the orchestrator (one tracker
         # per instance) so a fresh session resets the ladder by design.
         # See :mod:`orchestrator.budget_escalation`.
+        # RECOVERY-CONTRACT §7 Step 2 (gate R4): the counter is now resume-safe.
+        # Rehydrate from the on-disk ``budget_cycle`` ledger ops so a fresh
+        # Orchestrator on a resumed cwd picks up where the prior session left
+        # off (escalating / exhausting) instead of restarting the ladder at 0.
+        # ``rehydrate_from_ledger`` is best-effort — a fresh run (empty ledger)
+        # yields an all-0 tracker, byte-identical to the prior in-memory default.
         from orchestrator.budget_escalation import BudgetEscalationTracker
 
-        self._budget_escalation_tracker = BudgetEscalationTracker()
+        self._budget_escalation_tracker = (
+            BudgetEscalationTracker.rehydrate_from_ledger(cwd)
+        )
 
         # Wire AgentExtensionPlugins: merge their specs into the agent registry.
         if plugin_registry is not None:

@@ -18,7 +18,7 @@ from agents import build_registry
 from autologging import get_logger
 from cli._blocked_banner import _maybe_print_blocked_banner
 from config.loader import load_config
-from errors import AutodevError
+from errors import AutodevError, PhaseStuckError
 from orchestrator import Orchestrator
 from state.paths import config_path, index_db_path
 
@@ -137,6 +137,16 @@ def resume(platform: str | None) -> None:
 
     try:
         asyncio.run(_run())
+    except PhaseStuckError as exc:
+        # A PhaseStuckError means the run was interrupted and left tasks
+        # wedged in a non-terminal state — NOT a genuine implementation
+        # failure. Exit 1 ("interrupted / please resume") rather than 2
+        # ("genuine failure") so callers can distinguish "run delivered
+        # something but stalled" from "the adapter or plan was broken."
+        console.print(
+            f"[yellow]autodev resume interrupted[/yellow]: {exc}"
+        )
+        sys.exit(1)
     except AutodevError as exc:
         console.print(f"[red]autodev resume failed[/red]: {exc}")
         sys.exit(2)

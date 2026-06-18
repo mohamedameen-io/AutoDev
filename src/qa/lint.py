@@ -3,13 +3,36 @@
 Runs the detected linter for the project and returns a
 :class:`~plugins.registry.GateResult`.
 
-Graceful degradation: if the linter binary is not installed, the gate passes
-with an informational message.
+Toolchain-absent degrade-LOUD (WS2-6)
+-------------------------------------
+A missing linter binary is *unknown*, not *clean*. When the linter is absent
+(``FileNotFoundError``) this gate now returns ``passed=False`` with a
+``skipped_toolchain_missing`` signal instead of silently passing.
+
+ESLint config-absent skip (stabilization-v1)
+--------------------------------------------
+ESLint v9+ requires an ``eslint.config.js`` (or equivalent) and exits non-zero
+with a setup error when none is found.  That is not a code violation — it is an
+environment condition.  When no eslint config is detected in *cwd*, the gate
+returns ``passed=True`` with ``skipped_lint_no_config=True`` (mirroring the
+language/linter-absent skip pattern already used here).
+
+Tool setup / env errors (stabilization-v1)
+------------------------------------------
+ENOENT (tool not on PATH) and ESLint's "couldn't find a configuration file"
+output are environment failures, not code violations.  These are now classified
+as ``severity="warn"`` (``passed=True``) so the pipeline continues and the
+issue is surfaced as a non-blocking advisory.  Genuine lint violations
+(non-zero exit without any setup-error signal) remain ``severity="block"``.
+Note: the ESLint config-absent and tool-env-error cases are intentional
+exceptions to the "unconditional passed=False on tool errors" rule — they
+degrade to skip/warn rather than block, by design.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from plugins.registry import GateResult
@@ -73,7 +96,15 @@ async def _run_subprocess(
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except FileNotFoundError:
-        return GateResult(passed=True, details=f"{tool_name} not found, skipping lint")
+        # WS2-6: degrade loud — a missing linter is unknown, not clean.
+        return GateResult(
+            passed=False,
+            details=(
+                f"{tool_name} not installed: lint toolchain missing "
+                "(skipped_toolchain_missing)"
+            ),
+            metrics={"skipped_toolchain_missing": True, "tool": tool_name},
+        )
     except asyncio.TimeoutError:
         return GateResult(passed=False, details=f"{tool_name} lint timed out")
 
@@ -110,13 +141,109 @@ async def _run_python_lint(
     return await _run_subprocess(args, cwd, timeout_s=timeout_s, tool_name=linter)
 
 
+def _has_eslint_config(cwd: Path) -> bool:
+    """Return True if *cwd* contains an ESLint configuration.
+
+    Checks for:
+    * ``eslint.config.{js,mjs,cjs,ts,mts,cts}`` (ESLint v9+ flat config; TS
+      variants are supported by ESLint 9.10+)
+    * ``.eslintrc``, ``.eslintrc.{js,cjs,yaml,yml,json}`` (legacy)
+    * ``package.json`` with an ``"eslintConfig"`` key
+    """
+    flat_configs = (
+        "eslint.config.js",
+        "eslint.config.mjs",
+        "eslint.config.cjs",
+        "eslint.config.ts",
+        "eslint.config.mts",
+        "eslint.config.cts",
+    )
+    for name in flat_configs:
+        if (cwd / name).is_file():
+            return True
+
+    legacy_configs = (
+        ".eslintrc",
+        ".eslintrc.js",
+        ".eslintrc.cjs",
+        ".eslintrc.yaml",
+        ".eslintrc.yml",
+        ".eslintrc.json",
+    )
+    for name in legacy_configs:
+        if (cwd / name).is_file():
+            return True
+
+    pkg = cwd / "package.json"
+    if pkg.is_file():
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "eslintConfig" in data:
+                return True
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    return False
+
+
+# stabilization-v1: ESLint v9+ emits one of these *startup* errors when it cannot
+# find / load its config.  These are environment conditions, not code violations.
+#
+# IMPORTANT: every signal is tightly anchored to ESLint's actual config-not-found
+# startup message — a find/locate verb paired with a config noun, or the literal
+# "no eslint configuration found".  We deliberately do NOT match bare substrings
+# like "configuration file", "eslint config", or "no config": a genuine lint
+# violation whose rule advisory merely *contains* such a phrase (e.g. "specify
+# 'env.node: true' in your configuration file") must stay passed=False/block and
+# never be demoted to a non-blocking warn.
+_ESLINT_SETUP_ERROR_SIGNALS = (
+    "couldn't find a configuration file",
+    "couldn't find an eslint.config",
+    "could not find a configuration file",
+    "could not find an eslint.config",
+    "could not find the config file",
+    "no eslint configuration found",
+)
+
+
 async def _run_eslint(cwd: Path, *, timeout_s: float) -> GateResult:
+    # stabilization-v1: pre-check for eslint config.  ESLint v9+ exits non-zero
+    # with a setup error when none is found; that is not a code violation.
+    # Mirror the language/linter-absent skip pattern used elsewhere in this file.
+    if not _has_eslint_config(cwd):
+        return GateResult(
+            passed=True,
+            details="eslint: no config file found, skipping lint",
+            metrics={"skipped_lint_no_config": True},
+        )
     # Prefer local npx eslint; fall back gracefully.
-    return await _run_subprocess(["npx", "eslint", "."], cwd, timeout_s=timeout_s, tool_name="eslint")
+    result = await _run_subprocess(["npx", "eslint", "."], cwd, timeout_s=timeout_s, tool_name="eslint")
+
+    if not result.passed:
+        # stabilization-v1: re-classify ESLint tool/env failures as warn (non-blocking).
+        # ENOENT (npx/eslint not on PATH) or ESLint config-not-found output are
+        # environment conditions, not code violations — surface as advisory, continue.
+        is_toolchain_missing = result.metrics.get("skipped_toolchain_missing", False)
+        combined_lower = result.details.lower()
+        is_setup_error = any(sig in combined_lower for sig in _ESLINT_SETUP_ERROR_SIGNALS)
+        if is_toolchain_missing or is_setup_error:
+            return GateResult(
+                passed=True,
+                severity="warn",
+                details=result.details,
+                metrics={**result.metrics, "lint_setup_error": True},
+            )
+
+    return result
 
 
 async def _run_cargo_clippy(cwd: Path, *, timeout_s: float) -> GateResult:
-    return await _run_subprocess(["cargo", "clippy"], cwd, timeout_s=timeout_s, tool_name="cargo clippy")
+    # WS2-10: ``--workspace`` lints every member crate, not just the package in
+    # ``cwd``. A lone-package (non-workspace) repo is treated by cargo as a
+    # one-member workspace, so the flag is safe to pass unconditionally.
+    return await _run_subprocess(
+        ["cargo", "clippy", "--workspace"], cwd, timeout_s=timeout_s, tool_name="cargo clippy"
+    )
 
 
 async def _run_golangci_lint(cwd: Path, *, timeout_s: float) -> GateResult:

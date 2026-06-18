@@ -46,7 +46,6 @@ Default thresholds (Fontana 2015 anchors)
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -112,7 +111,7 @@ def _iter_python_files(cwd: Path, paths: list[Path] | None) -> list[Path]:
         return out
 
     seen: set[Path] = set()
-    out: list[Path] = []
+    out = []
     for raw in paths:
         candidate = raw if raw.is_absolute() else cwd / raw
         # Bug #3 (v0.25.1): ``resolve()`` raises ``ValueError`` on embedded

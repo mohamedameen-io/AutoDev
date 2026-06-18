@@ -778,10 +778,10 @@ async def run_review_tournament(
         task_id=task.id,
         rounds=rounds_run,
     )
-    winning_cand = last_candidates.get(last_winner) if last_candidates else None
+    last_winning_cand = last_candidates.get(last_winner) if last_candidates else None
     return ReviewTournamentResult(
-        winning_verdict=winning_cand.verdict if winning_cand else "MALFORMED",
-        winning_issues=winning_cand.issues if winning_cand else [],
+        winning_verdict=last_winning_cand.verdict if last_winning_cand else "MALFORMED",
+        winning_issues=last_winning_cand.issues if last_winning_cand else [],
         winning_label=last_winner,
         tournament_id=tournament_id,
         converged=False,

@@ -137,7 +137,8 @@ async def test_below_threshold_preserves_legacy_continue_behavior(
     task = (await pm.get_task("1.1")) or pytest.fail("task not found")
     # First call: retry path (retry_limit=3, no escalation yet).
     out = await ep._try_retry_or_escalate(
-        orch, task, retry_limit=3, reason="coder failure"
+        orch, task, retry_limit=3, reason="coder failure",
+        failure_class="worker_exception",
     )
     assert out.escalated is False
     # Stuck state was bumped to discard_count=1.
@@ -179,7 +180,8 @@ async def test_3_discards_invokes_stuck_critic_in_refine_mode(
 
     monkeypatch.setattr(ep, "_escalate_stuck_to_critic", fake_escalate)
     out = await ep._try_retry_or_escalate(
-        orch, task, retry_limit=10, reason="coder failure"
+        orch, task, retry_limit=10, reason="coder failure",
+        failure_class="worker_exception",
     )
     # The legacy 'escalated' flag is NOT set on a REFINE — the task is
     # restarted with fresh guidance, not blocked.
@@ -219,7 +221,8 @@ async def test_5_discards_invokes_stuck_critic_in_pivot_mode(
 
     monkeypatch.setattr(ep, "_escalate_stuck_to_critic", fake_escalate)
     out = await ep._try_retry_or_escalate(
-        orch, task, retry_limit=10, reason="coder failure"
+        orch, task, retry_limit=10, reason="coder failure",
+        failure_class="worker_exception",
     )
     assert out.escalated is False
     assert captured == ["PIVOT"]
@@ -265,7 +268,8 @@ async def test_3_pivots_invokes_stuck_critic_in_soft_blocker_mode(
 
     monkeypatch.setattr(ep, "_escalate_stuck_to_critic", fake_escalate)
     out = await ep._try_retry_or_escalate(
-        orch, task, retry_limit=10, reason="coder failure"
+        orch, task, retry_limit=10, reason="coder failure",
+        failure_class="worker_exception",
     )
     # v0.17.0: at pivot_count=2 + search_count=0, the ladder returns
     # ``WEB_SEARCH``. The legacy v0.15.0 expectation was PIVOT/SOFT_BLOCKER.
@@ -315,7 +319,8 @@ async def test_soft_blocker_resolution_blocks_task(
 
     monkeypatch.setattr(ep, "_escalate_stuck_to_critic", fake_escalate)
     out = await ep._try_retry_or_escalate(
-        orch, task, retry_limit=10, reason="coder failure"
+        orch, task, retry_limit=10, reason="coder failure",
+        failure_class="worker_exception",
     )
     assert out.escalated is True
     assert out.status == "blocked"

@@ -31,8 +31,28 @@ def _resolver_disabled_by_default(
     covered by tests marked ``@pytest.mark.resolver_enabled`` (which opt back
     in). Production / the CLI / the benchmark do NOT set this env var, so the
     resolver is ON there.
+
+    Two env vars participate here, and the distinction is the whole point of the
+    N2 release-gate broken-control (Phase 0 / B6):
+
+    * ``AUTODEV_RESOLVER_DISABLED`` — the suite's INTERNAL default-off knob. It
+      is fully *auto-managed* by this fixture: for ``resolver_enabled`` tests it
+      is force-DELETED (resolver ON), otherwise force-SET (resolver OFF). An
+      external value is therefore NEUTRALIZED — which is exactly why it cannot
+      serve as the release broken-control.
+    * ``AUTODEV_RESOLVER_FORCE_DISABLED`` — the OPERATOR override. When set to
+      ``"1"`` this fixture does NOT auto-unset the resolver even for
+      ``resolver_enabled`` tests; instead it forces the resolver OFF for the
+      WHOLE suite. This is the valid N2 broken-control: it turns the engagement
+      assertions (e.g. ``test_resolver_reached_from_real_loop``) RED, proving
+      the engagement gate fires on the planted disable rather than passing
+      vacuously.
+
+    Backward-compatible: when ``AUTODEV_RESOLVER_FORCE_DISABLED`` is unset,
+    behavior is identical to the prior implementation.
     """
-    if request.node.get_closest_marker("resolver_enabled"):
+    force_off = os.environ.get("AUTODEV_RESOLVER_FORCE_DISABLED") == "1"
+    if request.node.get_closest_marker("resolver_enabled") and not force_off:
         monkeypatch.delenv("AUTODEV_RESOLVER_DISABLED", raising=False)
     else:
         monkeypatch.setenv("AUTODEV_RESOLVER_DISABLED", "1")

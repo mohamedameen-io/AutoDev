@@ -10,6 +10,7 @@ from state.schemas import AcceptanceCriterion
 from tournament.phase_review import (
     PhaseReviewBundle,
     _PhaseReviewContentHandler,
+    parse_critic_advisory_note,
 )
 
 
@@ -183,3 +184,86 @@ def test_hash_stable_across_calls() -> None:
     # Variant label participates → A vs B differ.
     b = _make_bundle("B", direction_text="- B direction")
     assert h.hash(t) != h.hash(b)
+
+
+# ---------------------------------------------------------------------------
+# B2: reviewer over-engineering advisory — prompt
+# ---------------------------------------------------------------------------
+
+
+def test_render_for_critic_asks_for_advisory_note() -> None:
+    """v1.0 B2: critic prompt must ask for an over-engineering/tech-debt advisory.
+
+    The prompt must:
+    1. Request an advisory note in an OVER_ENGINEERING_ADVISORY: section.
+    2. Explicitly frame it as advisory / non-blocking.
+    3. Clarify it must NOT change the verdict.
+    """
+    h = _PhaseReviewContentHandler()
+    t = _make_bundle()
+    out = h.render_for_critic(t, "Refactor the dispatcher.")
+    # Section marker present.
+    assert "OVER_ENGINEERING_ADVISORY" in out
+    # Advisory / non-blocking framing present.
+    assert any(
+        kw in out.lower()
+        for kw in ("advisory", "non-blocking", "nonblocking", "not a reason")
+    ), "Prompt must frame the note as advisory/non-blocking"
+    # Must not change verdict — explicit instruction.
+    assert any(
+        phrase in out.lower()
+        for phrase in ("not change", "does not change", "do not change", "must not change")
+    ), "Prompt must instruct that the note does NOT change the verdict"
+
+
+# ---------------------------------------------------------------------------
+# B2: parse_critic_advisory_note
+# ---------------------------------------------------------------------------
+
+
+def test_parse_critic_advisory_note_present() -> None:
+    """Advisory section is extracted when the critic includes it."""
+    critic_output = (
+        "Some problems found:\n"
+        "- Missing test for edge case.\n\n"
+        "OVER_ENGINEERING_ADVISORY: The implementation added three new\n"
+        "wrapper classes that could have been inlined.\n"
+    )
+    note = parse_critic_advisory_note(critic_output)
+    assert note is not None
+    assert "wrapper classes" in note
+    # Note text must not include the section marker.
+    assert "OVER_ENGINEERING_ADVISORY:" not in note
+
+
+def test_parse_critic_advisory_note_absent_returns_none() -> None:
+    """No advisory section → graceful None, no crash."""
+    critic_output = (
+        "PROBLEMS FOUND:\n"
+        "- Acceptance criterion 1 is not met.\n"
+    )
+    note = parse_critic_advisory_note(critic_output)
+    assert note is None
+
+
+def test_parse_critic_advisory_note_empty_section_returns_none() -> None:
+    """Explicit empty advisory section returns None (or empty string handled gracefully)."""
+    critic_output = "Some problems.\n\nOVER_ENGINEERING_ADVISORY:\n"
+    note = parse_critic_advisory_note(critic_output)
+    # None or empty string both acceptable — must not raise.
+    assert note is None or note.strip() == ""
+
+
+def test_parse_critic_advisory_note_multiline() -> None:
+    """Multi-line advisory body is captured in full."""
+    critic_output = (
+        "Problem 1.\n\n"
+        "OVER_ENGINEERING_ADVISORY: Line one of advisory.\n"
+        "Line two of advisory.\n"
+        "Line three.\n"
+    )
+    note = parse_critic_advisory_note(critic_output)
+    assert note is not None
+    assert "Line one" in note
+    assert "Line two" in note
+    assert "Line three" in note

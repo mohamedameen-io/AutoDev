@@ -120,6 +120,40 @@ include = [
     "/LICENSE",
 ]
 
+[tool.ruff]
+# Match the project's minimum supported Python (requires-python = ">=3.11").
+target-version = "py311"
+# Code in src/ runs up to ~100 cols in places; set the limit to reality so the
+# formatter/imports don't fight existing style. NOTE: E501 (line-too-long) is
+# NOT in the default rule selection below, so this value does not add errors —
+# it only documents intent and guides any future `ruff format` use.
+line-length = 100
+src = ["src", "tests"]
+# tests/fixtures/ holds verbatim code SAMPLES used as test INPUT (e.g. the
+# anti_bloat pairs whose whole purpose is to contain dead imports / bloat for
+# the code-size gate to measure). Linting — or worse, auto-fixing — them would
+# corrupt the fixtures and break the tests, so they are data, not source.
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+# Keep ruff's default rule set (E4/E7/E9 pycodestyle + F pyflakes). This is the
+# exact selection that produced the gate-N1 baseline (F401/F841/E402/E741/F821/
+# F822). Do NOT broaden it here — broadening is a separate, explicit decision.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+# Pin config so `mypy src` is reproducible in CI. These settings reproduce the
+# CURRENT effective (default) strictness that produced the gate-N1 baseline of
+# 34 errors — they do NOT crank strictness higher.
+python_version = "3.11"
+# src/ is a PEP-420 namespace layout (no src/__init__.py); mirror the pytest
+# pythonpath so imports like `orchestrator.*` and `state.*` resolve.
+mypy_path = ["src", "."]
+namespace_packages = true
+explicit_package_bases = true
+# Third-party deps without type stubs (e.g. radon) must not fail the gate.
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

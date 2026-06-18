@@ -73,7 +73,7 @@ def test_init_builds_empty_index_for_empty_repo(tmp_path: Path) -> None:
         return_value=_FakeCapacity(is_huge=False)
     )
 
-    with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
+    with runner.isolated_filesystem(temp_dir=tmp_path):
         with mock.patch.dict(
             "sys.modules",
             {
@@ -108,7 +108,7 @@ def test_init_builds_populated_index_for_small_fixture(tmp_path: Path) -> None:
         return_value=_FakeCapacity(is_huge=False)
     )
 
-    with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
+    with runner.isolated_filesystem(temp_dir=tmp_path):
         with mock.patch.dict(
             "sys.modules", {"state.file_index": fake_index_module}
         ), mock.patch(
@@ -153,7 +153,7 @@ def test_init_async_for_huge_repo(tmp_path: Path) -> None:
         cfg.index_huge_repo_async_init = True
         return cfg
 
-    with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
+    with runner.isolated_filesystem(temp_dir=tmp_path):
         with mock.patch.dict(
             "sys.modules", {"state.file_index": fake_index_module}
         ), mock.patch(

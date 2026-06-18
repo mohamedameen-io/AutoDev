@@ -2,6 +2,7 @@
 
 from .scorer import (
     apply_patch_to_repo,
+    diff_since_commit,
     extract_diff_from_ledger,
     score_benchmark_results,
     score_task_with_patch,
@@ -15,6 +16,7 @@ from .task_runner import (
 
 __all__ = [
     "apply_patch_to_repo",
+    "diff_since_commit",
     "extract_diff_from_ledger",
     "score_benchmark_results",
     "score_task_with_patch",

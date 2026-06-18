@@ -1,0 +1,92 @@
+diff --git a/contacts.py b/contacts.py
+index 07869c0..6e2a1e3 100644
+--- a/contacts.py
++++ b/contacts.py
+@@ -1,18 +1,6 @@
+ """Contact records."""
+ 
+-
+-def _valid_email(addr: str) -> bool:
+-    # Triplicated across users.py / orders.py / contacts.py — extract me.
+-    if not isinstance(addr, str):
+-        return False
+-    if addr.count("@") != 1:
+-        return False
+-    local, _, domain = addr.partition("@")
+-    if not local or not domain:
+-        return False
+-    if "." not in domain:
+-        return False
+-    return True
++from validation import _valid_email
+ 
+ 
+ def add_contact(name: str, email: str) -> dict:
+diff --git a/orders.py b/orders.py
+index 8054273..c969698 100644
+--- a/orders.py
++++ b/orders.py
+@@ -1,18 +1,6 @@
+ """Order records."""
+ 
+-
+-def _valid_email(addr: str) -> bool:
+-    # Triplicated across users.py / orders.py / contacts.py — extract me.
+-    if not isinstance(addr, str):
+-        return False
+-    if addr.count("@") != 1:
+-        return False
+-    local, _, domain = addr.partition("@")
+-    if not local or not domain:
+-        return False
+-    if "." not in domain:
+-        return False
+-    return True
++from validation import _valid_email
+ 
+ 
+ def order_receipt_email(email: str) -> bool:
+diff --git a/users.py b/users.py
+index c368bf0..1735049 100644
+--- a/users.py
++++ b/users.py
+@@ -1,18 +1,6 @@
+ """User records."""
+ 
+-
+-def _valid_email(addr: str) -> bool:
+-    # Triplicated across users.py / orders.py / contacts.py — extract me.
+-    if not isinstance(addr, str):
+-        return False
+-    if addr.count("@") != 1:
+-        return False
+-    local, _, domain = addr.partition("@")
+-    if not local or not domain:
+-        return False
+-    if "." not in domain:
+-        return False
+-    return True
++from validation import _valid_email
+ 
+ 
+ def register_user(name: str, email: str) -> dict:
+diff --git a/validation.py b/validation.py
+new file mode 100644
+index 0000000..8f373e6
+--- /dev/null
++++ b/validation.py
+@@ -0,0 +1,14 @@
++"""Shared validation helpers."""
++
++
++def _valid_email(addr: str) -> bool:
++    if not isinstance(addr, str):
++        return False
++    if addr.count("@") != 1:
++        return False
++    local, _, domain = addr.partition("@")
++    if not local or not domain:
++        return False
++    if "." not in domain:
++        return False
++    return True

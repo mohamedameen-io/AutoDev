@@ -503,6 +503,19 @@ class ReviewEvidence(_BaseEvidence):
     output_text: str = ""
     # v0.31.0 (Phase 1.2): see ``CoderEvidence.raw_response``.
     raw_response: str | None = None
+    # Phase 1A R7 (STABLE-RELEASE-GATE): INFRA soft-pass marker. Set
+    # ``True`` ONLY when this APPROVED verdict is a soft-pass for an
+    # infrastructural reason (the *reviewer* exhausted its turn budget so
+    # the developer diff was accepted WITHOUT a genuine reviewer verdict),
+    # NOT a real reviewer APPROVED. The approved-on-exhaustion completion
+    # gate (:func:`orchestrator.execute_phase._maybe_accept_approved_on_exhaustion`)
+    # REFUSES to auto-complete a turn-exhausted task on a soft-passed
+    # APPROVED — only a GENUINE (``soft_passed`` None/False) APPROVED may
+    # complete. A real reviewer APPROVED leaves this ``None``. Optional with
+    # a ``None`` default for backward compatibility with evidence files
+    # written before this field existed (they deserialise as genuine).
+    soft_passed: bool | None = None
+    soft_pass_reason: str | None = None
 
 
 class TestEvidence(_BaseEvidence):
@@ -583,7 +596,16 @@ class FramingEvidence(_BaseEvidence):
     model_config = ConfigDict(extra="forbid")
 
     kind: Literal["framing"] = "framing"
-    classification: Literal["local_defect", "realized_design_failure"]
+    # WS2-17: the two original BUG classes plus three WORK-TYPE classes. Feature
+    # / refactor / greenfield specs are no longer forced to ``local_defect``;
+    # existing evidence files (only the two bug classes) still deserialize.
+    classification: Literal[
+        "local_defect",
+        "realized_design_failure",
+        "feature",
+        "refactor",
+        "greenfield",
+    ]
     confidence: float = Field(ge=0.0, le=1.0)
     hypothesis_challenged: str
     signals_fired: list[str] = Field(default_factory=list)
@@ -689,6 +711,13 @@ class IntakeEvidence(_BaseEvidence):
     locked_spec_hash: str
     sources_used: list[str] = Field(default_factory=list)
     excluded_globs: list[str] = Field(default_factory=list)
+    # WS-SCALE-01 (gate S4): repo-scale signals READ from
+    # ``runtime.repo_probe.RepoCapacity`` and surfaced for downstream framing.
+    # At minimum carries ``{'is_large','depth_max','avg_file_size_bytes'}``;
+    # ``is_large`` is True iff ``depth_max > 8`` OR ``avg_file_size_bytes >
+    # 50_000``. Default ``{}`` preserves back-compat for evidence written
+    # before the field existed (resume re-derives an empty-but-typed dict).
+    scale_context: dict[str, object] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import re
+import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,7 @@ from tournament.errors import (
     AuthenticationFailedError,
     InfrastructureCircuitOpenError,
 )
+from tournament.prompts import build_developer_prompt
 from tournament.task_overrides import (
     resolve_task_max_turns,
     resolve_task_timeout_s,
@@ -78,7 +80,9 @@ from tournament.task_overrides import (
 
 
 if TYPE_CHECKING:
+    from config.schema import QAGatesConfig
     from orchestrator import Orchestrator
+    from state.schemas import RecoveryHint
 
 
 logger = get_logger(__name__)
@@ -342,7 +346,7 @@ def _build_recovery_hint(
         ]
     )
     return RecoveryHint(
-        class_=hint_class,
+        class_=hint_class,  # type: ignore[call-arg]  # pydantic alias: class_ valid via populate_by_name
         recommended_user_action=action,
         relevant_evidence_files=evid,
         relevant_debug_files=dbg,
@@ -495,7 +499,7 @@ async def _build_recent_evidence_block(
 
 def _build_recovery_hint_from_reason(
     *, task_id: str, reason: str
-) -> "state.schemas.RecoveryHint":  # noqa: F821 — string annotation, lazy import
+) -> "RecoveryHint":
     """Map a free-form ``reason`` string to a typed :class:`RecoveryHint`.
 
     Used by sites that already classify via the ``reason`` text passed
@@ -1195,6 +1199,108 @@ async def _reset_skip_corrective_counter(
         )
 
 
+# F-2 (field-finding): PHASE-scoped non-convergence ceiling. The per-(task,
+# failure_class) cycle guard in ``_maybe_resolve_blocker`` never bounds the
+# cross-corrective-task loop because each freshly-minted corrective has a NEW id
+# => a fresh per-task counter. These helpers track, per phase + failure_class,
+# the count of CONSECUTIVE same-class correctives minted without forward
+# progress. Keyed on ``Phase.metadata`` (mirrors ``skip_corrective_count``) so
+# corrective-task-id churn cannot reset it. Per-class keying means a DIFFERENT
+# failure_class is a fresh (zero) counter for free.
+_CORRECTIVE_CYCLE_META_PREFIX = "corrective_cycle_count:"
+
+
+def _corrective_cycle_key(failure_class: str) -> str:
+    """Metadata key for the per-phase same-class corrective-cycle counter."""
+    return f"{_CORRECTIVE_CYCLE_META_PREFIX}{failure_class}"
+
+
+async def _corrective_cycle_count(
+    orch: "Orchestrator", *, phase_id: str, failure_class: str
+) -> int:
+    """Read the current per-phase same-class corrective-cycle count (0 if unset
+    or unreadable — fail-open so an unreadable counter never blocks recovery)."""
+    try:
+        plan = await orch.plan_manager.load()
+        if plan is None:
+            return 0
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            return 0
+        return int(
+            (phase.metadata or {}).get(_corrective_cycle_key(failure_class), 0)
+        )
+    except Exception as exc:  # noqa: BLE001 - read must never break the loop
+        logger.warning(
+            "execute_phase.corrective_cycle_count_read_failed",
+            phase_id=phase_id,
+            failure_class=failure_class,
+            err=str(exc),
+        )
+        return 0
+
+
+async def _bump_corrective_cycle_counter(
+    orch: "Orchestrator", *, phase_id: str, failure_class: str
+) -> int:
+    """Increment the per-phase same-class corrective-cycle counter and return the
+    NEW value. Best-effort: a persistence failure logs + returns the pre-bump
+    value rather than masking the mint (the ceiling is advisory loop-safety, not
+    a correctness invariant of the mint itself)."""
+    prior = 0
+    try:
+        prior = await _corrective_cycle_count(
+            orch, phase_id=phase_id, failure_class=failure_class
+        )
+        new_count = prior + 1
+        await orch.plan_manager.update_phase_meta(
+            phase_id,
+            metadata={_corrective_cycle_key(failure_class): new_count},
+        )
+        return new_count
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.corrective_cycle_counter_bump_failed",
+            phase_id=phase_id,
+            failure_class=failure_class,
+            err=str(exc),
+        )
+        return prior
+
+
+async def _reset_corrective_cycle_counters(
+    orch: "Orchestrator", *, phase_id: str
+) -> None:
+    """Reset ALL per-phase same-class corrective-cycle counters to 0 on forward
+    progress (a task in the phase completing). PRESERVES legitimate recovery:
+    once the loop actually delivers, the ceiling budget is replenished so a later
+    same-class conflict gets a full fresh budget rather than tripping on stale
+    history. No-op when no counter is set (avoids a redundant ledger entry on the
+    happy path)."""
+    try:
+        plan = await orch.plan_manager.load()
+        if plan is None:
+            return
+        phase = next((p for p in plan.phases if p.id == phase_id), None)
+        if phase is None:
+            return
+        meta = phase.metadata or {}
+        stale = {
+            k: 0
+            for k, v in meta.items()
+            if k.startswith(_CORRECTIVE_CYCLE_META_PREFIX) and int(v or 0) != 0
+        }
+        if not stale:
+            return
+        await orch.plan_manager.update_phase_meta(phase_id, metadata=stale)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.corrective_cycle_counter_reset_failed",
+            phase_id=phase_id,
+            err=str(exc),
+        )
+
+
 async def _dispatch_architect_consult(
     orch: "Orchestrator",
     task: Task,
@@ -1619,16 +1725,38 @@ _DEFAULT_RESOLVER_ACTIONS: tuple[str, ...] = (
 )
 
 
+# Loop-safety backstop (B5) storage. Keyed on the orchestrator INSTANCE via a
+# module-level ``WeakKeyDictionary`` so the per-(task, failure_class) cycle
+# counter survives even when the orch refuses ``setattr`` (``__slots__`` orchs,
+# attribute-guarded stubs). WeakKeyDictionary so a finished orchestrator is GC'd
+# without leaking its counter. This replaces the prior ephemeral pattern where a
+# swallowed ``setattr`` failure dropped the guard on the floor (a fresh ``{}``
+# every call → the cap never bound → the resolver could re-loop unboundedly).
+_RESOLVER_CYCLE_COUNTS: "weakref.WeakKeyDictionary[object, dict[str, int]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
 def _prior_resolution_actions(
     orch: "Orchestrator", task_id: str | None, fclass: str
 ) -> list[str]:
-    """Resume-safe: the resolver actions already applied for this blocker key.
+    """Resume-safe: the recovery actions already applied for this task's blocker.
 
-    Read from the ledger (``resolution_chosen`` ops) so the deterministic ladder
-    advances across retries / process restarts instead of re-picking its first
-    rung forever. Mirrors the key used by ``blocker_resolver.blocker_key``.
-    Best-effort — any failure yields ``[]`` (the per-blocker cycle budget is a
-    separate hard stop, so an empty list cannot cause an unbounded loop).
+    Read from the ledger so the deterministic ladder advances across retries /
+    process restarts instead of re-picking its first rung forever:
+
+    * ``resolution_chosen`` ops for THIS blocker key (the resolver's own actions),
+      keyed by ``blocker_key == f"{task_id}:{fclass}"`` (mirrors
+      ``blocker_resolver.blocker_key``).
+    * Step 3: the LEGACY escalation-ladder recovery ops for this task —
+      ``stuck_refine`` -> ``"refine"`` and ``stuck_pivot`` -> ``"pivot"`` — keyed
+      by ``task_id`` (these ops predate the per-class blocker key). Surfacing them
+      gives the resolver the FULL recovery history (it now knows the ladder has
+      already tried refine/pivot) instead of only the resolver's own attempts.
+
+    Returned in ledger seq order. Best-effort — any failure yields ``[]`` (the
+    per-blocker cycle budget is a separate hard stop, so an empty list cannot
+    cause an unbounded loop).
     """
     if task_id is None:
         return []
@@ -1638,13 +1766,60 @@ def _prior_resolution_actions(
         key = f"{task_id}:{fclass}"
         out: list[str] = []
         for entry in read_entries(orch.cwd):
-            if entry.op != "resolution_chosen":
+            payload = entry.payload if isinstance(entry.payload, dict) else {}
+            if entry.op == "resolution_chosen":
+                if payload.get("blocker_key") == key:
+                    act = payload.get("action")
+                    if isinstance(act, str):
+                        out.append(act)
+            elif entry.op == "stuck_refine":
+                if payload.get("task_id") == task_id:
+                    out.append("refine")
+            elif entry.op == "stuck_pivot":
+                if payload.get("task_id") == task_id:
+                    out.append("pivot")
+        return out
+    except Exception:  # noqa: BLE001 - audit read must never block recovery
+        return []
+
+
+def _ledger_trajectory(
+    orch: "Orchestrator", task_id: str | None
+) -> list[str]:
+    """Resume-safe ledger trajectory for ``task_id`` across the ladder op families.
+
+    Step 3 (RECOVERY-CONTRACT §7): populate ``BlockerContext.attempt_history``
+    (always ``[]`` before this) with the persisted recovery trajectory for this
+    task, in seq order (most-recent-last), as a list of short ``(op, …)`` strings
+    the resolver can reason over. Reads the ladder/resolver op families
+    ``stuck_refine`` / ``stuck_pivot`` / ``resolution_chosen`` /
+    ``budget_escalation`` / ``budget_cycle``. Mirrors
+    :func:`_prior_resolution_actions`'s read pattern. Best-effort — never raises.
+    """
+    if task_id is None:
+        return []
+    _families = {
+        "stuck_refine",
+        "stuck_pivot",
+        "resolution_chosen",
+        "budget_escalation",
+        "budget_cycle",
+    }
+    try:
+        from state.ledger import read_entries
+
+        out: list[str] = []
+        for entry in read_entries(orch.cwd):
+            if entry.op not in _families:
                 continue
             payload = entry.payload if isinstance(entry.payload, dict) else {}
-            if payload.get("blocker_key") == key:
+            if payload.get("task_id") != task_id:
+                continue
+            if entry.op == "resolution_chosen":
                 act = payload.get("action")
-                if isinstance(act, str):
-                    out.append(act)
+                out.append(f"resolution_chosen:{act}" if act else "resolution_chosen")
+            else:
+                out.append(entry.op)
         return out
     except Exception:  # noqa: BLE001 - audit read must never block recovery
         return []
@@ -1681,12 +1856,38 @@ async def _resolver_retry(
 
 
 async def _resolver_corrective(
-    orch: "Orchestrator", task: Task, direction: str
+    orch: "Orchestrator",
+    task: Task,
+    direction: str,
+    *,
+    failure_class: str | None = None,
 ) -> Task | None:
     """Inject corrective sub-tasks from ``direction`` and skip ``task`` (the
     architect-refine pattern). Returns the skipped Task on success, or ``None``
     (caller falls through to its legacy block) when no direction is usable, no
     plan/phase is loadable, or injection fails.
+
+    F-2 (field-finding): when ``failure_class`` is supplied, a PHASE-scoped
+    non-convergence ceiling gates minting BEFORE ``append_corrective_tasks``. Once
+    ``cfg.resolver.max_corrective_cycles_per_phase`` consecutive same-class
+    correctives have been minted WITHOUT forward progress, this STOPS minting and
+    DECLINES (returns ``None``) after emitting a LOUD, attributable
+    ``corrective_nonconvergent_ceiling`` ledger op. Declining means the caller
+    (``_apply_resolution`` → ``_maybe_resolve_blocker`` → the sanctioned
+    ``blocker_guard.block_task`` committer at the originating block site) commits
+    a SINGLE terminal ``blocked`` transition instead of minting yet another
+    colliding corrective — i.e. it fails LOUD-FAST rather than churning to the
+    40-min execute wall. (We deliberately do NOT block from inside this helper: the
+    originating ``block_task`` would then re-commit ``blocked`` on an
+    already-blocked task — an illegal ``blocked→blocked`` FSM edge — so the single
+    sanctioned committer must remain the one at the call site, per the F1d
+    invariant.) This bounds the cross-corrective-task loop the per-(task,
+    failure_class) guard cannot: each freshly-minted corrective has a NEW id, so
+    that guard's counter always resets to 0.
+
+    Legitimate recovery is PRESERVED: the counter is per-class (a DIFFERENT
+    failure_class is a fresh, zero budget) and is reset on forward progress (a task
+    in the phase completing — see :func:`_reset_corrective_cycle_counters`).
     """
     if not direction or not direction.strip():
         return None
@@ -1694,6 +1895,31 @@ async def _resolver_corrective(
         from orchestrator.corrective_parser import parse_corrective_direction
 
         phase_id = task.phase_id
+
+        # F-2 phase-scoped non-convergence ceiling (gate BEFORE minting).
+        if failure_class:
+            ceiling = int(
+                getattr(
+                    getattr(orch.cfg, "resolver", None),
+                    "max_corrective_cycles_per_phase",
+                    3,
+                )
+            )
+            prior_cycles = await _corrective_cycle_count(
+                orch, phase_id=phase_id, failure_class=failure_class
+            )
+            if prior_cycles >= ceiling:
+                await _emit_nonconvergent_ceiling(
+                    orch,
+                    task,
+                    phase_id=phase_id,
+                    failure_class=failure_class,
+                    cycles=prior_cycles,
+                    ceiling=ceiling,
+                )
+                # DECLINE: the originating block_task commits the terminal block.
+                return None
+
         cap = int(getattr(orch.cfg, "max_corrective_tasks_per_phase", 8))
         plan_cap = int(getattr(orch.cfg, "max_corrective_tasks_per_plan", 24))
         plan = await orch.plan_manager.load()
@@ -1718,6 +1944,13 @@ async def _resolver_corrective(
             max_corrective_tasks_per_phase=cap,
             max_corrective_tasks_per_plan=plan_cap,
         )
+        # F-2: count this minted same-class corrective round toward the
+        # phase-scoped ceiling (only when a failure_class is attributed — the
+        # legacy callers that omit it keep their unchanged behavior).
+        if failure_class:
+            await _bump_corrective_cycle_counter(
+                orch, phase_id=phase_id, failure_class=failure_class
+            )
         return await orch.plan_manager.update_task_status(
             task.id,
             "skipped",
@@ -1736,6 +1969,140 @@ async def _resolver_corrective(
             err=str(exc),
         )
         return None
+
+
+async def _emit_nonconvergent_ceiling(
+    orch: "Orchestrator",
+    task: Task,
+    *,
+    phase_id: str,
+    failure_class: str,
+    cycles: int,
+    ceiling: int,
+) -> None:
+    """F-2 fail-loud-fast signal: the phase-scoped non-convergence ceiling tripped.
+
+    Emit a LOUD, attributable ``corrective_nonconvergent_ceiling`` ledger op (the
+    distinct, greppable reason the field analysis needs) WITHOUT committing the
+    block here — the caller declines, so the sanctioned ``block_task`` committer at
+    the originating block site commits the single terminal ``blocked`` transition.
+    Best-effort: a breadcrumb failure must never mask the decline."""
+    reason = (
+        f"corrective_nonconvergent: phase {phase_id} regenerated {cycles} "
+        f"consecutive '{failure_class}' correctives without forward progress "
+        f"(ceiling={ceiling}); re-architecting is not converging — failing fast "
+        f"instead of churning to the execute timeout."
+    )
+    logger.warning(
+        "execute_phase.corrective_nonconvergent_ceiling",
+        task_id=task.id,
+        phase_id=phase_id,
+        failure_class=failure_class,
+        cycles=cycles,
+        ceiling=ceiling,
+    )
+    try:
+        await orch.plan_manager.ledger_append(
+            op="corrective_nonconvergent_ceiling",
+            payload={
+                "task_id": task.id,
+                "phase_id": phase_id,
+                "failure_class": failure_class,
+                "cycles": cycles,
+                "ceiling": ceiling,
+                "reason": reason,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - breadcrumb best-effort; never mask
+        logger.warning(
+            "execute_phase.ledger_append_failed",
+            op="corrective_nonconvergent_ceiling",
+            err=str(exc),
+        )
+
+
+# Step 5 (RECOVERY-CONTRACT §7; gate R3): the structural actions
+# (re_architect/re_plan/narrow_scope/split_task) USED to route their PROSE
+# ``rationale`` straight into ``_resolver_corrective`` → ``parse_corrective_direction``,
+# which splits on TOP-LEVEL bullets (``- ``/``* ``/``1. ``). Prose has no bullets, so
+# the parser returned 0 corrective tasks, ``_resolver_corrective`` returned ``None``,
+# and the resolver DECLINED → the task hard-blocked. This was the empirically-confirmed
+# delivery binding constraint (field-probes SYNTHESIS.md: ``conflict_3way_failed →
+# re_architect → fell_through → blocked``, reproduced on a feature, a refactor, and a
+# 50k-file repo). The fix: when the action did not already supply a structured
+# ``params['direction']``, SYNTHESIZE a real bulleted direction from the task context +
+# action type so the parser yields >= 1 corrective task. Deterministic — no LLM call.
+_STRUCTURAL_CORRECTIVE_ACTIONS: frozenset[str] = frozenset(
+    {"split_task", "narrow_scope", "re_architect", "re_plan"}
+)
+
+
+def _direction_has_bullets(direction: str) -> bool:
+    """True if ``direction`` already contains a top-level bullet the parser sees.
+
+    Mirrors ``corrective_parser._RE_TOP_LEVEL_BULLET`` (``- ``/``* ``/``1. `` at
+    column 0 or with one leading space) so an LLM-supplied structured
+    ``params['direction']`` is preserved verbatim and only PROSE (no bullets) is
+    re-synthesized. Cheap, import-light, never raises.
+    """
+    if not direction or not direction.strip():
+        return False
+    import re as _re
+
+    pat = _re.compile(r"^[ ]?(?:[-*]|\d+\.)\s+.+$")
+    return any(pat.match(line) for line in direction.splitlines())
+
+
+def _synthesize_corrective_direction(
+    task: Task, action: str, rationale: str
+) -> str:
+    """Build a STRUCTURED (bulleted) corrective direction for a structural action.
+
+    Step 5 keystone. Returns a string with >= 1 top-level ``- `` bullet so
+    ``corrective_parser.parse_corrective_direction`` yields >= 1 corrective Task —
+    turning a previously-inert structural resolver action into real injected work.
+    Deterministic: derived purely from the task context + action type (NO LLM).
+
+    Templates per action:
+
+      * ``re_architect`` — re-implement as smaller non-overlapping changes scoped
+        to the task's files (so colliding patches stop colliding).
+      * ``re_plan``      — re-plan into independently-applicable, well-ordered steps.
+      * ``narrow_scope`` — constrain to ONLY the task's declared in-scope files.
+      * ``split_task``   — TWO bullets (part 1 / part 2), each an independently
+        shippable half.
+
+    The trailing ``rationale`` (the resolver's prose) is appended INSIDE the bullet
+    body so it informs the developer without breaking the top-level bullet contract.
+    """
+    title = (task.title or task.id or "the blocked task").strip()
+    files = list(getattr(task, "files", None) or [])
+    files_str = ", ".join(files) if files else "the originally-claimed files"
+    tail = f" {rationale.strip()}" if rationale and rationale.strip() else ""
+
+    if action == "split_task":
+        return (
+            f'- {title} — part 1: the first, independently-shippable half of the '
+            f"change. Implement only this half; leave the rest for part 2.{tail}\n"
+            f'- {title} — part 2: the remaining half of the change, applied on top '
+            f"of part 1 so the two no longer collide."
+        )
+    if action == "narrow_scope":
+        return (
+            f'- Constrain "{title}" to ONLY its declared in-scope files: '
+            f"{files_str}. Do not edit anything outside that set.{tail}"
+        )
+    if action == "re_plan":
+        return (
+            f'- Re-plan "{title}" into independently-applicable steps with a '
+            f"well-formed dependency order, so each step applies cleanly on its "
+            f"own.{tail}"
+        )
+    # re_architect (default for the structural family).
+    return (
+        f'- Re-implement "{title}" as smaller, non-overlapping changes so the '
+        f"patches stop colliding. Scope strictly to: {files_str}.{tail}"
+    )
 
 
 async def _apply_resolution(
@@ -1760,16 +2127,56 @@ async def _apply_resolution(
         return None
     if a in ("ask_human", "fall_through", "web_search", "reroute"):
         return None
-    if a in ("split_task", "narrow_scope", "re_architect", "re_plan"):
-        direction = str(params.get("direction") or rationale or "")
-        return await _resolver_corrective(orch, task, direction)
+    if a in _STRUCTURAL_CORRECTIVE_ACTIONS:
+        # Step 5: prefer an LLM-supplied STRUCTURED direction; only synthesize a
+        # bulleted one when it's missing/prose. The synthesized direction is
+        # guaranteed to make ``parse_corrective_direction`` return >= 1 task, so
+        # the structural action is no longer inert (the prose→0→block cascade).
+        supplied = str(params.get("direction") or "")
+        if _direction_has_bullets(supplied):
+            direction = supplied
+        else:
+            direction = _synthesize_corrective_direction(task, a, rationale)
+        # F-2: thread the originating failure_class so ``_resolver_corrective``
+        # can bound CONSECUTIVE same-class corrective regeneration at the
+        # phase-scoped ceiling (the cross-corrective-task loop the per-task guard
+        # cannot see).
+        return await _resolver_corrective(
+            orch,
+            task,
+            direction,
+            failure_class=getattr(ctx, "failure_class", None),
+        )
     if a == "consult_knowledge":
         try:
             from orchestrator import blocker_resolver as _br
 
             summary = await _br.consult_knowledge(orch, ctx)  # type: ignore[arg-type]
-        except Exception:  # noqa: BLE001
-            summary = ""
+        except Exception as exc:  # noqa: BLE001
+            # WS3-silent-degrade (should-fix): KB STARVATION. The consult raised
+            # — previously we swallowed it to ``summary = ""`` and STILL retried,
+            # burning a resolver cycle on an information-free re-dispatch (the
+            # exact "KB starvation silently degrades into a blind retry" failure
+            # mode). Emit a typed ``resolver_kb_failed`` breadcrumb and DECLINE
+            # (return None). The caller (``_maybe_resolve_blocker``) recognises a
+            # declined ``consult_knowledge`` and REFUNDS the cycle, so a KB
+            # outage does not consume the bounded recovery budget.
+            try:
+                await orch.plan_manager.ledger_append(
+                    op="resolver_kb_failed",
+                    payload={
+                        "task_id": task.id,
+                        "failure_class": getattr(ctx, "failure_class", None),
+                        "err": str(exc)[:300],
+                    },
+                )
+            except Exception as crumb_exc:  # noqa: BLE001 — crumb best-effort
+                logger.warning(
+                    "execute_phase.ledger_append_failed",
+                    op="resolver_kb_failed",
+                    err=str(crumb_exc),
+                )
+            return None
         note = (
             f"consult_knowledge — prior failures:\n{summary[:800]}"
             if summary
@@ -1787,6 +2194,31 @@ async def _apply_resolution(
         return await _resolver_retry(orch, task, note=f"{a}: {rationale}")
     # Unknown action string — fail safe to legacy block.
     return None
+
+
+# Step 4: the in-loop retry/escalate sites (developer / reviewer / test_engineer)
+# don't share a single ``role`` local, so the chokepoint derives the originating
+# role from the REAL ``failure_class`` threaded in by the caller (Step 3). Used
+# only to populate ``BlockerContext.failing_role`` for resolver observability /
+# routing; an unmapped class yields None (no role attributed).
+_FAILURE_CLASS_TO_ROLE: dict[str, str] = {
+    _fcls.WORKER_EXCEPTION: "developer",
+    _fcls.QA_GATE_FAILED: "developer",
+    _fcls.EDIT_SCOPE_VIOLATION: "developer",
+    _fcls.WORKTREE_APPLY_FAILED: "developer",
+    _fcls.WORKTREE_DIFF_CHECK_FAILED: "developer",
+    _fcls.TESTS_FAILED: "developer",
+    _fcls.REVIEW_REJECTED: "reviewer",
+    _fcls.REVIEW_MALFORMED: "reviewer",
+    _fcls.REVIEW_ESCALATED: "reviewer",
+    _fcls.TEST_DIAGNOSIS_HARDFAIL: "test_engineer",
+    _fcls.TEST_DIAGNOSIS_NO_SIGNAL: "test_engineer",
+}
+
+
+def _failing_role_for_class(failure_class: str) -> str | None:
+    """Map a terminal ``failure_class`` to the role that produced it (or None)."""
+    return _FAILURE_CLASS_TO_ROLE.get(failure_class)
 
 
 async def _maybe_resolve_blocker(
@@ -1831,22 +2263,25 @@ async def _maybe_resolve_blocker(
     # unboundedly. This counter guarantees the chokepoint stops recovering and
     # falls through to the legacy block after ``max_cycles_per_blocker`` hits,
     # regardless of ledger state.
-    try:
-        max_cycles = int(getattr(rcfg, "max_cycles_per_blocker", 3))
-        guard_key = f"{task.id if task is not None else '-'}:{failure_class}"
-        counts = getattr(orch, "_resolver_cycle_counts", None)
-        if counts is None:
-            counts = {}
-            try:
-                orch._resolver_cycle_counts = counts  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                counts = {}
-        if counts.get(guard_key, 0) >= max_cycles:
-            return None
-        counts[guard_key] = counts.get(guard_key, 0) + 1
-    except Exception:  # noqa: BLE001
-        pass
+    max_cycles = int(getattr(rcfg, "max_cycles_per_blocker", 3))
+    guard_key = f"{task.id if task is not None else '-'}:{failure_class}"
+    # Backstop storage: a module-level WeakKeyDictionary keyed on the orch
+    # INSTANCE. This survives even if the orch refuses ``setattr`` — the prior
+    # ``setattr(orch, "_resolver_cycle_counts", {})`` with a swallowed failure
+    # silently dropped the guard (a fresh ``{}`` every call → the cap never
+    # bound → unbounded re-loop). No ``except: pass``: the WeakKeyDictionary
+    # write cannot fail for a hashable orch, and the counter is the loop-safety
+    # invariant — a swallowed failure here is exactly the bug being closed.
+    counts = _RESOLVER_CYCLE_COUNTS.get(orch)
+    if counts is None:
+        counts = {}
+        _RESOLVER_CYCLE_COUNTS[orch] = counts
+    if counts.get(guard_key, 0) >= max_cycles:
+        return None
+    counts[guard_key] = counts.get(guard_key, 0) + 1
 
+    # Build the BlockerContext (cheap, local-helper reads; best-effort — a
+    # failure here is a pure fall-through, no visibility op needed).
     try:
         from orchestrator import blocker_resolver as _br
         from orchestrator import failure_classes as _fc
@@ -1863,11 +2298,28 @@ async def _maybe_resolve_blocker(
             failing_role=failing_role,
             task_id=task_id,
             phase_id=ph,
-            attempt_history=[],
+            # Step 3: populate the ledger trajectory (was always []) so the
+            # resolver sees the recovery history that led to this blocker.
+            attempt_history=_ledger_trajectory(orch, task_id),
             recovery_already_tried=_prior_resolution_actions(orch, task_id, fclass),
             evidence_refs=evidence_refs or [],
             available_actions=list(_DEFAULT_RESOLVER_ACTIONS),
         )
+    except Exception as exc:  # noqa: BLE001 - resolver must never break the loop
+        logger.warning(
+            "execute_phase.resolver_context_build_failed",
+            failure_class=failure_class,
+            err=str(exc),
+        )
+        return None
+
+    # Dispatch into the resolver. WS3 fix: a dispatch failure must NOT be a
+    # silent fall-through — resolver inertness has to be visible. Emit exactly
+    # one ``blocker_escalated`` op marked ``dispatch_failed`` (so a post-mortem
+    # can see the resolver was reached but failed to act) BEFORE falling through
+    # to the caller's legacy block. The ``except`` is scoped to the single
+    # ``resolve_blocker`` await — no broader than the dispatch it guards.
+    try:
         action = await _br.resolve_blocker(orch, ctx)
     except Exception as exc:  # noqa: BLE001 - resolver must never break the loop
         logger.warning(
@@ -1875,6 +2327,24 @@ async def _maybe_resolve_blocker(
             failure_class=failure_class,
             err=str(exc),
         )
+        try:
+            await orch.plan_manager.ledger_append(
+                op="blocker_escalated",
+                payload={
+                    "task_id": task_id,
+                    "phase_id": ph,
+                    "failure_class": fclass,
+                    "failing_role": failing_role,
+                    "raw_error_excerpt": str(exc)[:500],
+                    "source": "dispatch_failed",
+                },
+            )
+        except Exception as crumb_exc:  # noqa: BLE001 - crumb must not mask the loop
+            logger.warning(
+                "execute_phase.ledger_append_failed",
+                op="blocker_escalated",
+                err=str(crumb_exc),
+            )
         return None
 
     try:
@@ -1888,6 +2358,15 @@ async def _maybe_resolve_blocker(
         recovered = None
 
     act_name = getattr(action, "action", "fall_through")
+
+    # WS3-silent-degrade (should-fix): a ``consult_knowledge`` that DECLINED
+    # (returned None) means the KB consult failed (starvation) — it produced no
+    # recovery and emitted ``resolver_kb_failed``. A KB outage must not eat the
+    # bounded per-(task, failure_class) recovery budget, so REFUND the cycle that
+    # was reserved up-front. Scoped narrowly: only consult_knowledge, only on
+    # decline; every acting/declining-by-design path keeps consuming its cycle.
+    if act_name == "consult_knowledge" and recovered is None:
+        counts[guard_key] = max(0, counts.get(guard_key, 1) - 1)
     if recovered is not None:
         outcome = "recovered"
     elif act_name == "ask_human":
@@ -2052,6 +2531,150 @@ async def _credit_injected_lessons_for_task(
 _CONFLICT_REWRITE_RETRY_CAP = 2
 
 
+async def _resolve_apply_time_edit_scope(
+    orch: "Orchestrator", task: Task
+) -> list[str]:
+    """F-4: resolve the EFFECTIVE apply-time edit scope for ``task``.
+
+    The scope is the resolved plan/phase scope — ``phase.edit_scope`` for
+    the task's phase, falling back to ``plan.edit_scope`` — UNION the task's
+    OWN claimed paths (``files`` + ``files_new`` + ``extended_scope``),
+    deduplicated and order-stable. The union matters: legitimate flows edit
+    beyond the architect-declared plan/phase scope — new helper files land in
+    ``files_new`` and a task's declared ``files`` may themselves sit outside
+    a coarse plan scope — so folding them in keeps a correct task from being
+    warned/blocked.
+
+    Returns ``[]`` (the legacy whole-repo sentinel) when neither a resolved
+    plan/phase scope NOR any task-claimed path exists — e.g. an empty-
+    ``files`` corrective on a repo with no declared ``edit_scope``. The
+    caller treats an empty result as "skip the check entirely", which is
+    exactly what stops empty-scope correctives from being warned/blocked.
+
+    Mirrors the resolver shape used for sparse-checkout cone resolution in
+    :func:`run_execute_phase` (``phase.edit_scope or plan.edit_scope`` then a
+    fall-through to the task's own files), kept in-helper so no
+    ``edit_scope=`` kwarg is threaded through the ``apply_patch_to_main``
+    call sites (which would break the ``FakeWorktreeMgr`` test stub).
+    """
+    resolved: list[str] = []
+    try:
+        plan = await orch.plan_manager.load()
+    except Exception:  # noqa: BLE001 — scope resolution is best-effort
+        plan = None
+    if plan is not None:
+        for _ph in plan.phases:
+            if _ph.id == task.phase_id:
+                resolved = (
+                    list(_ph.edit_scope)
+                    if _ph.edit_scope is not None
+                    else list(plan.edit_scope)
+                )
+                break
+        else:
+            resolved = list(plan.edit_scope)
+
+    # UNION the task's own claimed paths so legitimately-touched files
+    # (declared ``files``, new files in ``files_new``, and ``extended_scope``)
+    # are always in scope.
+    union: list[str] = list(resolved)
+    for p in (
+        list(getattr(task, "files", []) or [])
+        + list(getattr(task, "files_new", []) or [])
+        + list(getattr(task, "extended_scope", []) or [])
+    ):
+        if isinstance(p, str) and p.strip():
+            union.append(p)
+
+    # Dedup, order-stable.
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in union:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+async def _warn_apply_time_edit_scope(
+    orch: "Orchestrator",
+    task: Task,
+    worktree: Path,
+    worktree_mgr: "WorktreeManager",
+    effective_scope: list[str],
+) -> None:
+    """F-4 WARN: advisory, NON-blocking apply-time edit-scope check.
+
+    Computes the worktree diff (via the manager's ``get_diff_vs_base``),
+    extracts the changed files, and checks each against ``effective_scope``
+    using :func:`orchestrator.dag.is_in_scope`. For any out-of-scope file it
+    logs a structured ``execute_phase.edit_scope_apply_violation`` event and
+    appends a best-effort, NON-BLOCKING ``edit_scope_apply_violation`` ledger
+    breadcrumb (mirroring the ``conflict_critic_decision`` pattern). It does
+    NOT block — the caller applies the diff regardless. Any failure here is
+    swallowed so the advisory never derails a legitimate apply.
+
+    The caller guarantees ``effective_scope`` is non-empty (an empty scope is
+    the whole-repo no-op and is filtered out upstream).
+    """
+    from adapters.git_utils import extract_files_from_diff
+    from orchestrator.dag import is_in_scope
+
+    try:
+        diff_text = await worktree_mgr.get_diff_vs_base(worktree)
+    except Exception as exc:  # noqa: BLE001 — best-effort advisory
+        logger.warning(
+            "execute_phase.edit_scope_apply_warn_diff_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return
+
+    files_in_diff = extract_files_from_diff(diff_text or "")
+    out_of_scope = [
+        fp for fp in files_in_diff if not is_in_scope(fp, effective_scope)
+    ]
+    if not out_of_scope:
+        return
+
+    logger.warning(
+        "execute_phase.edit_scope_apply_violation",
+        task_id=task.id,
+        out_of_scope_files=out_of_scope,
+        effective_scope=effective_scope,
+        policy="warn",
+    )
+
+    # Best-effort ledger breadcrumb — observability only, NEVER blocks.
+    try:
+        from state.ledger import append_entry as _append_entry
+        from state.lockfile import plan_lock as _plan_lock
+
+        async with _plan_lock(
+            orch.cwd,
+            timeout_s=getattr(orch.plan_manager, "_lock_timeout_s", 30.0),
+        ):
+            await _append_entry(
+                orch.cwd,
+                op="edit_scope_apply_violation",
+                payload={
+                    "task_id": task.id,
+                    "out_of_scope_files": out_of_scope,
+                    "effective_scope": effective_scope,
+                    "policy": "warn",
+                },
+                session_id=getattr(
+                    orch.plan_manager, "_session_id", orch.session_id
+                ),
+            )
+    except Exception as exc_led:  # noqa: BLE001 — best-effort breadcrumb
+        logger.warning(
+            "execute_phase.edit_scope_apply_violation_emit_failed",
+            task_id=task.id,
+            err=str(exc_led),
+        )
+
+
 async def _apply_with_conflict_escalation(
     orch: "Orchestrator",
     task: Task,
@@ -2066,6 +2689,12 @@ async def _apply_with_conflict_escalation(
     ``blocked`` (caller-side update_task_status, this helper records
     the blocked reason via the worker contract).
 
+    **Error contract**: this function swallows all ``WorktreeError``
+    exceptions internally and signals failure via a ``False`` return — it
+    does NOT propagate ``WorktreeError`` to callers. The ``except
+    WorktreeError`` guard at call sites is a deliberate defensive net
+    against a future contract change, not a currently-reachable path.
+
     Branches on the critic's RESOLUTION directive:
 
     * ``rebase-and-retry`` → re-attempt apply with ``three_way=True``.
@@ -2077,22 +2706,139 @@ async def _apply_with_conflict_escalation(
     The cap of two rewrite rounds prevents critic-developer ping-pong
     on pathological cases.
     """
+    from orchestrator.dag import EditScopeViolation
+
     rewrite_rounds = 0
     # v0.25.1 Bug #2: persistent integration. Commit per task so the next
     # task's per-task worktree (created at HEAD) sees prior tasks' changes.
     commit_msg = f"autodev: task {task.id} ({task.title})"
+
+    # F-4: compute the apply-time edit-scope ONCE, in-helper (NOT a threaded
+    # call-site kwarg — that would break the FakeWorktreeMgr stub which does
+    # not accept ``edit_scope``). The effective scope is the resolved
+    # plan/phase scope UNION the task's own claimed files; an EMPTY result
+    # means "whole repo" (legacy no-op) which is what keeps empty-``files``
+    # correctives from being warned/blocked. ``apply_scope`` is the value
+    # forwarded to the apply gate: only ``block`` mode forwards it (so the
+    # gate raises); ``off``/``warn`` forward ``None`` (gate skipped) and warn
+    # performs its OWN advisory check below.
+    _policy = getattr(orch.cfg, "enforce_apply_time_edit_scope", "warn")
+    effective_scope = await _resolve_apply_time_edit_scope(orch, task)
+    apply_scope: list[str] | None = (
+        effective_scope if _policy == "block" and effective_scope else None
+    )
+    # Only block mode forwards a scope to the apply gate. ``off``/``warn``
+    # call the apply with the LEGACY signature (no ``edit_scope`` kwarg) so
+    # the in-tree ``FakeWorktreeMgr`` stub — which does not accept it — is
+    # never broken. ``**_scope_kw`` is empty unless block mode resolved a
+    # non-empty scope.
+    _scope_kw: dict[str, Any] = (
+        {"edit_scope": apply_scope} if apply_scope else {}
+    )
+    # F-4 WARN: advisory, NON-blocking. Compute the violating files ourselves
+    # (the apply still runs WITHOUT a scope gate). Done once, before the
+    # first apply attempt, so a clean apply is still audited.
+    if _policy == "warn" and effective_scope:
+        await _warn_apply_time_edit_scope(
+            orch, task, worktree, worktree_mgr, effective_scope
+        )
+
     while True:
         try:
             await worktree_mgr.apply_patch_to_main(
-                worktree, base_ref="HEAD", commit_message=commit_msg
+                worktree,
+                base_ref="HEAD",
+                commit_message=commit_msg,
+                **_scope_kw,
             )
             return True
+        except EditScopeViolation as exc_scope:
+            # F-4 BLOCK mode: the apply-time gate (fed ``apply_scope``)
+            # rejected an out-of-scope diff hunk BEFORE any ``git apply`` ran
+            # — main is untouched. A scope violation is a deliberate POLICY
+            # block, NOT a recoverable merge conflict, so terminate the task
+            # directly via the single block chokepoint (no critic escalation,
+            # no 3-way retry — the gate is unconditional and would re-raise).
+            # Only reachable in ``block`` mode (``apply_scope`` is None for
+            # off/warn, so the gate is skipped). The structured WARN log /
+            # ledger breadcrumb already fired upstream when policy=warn; here
+            # the block itself is the audit trail.
+            logger.warning(
+                "execute_phase.edit_scope_apply_blocked",
+                task_id=task.id,
+                err=str(exc_scope),
+            )
+            await block_task(
+                orch,
+                task,
+                failure_class=_fcls.EDIT_SCOPE_VIOLATION,
+                raw_error=f"edit_scope_apply_violation: {exc_scope}",
+                meta={
+                    "blocked_reason": (
+                        f"edit_scope_apply_violation: {exc_scope}"
+                    )
+                },
+            )
+            return False
         except WorktreeError as exc:
             logger.warning(
                 "execute_phase.apply_patch_conflict",
                 task_id=task.id,
                 err=str(exc),
             )
+
+            # A2 (Finding #2): spurious ``conflict_3way_failed`` on trivial
+            # fixes. The ONLY emitter of ``conflict_3way_failed`` is the
+            # critic-gated 3-way retry below — but the plain ``git apply``
+            # tried first is brittle: when main has advanced under the task
+            # (a sibling committed via commit-per-task) the stale-base diff's
+            # hunk context no longer matches main verbatim and plain apply
+            # fails for INDEPENDENT, perfectly-mergeable edits. Today that
+            # failure routes UNCONDITIONALLY through the critic LLM, and
+            # ``--3way`` is only attempted if the critic happens to return
+            # ``rebase-and-retry``; an over-cautious ``abandon-task`` /
+            # ``rewrite`` verdict (or a flaky critic) spuriously blocks a
+            # diff that ``--3way`` would apply cleanly. Reproduced in
+            # tests/test_impl_tournament_spurious_conflict_a2.py.
+            #
+            # Fix: attempt the 3-way apply automatically BEFORE consulting
+            # the critic, reusing the SAME ``apply_patch_to_main(three_way=
+            # True)`` path. ``--3way`` rebuilds the merge base from the diff's
+            # blob OIDs, so independent edits reconcile cleanly while a
+            # GENUINE conflict (overlapping edits on the same lines) still
+            # raises ``WorktreeError`` from the real ``git apply --3way``
+            # (rc != 0 on conflict markers) — we then fall through to the
+            # existing critic escalation, which can still terminate as
+            # ``conflict_3way_failed``. So real conflicts still fail loud and
+            # main is never left with silently-applied conflict markers; only
+            # the spurious "main moved, edits don't overlap" case is rescued.
+            try:
+                await worktree_mgr.apply_patch_to_main(
+                    worktree,
+                    base_ref="HEAD",
+                    three_way=True,
+                    commit_message=commit_msg,
+                    **_scope_kw,
+                )
+                logger.info(
+                    "execute_phase.conflict_resolved_auto_3way",
+                    task_id=task.id,
+                )
+                return True
+            except WorktreeError as exc_auto3:
+                logger.info(
+                    "execute_phase.auto_3way_failed_escalating",
+                    task_id=task.id,
+                    err=str(exc_auto3),
+                )
+                # A failed 3-way can leave the main tree in a partial /
+                # merge-in-progress state (conflict markers / staged hunks).
+                # Restore a clean tree BEFORE the critic round so the critic's
+                # ``get_diff_vs_base`` sees the worktree's real diff and the
+                # next plain/3-way retry starts from a clean main — idempotent
+                # and never masks the underlying conflict (mirrors the cleanup
+                # the genuine-conflict branch already does).
+                await worktree_mgr.abort_failed_apply(targets=list(task.files))
 
             try:
                 conflict_diff = await worktree_mgr.get_diff_vs_base(worktree)
@@ -2107,6 +2853,44 @@ async def _apply_with_conflict_escalation(
                 conflict_files=list(task.files),
             )
 
+            # Phase 1A Step 1 (RECOVERY-CONTRACT §7.1): record the critic's
+            # merge-strategy CHOICE as a typed audit breadcrumb. Previously
+            # the rebase/rewrite/abandon decision was invisible (zero ledger
+            # ops); the terminal branches below emit ``blocker_escalated`` via
+            # ``block_task`` but the CHOICE itself was unrecorded. Pure
+            # observability — does NOT mutate plan state. Best-effort: wrapped
+            # so a ledger hiccup never derails conflict recovery, but it MUST
+            # normally fire.
+            try:
+                from state.ledger import append_entry as _append_entry
+                from state.lockfile import plan_lock as _plan_lock
+
+                async with _plan_lock(
+                    orch.cwd,
+                    timeout_s=getattr(
+                        orch.plan_manager, "_lock_timeout_s", 30.0
+                    ),
+                ):
+                    await _append_entry(
+                        orch.cwd,
+                        op="conflict_critic_decision",
+                        payload={
+                            "task_id": task.id,
+                            "action": resolution.action,
+                            "conflict_files": list(task.files),
+                            "rewrite_rounds": rewrite_rounds,
+                        },
+                        session_id=getattr(
+                            orch.plan_manager, "_session_id", orch.session_id
+                        ),
+                    )
+            except Exception as exc_dec:  # noqa: BLE001 — best-effort breadcrumb
+                logger.warning(
+                    "execute_phase.conflict_critic_decision_emit_failed",
+                    task_id=task.id,
+                    err=str(exc_dec),
+                )
+
             if resolution.action == "rebase-and-retry":
                 # Try 3-way apply. If THIS also fails, fall through to
                 # abandon (no infinite loop on persistent conflicts).
@@ -2116,6 +2900,7 @@ async def _apply_with_conflict_escalation(
                         base_ref="HEAD",
                         three_way=True,
                         commit_message=commit_msg,
+                        **_scope_kw,
                     )
                     logger.info(
                         "execute_phase.conflict_resolved_3way",
@@ -2290,12 +3075,23 @@ async def run_execute_phase(
     # promoted to coded first — preventing the reaper from reverting a
     # task whose work actually completed (D-3 finding from the
     # 2026-05-09 Unity stall).
+    # WS3-silent-degrade (should-fix): reconcile + reap are SAFETY NETS that
+    # repair FSM state BEFORE any dispatch. A failure here means the plan state
+    # is in an unknown shape — silently continuing risked the dispatcher either
+    # reverting a task whose work actually completed (the reconcile gap) or
+    # stranding wedged orphan tasks the pending-only filter cannot pick up (the
+    # reap gap). A swallowed warning let the run proceed on corrupt state. These
+    # are now HARD failures: log at ERROR and re-raise so the run aborts loudly
+    # instead of degrading into a half-repaired state.
     try:
         await orch.plan_manager.reconcile_evidence_vs_ledger()
-    except Exception as exc:  # noqa: BLE001 — log + continue
-        logger.warning(
+    except Exception as exc:
+        logger.error(
             "execute_phase.reconcile_evidence_failed", err=str(exc)
         )
+        raise AutodevError(
+            f"reconcile_evidence_vs_ledger failed before dispatch: {exc}"
+        ) from exc
 
     # v0.22.2 B1: reap orphan in-flight tasks before any dispatch. An
     # interrupted run leaves tasks frozen in non-terminal-non-pending
@@ -2312,8 +3108,11 @@ async def run_execute_phase(
                 count=len(reaped),
                 task_ids=reaped,
             )
-    except Exception as exc:  # noqa: BLE001 — log + continue; do not block run
-        logger.warning("execute_phase.reap_orphans_failed", err=str(exc))
+    except Exception as exc:
+        logger.error("execute_phase.reap_orphans_failed", err=str(exc))
+        raise AutodevError(
+            f"reap_orphans failed before dispatch: {exc}"
+        ) from exc
 
     # v0.11.0: DAG-aware worker pool over all phases.
     plan = await orch.plan_manager.load()
@@ -2391,7 +3190,6 @@ async def run_execute_phase(
         # validator is a no-op and the loop proceeds unchanged.
         from orchestrator.dag import (
             DagValidationError,
-            EditScopeViolation,
             collect_edit_scope_violations,
             validate_dag_cycles_global,
             validate_dag_undefined_refs,
@@ -3456,6 +4254,111 @@ async def _execute_one_worker(
         # underlying issue. Re-raising propagates through
         # ``_execute_phase_dag`` (which has its own typed catch) up to
         # ``run_execute_phase`` for the structured-log + abort.
+        #
+        # Phase 1A Step 1 (RECOVERY-CONTRACT §7.1): emit a typed
+        # ``resolution_outcome`` breadcrumb IMMEDIATELY BEFORE the
+        # quarantine transition so every terminal ``quarantined``
+        # transition is preceded by a recovery-decision op (closes the
+        # WS1 two-channel-split breadcrumb gap). Pure observability — does
+        # NOT mutate plan state and does NOT (yet) route through
+        # ``block_task`` (that is Step 7). Best-effort: wrapped so it can
+        # never mask the original typed exception, but it MUST normally
+        # fire. ``failure_class`` is ``infra_circuit_open`` for the
+        # circuit-breaker path and the typed prefix (``auth_failed``) for
+        # the single-shot auth path.
+        _halt_fcls = (
+            _fcls.INFRA_CIRCUIT_OPEN
+            if isinstance(exc, InfrastructureCircuitOpenError)
+            else _halt_reason_prefix(exc)
+        )
+        # Phase 1A Step 7 (RECOVERY-CONTRACT §7 Step 7, gate R6): CONSULT the
+        # resolver on the dominant quarantine path so a ``blocker_escalated``
+        # escalation op precedes the quarantine transition. Pre-Step-7 this
+        # path bypassed the resolver entirely — divergent from the architect-
+        # consult infra path (``:1525``), which DID route through the resolver.
+        # The consult is FIRST (before the Step-1 ``resolution_outcome``
+        # breadcrumb and the ``quarantined`` stamp) so the ledger ordering is:
+        #   blocker_escalated → resolution_chosen → resolution_outcome →
+        #   update_task_status(quarantined).
+        # For BOTH AuthenticationFailedError and InfrastructureCircuitOpenError
+        # we use ``INFRA_CIRCUIT_OPEN`` as the failure_class: the resolver's
+        # deterministic action for that class is ``fall_through`` (the legacy
+        # quarantine is INTENTIONAL — ``blocker_resolver.py:165``), so
+        # ``_apply_resolution`` returns None → ``recovered is None`` → we fall
+        # through to the EXISTING quarantine stamp unchanged. We do NOT invent
+        # an auth failure class (out of scope) and we do NOT call ``block_task``
+        # here — that would commit ``"blocked"`` (terminal), but quarantined
+        # must stay resumable / non-terminal so ``Orchestrator.resume()`` picks
+        # it up. Best-effort: the resolver must NEVER mask the original typed
+        # exception, so if ``_maybe_resolve_blocker`` raises we log + continue
+        # to the quarantine stamp. When ``AUTODEV_RESOLVER_DISABLED`` is set
+        # (the suite default) ``_maybe_resolve_blocker`` is a no-op returning
+        # None → this path is byte-identical to pre-Step-7.
+        try:
+            recovered = await _maybe_resolve_blocker(
+                orch,
+                task,
+                failure_class=_fcls.INFRA_CIRCUIT_OPEN,
+                raw_error=str(exc),
+                failing_role=None,
+                phase_id=task.phase_id,
+            )
+            # INFRA_CIRCUIT_OPEN → fall_through → ``recovered`` is None by
+            # construction; the assertion documents the invariant without
+            # changing control flow (we fall through to the quarantine stamp
+            # regardless, and recovery on this class is intentionally a no-op).
+            if recovered is not None:  # pragma: no cover - defensive
+                logger.info(
+                    "execute_phase.quarantine_resolver_recovered_unexpected",
+                    task_id=task.id,
+                    note=(
+                        "INFRA_CIRCUIT_OPEN is expected to fall_through; "
+                        "preserving quarantine semantics regardless"
+                    ),
+                )
+        except Exception as exc4:  # noqa: BLE001 — never mask the original
+            logger.warning(
+                "execute_phase.quarantine_resolver_consult_failed",
+                task_id=task.id,
+                err=str(exc4),
+            )
+        # Phase 1A Step 1 (kept): the quarantine-DECISION ``resolution_outcome``
+        # breadcrumb (``quarantine_pending_operator``). This is distinct from
+        # any ``resolution_outcome`` the resolver consult above emits for its
+        # own ``fall_through`` — that records the RESOLVER's outcome, this one
+        # records the QUARANTINE decision. We keep exactly ONE quarantine
+        # ``resolution_outcome`` (this one); the resolver's fall_through outcome
+        # is a separate, semantically-different audit row.
+        try:
+            from state.ledger import append_entry as _append_entry
+            from state.lockfile import plan_lock as _plan_lock
+
+            async with _plan_lock(
+                orch.cwd,
+                timeout_s=getattr(
+                    orch.plan_manager, "_lock_timeout_s", 30.0
+                ),
+            ):
+                await _append_entry(
+                    orch.cwd,
+                    op="resolution_outcome",
+                    payload={
+                        "task_id": task.id,
+                        "action": "quarantine_pending_operator",
+                        "outcome": "observed",
+                        "failure_class": _halt_fcls,
+                        "reason": f"{_halt_reason_prefix(exc)}: {exc}",
+                    },
+                    session_id=getattr(
+                        orch.plan_manager, "_session_id", orch.session_id
+                    ),
+                )
+        except Exception as exc3:  # noqa: BLE001 — never mask the original
+            logger.warning(
+                "execute_phase.quarantine_breadcrumb_failed",
+                task_id=task.id,
+                err=str(exc3),
+            )
         try:
             await orch.plan_manager.update_task_status(
                 task.id,
@@ -4270,7 +5173,7 @@ async def _execute_one(
                     sparse_paths = [
                         p
                         for p in _task_cone
-                        if not (p in _seen or _seen.add(p))
+                        if not (p in _seen or _seen.add(p))  # type: ignore[func-returns-value]  # set.add returns None (falsy) by design — dedup idiom
                     ]
                     logger.info(
                         "execute_phase.sparse_cone_from_task_files",
@@ -4283,6 +5186,11 @@ async def _execute_one(
                 sparse_paths=sparse_paths,
                 include_headers_for_sparse=bool(
                     getattr(orch.cfg, "include_headers_for_sparse", True)
+                ),
+                # F-6 (Fix 2): fold tracked build/test-harness files into the
+                # cone so the QA gate (cwd=worktree) can actually run tests.
+                include_harness_for_sparse=bool(
+                    getattr(orch.cfg, "worktree_sparse_include_harness", True)
                 ),
             )
         except WorktreeError as exc:
@@ -4315,6 +5223,32 @@ async def _execute_one(
     try:
         # Retry loop — one iteration = one developer-then-gates cycle.
         last_issues: list[str] = []
+        # Step 5 (RECOVERY-CONTRACT §7 Part 3 — RECOVER_TASK guidance injection):
+        # when the resolver re-enabled this task via ``_resolver_retry`` it
+        # stamped a ``resolver_note`` onto ``Task.metadata`` (now a persisted,
+        # round-tripping field). Read it back into ``last_issues`` so the
+        # re-dispatched developer actually SEES the resolver's guidance — pre-Step-5
+        # the note was written and then discarded, never reaching the next
+        # developer envelope. The note is consumed (cleared) so it informs only
+        # the FIRST attempt of this re-dispatch, not every inner retry iteration.
+        try:
+            _resolver_note = (task.metadata or {}).get("resolver_note")
+            if _resolver_note:
+                last_issues = [f"resolver guidance: {_resolver_note}"]
+                await orch.plan_manager.update_task_status(
+                    task.id,
+                    task.status,
+                    meta={"resolver_note": None},
+                )
+                refreshed = await orch.plan_manager.get_task(task.id)
+                if refreshed is not None:
+                    task = refreshed
+        except Exception as exc:  # noqa: BLE001 — guidance injection is best-effort
+            logger.debug(
+                "execute_phase.resolver_note_inject_failed",
+                task_id=task.id,
+                err=str(exc),
+            )
         # v0.32.0 Phase 3 (Gap C): per-task attempt counters for the
         # infrastructure-class test diagnoses (collection_failed /
         # runtime_crash / capture_failed). Lives in this function's
@@ -4431,10 +5365,52 @@ async def _execute_one(
                 # non-approved / non-empty-diff task, so this never masks a
                 # real failure.
                 _accepted = await _maybe_accept_approved_on_exhaustion(
-                    orch, task, developer_result
+                    orch,
+                    task,
+                    developer_result,
+                    worktree=worktree,
+                    worktree_mgr=worktree_mgr,
                 )
                 if _accepted is not None:
                     return _accepted
+                # WS1-budget-exhaustion-absorbed-by-ladder (should-fix): the
+                # turn-budget escalation tracker returns a SYNTHETIC
+                # ``error_max_turns_escalation_exhausted`` AgentResult once the
+                # per-(task, role) escalation ladder is fully spent (see the
+                # ``is_exhausted`` short-circuit in ``delegate``). That synthetic
+                # terminal must NOT re-enter the discard/stuck ladder as a
+                # ``WORKER_EXCEPTION`` — doing so burns yet another retry slot on
+                # a task whose budget is already proven exhausted (the agent
+                # would just re-hit the same cap). It is a clean GUARDRAIL
+                # exhaustion, so terminate it through the single block chokepoint
+                # with ``GUARDRAIL_EXCEEDED`` (whose resolver rung is the
+                # budget-/cap-aware path), unless ``_maybe_accept_approved_on_
+                # exhaustion`` already salvaged an approved empty-diff above.
+                if (
+                    developer_result.subtype
+                    == "error_max_turns_escalation_exhausted"
+                ):
+                    _budget_exc = GuardrailExceededError(
+                        developer_result.error
+                        or "budget escalation ladder exhausted"
+                    )
+                    _budget_meta = _build_guardrail_block_meta(
+                        orch=orch, task_id=task.id, exc=_budget_exc
+                    )
+                    # A spent escalation ladder is a terminal escalation: autonomous
+                    # recovery budget is exhausted and the task needs human
+                    # attention. Stamp ``escalated`` so this matches the contract
+                    # the legacy ladder path produced (the task is blocked AND
+                    # escalated), only WITHOUT burning extra retry slots first.
+                    _budget_meta["escalated"] = True
+                    task = await block_task(
+                        orch,
+                        task,
+                        failure_class=_fcls.GUARDRAIL_EXCEEDED,
+                        raw_error=str(_budget_exc),
+                        meta=_budget_meta,
+                    )
+                    return task
                 # v0.39.0 (Cluster C2c): runtime under-decomposition
                 # telemetry. Best-effort, purely observational — never
                 # changes control flow (falls through to the existing
@@ -4476,6 +5452,8 @@ async def _execute_one(
                     task,
                     retry_limit,
                     reason=_build_adapter_failure_reason(developer_result),
+                    # Developer adapter failed at the code layer (no usable diff).
+                    failure_class=_fcls.WORKER_EXCEPTION,
                 )
                 if task.escalated:
                     return task
@@ -4523,7 +5501,12 @@ async def _execute_one(
                     "repository's code, not AutoDev's internal run state"
                 )
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason=_containment_reason
+                    orch,
+                    task,
+                    retry_limit,
+                    reason=_containment_reason,
+                    # Diff confined to .autodev/ — a scope violation.
+                    failure_class=_fcls.EDIT_SCOPE_VIOLATION,
                 )
                 if task.escalated:
                     return task
@@ -4535,8 +5518,16 @@ async def _execute_one(
             # Step 3: auto-gates (syntax/lint/build/test_runner/secretscan).
             # v0.13.0: pass developer_result so secretscan can scope to the
             # diff (skip pre-existing repo state).
+            # WS2-5 (G3): the developer's diff lives in the per-task WORKTREE,
+            # not in orch.cwd (the pre-change MAIN repo). Thread the worktree
+            # path so the gates verify the CHANGED tree. ``worktree`` is None
+            # on the legacy in-place path (no isolation), in which case the
+            # gates fall back to orch.cwd exactly as before.
             gate_failure = await _run_qa_gates(
-                orch, task, developer_result=developer_result
+                orch,
+                task,
+                developer_result=developer_result,
+                cwd_override=worktree,
             )
             if gate_failure is not None:
                 logger.warning(
@@ -4545,7 +5536,12 @@ async def _execute_one(
                     details=gate_failure,
                 )
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason=gate_failure
+                    orch,
+                    task,
+                    retry_limit,
+                    reason=gate_failure,
+                    # Auto-gate (syntax/lint/build/test_runner/secretscan) failed.
+                    failure_class=_fcls.QA_GATE_FAILED,
                 )
                 if task.escalated:
                     return task
@@ -4642,6 +5638,8 @@ async def _execute_one(
                         task,
                         retry_limit,
                         reason="review_tournament max_rounds",
+                        # Review tournament hit max_rounds without convergence.
+                        failure_class=_fcls.REVIEW_ESCALATED,
                     )
                     if task.escalated:
                         return task
@@ -4812,6 +5810,18 @@ async def _execute_one(
                         issues=issues,
                         output_text=review_result_text,
                         raw_response=review_result_text,
+                        # Phase 1A R7: stamp the INFRA soft-pass marker so
+                        # this APPROVED is schema-DISTINCT from a genuine
+                        # reviewer APPROVED. The approved-on-exhaustion
+                        # completion gate
+                        # (``_maybe_accept_approved_on_exhaustion``) REFUSES
+                        # to auto-complete a turn-exhausted task on a
+                        # soft-passed verdict — only a genuine APPROVED may
+                        # complete. Without this marker the infra soft-pass
+                        # was indistinguishable from a real APPROVED and
+                        # silently certified an unreviewed diff as done.
+                        soft_passed=True,
+                        soft_pass_reason="reviewer_infra_softpass",
                     )
                     await write_evidence(orch.cwd, task.id, review_ev)
             # v0.31.0 (Phase 1.3): a genuine MALFORMED (the reviewer did NOT
@@ -4831,7 +5841,12 @@ async def _execute_one(
                     ),
                 )
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason="reviewer MALFORMED"
+                    orch,
+                    task,
+                    retry_limit,
+                    reason="reviewer MALFORMED",
+                    # Reviewer verdict unparseable (NOT a turn-budget exhaustion).
+                    failure_class=_fcls.REVIEW_MALFORMED,
                 )
                 if task.escalated:
                     return task
@@ -4845,7 +5860,12 @@ async def _execute_one(
                     issues=issues,
                 )
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason=f"reviewer {verdict}"
+                    orch,
+                    task,
+                    retry_limit,
+                    reason=f"reviewer {verdict}",
+                    # Reviewer returned NEEDS_CHANGES / REJECTED.
+                    failure_class=_fcls.REVIEW_REJECTED,
                 )
                 if task.escalated:
                     return task
@@ -4970,7 +5990,12 @@ async def _execute_one(
                     total=total,
                 )
                 task = await _try_retry_or_escalate(
-                    orch, task, retry_limit, reason="tests failed"
+                    orch,
+                    task,
+                    retry_limit,
+                    reason="tests failed",
+                    # Tests collected and ran but at least one failed.
+                    failure_class=_fcls.TESTS_FAILED,
                 )
                 if task.escalated:
                     return task
@@ -5347,9 +6372,40 @@ async def _execute_one(
             # MODE and its RESOLUTION directive determines the next
             # step (rebase-and-retry / abandon-task / rewrite).
             if worktree_mgr is not None and worktree is not None:
-                applied = await _apply_with_conflict_escalation(
-                    orch, task, worktree, worktree_mgr
-                )
+                # WS1-worktree-apply-failed-dead (should-fix): a NON-conflict
+                # apply fault (the worktree vanished, a git index lock, a
+                # ``git apply``/merge-abort failure, etc.) raises ``WorktreeError``
+                # from somewhere the conflict-escalation machinery cannot contain
+                # — so it escapes ``_apply_with_conflict_escalation`` instead of
+                # resolving to a CONFLICT_* class. Before this guard such faults
+                # collapsed into the generic worker-exception handler as
+                # ``WORKER_EXCEPTION``, which is why ``WORKTREE_APPLY_FAILED`` had a
+                # taxonomy entry + a ``repair_environment`` resolver rung but ZERO
+                # producers — the rung never fired. Catch the escaping
+                # ``WorktreeError`` HERE and terminate through the single block
+                # chokepoint with the real class so its environment-repair rung is
+                # actually reachable. Genuine merge conflicts still terminate as
+                # CONFLICT_3WAY_FAILED / CONFLICT_ABANDON inside the helper.
+                try:
+                    applied = await _apply_with_conflict_escalation(
+                        orch, task, worktree, worktree_mgr
+                    )
+                except WorktreeError as exc:
+                    logger.warning(
+                        "execute_phase.worktree_apply_failed",
+                        task_id=task.id,
+                        err=str(exc),
+                    )
+                    task = await block_task(
+                        orch,
+                        task,
+                        failure_class=_fcls.WORKTREE_APPLY_FAILED,
+                        raw_error=f"worktree_apply_failed: {exc}",
+                        meta={
+                            "blocked_reason": f"worktree_apply_failed: {exc}",
+                        },
+                    )
+                    return task
                 if not applied:
                     return await orch.plan_manager.get_task(task.id) or task
 
@@ -5369,6 +6425,14 @@ async def _execute_one(
                     "execute_phase.reset_stuck_state_failed",
                     task_id=task.id,
                     err=str(exc),
+                )
+            # F-2: forward progress — a task in the phase completed, so the
+            # phase-scoped same-class corrective-cycle counters are replenished
+            # (a later same-class conflict gets a full fresh ceiling budget,
+            # preserving legitimate multi-corrective recovery).
+            if task.phase_id:
+                await _reset_corrective_cycle_counters(
+                    orch, phase_id=task.phase_id
                 )
             # v0.35.0 C1 prerequisite: credit every lesson that landed
             # in a prompt for this task with one succeeded_after_count
@@ -5487,7 +6551,7 @@ async def _enforce_retry_backoff(
     last_retry_at: str | None,
     min_interval_s: float,
     *,
-    now: Callable[[], "datetime"] | None = None,
+    now: Callable[[], "_dt.datetime"] | None = None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> float:
     """v0.25.1 Bug #4: pause until the retry interval has elapsed.
@@ -5536,8 +6600,20 @@ async def _try_retry_or_escalate(
     task: Task,
     retry_limit: int,
     reason: str,
+    *,
+    failure_class: str,
 ) -> Task:
     """Bump retry count or escalate when the limit is reached.
+
+    Step 3 (RECOVERY-CONTRACT §7): ``failure_class`` is REQUIRED (keyword-only,
+    no default) so every caller threads the REAL terminal-failure class. The
+    retry-exhaustion rung passes it to :func:`block_task` instead of the old
+    ``_fcls.UNKNOWN`` — so when the resolver is finally reached at the terminal
+    rung it classifies a concrete failure (and the deterministic ladder can pick
+    a real recovery action) rather than treating every real-loop failure as
+    novel/unseen. The keyword-only-no-default shape makes a silent UNKNOWN a
+    compile-error-equivalent (TypeError at every unported call site) rather than
+    an easy-to-miss default.
 
     Returns the updated task. If ``task.escalated`` becomes True on return,
     the caller should stop the loop.
@@ -5568,7 +6644,6 @@ async def _try_retry_or_escalate(
     """
     from orchestrator.escalation_ladder import next_step
     from orchestrator.knowledge_lookup import lookup_recent_failures
-    from orchestrator.repetition_recovery import choose_recovery_action
     from state.knowledge import TournamentEvent
 
     # v0.25.1 Bug #4: enforce the configured minimum retry interval
@@ -5623,6 +6698,48 @@ async def _try_retry_or_escalate(
     if detected_patterns:
         knowledge_context = {"detected_patterns": detected_patterns}
 
+    # Step 4 (RECOVERY-CONTRACT §7; gate R3) — THE KEYSTONE. Insert the resolver
+    # chokepoint BEFORE the legacy escalation ladder (``next_step``). Until now
+    # the resolver was SHADOWED: ``next_step`` ran the REFINE/PIVOT/ARCHITECT_CONSULT
+    # ladder (which returns WITHOUT block_task) and the resolver was only reached at
+    # the two terminal rungs (retry-exhaustion + soft-blocker → ``block_task``). The
+    # resolver therefore could not ACTIVELY recover a known-class failure ahead of
+    # the ladder. Here the chokepoint intercepts the failure FIRST, with the REAL
+    # ``failure_class`` (Step 3), and when it recovers (re-enables the task) we
+    # return the re-enabled task so the CALLER's loop re-dispatches it. The legacy
+    # ladder becomes the FALLBACK only when the resolver DECLINES (or is disabled).
+    #
+    # Termination: re-dispatching a still-failing developer re-enters this helper,
+    # which consults the resolver AGAIN — but ``_maybe_resolve_blocker`` enforces a
+    # per-(task, failure_class) cycle cap (the in-memory ``_RESOLVER_CYCLE_COUNTS``
+    # WeakKeyDictionary backstop + the resume-safe ledger budget). After
+    # ``max_cycles_per_blocker`` hits the chokepoint returns None → falls through
+    # to ``next_step`` → the
+    # legacy terminal block. The loop is therefore BOUNDED; no new uncapped loop is
+    # introduced.
+    #
+    # Resolver OFF (the suite default, ``AUTODEV_RESOLVER_DISABLED=1``) makes
+    # ``_maybe_resolve_blocker`` a pure no-op → ``recovered is None`` → identical
+    # legacy behaviour (the ``next_step`` ladder runs exactly as before).
+    recovered = await _maybe_resolve_blocker(
+        orch,
+        task,
+        failure_class=failure_class,
+        raw_error=reason,
+        # No single ``role`` var is in scope across all call sites (developer /
+        # reviewer / test_engineer reach this helper); derive the originating role
+        # from the REAL failure_class so the resolver's BlockerContext carries it.
+        failing_role=_failing_role_for_class(failure_class),
+        phase_id=task.phase_id,
+    )
+    if recovered is not None and getattr(recovered, "status", None) != "blocked":
+        # Resolver ACTIVELY recovered (re-enabled the task). Return the
+        # non-escalated, re-enabled task so the caller's loop re-dispatches it.
+        # This is the unification: the resolver drives recovery for known classes;
+        # the legacy ladder (next_step) is the fallback only when it declines.
+        return recovered
+    # else: resolver declined (or is disabled) → fall through to the legacy ladder.
+
     step = next_step(stuck_state, knowledge_context=knowledge_context)
 
     # v0.32.0 Phase 4.5: emit a forensic breadcrumb when the PRM
@@ -5650,28 +6767,23 @@ async def _try_retry_or_escalate(
                 err=str(exc),
             )
 
-    # v0.32.0 Phase 4.4: pick a recovery action so the ledger captures
-    # *why* the retry path is going to dispatch what it dispatches.
-    # The action does not currently override the ladder's choice (the
-    # ladder is the source of truth for the next dispatch rung); it is
-    # an audit-only annotation that lets forensics reconstruct the
-    # policy decision. Future work can route ``increase_scope`` /
-    # ``re_architect`` / ``do_nothing`` to dedicated paths once the
-    # corresponding dispatch sites mature.
-    qa_gates_passed = bool(getattr(task, "qa_gates_passed", False))
-    chosen_action = choose_recovery_action(
-        discard_count=stuck_state.discard_count,
-        pivot_count=stuck_state.pivot_count,
-        architect_count=stuck_state.architect_count,
-        qa_gates_passed=qa_gates_passed,
-        repetition_loop_detected=repetition_loop_detected,
-    )
+    # WS1-recovery-action-dead-annotation (should-fix): the
+    # ``choose_recovery_action`` policy was a DEAD PARALLEL decision — its
+    # ``RecoveryAction`` literal was computed and stamped into the ledger but
+    # NEVER dispatched (the ``step`` from ``next_step`` is, and always was, the
+    # sole source of truth for the next rung). Carrying a second, never-consulted
+    # decision alongside the real one only widened the recovery surface and made
+    # the audit trail lie about what drove dispatch. We REMOVE the phantom
+    # computation. The ``recovery_action_chosen`` op is retained (a gate test —
+    # ``test_recovery_step4_resolver_before_ladder`` — asserts its presence and
+    # ordering vs the resolver), but its ``action`` now records the REAL ladder
+    # decision (``step``) so the breadcrumb is honest rather than parallel.
     try:
         await orch.plan_manager.ledger_append(
             op="recovery_action_chosen",
             payload={
                 "task_id": task.id,
-                "action": chosen_action,
+                "action": step,
                 "reason": reason[:200],
                 "next_step": step,
             },
@@ -6046,14 +7158,15 @@ async def _try_retry_or_escalate(
         retry_exhausted_hint = _build_recovery_hint_from_reason(
             task_id=task.id, reason=reason
         )
-        # v0.42.1 F1: route the retry-exhaustion escalation through the single
-        # chokepoint (UNKNOWN so the LLM resolver gets a shot at recovery); a
-        # resolver recovery re-enables the task, otherwise ``block_task`` commits
-        # the legacy block unchanged.
+        # v0.42.1 F1 / Step 3: route the retry-exhaustion escalation through the
+        # single chokepoint with the REAL terminal failure_class threaded from
+        # the call site (was ``_fcls.UNKNOWN`` — which made the resolver treat
+        # every real-loop failure as novel/unseen). A resolver recovery re-enables
+        # the task; otherwise ``block_task`` commits the legacy block unchanged.
         updated = await block_task(
             orch,
             task,
-            failure_class=_fcls.UNKNOWN,
+            failure_class=failure_class,
             raw_error=f"escalated: {reason}",
             meta={
                 "blocked_reason": f"escalated: {reason}",
@@ -6101,7 +7214,17 @@ async def delegate(
     spec = orch.registry.get(role)
     if spec is None:
         raise AutodevError(f"role {role!r} not in registry")
-    parts: list[str] = [spec.prompt.strip()]
+    # v1.0 B1/B3: inject necessity ladder into the developer (coder) prompt so
+    # the code-writing role applies the same laziness gate as the architect.
+    # B3 modulates intensity via user_complexity (low→lite, high/max→deeper).
+    # build_developer_prompt() is the single definition of the injection
+    # contract shared with _CoderRunner.run in impl_tournament_runner.py.
+    base_prompt = spec.prompt.strip()
+    if role == "developer":
+        base_prompt = build_developer_prompt(
+            spec.prompt, user_complexity=orch.cfg.user_complexity
+        )
+    parts: list[str] = [base_prompt]
     parts.append("\n\n---\n")
     parts.append(envelope.render_as_task_message())
     if extra_context:
@@ -6514,9 +7637,44 @@ async def delegate(
                 subtype="error_max_turns_escalation_exhausted",
             )
 
-        _escalation_attempt = _budget_tracker.current_attempt(
-            envelope.task_id, role
-        )
+        # RECOVERY-CONTRACT §7 Step 8 (the A4 root cause): the LAST
+        # ``error_max_turns`` for this (task, role) was caused by an OVERSIZED
+        # prompt. Granting MORE turns is the wrong direction — the agent would
+        # just burn the extra budget re-reading the same bloat. SKIP the
+        # escalation (keep the BASE budget); the BOUND_INPUT resolver ladder is
+        # responsible for reducing the input on the next attempt. The normal
+        # (non-oversized) escalation ladder below is untouched.
+        if _budget_tracker.is_oversized(envelope.task_id, role):
+            _skip_payload = {
+                "task_id": envelope.task_id,
+                "role": role,
+                "max_turns": _prior_max_turns,
+                "reason": "oversized_input",
+            }
+            if getattr(orch, "plan_manager", None) is not None:
+                try:
+                    await orch.plan_manager.ledger_append(
+                        op="budget_escalation_skipped",
+                        payload=_skip_payload,
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort breadcrumb
+                    logger.warning(
+                        "orchestrator.budget_escalation_skipped",
+                        err=str(exc),
+                        **_skip_payload,
+                    )
+            else:
+                logger.warning(
+                    "orchestrator.budget_escalation_skipped",
+                    **_skip_payload,
+                )
+            _ = BudgetEscalationTracker
+            # Fall through with max_turns / timeout_s left at the base values.
+            _escalation_attempt = 0
+        else:
+            _escalation_attempt = _budget_tracker.current_attempt(
+                envelope.task_id, role
+            )
         if _escalation_attempt > 0:
             _new_max_turns, _new_timeout_s = escalate_budget(
                 _prior_max_turns,
@@ -6651,7 +7809,72 @@ async def delegate(
     # clears the counter. ``getattr`` keeps backward compat with the
     # older orchestrator stubs used by some unit tests.
     if _budget_tracker is not None and envelope.task_id:
-        _budget_tracker.record_result(envelope.task_id, role, result.subtype)
+        # RECOVERY-CONTRACT §7 Step 8 (the A4 root cause): an ``error_max_turns``
+        # failure is OVERSIZED_INPUT (not the normal guardrail exhaustion) when
+        # the dispatched prompt is too big — the agent burned its turns reading
+        # tools/context to digest the bloat. Classify by the REAL size source
+        # (``len(inv.prompt)`` — what the adapter actually saw) against the
+        # operator-tunable threshold, mark the per-(task, role) oversized flag,
+        # and emit a typed escalation breadcrumb. The flag makes the NEXT
+        # dispatch's budget gate skip turn escalation (BOUND_INPUT, not more
+        # turns). A non-oversized max-turns leaves the flag clear → normal
+        # escalation ladder still applies.
+        _oversized = False
+        if result.subtype == "error_max_turns":
+            _ovr_cfg = getattr(orch.cfg, "budget_escalation", None)
+            _ovr_threshold = (
+                getattr(_ovr_cfg, "oversized_input_char_threshold", None)
+                if _ovr_cfg is not None
+                else None
+            )
+            if _ovr_threshold is not None:
+                _max_turns_class = _fcls.classify_max_turns_failure(
+                    prompt_len=len(inv.prompt),
+                    threshold=int(_ovr_threshold),
+                )
+                _oversized = _max_turns_class == _fcls.OVERSIZED_INPUT
+                if _oversized and getattr(orch, "plan_manager", None) is not None:
+                    # Typed breadcrumb so post-mortems can see the bound-input
+                    # routing (and the F1d invariant sees a pre-block escalation
+                    # op). Best-effort — a ledger hiccup MUST NOT mask dispatch.
+                    try:
+                        await orch.plan_manager.ledger_append(
+                            op="blocker_escalated",
+                            payload={
+                                "task_id": envelope.task_id,
+                                "phase_id": None,
+                                "failure_class": _fcls.OVERSIZED_INPUT,
+                                "failing_role": role,
+                                "prompt_len": len(inv.prompt),
+                                "threshold": int(_ovr_threshold),
+                                "source": "delegate.oversized_input",
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 — forensics only
+                        logger.warning(
+                            "execute_phase.oversized_input_ledger_failed",
+                            task_id=envelope.task_id,
+                            err=str(exc),
+                        )
+        _budget_tracker.record_result(
+            envelope.task_id, role, result.subtype, oversized=_oversized
+        )
+        # RECOVERY-CONTRACT §7 Step 2 (gate R4): persist the NEW counter value
+        # so the per-(task_id, role) escalation ladder survives ``autodev
+        # resume`` (last-value-wins via a ``budget_cycle`` ledger op). The
+        # tracker is the in-memory write-through cache; the ledger is the source
+        # of truth on resume. Best-effort — the persist helper swallows ledger
+        # failures so the retry/escalate FSM still sees ``result`` unchanged.
+        from orchestrator.budget_escalation import (  # noqa: PLC0415
+            persist_budget_cycle,
+        )
+
+        await persist_budget_cycle(
+            orch,
+            envelope.task_id,
+            role,
+            _budget_tracker.current_attempt(envelope.task_id, role),
+        )
 
     # v0.30.0 Bug 4: per-adapter-failure audit breadcrumb. Append one
     # ``adapter_failure`` ledger op for every ``success=False`` result
@@ -6796,37 +8019,23 @@ def _developer_envelope(task: Task, extra_issues: list[str]) -> DelegationEnvelo
 # but routinely dominate diff bytes. Skipped wholesale by the chunked
 # envelope so the per-file budget is spent on files a human reviewer
 # would actually want to see.
-_REVIEW_GENERATED_FILE_GLOBS: tuple[str, ...] = (
-    "*.lock",
-    "package-lock.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-    "Cargo.lock",
-    "uv.lock",
-    "poetry.lock",
-    "Gemfile.lock",
-    "composer.lock",
-    "*.min.js",
-    "*.min.css",
+#
+# F-5: the pattern set and predicate now live in ``adapters.git_utils`` as
+# the SINGLE source of truth — the worktree diff source (get_diff_vs_base)
+# reuses the exact same set to filter generated cruft (e.g. regenerated
+# ``__pycache__/*.pyc``) out of the DELIVERED diff. ``_matches_generated_glob``
+# is kept as a re-export so existing callers / tests in this module stay
+# stable; the underlying glob set is ``git_utils.GENERATED_FILE_GLOBS``.
+from adapters.git_utils import (  # noqa: E402
+    matches_generated_glob as _matches_generated_glob,
 )
+
 # Soft byte caps — not hard limits, the chunker rounds at file boundaries.
 _REVIEW_PER_FILE_FULL_BYTES = 2_048  # files ≤ this size pass through whole.
 _REVIEW_PER_FILE_HEAD_BYTES = 1_024  # head slice for oversize files.
 _REVIEW_PER_FILE_TAIL_BYTES = 512  # tail slice for oversize files.
 _REVIEW_TOTAL_ENVELOPE_BYTES = 32_768  # soft cap on the chunked envelope.
 _REVIEW_DIFF_PASSTHROUGH_BYTES = 8_192  # diffs ≤ this size skip chunking.
-
-
-def _matches_generated_glob(path: str) -> bool:
-    """Return True if ``path`` matches any generated/lock file glob."""
-    import fnmatch as _fn
-
-    base = path.rsplit("/", 1)[-1]
-    for pattern in _REVIEW_GENERATED_FILE_GLOBS:
-        if _fn.fnmatch(path, pattern) or _fn.fnmatch(base, pattern):
-            return True
-    # Also skip any path containing a ``__pycache__/`` segment.
-    return "__pycache__/" in path or path.startswith("__pycache__/")
 
 
 def _split_diff_by_file(diff: str) -> list[tuple[str, str]]:
@@ -7150,6 +8359,9 @@ async def _maybe_accept_approved_on_exhaustion(
     orch: "Orchestrator",
     task: "Task",
     developer_result: "AgentResult",
+    *,
+    worktree: "Path | None" = None,
+    worktree_mgr: "WorktreeManager | None" = None,
 ) -> "Task | None":
     """Tier J: accept an APPROVED-but-turn-exhausted task instead of blocking.
 
@@ -7172,9 +8384,12 @@ async def _maybe_accept_approved_on_exhaustion(
        (:data:`_TURN_EXHAUSTION_SUBTYPES`). A semantic NEEDS_CHANGES /
        REJECTED retry, a parse error, an auth/transport failure, etc. is
        NOT accepted — those must still block.
-    2. A reviewer verdict of ``APPROVED`` is on record for this task's
-       artifact (``{task_id}-review.json``). Any other verdict (or no
-       review evidence at all) is NOT accepted.
+    2. A GENUINE reviewer verdict of ``APPROVED`` is on record for this
+       task's artifact (``{task_id}-review.json``). Any other verdict (or no
+       review evidence at all) is NOT accepted. An INFRA soft-pass APPROVED
+       — one stamped ``soft_passed=True`` because the *reviewer* itself
+       exhausted its turns and the diff was accepted WITHOUT a real verdict
+       — is REFUSED (R7); completing on it would certify an unreviewed diff.
     3. The current (turn-exhausted) developer attempt produced no diff —
        ``developer_result.diff`` is empty / whitespace-only. This is the
        reliable signal: a turn-exhausted attempt emits no patch, and an
@@ -7182,6 +8397,15 @@ async def _maybe_accept_approved_on_exhaustion(
        apply step. A non-empty in-hand diff is deliberately NOT auto-
        accepted here (applying an un-reviewed partial diff would be
        unsafe); it falls through to the unchanged path.
+
+    When ``worktree`` and ``worktree_mgr`` are supplied the function also
+    checks whether the worktree holds uncommitted changes from a prior
+    successful attempt (the scenario where attempt N wrote a diff, the
+    reviewer APPROVED, but attempt N+1 then turn-exhausted with no new
+    diff). In that case the prior approved changes are applied to main
+    before the task is marked complete — otherwise the ``finally`` block
+    in ``_execute_one`` removes the worktree and those changes are
+    silently discarded.
 
     Idempotent: marking the task ``complete`` is the terminal transition,
     so a re-entry (e.g. resume) re-reads the same APPROVED evidence and
@@ -7209,6 +8433,31 @@ async def _maybe_accept_approved_on_exhaustion(
     if review_ev is None or getattr(review_ev, "verdict", None) != "APPROVED":
         return None
 
+    # Phase 1A R7 (STABLE-RELEASE-GATE): a turn-exhausted task may
+    # auto-complete ONLY on a GENUINE reviewer APPROVED — never on an INFRA
+    # soft-pass APPROVED (one stamped ``soft_passed=True`` because the
+    # *reviewer* itself ran out of turns and the diff was accepted WITHOUT a
+    # real verdict; see the reviewer infra soft-pass site above). Completing
+    # on a soft-passed verdict would certify an UNREVIEWED diff as done. The
+    # refusal is observable, not silent: emit a typed breadcrumb so the
+    # bypass attempt is visible in the logs, then fall through to the
+    # unchanged retry/escalate ladder.
+    if getattr(review_ev, "soft_passed", False):
+        logger.warning(
+            "execute_phase.refused_softpass_completion_on_exhaustion",
+            task_id=task.id,
+            subtype=subtype,
+            verdict="APPROVED",
+            soft_pass_reason=getattr(review_ev, "soft_pass_reason", None),
+            note=(
+                "APPROVED ReviewEvidence is an INFRA soft-pass "
+                "(soft_passed=True), not a genuine reviewer verdict; "
+                "REFUSING to auto-complete a turn-exhausted task on it — "
+                "falling through to retry/escalate (R7)."
+            ),
+        )
+        return None
+
     # The current (turn-exhausted) attempt must carry no diff — an empty
     # diff integrates as a no-op, so completion is safe without an apply
     # step. A turn-exhausted attempt reliably emits no patch; a non-empty
@@ -7218,13 +8467,83 @@ async def _maybe_accept_approved_on_exhaustion(
     if in_hand_diff is not None and in_hand_diff.strip():
         return None
 
+    # worktree_diff is resolved below (inside the worktree apply block); a
+    # None here means no worktree manager was provided → effectively empty.
+    worktree_diff: str | None = None
+
+    # Apply any prior successful attempt's changes from the worktree to
+    # main before marking complete. When this function fires, the worktree
+    # may hold changes from a prior attempt that passed review (the current
+    # exhausted attempt produced no diff). Without this apply, those changes
+    # are silently discarded when the worktree is cleaned up in the finally
+    # block of _execute_one.
+    if worktree_mgr is not None and worktree is not None:
+        try:
+            worktree_diff = await worktree_mgr.get_diff_vs_base(worktree)
+        except Exception as exc:  # noqa: BLE001
+            # We CANNOT determine whether the worktree holds unapplied
+            # approved changes.  Silently completing the task here risks
+            # discarding those changes — the exact silent-loss class A4
+            # exists to prevent.  Block loud so a human can inspect.
+            logger.error(
+                "execute_phase.accept_approved_on_exhaustion.diff_check_failed",
+                task_id=task.id,
+                err=str(exc),
+                note=(
+                    "cannot determine worktree diff — BLOCKING task "
+                    "rather than silently completing (safe-fail)"
+                ),
+            )
+            task = await block_task(
+                orch,
+                task,
+                failure_class=_fcls.WORKTREE_DIFF_CHECK_FAILED,
+                raw_error=f"worktree_diff_check_failed: {exc}",
+                meta={"blocked_reason": f"worktree_diff_check_failed: {exc}"},
+            )
+            return task
+        if worktree_diff.strip():
+            # Worktree has prior approved changes — apply to main before
+            # completing. A conflict or apply failure blocks the task (the
+            # caller must not silently complete on unapplied changes).
+            logger.info(
+                "execute_phase.accept_approved_on_exhaustion.applying_prior_diff",
+                task_id=task.id,
+            )
+            try:
+                applied = await _apply_with_conflict_escalation(
+                    orch, task, worktree, worktree_mgr
+                )
+            except WorktreeError as exc:
+                # Deliberate defensive guard: _apply_with_conflict_escalation
+                # currently swallows all WorktreeError internally and signals
+                # failure via a False return (see its docstring). This clause
+                # is NOT a currently-reachable path — it exists as a safety
+                # net in case that internal contract changes in the future.
+                task = await block_task(
+                    orch,
+                    task,
+                    failure_class=_fcls.WORKTREE_APPLY_FAILED,
+                    raw_error=f"worktree_apply_failed: {exc}",
+                    meta={"blocked_reason": f"worktree_apply_failed: {exc}"},
+                )
+                return task
+            if not applied:
+                # Conflict → task already blocked by
+                # _apply_with_conflict_escalation.
+                return await orch.plan_manager.get_task(task.id) or task
+
+    # Emit the acceptance breadcrumb now that we know whether the worktree
+    # diff was empty (no prior changes) or non-empty (applied above).
+    _actual_diff_empty = worktree_diff is None or not worktree_diff.strip()
     logger.warning(
         "execute_phase.accepted_approved_on_exhaustion",
         task_id=task.id,
         subtype=subtype,
         verdict="APPROVED",
-        diff_empty=True,
+        diff_empty=_actual_diff_empty,
     )
+
     # Audit-only ledger breadcrumb. Best-effort — a ledger failure here
     # MUST NOT mask the completion the operator needs.
     if getattr(orch, "plan_manager", None) is not None:
@@ -7235,7 +8554,7 @@ async def _maybe_accept_approved_on_exhaustion(
                     "task_id": task.id,
                     "verdict": "APPROVED",
                     "subtype": subtype or "unknown",
-                    "diff_empty": True,
+                    "diff_empty": _actual_diff_empty,
                 },
             )
         except Exception as exc:  # noqa: BLE001 — best-effort breadcrumb
@@ -7245,9 +8564,8 @@ async def _maybe_accept_approved_on_exhaustion(
                 err=str(exc),
             )
 
-    # Mark complete. An empty diff integrates as a no-op, so there is
-    # nothing to apply to main — the reviewer already certified the
-    # empty diff as structurally correct. The task is ``in_progress`` at
+    # Mark complete. At this point the diff was either empty (no-op) or
+    # already applied to main above. The task is ``in_progress`` at
     # this point (set at dispatch and reset on every retry), and the FSM
     # forbids a direct ``in_progress -> complete`` edge, so walk the
     # canonical happy-path pipeline states the approved artifact would
@@ -7274,6 +8592,10 @@ async def _maybe_accept_approved_on_exhaustion(
             task_id=task.id,
             err=str(exc),
         )
+    # F-2: forward progress resets the phase-scoped corrective-cycle counters
+    # (mirrors the happy-path completion tail above).
+    if task.phase_id:
+        await _reset_corrective_cycle_counters(orch, phase_id=task.phase_id)
     return completed
 
 
@@ -7413,7 +8735,7 @@ def _surface_warning(task: "Task", gate_name: str, result: GateResult) -> None:
 
 
 def _run_secretscan_with_cfg(
-    cwd: Path, secretscan_paths: list[Path] | None, cfg: object
+    cwd: Path, secretscan_paths: list[Path] | None, cfg: "QAGatesConfig"
 ) -> Awaitable[GateResult]:
     """v0.23.0 C2: bridge that only forwards new C2 kwargs when set.
 
@@ -7424,7 +8746,7 @@ def _run_secretscan_with_cfg(
     through (and any test that exercises the C2 surface will mock
     accordingly).
     """
-    extra: dict[str, object] = {}
+    extra: dict[str, Any] = {}
     ignore = getattr(cfg, "secretscan_ignore_paths", None)
     if ignore:
         extra["ignore_paths"] = ignore
@@ -7492,6 +8814,8 @@ async def _run_qa_gates(
     orch: "Orchestrator",
     task: "Task",
     developer_result: AgentResult | None = None,
+    *,
+    cwd_override: Path | None = None,
 ) -> str | None:
     """Run enabled QA gates. Returns the first failure detail string, or None if all pass.
 
@@ -7506,13 +8830,61 @@ async def _run_qa_gates(
     severity="info"`` are surfaced via :func:`_surface_warning` and the
     gate dispatch continues. Existing gates that don't set ``severity``
     inherit the "block" default — pre-v0.22.0 behavior is preserved.
+
+    WS2-5 (G3): ``cwd_override`` is the per-task WORKTREE path. When the
+    task runs under worktree isolation the developer's diff is materialized
+    there — NOT in ``orch.cwd`` (the pre-change MAIN repo). The syntax /
+    lint / build / test / secretscan / hallucination gates must therefore
+    scan the worktree, or they vacuously PASS against a clean main while the
+    actual changed tree is broken (a silent wrong-pass). ``None`` (the
+    legacy default — single-task CLI, non-git tests) preserves the
+    in-place ``orch.cwd`` behavior. Only the cwd the gates *see* changes;
+    diff-scope path computation and all other logic are untouched.
     """
     from errors import DiffParseError
     from plugins.registry import QAContext
 
     cfg = orch.cfg.qa_gates
-    cwd = orch.cwd
+    cwd = cwd_override if cwd_override is not None else orch.cwd
     language = detect_language(cwd)
+
+    # Gate-closer A (G6): an UNSUPPORTED language must NOT vacuously soft-pass.
+    # Without this guard, ``detect_language`` returning ``None`` (with source)
+    # or a recognised-but-NON-RUNNABLE language (cpp / dotnet / ruby / swift /
+    # ...) let every per-language gate return ``passed=True`` ("language not
+    # detected, skipping") — a silent clean bill of health for a repo whose
+    # tests AutoDev cannot run. ``classify_language_support`` distinguishes that
+    # case from a genuinely-empty repo (no source → legit ``no_source`` pass):
+    # only the unsupported-with-source / non-runnable case emits a typed
+    # ``language_unsupported`` ledger op and degrades LOUD (returns the
+    # diagnostic as the blocking detail). The empty-repo case falls through to
+    # the normal gate loop, which legitimately soft-passes.
+    from qa.detect import classify_language_support
+
+    support_status, support_lang, support_reason = classify_language_support(cwd)
+    if support_status == "unsupported":
+        try:
+            await orch.plan_manager.ledger_append(
+                op="language_unsupported",
+                payload={
+                    "language": support_lang,
+                    "reason": support_reason,
+                    "has_source": True,
+                },
+            )
+        except Exception as crumb_exc:  # noqa: BLE001 - crumb must not mask gate
+            logger.warning(
+                "execute_phase.ledger_append_failed",
+                op="language_unsupported",
+                err=str(crumb_exc),
+            )
+        logger.warning(
+            "execute_phase.qa_gate_language_unsupported",
+            task_id=getattr(task, "id", None),
+            language=support_lang,
+            reason=support_reason,
+        )
+        return f"language_unsupported: {support_reason}"
 
     # v0.27.0 (audit §6): fail-closed when a diff-producing task ships a
     # malformed diff body. Investigation tasks (``produces_diff=False``)
@@ -7574,7 +8946,7 @@ async def _run_qa_gates(
     gates: list[tuple[str, bool, Callable[[], Awaitable[GateResult]]]] = [
         ("syntax_check", cfg.syntax_check, lambda: run_syntax_check(cwd, language)),
         ("lint", cfg.lint, lambda: run_lint(cwd, language, paths=secretscan_paths, timeout_s=cfg.lint_timeout_s)),
-        ("build_check", cfg.build_check, lambda: run_build_check(cwd, language)),
+        ("build_check", cfg.build_check, lambda: run_build_check(cwd, language, timeout_s=cfg.build_check_timeout_s)),
         ("test_runner", cfg.test_runner, lambda: run_tests(cwd, paths=secretscan_paths, timeout_s=cfg.test_timeout_s)),
         (
             "secretscan",
@@ -7594,7 +8966,15 @@ async def _run_qa_gates(
                 extra_skip_dirs=getattr(
                     cfg, "hallucination_guard_skip_dirs", None
                 ),
-                allowlist=_hallucination_allowlist_for(cwd),
+                # WS2-5 (G3): the allowlist is keyed off the repo's language
+                # profile, which is identical for main and the worktree. Look
+                # it up against ``orch.cwd`` (the canonical AutoDev state dir)
+                # — NOT the gate ``cwd``. ``_hallucination_allowlist_for``
+                # persists ``.autodev/language_profile.json`` as a side effect;
+                # writing it into the worktree would pollute the task diff
+                # (e.g. an "already exists" apply-to-main conflict). The gate's
+                # symbol SCAN still runs against the worktree ``cwd`` above.
+                allowlist=_hallucination_allowlist_for(orch.cwd),
                 sparse_mode=_hallucination_sparse_mode_for(orch, cfg),
                 task_id=task.id,
                 cfg=cfg,

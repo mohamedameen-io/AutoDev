@@ -11,10 +11,13 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from adapters.base import NetworkProbeFailure, PlatformAdapter
+from adapters.base import (
+    AdapterCapabilities,
+    NetworkProbeFailure,
+    PlatformAdapter,
+)
 from adapters.git_utils import (
     _diff_files,
-    _git_diff,
     _git_diff_with_untracked,
     _git_porcelain_set,
 )
@@ -155,6 +158,16 @@ class ClaudeCodeAdapter(PlatformAdapter):
 
     name = "claude_code"
 
+    # WS3 (stabilization-v1) + Phase-4 A4 field fix: scoping to the EMPTY tool
+    # set is REAL here — ``_build_command`` renders ``allowed_tools=[]`` as
+    # ``--tools ""`` (the AVAILABILITY flag), which removes every built-in tool
+    # so a text-only role (critic_t / synthesizer) has nothing to call
+    # (field-verified: 0 ``tool_use``; see results/phase4/A4-microprobe.json).
+    # A populated ``allowed_tools`` list maps to ``--allowed-tools`` (an
+    # auto-approve list — permission-only). The earlier ``--allowed-tools ""``
+    # rendering was a silent no-op (tools still executed) — the bug A4 caught.
+    capabilities = AdapterCapabilities(supports_tool_scoping=True)
+
     def __init__(self, binary: str = "claude") -> None:
         self.binary = binary
         # v0.10.0: most recently spawned subprocess PID. Read by the
@@ -229,17 +242,28 @@ class ClaudeCodeAdapter(PlatformAdapter):
         # user-global default from ``~/.claude/settings.json``.
         if inv.effort:
             cmd += ["--effort", inv.effort]
+        # None → omit tool flags entirely (CLI default = all tools).
         if inv.allowed_tools is not None:
-            # None → omit --allowed-tools entirely (CLI default = all tools).
-            # [] → explicit "no tools": ",".join([]) == "" so we pass
-            #      --allowed-tools "" (an empty allow-list). A bare
-            #      `if inv.allowed_tools:` would drop [] and silently grant ALL
-            #      tools — the Run-5 no-op (v0.42.1 F2b). Only the text-only
-            #      tournament roles (critic_t/synthesizer) reach the adapter
-            #      with literal []; tournament/llm.py normalizes [] -> ["Read"]
-            #      for every other role, so the blast radius is exactly those
-            #      two roles.
-            cmd += ["--allowed-tools", ",".join(inv.allowed_tools)]
+            if len(inv.allowed_tools) == 0:
+                # [] → the text-only "no tools" intent (critic_t / synthesizer;
+                # tournament/llm.py normalizes [] -> ["Read"] for every OTHER
+                # role, so the blast radius is exactly those two). The disable
+                # MUST use ``--tools`` (which controls tool AVAILABILITY), NOT
+                # ``--allowed-tools`` (which is permission/auto-approve only).
+                # Phase-4 A4 field finding: under ``--allowed-tools ""`` a
+                # Bash-triggering prompt still EXECUTED Bash (permission_denials
+                # empty) — a silent no-op that left these roles with ALL tools
+                # and broke the S1 bounded-critic guarantee. ``--tools ""``
+                # removes every built-in tool so the model has nothing to call
+                # (field-verified: 0 tool_use). See results/phase4/.
+                cmd += ["--tools", ""]
+            else:
+                # A populated list is an AUTO-APPROVE list: ``--allowed-tools``
+                # names the tools the CLI may run without prompting. It is
+                # permission-only (does NOT remove other tools from the model) —
+                # the intended behaviour for developer-ish roles, which need
+                # their full toolset available.
+                cmd += ["--allowed-tools", ",".join(inv.allowed_tools)]
         # huge-repo (Cluster B1): isolate the spawned agent from the
         # target repo's SessionStart hooks + MCP servers (cold-start
         # win). Default on; ``suppress_target_repo_config=False`` →

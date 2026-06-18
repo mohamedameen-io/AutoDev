@@ -1,0 +1,13 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 14dfd18..1ba5bdc 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,7 +8,7 @@ pub fn count_vowels(s: &str) -> usize {
+     let mut n = 0;
+     for c in s.chars() {
+         match c.to_ascii_lowercase() {
+-            'a' | 'e' | 'i' | 'o' => n += 1,
++            'a' | 'e' | 'i' | 'o' | 'u' => n += 1,
+             _ => {}
+         }
+     }

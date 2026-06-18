@@ -29,10 +29,17 @@ misbehaving agent can't acquire unbounded budget.
 The escalation state is keyed on ``(scope_id, role)``; it resets when:
 
 * the role on a given scope succeeds (or fails with a different subtype),
-* a new scope is dispatched (different ``scope_id``),
-* the orchestrator instance is replaced (in-memory only — NOT persisted
-  across resume, by design — repeated max-turns in a fresh session
-  starts the escalation ladder over).
+* a new scope is dispatched (different ``scope_id``).
+
+RECOVERY-CONTRACT §7 Step 2 (gate R4): the counter is now **resume-safe**.
+``_counters`` is a fast in-memory write-through cache, but every counter change
+in the production path also appends a ``budget_cycle`` ledger op carrying the
+NEW value (``attempt=0`` on reset). On construction (including ``autodev
+resume``) :meth:`rehydrate_from_ledger` replays those ops with last-value-wins
+semantics and seeds ``_counters`` — so a task that already burned N consecutive
+``error_max_turns`` cycles keeps escalating/exhausting across a resume instead
+of restarting the ladder at 0. A fresh run (empty ledger) rehydrates to all-0,
+preserving the original behaviour byte-for-byte.
 
 v0.32.0 Phase 1.2: ``scope_id`` is the generic key dimension. The
 execute-phase ``delegate()`` site uses the per-task ``task_id`` as the
@@ -53,6 +60,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from orchestrator import Orchestrator
 
 
 # Hard ceiling on the per-call escalated ``max_turns``. A misbehaving
@@ -135,8 +147,11 @@ class BudgetEscalationTracker:
 
     The tracker is intentionally simple: a ``dict`` keyed on the
     composite ``(scope_id, role)`` tuple. Owned by the ``Orchestrator``
-    (one tracker per orchestrator instance). Not persisted — a fresh
-    session resets all counters by design.
+    (one tracker per orchestrator instance). The dict is a write-through
+    in-memory cache; the ledger is the source of truth on resume —
+    :meth:`rehydrate_from_ledger` seeds it from the on-disk ``budget_cycle``
+    ops (RECOVERY-CONTRACT §7 Step 2, gate R4). A fresh session (empty ledger)
+    rehydrates to all-0, so the original "fresh start" behaviour is preserved.
 
     ``scope_id`` is generic. The two production scopes today:
 
@@ -177,6 +192,14 @@ class BudgetEscalationTracker:
 
     max_escalations: int = MAX_ESCALATIONS
     _counters: dict[tuple[str, str], int] = field(default_factory=dict)
+    # RECOVERY-CONTRACT §7 Step 8: per-(scope_id, role) "the last max-turns
+    # failure was caused by an OVERSIZED prompt" flag. When set, the
+    # ``delegate()`` budget gate SKIPS turn escalation for that pair (granting
+    # more turns is the wrong direction — the fix is to bound the input). The
+    # flag is set/cleared in lockstep with the counter by ``record_result``: an
+    # oversized ``error_max_turns`` sets it; any other subtype (success or
+    # different failure) clears it.
+    _oversized: set[tuple[str, str]] = field(default_factory=set)
 
     # Diagnostic surfaced when the escalation ladder is exhausted. Kept
     # as a class constant so tests and the surrounding orchestrator code
@@ -203,6 +226,17 @@ class BudgetEscalationTracker:
         dispatch a fourth attempt.
         """
         return self._counters.get((scope_id, role), 0) > self.max_escalations
+
+    def is_oversized(self, scope_id: str, role: str) -> bool:
+        """Return True when the last ``error_max_turns`` for this pair was caused
+        by an OVERSIZED prompt (RECOVERY-CONTRACT §7 Step 8).
+
+        The ``delegate()`` budget gate consults this BEFORE the next dispatch: a
+        ``True`` result means "do NOT widen turns — the remedy is to bound the
+        input, not to grant more budget." Cleared on any non-oversized result by
+        :meth:`record_result`.
+        """
+        return (scope_id, role) in self._oversized
 
     def escalate_for(
         self,
@@ -236,7 +270,14 @@ class BudgetEscalationTracker:
             timeout_s_ceiling=timeout_s_ceiling,
         )
 
-    def record_result(self, scope_id: str, role: str, subtype: str | None) -> None:
+    def record_result(
+        self,
+        scope_id: str,
+        role: str,
+        subtype: str | None,
+        *,
+        oversized: bool = False,
+    ) -> None:
         """Update the counter based on the adapter result's ``subtype``.
 
         ``error_max_turns`` increments; anything else (including success
@@ -244,13 +285,28 @@ class BudgetEscalationTracker:
         ``(scope_id, role)``. Other-failure subtypes deliberately reset
         the counter — the policy only escalates for *consecutive*
         ``error_max_turns``.
+
+        RECOVERY-CONTRACT §7 Step 8: ``oversized`` records whether THIS
+        ``error_max_turns`` was caused by an oversized prompt (computed at the
+        call site via :func:`failure_classes.classify_max_turns_failure`). An
+        oversized max-turns sets the per-pair oversized flag so the next
+        dispatch's budget gate skips turn escalation (BOUND_INPUT, not more
+        turns). The flag is cleared on any non-oversized result — including a
+        *non*-oversized ``error_max_turns`` (the cause changed back to a normal
+        budget exhaustion, which SHOULD escalate). ``oversized`` is ignored when
+        ``subtype != "error_max_turns"``.
         """
         key = (scope_id, role)
         if subtype == "error_max_turns":
             self._counters[key] = self._counters.get(key, 0) + 1
+            if oversized:
+                self._oversized.add(key)
+            else:
+                self._oversized.discard(key)
         else:
             # Reset on success OR on any non-max-turns failure subtype.
             self._counters.pop(key, None)
+            self._oversized.discard(key)
 
     def record_failure(
         self, scope_id: str, role: str, subtype: str | None
@@ -273,10 +329,108 @@ class BudgetEscalationTracker:
         :meth:`record_result` handle the reset implicitly.
         """
         self._counters.pop((scope_id, role), None)
+        self._oversized.discard((scope_id, role))
 
     def reset_all(self) -> None:
         """Clear every counter. Useful for tests; not used in production."""
         self._counters.clear()
+        self._oversized.clear()
+
+    @classmethod
+    def rehydrate_from_ledger(cls, cwd: Path) -> "BudgetEscalationTracker":
+        """Construct a tracker seeded from the on-disk ``budget_cycle`` ops.
+
+        RECOVERY-CONTRACT §7 Step 2 (gate R4). Reads the ledger via
+        :func:`state.ledger.read_entries` and computes the current attempt for
+        each ``(scope_id, role)`` with **last-value-wins** semantics — the
+        attempt of the highest-``seq`` ``budget_cycle`` op for that key (entries
+        are returned in ascending ``seq`` order, so the later one simply
+        overwrites the earlier). An ``attempt`` of ``0`` (a reset) is dropped
+        from ``_counters`` so :meth:`current_attempt` reports ``0`` exactly as a
+        live ``record_result`` reset would.
+
+        Best-effort: a missing / empty / corrupt ledger yields an empty tracker
+        (all-0), never raising — mirroring
+        :func:`orchestrator.blocker_resolver.count_prior_cycles`.
+        """
+        tracker = cls()
+        try:
+            from state.ledger import read_entries  # noqa: PLC0415
+
+            entries = read_entries(cwd)
+        except Exception:  # noqa: BLE001 - resume-safe; ledger may be absent/corrupt
+            return tracker
+        latest: dict[tuple[str, str], int] = {}
+        for e in entries:
+            if e.op != "budget_cycle":
+                continue
+            scope_id = e.payload.get("scope_id")
+            role = e.payload.get("role")
+            attempt = e.payload.get("attempt")
+            if not isinstance(scope_id, str) or not isinstance(role, str):
+                continue
+            if not isinstance(attempt, int):
+                continue
+            # Ascending seq → later entry wins (last-value-wins).
+            latest[(scope_id, role)] = attempt
+        # Only positive counts belong in ``_counters``; a 0 means "reset", which
+        # is the absence of a key for ``current_attempt``.
+        tracker._counters = {k: v for k, v in latest.items() if v > 0}
+        return tracker
+
+
+async def persist_budget_cycle(
+    orch: "Orchestrator", scope_id: str, role: str, attempt: int
+) -> None:
+    """Append a ``budget_cycle`` ledger op recording the NEW counter value.
+
+    RECOVERY-CONTRACT §7 Step 2 (gate R4). Called by the budget-tracker call
+    sites (execute-phase ``delegate()`` and the plan-phase architect-retry loop)
+    after every ``record_result`` / ``record_failure`` so the per-(scope_id,
+    role) counter survives ``autodev resume`` via
+    :meth:`BudgetEscalationTracker.rehydrate_from_ledger`.
+
+    Writes under :func:`state.lockfile.plan_lock` using the established
+    ``append_entry`` idiom. Best-effort: a ledger hiccup MUST NOT mask the
+    dispatch / retry FSM — failures are logged and swallowed (the in-memory
+    cache still holds the live value for the current process).
+    """
+    cwd = getattr(orch, "cwd", None)
+    if cwd is None:
+        return
+    try:
+        from state.ledger import append_entry as _append_entry  # noqa: PLC0415
+        from state.lockfile import plan_lock as _plan_lock  # noqa: PLC0415
+
+        _session_id = getattr(
+            getattr(orch, "plan_manager", None),
+            "_session_id",
+            getattr(orch, "session_id", "unknown"),
+        )
+        _timeout_s = getattr(
+            getattr(orch, "plan_manager", None), "_lock_timeout_s", 30.0
+        )
+        async with _plan_lock(cwd, timeout_s=_timeout_s):
+            await _append_entry(
+                cwd,
+                op="budget_cycle",
+                payload={
+                    "scope_id": scope_id,
+                    "role": role,
+                    "attempt": int(attempt),
+                },
+                session_id=_session_id,
+            )
+    except Exception as exc:  # noqa: BLE001 - best-effort breadcrumb
+        from autologging import get_logger  # noqa: PLC0415
+
+        get_logger().warning(
+            "budget_escalation.persist_cycle_failed",
+            scope_id=scope_id,
+            role=role,
+            attempt=attempt,
+            err=str(exc),
+        )
 
 
 __all__ = [
@@ -285,4 +439,5 @@ __all__ = [
     "DEFAULT_TIMEOUT_S_CEILING",
     "MAX_ESCALATIONS",
     "escalate_budget",
+    "persist_budget_cycle",
 ]

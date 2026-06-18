@@ -43,6 +43,7 @@ from tournament import (
     TournamentConfig,
 )
 from tournament.effort import resolve_role_effort
+from tournament.prompts import build_developer_prompt
 from tournament.timeouts import resolve_role_timeout_s
 
 
@@ -109,7 +110,7 @@ def _task_sparse_cone(task: "Task") -> list[str] | None:
     cone = [
         p
         for p in raw
-        if isinstance(p, str) and p.strip() and not (p in seen or seen.add(p))
+        if isinstance(p, str) and p.strip() and not (p in seen or seen.add(p))  # type: ignore[func-returns-value]  # set.add returns None (falsy) by design — dedup idiom
     ]
     return cone or None
 
@@ -224,7 +225,12 @@ class _CoderRunner:
 
         developer_prompt = "\n\n---\n".join(
             [
-                developer_spec.prompt.strip(),
+                # B3: pass user_complexity so intensity is modulated
+                # (low→lite/minimal, high/max→deeper-work allowed).
+                build_developer_prompt(
+                    developer_spec.prompt,
+                    user_complexity=orch.cfg.user_complexity,
+                ),
                 developer_env.render_as_task_message(),
             ]
         )

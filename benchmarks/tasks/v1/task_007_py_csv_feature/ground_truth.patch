@@ -1,0 +1,19 @@
+diff --git a/tabular.py b/tabular.py
+index d5a46e4..923a05e 100644
+--- a/tabular.py
++++ b/tabular.py
+@@ -6,3 +6,14 @@ def column_names(rows: list[dict]) -> list[str]:
+     if not rows:
+         return []
+     return list(rows[0].keys())
++
++
++def to_csv(rows: list[dict]) -> str:
++    """Serialise a list of dict rows to a CSV string."""
++    if not rows:
++        return ""
++    cols = column_names(rows)
++    lines = [",".join(cols)]
++    for row in rows:
++        lines.append(",".join(str(row[c]) for c in cols))
++    return "\n".join(lines) + "\n"

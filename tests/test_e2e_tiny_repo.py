@@ -22,7 +22,7 @@ from agents import build_registry
 from cli import cli
 from config.defaults import default_config
 from config.loader import save_config
-from config.schema import AutodevConfig
+from config.schema import AutodevConfig, QAGatesConfig
 from orchestrator import Orchestrator
 from state.plan_manager import PlanManager
 
@@ -73,6 +73,29 @@ def _init_autodev(repo: Path) -> AutodevConfig:
     cfg.platform = "claude_code"  # any concrete value; stub adapter ignores it
     cfg.tournaments.plan.enabled = False
     cfg.tournaments.impl.enabled = False
+    # This e2e exercises the ORCHESTRATION status-flow (plan → execute →
+    # status, kill/resume), not the QA gate chain. The StubAdapter returns a
+    # diff string but never materializes files in the per-task worktree (only
+    # the real Claude Code / Cursor adapters write to disk), so the language
+    # auto-gates cannot see the developer's changes. In particular, the repo
+    # is a manifest-less python repo (just ``math.py``), which the weighted
+    # ``qa/detect.py`` now correctly classifies as python — so the real
+    # ``qa/test_runner.py`` gate would run pytest, find no test file on disk,
+    # and Phase-1B's WS2-2 non-vacuity check would correctly fail loud. That
+    # is the *right* product behavior, but it is not what this test covers; it
+    # has dedicated coverage in ``tests/test_qa_test_runner.py``. Mirror
+    # ``tests/integration/test_e2e_pipeline_full.py`` and disable the
+    # environment-tooling gates so execute is driven by the stubbed
+    # developer/reviewer/test_engineer flow only.
+    cfg.qa_gates = QAGatesConfig(
+        syntax_check=False,
+        lint=False,
+        build_check=False,
+        test_runner=False,
+        secretscan=False,
+        sast_scan=False,
+        mutation_test=False,
+    )
     save_config(cfg, repo / ".autodev" / "config.json")
     return cfg
 

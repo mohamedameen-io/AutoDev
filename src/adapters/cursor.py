@@ -11,7 +11,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
 
-from adapters.base import PlatformAdapter
+from adapters.base import AdapterCapabilities, PlatformAdapter
 from adapters.git_utils import _diff_files, _git_diff, _git_porcelain_set
 from adapters.types import AgentInvocation, AgentResult, AgentSpec
 from autologging import get_logger
@@ -162,6 +162,15 @@ class CursorAdapter(PlatformAdapter):
     """Adapter backed by the `cursor agent --print` or `cursor-agent` binary."""
 
     name = "cursor"
+
+    # WS3 (stabilization-v1): the Cursor CLI has NO ``--allowed-tools``
+    # flag (verified against ``docs/cursor-cli-flags.md`` / the captured
+    # CLI help). It cannot ENFORCE an allow-list — text-only roles would
+    # otherwise run with full tools. Declaring the gap formally lets
+    # callers that need scoping for correctness detect it up-front
+    # (``require_tool_scoping``) and degrade, instead of relying on the
+    # per-invocation warning in ``_build_command`` after the fact.
+    capabilities = AdapterCapabilities(supports_tool_scoping=False)
 
     def __init__(self, binaries: tuple[str, ...] = _CURSOR_BINARIES) -> None:
         self.binaries = binaries

@@ -13,6 +13,7 @@ in an isolated tmp filesystem so plan.json writes are sandboxed.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -193,3 +194,79 @@ def test_tournament_run_still_works_after_group_refactor(tmp_path: Path) -> None
         f"exit={result.exit_code}\noutput:\n{result.output}\nexc:{result.exception!r}"
     )
     assert "Tournament complete" in result.output
+
+
+# ── F-1 bypass fix: promote path applies repair_phase_edit_scope ─────────────
+
+# A salvaged plan where the phase EDIT_SCOPE only lists ``index.js``, but
+# Task 1.2 declares ``test_index.js``.  Without the fix the promoted plan.json
+# would contain Phase 1 edit_scope = ["index.js"], and the pre-flight check
+# would raise edit_scope_violation for ``test_index.js`` at execute time.
+# With the fix the promote _persist path calls repair_phase_edit_scope before
+# init_plan, so ``test_index.js`` is admitted into the phase scope.
+_SALVAGE_NARROWED_SCOPE_MD = """# Plan: Salvaged narrow scope
+
+## Phase 1: Implement
+EDIT_SCOPE:
+  - index.js
+
+### Task 1.1: Implement the feature
+  - Description: add the feature to index.js
+  - Files: index.js
+  - Acceptance:
+    - [ ] feature works
+
+### Task 1.2: Add tests
+  - Description: cover the new feature with tests
+  - Files: test_index.js
+  - Acceptance:
+    - [ ] tests pass
+"""
+
+
+def test_tournament_promote_repairs_phase_edit_scope(tmp_path: Path) -> None:
+    """F-1 bypass fix: a salvaged plan whose phase ``edit_scope`` excludes a
+    file one of its tasks declares must have that file admitted into
+    ``phase.edit_scope`` after ``promote``, with no ``edit_scope_violation``.
+
+    RED without the fix (Phase 1 edit_scope stays ``["index.js"]``).
+    GREEN with it (Phase 1 edit_scope includes ``"test_index.js"``).
+    """
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as fs_dir:
+        fs_root = Path(fs_dir)
+        artifact_dir = fs_root / ".autodev" / "tournaments" / "plan-scopefix"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "incumbent_after_01.md").write_text(
+            _SALVAGE_NARROWED_SCOPE_MD, encoding="utf-8"
+        )
+
+        result = runner.invoke(
+            cli,
+            ["tournament", "promote", "--tournament-id", "plan-scopefix"],
+        )
+        assert result.exit_code == 0, (
+            f"exit={result.exit_code}\noutput:\n{result.output}\nexc:{result.exception!r}"
+        )
+
+        plan_json_path = fs_root / ".autodev" / "plan.json"
+        assert plan_json_path.exists(), "plan.json was not written"
+        plan_data = json.loads(plan_json_path.read_text(encoding="utf-8"))
+
+        # Locate Phase 1 in the persisted plan.
+        phases = plan_data.get("phases") or plan_data.get("plan", {}).get("phases", [])
+        assert phases, f"no phases in plan.json: {plan_data}"
+        phase1 = phases[0]
+        phase_scope = phase1.get("edit_scope")
+
+        # The repair must have widened the scope to include the task-declared file.
+        assert phase_scope is not None, (
+            "Phase 1 edit_scope is None — repair did not materialise a scope"
+        )
+        assert "index.js" in phase_scope, (
+            f"index.js missing from phase scope: {phase_scope}"
+        )
+        assert "test_index.js" in phase_scope, (
+            f"F-1 bypass not fixed: test_index.js not admitted into phase scope "
+            f"(got: {phase_scope})"
+        )

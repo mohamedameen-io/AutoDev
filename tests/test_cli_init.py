@@ -38,7 +38,7 @@ def test_init_creates_autodev_dir(tmp_path: Path) -> None:
 
 def test_init_fails_if_exists_no_force(tmp_path: Path) -> None:
     runner = CliRunner()
-    with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
+    with runner.isolated_filesystem(temp_dir=tmp_path):
         first = runner.invoke(cli, ["init"], catch_exceptions=False)
         assert first.exit_code == 0, first.output
 

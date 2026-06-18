@@ -328,6 +328,47 @@ jobs:
           fi
           echo "v0.36 D3 structural-retry helper anchor present."
 
+      # N1 (closes WS3-ruff-mypy-gate-missing-from-ci): the static gate is also
+      # enforced on the release path — ruff + mypy must be clean before a tag.
+      - name: ruff + mypy static gate (N1)
+        run: |
+          uv run ruff check src tests
+          uv run mypy src
+
+      # N2 (closes WS3-release-gate-presence-only-anchors): wire the preflight
+      # script — previously invoked by ZERO workflows — into the release. For a
+      # v1.0.0 release the script runs its BEHAVIORAL ``preflight_v100`` (the
+      # resolver engagement suite, resolver ON), not just the cheap presence
+      # greps. The script exits non-zero if the engagement op fails to fire OR
+      # zero tests are collected.
+      #
+      # Broken-control (operator, NOT run in CI — documented in
+      # STABLE-RELEASE-GATE.md N2):
+      #   AUTODEV_RESOLVER_FORCE_DISABLED=1 bash ci/release_preflight_greps.sh v1.0.0
+      # MUST exit non-zero. ``AUTODEV_RESOLVER_FORCE_DISABLED`` is the operator
+      # override the conftest does NOT auto-unset (unlike the suite's internal
+      # default-off ``AUTODEV_RESOLVER_DISABLED``), so it is the valid planted
+      # disable that turns this gate red.
+      - name: Release preflight (presence greps + behavioral engagement gate)
+        run: bash ci/release_preflight_greps.sh "${{ inputs.version }}"
+
+      # The engagement suite runs SEPARATELY and fails on 0-collected, per the
+      # release decision procedure: ``pytest tests/`` runs resolver-OFF for ~403
+      # files (conftest), so "all gates green" is gameable unless a dedicated
+      # step runs the marker set and fails when ZERO tests are collected.
+      - name: Engagement suite (resolver ON; fail on 0-collected)
+        run: |
+          OUT="$(uv run pytest -m resolver_enabled -v 2>&1)" && RC=0 || RC=$?
+          echo "$OUT"
+          if echo "$OUT" | grep -qiE 'collected 0 items|no tests ran'; then
+            echo "::error::pytest -m resolver_enabled collected 0 tests — vacuous pass blocked"
+            exit 1
+          fi
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::engagement suite failed (rc=$RC) — the resolver did not engage"
+            exit 1
+          fi
+
   unit-tests:
     name: Unit tests + E2E
     runs-on: ubuntu-latest

@@ -313,6 +313,7 @@ def default_config(platform: str = "auto") -> AutodevConfig:
         resolver=ResolverConfig(
             enabled=True,
             max_cycles_per_blocker=3,
+            max_corrective_cycles_per_phase=3,
             fast_path_only_on_known=True,
             model=None,
         ),

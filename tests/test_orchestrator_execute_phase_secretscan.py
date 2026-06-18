@@ -162,6 +162,7 @@ async def test_secretscan_invoked_with_developer_diff_paths(
             mutation_test_threshold = 0.7
             lint_timeout_s = 120.0
             test_timeout_s = 600.0
+            build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
 
     orch = type(
         "OrchStub",
@@ -234,6 +235,7 @@ async def test_secretscan_invoked_with_empty_paths_when_no_developer_result(
             mutation_test_threshold = 0.7
             lint_timeout_s = 120.0
             test_timeout_s = 600.0
+            build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
 
     orch = type(
         "OrchStub",
@@ -302,6 +304,7 @@ async def test_hallucination_guard_passes_empty_paths_when_no_developer_result(
             mutation_test_threshold = 0.7
             lint_timeout_s = 120.0
             test_timeout_s = 600.0
+            build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
 
     orch = type(
         "OrchStub",

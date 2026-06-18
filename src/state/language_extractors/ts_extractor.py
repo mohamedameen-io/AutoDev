@@ -35,8 +35,8 @@ try:  # pragma: no cover - native binding presence varies by platform
         _TSX_LANGUAGE = Language(tree_sitter_typescript.language_tsx())
         _TSX_PARSER = Parser(_TSX_LANGUAGE)
     except Exception:  # noqa: BLE001
-        _TSX_LANGUAGE = None
-        _TSX_PARSER = None
+        _TSX_LANGUAGE = None  # type: ignore[assignment]
+        _TSX_PARSER = None  # type: ignore[assignment]
     TS_TREESITTER_AVAILABLE = True
 except Exception:  # noqa: BLE001
     _TS_LANGUAGE = None  # type: ignore[assignment]

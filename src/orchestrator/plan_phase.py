@@ -20,12 +20,13 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from adapters.types import AgentInvocation, AgentResult
 from errors import AutodevError, TournamentError
 from autologging import get_logger
 from orchestrator.delegation_envelope import DelegationEnvelope
+from orchestrator.dependency_inference import repair_phase_edit_scope
 from orchestrator.diagnosis_phase import run_diagnosis_phase
 from orchestrator.file_existence_validator import validate_files_exist
 from orchestrator.framing_phase import run_framing_phase
@@ -406,6 +407,28 @@ async def _validate_with_persistent_drop(
                     op="path_validation_resolved_via_plan_global",
                     payload=res,
                 )
+            # Field-finding F-1: make each phase's ``edit_scope``
+            # self-consistent with the concrete files its own tasks declare.
+            # MUST run here — AFTER the on-disk drop / empty-scope guard
+            # above has finalized each phase's scope — so the repair sees the
+            # post-drop scope. Running it at parse time would pre-admit the
+            # task files and mask the empty-scope guard (a phase narrowed to
+            # an on-disk-missing path would no longer go empty after the
+            # drop, defeating the P0 silent-widen guard). Both the initial
+            # validation pass and the tournament-gate re-validation reach
+            # this point. The tournament-promote ``_persist`` path
+            # (``cli.commands.tournament.promote_subcommand``) bypasses this
+            # function and calls ``repair_phase_edit_scope`` directly before
+            # ``init_plan`` — so BOTH routes to ``init_plan`` apply the
+            # repair, and every execute-time consumer (the pre-flight
+            # ``collect_edit_scope_violations``, the sparse-checkout cone, and
+            # the developer-prompt EDIT SCOPE addendum) sees one consistent
+            # scope. The repair is a no-op for whole-repo (empty) scopes and
+            # never admits a file no task declares; the apply-time boundary on
+            # the developer's ACTUAL edits is unchanged.
+            repair_phase_edit_scope(
+                plan.phases, plan_edit_scope=plan.edit_scope
+            )
             return plan
         except PathValidationError as exc:
             key = (exc.raw, exc.reason)
@@ -620,6 +643,139 @@ async def _advise_task_decomposition(
         # Advisory must never break the plan phase.
         logger.warning(
             "plan_phase.task_decomposition_advisory_failed", err=str(exc)
+        )
+
+
+# v1.0 B1: manifest/lockfile paths that signal a new external dependency being
+# added. Any task touching these files is flagged as a potential over-engineering
+# smell so retrospectives can inspect whether the necessity ladder was applied.
+_DEPENDENCY_MANIFEST_PATTERNS: tuple[str, ...] = (
+    "requirements.txt",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "Pipfile",
+    "Cargo.toml",
+    "Cargo.lock",
+    "go.mod",
+    "go.sum",
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "build.gradle",
+    "pom.xml",
+    "*.gemspec",
+    "Gemfile",
+    "Gemfile.lock",
+)
+
+# Number of *new* files (files_new) in a single task that constitutes a
+# structural bloat smell — the architect may be spinning up abstractions that
+# could live as inline helpers. Set to 6 (coarse proxy) to avoid alert
+# fatigue: a normal task with module + test + types = 3 new files would
+# fire at threshold=3, which causes noise on most real plans.
+_NEW_FILE_BLOAT_THRESHOLD: int = 6
+
+
+async def _advise_over_engineering(
+    orch: "Orchestrator", plan: Plan
+) -> None:
+    """v1.0 (B1): post-parse over-engineering advisory.
+
+    Scans the final approved plan for two structural smells:
+
+    1. **Dependency manifest touch** — a task lists a manifest or lockfile
+       (``requirements.txt``, ``Cargo.toml``, ``package.json``, etc.) in its
+       ``files`` or ``files_new`` list, signalling that a new external package
+       is being added. This *may* be entirely justified, but should be
+       cross-checked against the necessity ladder.
+
+    2. **New-file bloat** — a task creates 6 or more brand-new files. A high
+       new-file count often means abstractions that could be collocated or
+       inlined were given their own modules.
+
+    Purely observational: NEVER mutates or rejects the plan, NEVER changes
+    control flow, and NEVER raises (the entire body is wrapped defensively).
+    Fires on all repos (unlike decomposition advisory which gates on
+    ``is_huge``).
+    """
+    try:
+        for phase in plan.phases:
+            for task in getattr(phase, "tasks", []) or []:
+                all_files = list(task.files or []) + list(task.files_new or [])
+
+                # Smell 1: dependency manifest
+                dep_matches: list[str] = []
+                for f in all_files:
+                    basename = f.split("/")[-1] if "/" in f else f
+                    for pattern in _DEPENDENCY_MANIFEST_PATTERNS:
+                        if pattern.startswith("*"):
+                            if basename.endswith(pattern[1:]):
+                                dep_matches.append(f)
+                                break
+                        else:
+                            if basename == pattern or f == pattern:
+                                dep_matches.append(f)
+                                break
+
+                if dep_matches:
+                    logger.warning(
+                        "plan_phase.over_engineering_advisory",
+                        smell="dependency_manifest",
+                        task_id=task.id,
+                        manifests=dep_matches,
+                    )
+                    try:
+                        await orch.plan_manager.ledger_append(
+                            op="over_engineering_advisory",
+                            payload={
+                                "task_id": task.id,
+                                "smell": "dependency_manifest",
+                                "source": "planner_advisory",
+                                "attempt": 0,
+                                "manifests": dep_matches,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "plan_phase.ledger_append_failed",
+                            op="over_engineering_advisory",
+                            err=str(exc),
+                        )
+
+                # Smell 2: new-file bloat
+                new_file_count = len(task.files_new or [])
+                if new_file_count >= _NEW_FILE_BLOAT_THRESHOLD:
+                    logger.warning(
+                        "plan_phase.over_engineering_advisory",
+                        smell="new_file_bloat",
+                        task_id=task.id,
+                        new_file_count=new_file_count,
+                        new_files=(task.files_new or [])[:10],
+                    )
+                    try:
+                        await orch.plan_manager.ledger_append(
+                            op="over_engineering_advisory",
+                            payload={
+                                "task_id": task.id,
+                                "smell": "new_file_bloat",
+                                "source": "planner_advisory",
+                                "attempt": 0,
+                                "new_file_count": new_file_count,
+                                "new_files": (task.files_new or [])[:10],
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "plan_phase.ledger_append_failed",
+                            op="over_engineering_advisory",
+                            err=str(exc),
+                        )
+    except Exception as exc:  # noqa: BLE001
+        # Advisory must never break the plan phase.
+        logger.warning(
+            "plan_phase.over_engineering_advisory_failed", err=str(exc)
         )
 
 
@@ -871,9 +1027,6 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         # for the forensic summary.
         last_parsed_plan: Plan | None = None
         archived_dumps_paths: list[str] = []
-        # v0.32.0 Phase 1.4: model override applied by tier 5 model
-        # escalation. ``None`` means "use the registry default".
-        architect_model_override: str | None = None
         architect_spec = orch.registry.get("architect")
         retry_max = (
             (architect_spec.max_turns or 5) + 2 if architect_spec else 7
@@ -1053,6 +1206,23 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
                     _budget_tracker.record_failure(
                         _PLAN_PHASE_SCOPE, "architect", _sub
                     )
+                # RECOVERY-CONTRACT §7 Step 2 (gate R4): persist the NEW counter
+                # value so the plan-phase architect escalation ladder survives
+                # ``autodev resume`` (last-value-wins via a ``budget_cycle``
+                # ledger op). Best-effort — failures are swallowed so the
+                # architect retry loop is unaffected.
+                from orchestrator.budget_escalation import (  # noqa: PLC0415
+                    persist_budget_cycle,
+                )
+
+                await persist_budget_cycle(
+                    orch,
+                    _PLAN_PHASE_SCOPE,
+                    "architect",
+                    _budget_tracker.current_attempt(
+                        _PLAN_PHASE_SCOPE, "architect"
+                    ),
+                )
             plan_md = architect_result.text
             # Fallback: if architect wrote to a file instead of returning
             # text, try reading the plan from known file locations.
@@ -1397,6 +1567,9 @@ async def run_plan_phase(orch: "Orchestrator", intent: str) -> Plan:
         # the final approved plan, just before it's committed to the ledger.
         # Advisory only — never mutates/rejects the plan or raises.
         await _advise_task_decomposition(orch, plan, cwd)
+        # v1.0 (B1): over-engineering advisory — checks for dep-manifest
+        # touches and new-file bloat. Advisory only; never gates the plan.
+        await _advise_over_engineering(orch, plan)
         await orch.plan_manager.init_plan(plan)
         logger.info(
             "plan_phase.approved",
@@ -1772,9 +1945,9 @@ async def _delegate(
     if injected_ids and envelope.task_id:
         correlation = getattr(orch, "_injected_lessons_by_task", None)
         if correlation is not None:
-            key = (envelope.task_id, role)
-            existing = correlation.get(key, [])
-            correlation[key] = existing + [
+            corr_key = (envelope.task_id, role)
+            existing = correlation.get(corr_key, [])
+            correlation[corr_key] = existing + [
                 i for i in injected_ids if i not in existing
             ]
 

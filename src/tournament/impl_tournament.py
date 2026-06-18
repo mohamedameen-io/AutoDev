@@ -589,10 +589,25 @@ class ImplTournament(Tournament[ImplBundle]):
             partial_judges=(None, None),
         )
 
-        # 5. Borda aggregation with conservative tiebreak to A.
+        # 5. Drop empty-diff candidate variants BEFORE Borda scoring.
+        #
+        # WS3 silent-degrade guard: a coder that produced no diff (e.g. the
+        # degenerate coder-failure bundle, or a no-op synthesis) must not be
+        # able to *win* the tournament silently. We exclude any empty-diff
+        # candidate label (B / AB) from the Borda label set so it accrues
+        # zero weight and cannot be selected as winner. The incumbent A is
+        # always retained as the safe conservative fallback. If *every*
+        # variant — including the incumbent — is empty, there is nothing to
+        # choose: raise a task-level failure instead of returning a silent
+        # empty win.
+        eligible_labels, _dropped_empty = self._filter_empty_variants(
+            incumbent, v_b, v_ab, pass_num=pass_num
+        )
+
+        # 6. Borda aggregation with conservative tiebreak to A.
         tiebreak = "A" if self.cfg.conservative_tiebreak else None
         winner, scores, valid_judges = aggregate_rankings(
-            rankings, labels=["A", "B", "AB"], tiebreak_winner=tiebreak
+            rankings, labels=eligible_labels, tiebreak_winner=tiebreak
         )
 
         version_b_md = self.handler.render_as_markdown(v_b)
@@ -634,6 +649,62 @@ class ImplTournament(Tournament[ImplBundle]):
             valid_judges=valid_judges,
         )
         return winner, chosen, result  # type: ignore[return-value]
+
+    def _filter_empty_variants(
+        self,
+        incumbent: ImplBundle,
+        v_b: ImplBundle,
+        v_ab: ImplBundle,
+        *,
+        pass_num: int,
+    ) -> tuple[list[str], list[str]]:
+        """Return ``(eligible_labels, dropped_empty_labels)`` for Borda.
+
+        WS3 silent-degrade-empty-diff guard. A *candidate* variant (``B`` or
+        ``AB``) whose realized diff is empty represents a coder that produced
+        no change — it must not be eligible to *win* the tournament, because
+        an empty win silently degrades the incumbent's output to a no-op. We
+        drop such labels from the Borda label set (the judges still *see*
+        every proposal; they simply cannot award the win to a no-op).
+
+        The incumbent ``A`` is always retained as the safe conservative
+        fallback. If *every* variant — including the incumbent — has an empty
+        diff, there is genuinely nothing to choose: we raise a typed
+        task-level failure (``TournamentError``) after emitting the
+        ``tournament_all_variants_failed`` op, rather than returning a silent
+        empty win.
+        """
+        candidates = (("B", v_b), ("AB", v_ab))
+        dropped_empty = [
+            label for label, bundle in candidates if _is_empty_diff(bundle)
+        ]
+        eligible_labels = [
+            label for label in ("A", "B", "AB") if label not in dropped_empty
+        ]
+
+        if dropped_empty:
+            self._impl_log.warning(
+                "tournament_empty_variant_dropped",
+                pass_num=pass_num,
+                dropped=dropped_empty,
+                eligible=eligible_labels,
+            )
+
+        # All variants (incumbent included) are empty → nothing to score.
+        if dropped_empty == ["B", "AB"] and _is_empty_diff(incumbent):
+            self._impl_log.error(
+                "tournament_all_variants_failed",
+                pass_num=pass_num,
+                task_id=incumbent.task_id,
+                reason="every_variant_has_empty_diff",
+            )
+            raise TournamentError(
+                "impl tournament produced no usable variant: "
+                f"every variant has an empty diff (task {incumbent.task_id!r}, "
+                f"pass {pass_num})"
+            )
+
+        return eligible_labels, dropped_empty
 
     async def _realize_variant(
         self,
@@ -697,6 +768,16 @@ def _fmt_files(files: list[str]) -> str:
     if len(files) <= 6:
         return ", ".join(files)
     return ", ".join(files[:6]) + f", ... (+{len(files) - 6} more)"
+
+
+def _is_empty_diff(bundle: ImplBundle) -> bool:
+    """True when a bundle carries no actual code change.
+
+    A whitespace-only diff is treated as empty: a coder that emitted only
+    blank lines / a stray newline produced no real change and must not be
+    eligible to win (see :meth:`ImplTournament._filter_empty_variants`).
+    """
+    return not bundle.diff.strip()
 
 
 __all__ = [

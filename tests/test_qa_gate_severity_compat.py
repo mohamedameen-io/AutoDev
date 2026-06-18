@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 
-from adapters.types import AgentResult
 from plugins.registry import GateResult
 
 
@@ -91,6 +90,7 @@ async def test_legacy_failing_gate_still_halts(
             code_size_thresholds = None
             lint_timeout_s = 120.0
             test_timeout_s = 600.0
+            build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
 
         hallucination_guard = False  # disable to isolate secretscan path
 
@@ -157,6 +157,7 @@ async def test_warn_severity_does_not_halt(
             code_size_thresholds = None
             lint_timeout_s = 120.0
             test_timeout_s = 600.0
+            build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
 
         hallucination_guard = False
 
@@ -227,6 +228,7 @@ async def test_info_severity_failure_does_not_halt(
             code_size_thresholds = None
             lint_timeout_s = 120.0
             test_timeout_s = 600.0
+            build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
 
         hallucination_guard = False
 

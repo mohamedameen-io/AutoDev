@@ -20,15 +20,12 @@ import json
 from io import StringIO
 from pathlib import Path
 
-import pytest
 from rich.console import Console
 
 from adapters.base import NetworkProbeFailure
 from orchestrator.file_existence_validator import _classify_rejection
 from orchestrator.plan_phase_recovery import should_change_model_for_class
 from orchestrator.retry_envelope import (
-    PriorError,
-    TypedRetryEnvelope,
     diagnosis_for_class,
 )
 from orchestrator.spec_validator import validate_spec_text

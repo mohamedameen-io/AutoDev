@@ -82,10 +82,14 @@ async def test_build_check_go_passes(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_build_check_tool_not_found(tmp_path: Path) -> None:
+    # WS2-6 golden-baseline shift: a missing build toolchain used to silently
+    # pass (passed=True, "not found, skipping"). That was a vacuous green — a
+    # missing toolchain is *unknown*, not *clean*. The gate now degrades LOUD.
     with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
         result = await run_build_check(tmp_path, language="rust")
-    assert result.passed
-    assert "not found" in result.details
+    assert not result.passed
+    assert "not installed" in result.details
+    assert result.metrics.get("skipped_toolchain_missing") is True
 
 
 @pytest.mark.asyncio
@@ -109,8 +113,28 @@ async def test_build_check_nodejs_with_build_script(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_build_check_nodejs_no_build_script(tmp_path: Path) -> None:
+    # WS2-9 golden-baseline shift: with no build script AND no tsconfig.json,
+    # the gate used to run ``npx tsc --noEmit`` — which FALSE-BLOCKS config-less
+    # JS repos. The fix skips the tsc step when there is no tsconfig, so no
+    # subprocess is spawned. Was: ``call_args.args[0] == "npx"``.
     import json
     (tmp_path / "package.json").write_text(json.dumps({"scripts": {}}))
+    proc = _make_proc(0)
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
+        result = await run_build_check(tmp_path, language="nodejs")
+    assert result.passed
+    # No tsconfig → tsc skipped → no subprocess invoked.
+    assert mock_exec.call_args is None
+    assert "tsconfig" in result.details
+
+
+@pytest.mark.asyncio
+async def test_build_check_nodejs_no_build_script_with_tsconfig(tmp_path: Path) -> None:
+    # The companion to the above: WITH a tsconfig.json the tsc fallback still
+    # runs via npx (no local node_modules/.bin/tsc present).
+    import json
+    (tmp_path / "package.json").write_text(json.dumps({"scripts": {}}))
+    (tmp_path / "tsconfig.json").write_text("{}")
     proc = _make_proc(0)
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_build_check(tmp_path, language="nodejs")

@@ -168,10 +168,15 @@ async def test_syntax_check_nodejs_fails(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_syntax_check_nodejs_no_files(tmp_path: Path) -> None:
-    """No .js files in directory -> passed with informational message."""
+    """No JS/TS files in directory -> passed with informational message.
+
+    WS2-8 golden-baseline shift: the node syntax check now covers TypeScript
+    too, so an empty repo reports "no JS/TS files found" instead of the old
+    JS-only "no .js files found". Feature-now-active, not a regression.
+    """
     result = await run_syntax_check(tmp_path, language="nodejs")
     assert result.passed
-    assert "no .js files" in result.details
+    assert "no JS/TS files" in result.details
 
 
 @pytest.mark.asyncio

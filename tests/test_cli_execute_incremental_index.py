@@ -56,7 +56,8 @@ def test_execute_runs_incremental_when_index_exists(tmp_path: Path) -> None:
         ):
             # The execute command will exit early (no plan) — we just need
             # to verify the index hook fired before Orchestrator construction.
-            result = runner.invoke(cli, ["execute"], catch_exceptions=True)
+            # Side-effecting call: triggers the index hook the test verifies.
+            runner.invoke(cli, ["execute"], catch_exceptions=True)
 
         # build_incremental should be called once; build_full NOT called.
         assert fake_index_module.IndexBuilder.build_incremental.call_count == 1
@@ -85,7 +86,8 @@ def test_execute_runs_full_when_index_missing(tmp_path: Path) -> None:
         with mock.patch.dict(
             "sys.modules", {"state.file_index": fake_index_module}
         ):
-            result = runner.invoke(cli, ["execute"], catch_exceptions=True)
+            # Side-effecting call: triggers the index hook the test verifies.
+            runner.invoke(cli, ["execute"], catch_exceptions=True)
 
         assert fake_index_module.IndexBuilder.build_full.call_count == 1
         assert fake_index_module.IndexBuilder.build_incremental.call_count == 0
@@ -112,7 +114,8 @@ def test_execute_skips_when_marker_exists(tmp_path: Path) -> None:
         with mock.patch.dict(
             "sys.modules", {"state.file_index": fake_index_module}
         ):
-            result = runner.invoke(cli, ["execute"], catch_exceptions=True)
+            # Side-effecting call: triggers the index hook the test verifies.
+            runner.invoke(cli, ["execute"], catch_exceptions=True)
 
         assert fake_index_module.IndexBuilder.build_full.call_count == 0
         assert fake_index_module.IndexBuilder.build_incremental.call_count == 0

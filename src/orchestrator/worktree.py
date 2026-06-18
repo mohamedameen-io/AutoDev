@@ -22,7 +22,7 @@ import asyncio
 import re
 import shutil
 from contextlib import suppress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 from errors import AutodevError
@@ -99,6 +99,212 @@ def _sibling_header_paths(
                 line = line.strip()
                 if line:
                     out.add(line)
+    return out
+
+
+# F-6 (Fix 2): curated TRACKED build/test-harness files folded into the
+# per-task sparse cone so the QA ``test_runner`` gate (cwd=worktree) can
+# actually run tests. Two shapes:
+#
+# * ``_HARNESS_MANIFEST_NAMES`` — exact basenames of build/test manifests &
+#   lockfiles. These conventionally sit at the repo root or a package root, so
+#   matching them everywhere (a repo-wide ``ls-files '**/package.json'``) would
+#   be UNBOUNDED on a monorepo with thousands of shards. We therefore match
+#   them only at the repo root AND along the ancestor chain of the task's files
+#   (the package roots the task actually touches) — see
+#   :func:`_harness_paths_for_sparse`.
+# * ``conftest.py`` is handled the same ancestor-chain way: pytest collection
+#   requires the ``conftest.py`` in every ANCESTOR directory of a test, so we
+#   pull the root + each ancestor of the task's dir tree.
+#
+# ``node_modules`` / ``site-packages`` / ``.venv`` are gitignored → never
+# tracked → never matched here (dependency install is out of scope).
+_HARNESS_MANIFEST_NAMES: frozenset[str] = frozenset(
+    {
+        # nodejs
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "tsconfig.json",
+        # python
+        "pyproject.toml",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "setup.py",
+        "conftest.py",
+        # rust
+        "Cargo.toml",
+        "Cargo.lock",
+        # go
+        "go.mod",
+        "go.sum",
+    }
+)
+
+# Test-file/dir conventions. The riskiest entry is the broad ``tests/`` tree, so
+# test inclusion is SCOPED to the package/dir tree containing the task's files
+# (never repo-wide) and bounded by ``WORKTREE_HEADER_EXPANSION_CAP``: we pull the
+# RELEVANT tests, not a repo-wide test mountain.
+#   * directory names: ``tests`` / ``test`` / ``__tests__``
+#   * file patterns: ``test_*.py``, ``*_test.go``, ``*.test.{js,ts,jsx,tsx}``,
+#     ``*.spec.{js,ts,jsx,tsx}``
+_HARNESS_TEST_DIR_NAMES: frozenset[str] = frozenset({"tests", "test", "__tests__"})
+
+
+def _is_harness_test_file(name: str) -> bool:
+    """True when basename *name* matches a cross-language test-file convention."""
+    if name.startswith("test_") and name.endswith(".py"):
+        return True
+    if name.endswith("_test.go"):
+        return True
+    for ext in (".js", ".ts", ".jsx", ".tsx"):
+        if name.endswith(".test" + ext) or name.endswith(".spec" + ext):
+            return True
+    return False
+
+
+def _ancestor_rel_dirs(rel_files: Iterable[str]) -> list[str]:
+    """Return the repo-relative ancestor directories of *rel_files* (incl. root).
+
+    For ``["pkg/sub/foo.py"]`` returns ``["", "pkg", "pkg/sub"]`` (root first).
+    Deduplicated, order-stable. The root is represented as ``""``. Absolute
+    paths and ``..`` escapes are skipped (the cone only admits in-repo paths).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(d: str) -> None:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+
+    _add("")  # repo root
+    for rel in rel_files:
+        if not rel or rel.startswith("/"):
+            continue
+        parts = PurePosixPath(rel).parts
+        if any(p == ".." for p in parts):
+            continue
+        # Drop the filename; walk the directory parts.
+        acc: list[str] = []
+        for part in parts[:-1]:
+            acc.append(part)
+            _add("/".join(acc))
+    return out
+
+
+def _harness_paths_for_sparse(
+    git_root: Path,
+    scope_files: Iterable[str],
+) -> set[str]:
+    """F-6 (Fix 2): repo-relative TRACKED test-harness paths for the sparse cone.
+
+    Resolution is bounded by construction — it never does a repo-wide glob:
+
+    * **Manifests / conftest** (``_HARNESS_MANIFEST_NAMES``): matched at the repo
+      ROOT and at each ANCESTOR directory of *scope_files* (the package roots the
+      task touches). A monorepo's thousands of unrelated ``package.json`` shards
+      are therefore NOT pulled in — only those on the task's own path.
+    * **Test files/dirs**: SCOPED to the directory tree of each scope file. For a
+      scope file ``pkg/foo.py`` we admit (a) any tracked file under a
+      ``tests``/``test``/``__tests__`` sibling dir of ``pkg`` (and of its
+      ancestors), and (b) tracked test-pattern files (``test_*.py`` etc.) under
+      the task's dir tree (recursive, capped). This pulls the RELEVANT tests, not
+      a repo-wide test tree.
+    * **Root-leaf skip**: the leaf-dir test-pattern scan is SKIPPED when the task's
+      scope file is at the repo root (``leaf dir == ""``). A repo-root pathspec
+      ``git ls-files "*"`` is recursive across the entire repo; on a million-file
+      monorepo that exhausts memory before the cap bail ever fires. Root manifests/
+      conftest are already pulled by the ancestor scan. Non-root leaf dirs keep the
+      scan (bounded by that package's subtree).
+    * **Early-exit**: after each scan loop, if the accumulated ``out`` set exceeds
+      ``WORKTREE_HEADER_EXPANSION_CAP`` we return immediately — the caller bails at
+      the same threshold, so returning early is equivalent and avoids scanning
+      further specs needlessly (bounds the many-specs case too).
+
+    Only TRACKED files are returned (resolved via ``git ls-files`` — the same
+    tracked-files helper the sibling-header union uses), so the result is always
+    a strict subset of what the worktree already knows about; untracked /
+    gitignored paths (``node_modules`` …) are never admitted.
+    """
+    scope = [s for s in scope_files if s and not s.startswith("/")]
+    out: set[str] = set()
+    anc_dirs = _ancestor_rel_dirs(scope)
+
+    # 1) Manifests + conftest at the root and each ancestor dir of the scope.
+    for d in anc_dirs:
+        for name in _HARNESS_MANIFEST_NAMES:
+            spec = f"{d}/{name}" if d else name
+            try:
+                listing = subprocess_run_ls_files(git_root, spec)
+            except OSError:
+                continue
+            for line in listing.splitlines():
+                line = line.strip()
+                if line:
+                    out.add(line)
+        # Early-exit: stop scanning if we've already exceeded the cap; the caller
+        # bails the entire harness set at WORKTREE_HEADER_EXPANSION_CAP anyway.
+        if len(out) > WORKTREE_HEADER_EXPANSION_CAP:
+            return out
+
+    # 2) Test dirs/files scoped to the task's directory tree. For each ancestor
+    #    dir we look for sibling test directories; for the task's own dir we
+    #    also admit test-pattern files. ``git ls-files <dir>/`` lists the
+    #    tracked files under that dir (recursively) — we then filter.
+    test_dir_specs: set[str] = set()
+    for d in anc_dirs:
+        for tname in _HARNESS_TEST_DIR_NAMES:
+            test_dir_specs.add(f"{d}/{tname}" if d else tname)
+    for spec in test_dir_specs:
+        try:
+            listing = subprocess_run_ls_files(git_root, spec)
+        except OSError:
+            continue
+        for line in listing.splitlines():
+            line = line.strip()
+            if line:
+                out.add(line)
+        # Early-exit: same rationale as section 1 above.
+        if len(out) > WORKTREE_HEADER_EXPANSION_CAP:
+            return out
+
+    # Also admit test-pattern files under the task's dir tree (recursive, capped),
+    # so a co-located ``foo.test.js`` / ``test_foo.py`` next to the edited source
+    # is pulled in even without a tests/ subdir.
+    leaf_dirs = {str(PurePosixPath(s).parent) for s in scope}
+    leaf_dirs = {"" if d == "." else d for d in leaf_dirs}
+    for d in leaf_dirs:
+        # Skip the repo-root leaf-dir scan entirely. When the task's scope file
+        # sits at the repo root, ``d == ""`` and the pathspec becomes ``"*"``,
+        # which git ls-files resolves RECURSIVELY across the entire repo (it
+        # matches slashes). On a million-file monorepo that loads the whole file
+        # list into memory before the caller's cap bail ever triggers, defeating
+        # the sparse-for-scale design. Root-level co-located test files are also
+        # unusual; root manifests/conftest are already pulled by the ancestor
+        # scan above. Non-root leaf dirs keep the scan (bounded by that package's
+        # subtree).
+        if d == "":
+            continue
+        spec = f"{d}/*"
+        try:
+            listing = subprocess_run_ls_files(git_root, spec)
+        except OSError:
+            continue
+        for line in listing.splitlines():
+            line = line.strip()
+            if line and _is_harness_test_file(PurePosixPath(line).name):
+                out.add(line)
+        # Early-exit: if the accumulated set already exceeds the cap, stop
+        # scanning further specs. The caller in create_per_task already bails
+        # when the harness set exceeds WORKTREE_HEADER_EXPANSION_CAP, so
+        # returning an over-cap set early is equivalent — it just avoids
+        # continuing to scan and accumulate across many leaf dirs.
+        if len(out) > WORKTREE_HEADER_EXPANSION_CAP:
+            return out
+
     return out
 
 
@@ -195,6 +401,11 @@ class WorktreeManager:
         # so the ledger write stays at the orchestrator's PlanManager
         # site (the manager does not own ledger access).
         self.last_sparse_headers_added: int = 0
+        # F-6 (Fix 2): count of tracked test-harness files folded into the
+        # most recent sparse ``create_per_task`` (package.json, conftest.py,
+        # the task's tests, …). 0 when harness inclusion was disabled or
+        # bailed because it exceeded WORKTREE_HEADER_EXPANSION_CAP.
+        self.last_sparse_harness_added: int = 0
 
     def _create_timeout_s(self) -> float:
         """Per-call timeout for slow ``git worktree add`` operations.
@@ -350,6 +561,7 @@ class WorktreeManager:
         sparse_paths: list[str] | None = None,
         *,
         include_headers_for_sparse: bool = True,
+        include_harness_for_sparse: bool = True,
     ) -> Path:
         """Create a per-task worktree at ``tournament_dir/tasks/<task_id>``.
 
@@ -364,6 +576,22 @@ class WorktreeManager:
         v0.17.0 S6: ``sparse_paths`` is forwarded into the same
         sparse-checkout machinery used by :meth:`create`. ``None`` (or
         an empty list) preserves legacy full-checkout behavior.
+
+        F-6 (Fix 2): when ``include_harness_for_sparse`` is True (the
+        default), a small curated globset of TRACKED build/test-harness
+        files (``package.json``/lockfiles, ``pyproject.toml``,
+        ``pytest.ini``, ``conftest.py``, ``Cargo.toml``, ``go.mod``, …) and
+        the task's RELEVANT test files (scoped to the package/dir tree of
+        ``sparse_paths`` — never a repo-wide test mountain) are folded into
+        the sparse cone alongside the sibling-header union. Without this,
+        the QA ``test_runner`` gate (which runs with ``cwd=worktree``) could
+        not see ``package.json``/the test files and false-blocked (e.g.
+        ``npm test`` ENOENT). The harness expansion shares the
+        ``WORKTREE_HEADER_EXPANSION_CAP`` bound: if it would add more than
+        the cap (a monorepo with thousands of manifest shards or a giant
+        test tree), it BAILS OUT entirely (logs + proceeds without it) so
+        the cone stays sparse-for-scale. ``False`` preserves the legacy
+        scope-only cone.
 
         v0.39.0 (huge-repo follow-up): both the sparse ``--no-checkout``
         and the non-sparse fallback ``git worktree add`` now pass
@@ -427,6 +655,28 @@ class WorktreeManager:
                 else:
                     effective_paths.extend(new_paths)
                     added_headers = len(new_paths)
+            # F-6 (Fix 2): fold curated TRACKED test-harness files into the
+            # cone so the QA gate (cwd=worktree) can run tests. Computed from
+            # the ORIGINAL scope (``sparse_paths``), not the header-expanded
+            # set, so a stray header dir can't widen the harness search. Shares
+            # the header cap: an over-cap harness set (monorepo manifest shards
+            # / a giant test tree) BAILS OUT so the cone stays bounded.
+            added_harness = 0
+            if include_harness_for_sparse and (sparse_paths or []):
+                harness = _harness_paths_for_sparse(
+                    self._main, list(sparse_paths or [])
+                )
+                new_harness = sorted(harness - set(effective_paths))
+                if len(new_harness) > WORKTREE_HEADER_EXPANSION_CAP:
+                    self._log.warning(
+                        "worktree.sparse_harness_expansion.capped",
+                        task_id=task_id,
+                        proposed=len(new_harness),
+                        cap=WORKTREE_HEADER_EXPANSION_CAP,
+                    )
+                else:
+                    effective_paths.extend(new_harness)
+                    added_harness = len(new_harness)
             for cmd in (
                 ["sparse-checkout", "init", "--cone"],
                 ["sparse-checkout", "set", *effective_paths],
@@ -455,6 +705,16 @@ class WorktreeManager:
                     task_id=task_id,
                     added_paths=added_headers,
                     mode="sibling_headers",
+                )
+            self.last_sparse_harness_added = added_harness
+            if added_harness:
+                # F-6 (Fix 2): telemetry breadcrumb for test-harness inclusion
+                # (same shape as the sibling-header breadcrumb above).
+                self._log.info(
+                    "sparse_worktree_expanded",
+                    task_id=task_id,
+                    added_paths=added_harness,
+                    mode="test_harness",
                 )
             worktree_state.record_create(
                 self._autodev_root,
@@ -718,18 +978,40 @@ class WorktreeManager:
     ) -> str:
         """Return unified diff from ``base_ref`` to the worktree's content.
 
-        Uses ``git diff --no-color <base_ref>`` run with ``cwd=worktree`` so
-        both tracked-modified AND untracked new files are represented. Any
-        untracked files are intentionally included via a second ``git diff
-        --no-index`` pass for each.
+        Uses ``git diff --no-color --binary --full-index <base_ref>`` run
+        with ``cwd=worktree`` so both tracked-modified AND untracked new
+        files are represented. Any untracked files are intentionally
+        included via a second ``git diff --no-index`` pass for each.
+
+        v0.42.2 (F-5) — ``--binary --full-index`` makes the patch
+        self-contained for TRACKED binary changes. Without it, git emits
+        only an abbreviated ``Binary files a/… and b/… differ`` hunk with
+        an abbreviated index and no payload; the downstream ``git apply``
+        then fails ("cannot apply binary patch … without full index line"),
+        surfacing as a spurious ``conflict_3way_failed`` even though no
+        source conflict exists. The flag is harmless for text-only diffs.
+
+        v0.42.2 (F-5) — generated cruft (``__pycache__/*.pyc`` and the other
+        patterns in :data:`adapters.git_utils.GENERATED_FILE_GLOBS`) is
+        filtered OUT of the returned diff. The agent must never DELIVER
+        regenerated bytecode (in the field, pytest in the worktree during
+        the QA gate regenerated a tracked ``.pyc``, breaking the apply).
+        Filtering at this single diff source covers every consumer of the
+        worktree diff — both ``get_diff_vs_base`` callers and the
+        ``apply_patch_to_main`` path. The predicate matches ONLY
+        clearly-generated artefacts, so a real task's source/binary asset
+        is preserved.
         """
+        from adapters.git_utils import filter_generated_from_diff
+
         if not worktree.exists():
             raise WorktreeError(f"worktree {worktree} does not exist")
 
         # 1. Diff for tracked changes (including staged) against base_ref.
+        #    ``--binary --full-index`` ⇒ self-contained binary patch (F-5).
         rc, out, err = await _run_git(
             worktree,
-            ["diff", "--no-color", base_ref],
+            ["diff", "--no-color", "--binary", "--full-index", base_ref],
         )
         if rc != 0:
             raise WorktreeError(
@@ -737,7 +1019,9 @@ class WorktreeManager:
             )
         diff_text = out
 
-        # 2. Add untracked files — git diff ignores them by default.
+        # 2. Add untracked files — git diff ignores them by default. Use the
+        #    same ``--binary --full-index`` so a new binary file is captured
+        #    with its payload (F-5).
         untracked = await self._list_untracked(worktree)
         for rel in untracked:
             rc2, out2, _ = await _run_git(
@@ -745,6 +1029,8 @@ class WorktreeManager:
                 [
                     "diff",
                     "--no-color",
+                    "--binary",
+                    "--full-index",
                     "--no-index",
                     "/dev/null",
                     rel,
@@ -754,7 +1040,11 @@ class WorktreeManager:
             if rc2 in (0, 1):
                 diff_text += out2
 
-        return diff_text
+        # 3. Drop generated cruft (e.g. regenerated ``__pycache__/*.pyc``)
+        #    from the delivered diff — single source of truth in git_utils
+        #    (F-5). Done last so it applies to BOTH the tracked and
+        #    untracked sections uniformly.
+        return filter_generated_from_diff(diff_text)
 
     async def _list_untracked(self, worktree: Path) -> list[str]:
         """Return paths of untracked files (excluding gitignored)."""
@@ -807,6 +1097,14 @@ class WorktreeManager:
             return
 
         # v0.14.0: pre-flight scope check before any git apply runs.
+        # KNOWN LATENT GAP (pre-existing, tracked under F-4 apply-time scope
+        # enforcement): ``extract_files_from_diff`` parses only ``+++ b/``
+        # lines, so BINARY file changes (no ``+++ b/`` line) are invisible
+        # here — binary edits are NOT scope-gated. Now that F-5 makes binary
+        # patches apply, any future activation of apply-time enforcement must
+        # also teach ``extract_files_from_diff`` to parse the ``diff --git
+        # a/.. b/..`` header (or the ``Binary files .. differ`` line) so
+        # binary targets are gated too.
         if edit_scope:
             from adapters.git_utils import extract_files_from_diff
             from orchestrator.dag import EditScopeViolation, is_in_scope
@@ -862,6 +1160,12 @@ class WorktreeManager:
             await _run_git(self._main, ["checkout", "--", *_targets])
 
         # Pre-flight: ``git apply --check`` so we fail fast on conflicts.
+        # NOTE: with ``--3way``, ``git apply --check`` is NON-authoritative —
+        # it returns rc=0 even on genuine conflicts (applies a tentative merge).
+        # The AUTHORITATIVE failure signal is the real ``git apply --3way
+        # --index`` rc below; the A2 auto-3way reconciliation path relies on
+        # this distinction to let spurious conflicts through while still
+        # raising loudly on genuine ones.
         check_rc, _, check_err = await _run_git(
             self._main,
             check_args,
@@ -953,6 +1257,20 @@ class WorktreeManager:
         untracked files, which is still safe because ``reset --hard``
         already restored every tracked file to ``HEAD``.
 
+        A1 (Finding #1): the repo-wide ``git clean`` ALWAYS excludes AutoDev's
+        own state directory (``.autodev/``, normally untracked in the target
+        repo). Without this exclude, a corrective task synthesized by
+        ``corrective_parser.parse_corrective_direction`` — which carries
+        ``files=[]`` — drove the repo-wide path (empty ``targets``) and the
+        ``git clean -fd`` DELETED ``.autodev/plan-ledger.jsonl`` out from under
+        the live ``PlanManager``. The next ``block_task`` →
+        ``update_task_status("blocked")`` → ``_load_sync()`` then read an empty
+        ledger and raised ``"no plan initialized; call init_plan first"`` — the
+        field-observed worker_exception that silently killed delivery on the
+        conflict→re_architect→corrective→block path. AutoDev's run-state is
+        never a legitimate ``git clean`` target, so excluding it is always
+        correct (the scoped path is unaffected — it only cleans ``targets``).
+
         Never raises: a cleanup failure here must not mask the underlying
         apply failure the caller is already handling. Errors are logged and
         swallowed.
@@ -989,7 +1307,20 @@ class WorktreeManager:
         # Remove untracked files the partial apply may have created. Scope
         # to the attempted targets when known so unrelated untracked state
         # (e.g. a developer's scratch file elsewhere) is untouched.
+        #
+        # A1: ALWAYS exclude AutoDev's own state dir from the clean. On the
+        # repo-wide path (empty ``targets`` — the corrective-task shape, since
+        # ``parse_corrective_direction`` produces tasks with ``files=[]``) an
+        # un-excluded ``git clean -fd`` deleted the untracked
+        # ``.autodev/plan-ledger.jsonl``, wiping the live plan and surfacing as
+        # the spurious ``"no plan initialized"`` block. The exclude is harmless
+        # on the scoped path (which lists explicit ``targets`` and never
+        # ``.autodev``) and on a repo where ``.autodev`` is somehow tracked
+        # (``git clean`` ignores tracked files regardless).
         clean_args = ["clean", "-fd"]
+        autodev_excludes = self._git_clean_autodev_excludes()
+        for exclude in autodev_excludes:
+            clean_args.extend(["-e", exclude])
         scoped = [t for t in (targets or []) if t]
         if scoped:
             clean_args.append("--")
@@ -1004,7 +1335,42 @@ class WorktreeManager:
             self._log.info(
                 "worktree.abort_failed_apply.cleaned",
                 scoped=bool(scoped),
+                autodev_protected=bool(autodev_excludes),
             )
+
+    def _git_clean_autodev_excludes(self) -> list[str]:
+        """Return ``git clean -e`` pathspec(s) protecting AutoDev's state dir.
+
+        A1 safety net: the per-repo ``.autodev/`` directory (ledger, snapshot,
+        evidence, tournaments) is normally UNTRACKED in the target repo, so a
+        repo-wide ``git clean -fd`` would delete it — destroying the live plan
+        mid-run. This computes the exclude pathspec relative to the main repo
+        root. Returns the canonical ``.autodev`` (the standard layout) plus, if
+        ``self._autodev_root`` lives under the main repo at a non-standard
+        location, that relative path too. Empty only when the autodev root is
+        OUTSIDE the repo (then ``git clean`` can't reach it anyway).
+
+        The canonical ``AUTODEV_DIR`` exclude is deliberately BROAD (un-anchored,
+        so ``git clean -e`` protects a ``.autodev/`` wherever it sits in the
+        tree). Protecting AutoDev's live run-state is always the safe direction,
+        so this is NOT narrowed to a root-anchored ``/.autodev`` — that would
+        stop protecting non-standard ``_autodev_root`` layouts.
+        """
+        from state.paths import AUTODEV_DIR
+
+        excludes: list[str] = [AUTODEV_DIR]
+        try:
+            rel = self._autodev_root.resolve().relative_to(self._main.resolve())
+            rel_str = rel.as_posix()
+            # ``rel_str == "."`` means the autodev root IS the main repo root;
+            # appending ``-e .`` would be a meaningless (and confusing) no-op.
+            if rel_str not in (".", "") and rel_str not in excludes:
+                excludes.append(rel_str)
+        except (ValueError, OSError):
+            # autodev_root is outside the repo (or unresolvable) — the
+            # canonical ``.autodev`` exclude is the only relevant guard.
+            pass
+        return excludes
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────

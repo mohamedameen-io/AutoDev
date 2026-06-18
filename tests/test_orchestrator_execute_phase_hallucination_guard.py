@@ -35,6 +35,7 @@ def _stub_orch(tmp_path: Path, *, hallucination_guard: bool = True) -> object:
             mutation_test_threshold = 0.7
             lint_timeout_s = 120.0
             test_timeout_s = 600.0
+            build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
 
         # Top-level toggle (read off cfg.hallucination_guard, mirrors
         # the existing pattern for `cfg.qa_gates.*`).

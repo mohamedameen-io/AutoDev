@@ -1,0 +1,8 @@
+{
+  "language": "rust",
+  "difficulty": "easy",
+  "expected_minutes": 4,
+  "license": "MIT",
+  "origin": "synthetic",
+  "description": "count_vowels() omits 'u'. Add the missing vowel so it counts a, e, i, o, u case-insensitively."
+}

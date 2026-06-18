@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from orchestrator.recusal import JudgeRecusal
 from state.schemas import Task

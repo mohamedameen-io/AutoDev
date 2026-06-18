@@ -128,6 +128,7 @@ async def test_run_qa_gates_fails_closed_on_garbage_diff_for_diff_task(
             mutation_test_threshold = 0.7
             lint_timeout_s = 120.0
             test_timeout_s = 600.0
+            build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
 
     orch = type(
         "OrchStub",
@@ -211,6 +212,7 @@ async def test_run_qa_gates_skips_diff_gate_for_investigation_task(
                 mutation_test_threshold = 0.7
                 lint_timeout_s = 120.0
                 test_timeout_s = 600.0
+                build_check_timeout_s = 120.0  # WS2-11: build-gate timeout knob
 
         orch = type(
             "OrchStub",

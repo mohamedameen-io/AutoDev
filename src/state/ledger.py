@@ -308,6 +308,17 @@ LedgerOp = Literal[
     # ``{from_max_turns: int, to_max_turns: int, attempt: int,
     # reason: str}``.
     "plan_phase_budget_escalation",
+    # RECOVERY-CONTRACT §7 Step 2 (gate R4): resume-safe per-(scope_id, role)
+    # consecutive-``error_max_turns`` COUNTER value. Audit-only; replay no-op.
+    # Persisted on EVERY counter change in the production path (last-value-wins:
+    # the current attempt for a key = the ``attempt`` of the highest-seq
+    # ``budget_cycle`` op for that key). Rehydrated into the
+    # ``BudgetEscalationTracker`` on construction so ``autodev resume`` does NOT
+    # restart the escalation ladder at 0. Distinct from ``budget_escalation``
+    # (which records the max_turns BUMP event); this op records the COUNTER.
+    # Payload shape: ``{scope_id: str, role: str, attempt: int}`` (attempt=0 on
+    # reset).
+    "budget_cycle",
     # v0.32.0 Phase 2: review-tournament lifecycle ops. All four are
     # audit-only — they do NOT mutate plan state on replay (the
     # underlying task status changes flow through the regular
@@ -496,6 +507,18 @@ LedgerOp = Literal[
     # mutated by this op; the counter itself flows through the regular
     # ``update_phase_meta`` op.
     "skip_corrective_loop_detected",
+    # F-2 (field-finding): phase-scoped NON-CONVERGENCE ceiling tripped. Audit-
+    # only, LOUD fail-fast breadcrumb — fired when a phase has regenerated
+    # ``cfg.resolver.max_corrective_cycles_per_phase`` consecutive same-
+    # ``failure_class`` correctives without forward progress, so the resolver
+    # STOPS minting and declines (the originating ``block_task`` then commits the
+    # single terminal block). This is the distinct, greppable attribution for the
+    # unbounded corrective-regeneration loop that timed hard tasks out at the
+    # 40-min execute wall. Payload: ``{task_id, phase_id, failure_class, cycles,
+    # ceiling, reason}``. Plan state is not mutated by this op (the per-phase
+    # counter flows through ``update_phase_meta``; the block flows through
+    # ``update_task_status``); replay treats it as a no-op.
+    "corrective_nonconvergent_ceiling",
     # v0.38.0 I2 (HK4): ``autodev requeue --capped-phases`` was invoked.
     # Audit-only breadcrumb mirroring the existing ``requeue`` op
     # rationale — the per-task ``status: blocked → pending`` transitions
@@ -608,11 +631,99 @@ LedgerOp = Literal[
     # - ``resolution_chosen``: ``{task_id, failure_class, action,
     #   rationale_excerpt, params}``. Emitted once the resolver picks an action.
     # - ``resolution_outcome``: ``{task_id, action, outcome: "applied" |
-    #   "fell_through" | "ask_human", reason}``. Emitted after the site applies
-    #   (or declines) the action.
+    #   "fell_through" | "ask_human" | "observed", reason}``. Emitted after the
+    #   site applies (or declines) the action. The ``"observed"`` outcome (Phase
+    #   1A Step 1) marks an observability-only breadcrumb on the quarantine path:
+    #   the site is recording that a recovery-class transition is about to
+    #   happen (e.g. ``quarantine_pending_operator``), not that the resolver
+    #   chose-and-applied an action.
     "blocker_escalated",
     "resolution_chosen",
     "resolution_outcome",
+    # WS3-silent-degrade: KB-consult outage at the ``consult_knowledge`` rung.
+    # Audit-only; payload ``{task_id, failure_class, err}``. The resolver declines
+    # (no recovery) and refunds the per-blocker cycle, so a KB outage never burns
+    # the bounded recovery budget. Replay no-op.
+    "resolver_kb_failed",
+    # Phase 1A Step 1 (RECOVERY-CONTRACT §7.1): the conflict-escalation critic's
+    # merge-strategy DECISION. Audit-only — NEVER mutates plan state (the chosen
+    # branch's terminal block, if any, applies via ``block_task`` →
+    # ``update_task_status`` alongside). Payload shape:
+    # ``{task_id, action: "rebase-and-retry" | "abandon-task" | "rewrite",
+    #   conflict_files: list[str], rewrite_rounds: int}``. Records the critic's
+    # CHOICE (previously invisible — zero ledger ops) so post-mortems can audit
+    # how a 3-way merge conflict was resolved before any block.
+    "conflict_critic_decision",
+    # Step 5 (RECOVERY-CONTRACT §7 Part 4): the terminal ``block_task`` commit
+    # found the PlanManager's ledger unexpectedly empty/absent ("no plan
+    # initialized"). Audit-only attributable breadcrumb so the field-observed
+    # ``worker_exception: "no plan initialized"`` on the conflict→corrective path
+    # is never silent/misclassified. The block still re-raises (genuine state
+    # corruption stays loud); this op records WHERE. Payload:
+    # ``{task_id, failure_class, raw_error, err}``. Replay is a forensic no-op.
+    "block_path_plan_uninitialized",
+    # Gate-closer A (G6): the QA-gate dispatch detected an UNSUPPORTED language
+    # — ``detect_language`` returned ``None`` while the repo carries source, OR
+    # a recognised-but-NON-RUNNABLE language (e.g. ``elixir`` / ``dotnet`` /
+    # ``ruby`` / ``swift`` / ``cpp``; not in ``qa.detect.RUNNABLE_TEST_LANGUAGES``).
+    # Without this op the unsupported case was INVISIBLE: every per-language gate
+    # vacuously soft-passed ("language not detected, skipping") and the dispatch
+    # returned the all-clear. The op makes the degrade-loud decision auditable.
+    # Audit-only — it NEVER mutates plan state (the task-status transition, if
+    # any, flows through the regular ``update_task_status`` op emitted alongside
+    # by the retry/escalate FSM that consumes the blocking detail string).
+    # Payload shape: ``{language: str | None, reason: str, has_source: bool}``
+    # where ``language`` is the detected non-runnable language or ``None`` for
+    # "no recognised signal but source present". A genuinely-empty repo (no
+    # source at all) does NOT emit this op — that stays the legit ``no_source``
+    # pass. Replay is a forensic no-op, tolerated even before any ``init_plan``.
+    "language_unsupported",
+    # v1.0 B1: planner-side over-engineering/tech-debt advisory. Emitted by
+    # ``plan_phase._advise_over_engineering`` after the plan is parsed. Audit-
+    # only — NEVER mutates plan state (the plan is NOT rejected or modified
+    # in response). Payload shape:
+    # ``{task_id: str, smell: str, source: "planner_advisory",
+    #   attempt: int, ...smell-specific fields...}``
+    # where ``smell`` is ``"dependency_manifest"`` or ``"new_file_bloat"``.
+    # Replay is a forensic no-op.
+    "over_engineering_advisory",
+    # v1.0 B2: reviewer-side over-engineering/tech-debt advisory. Emitted by
+    # ``orchestrator.phase_review_runner._emit_reviewer_advisory`` after the
+    # phase-review tournament completes. Audit-only — NEVER mutates plan state,
+    # NEVER changes the tournament verdict, and NEVER blocks execution. The
+    # recording is best-effort: a failure to append this op is swallowed so the
+    # verdict path is unaffected. Payload shape:
+    # ``{phase_id: str, note: str, source: "reviewer_advisory"}``.
+    # Replay is a forensic no-op.
+    "reviewer_over_engineering_advisory",
+    # F-7 (field-finding): the plan-tournament cumulative WALL-CLOCK ceiling
+    # tripped. Audit-only, LOUD fail-fast breadcrumb — fired by
+    # ``orchestrator.plan_tournament_runner.run_plan_tournament`` when the
+    # tournament loop raises a ``plan_phase_wall_budget_exceeded``
+    # ``TournamentError`` (cumulative elapsed exceeded
+    # ``cfg.guardrails.plan_phase_wall_budget_s``, checked BETWEEN passes).
+    # This is the distinct, greppable attribution for the previously-opaque
+    # "timed out after 2400s" external SIGKILL: the runner emits this op,
+    # then re-raises so the existing plan-phase salvage path recovers the
+    # best on-disk incumbent. Plan state is NOT mutated by this op (the
+    # salvage / fallback flows through the regular plan-phase code paths);
+    # replay treats it as a no-op, and it is tolerated even when plan is
+    # None (it can fire before ``init_plan`` during the plan phase). Payload:
+    # ``{spec_hash, branch_index, budget_s, elapsed_s, passes_completed,
+    #   tournament_id, reason}``.
+    "plan_phase_wall_budget_exceeded",
+    # F-4 (field-finding): apply-time edit-scope WARN breadcrumb. Emitted by
+    # ``orchestrator.execute_phase._apply_with_conflict_escalation`` when the
+    # ``enforce_apply_time_edit_scope`` policy is ``"warn"`` and the
+    # developer's worktree diff touches a file outside the resolved
+    # effective scope. Audit-only — purely advisory: the diff is STILL
+    # applied (warn mode never blocks), so this op NEVER mutates plan state.
+    # Best-effort: a failure to append it is swallowed so apply is never
+    # derailed. Replay is a forensic no-op, tolerated even when plan is None.
+    # Payload shape:
+    # ``{task_id: str, out_of_scope_files: list[str], effective_scope:
+    #   list[str], policy: "warn"}``.
+    "edit_scope_apply_violation",
 ]
 
 
@@ -958,8 +1069,22 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # return early here — before the ``plan is None`` guard below.
         return plan
 
-    if op in ("blocker_escalated", "resolution_chosen", "resolution_outcome"):
+    if op in (
+        "blocker_escalated",
+        "resolution_chosen",
+        "resolution_outcome",
+        "conflict_critic_decision",
+        "resolver_kb_failed",
+    ):
         # ADR-0047: audit-only breadcrumbs for the Universal Blocker Resolver.
+        # WS3-silent-degrade: ``resolver_kb_failed`` records a KB-consult outage
+        # at the ``consult_knowledge`` rung (KB starvation) — audit-only, never
+        # mutates plan state (the resolver simply declines and the per-blocker
+        # cycle is refunded by ``_maybe_resolve_blocker``).
+        # Phase 1A Step 1 adds ``conflict_critic_decision`` (the conflict
+        # critic's merge-strategy choice) to the same audit-only set — it never
+        # mutates plan state; the chosen branch's terminal block (if any)
+        # applies via the regular ``update_task_status`` op emitted alongside.
         # The resolver fires during execute_phase (plan already persisted), but
         # these ops never mutate plan state — the chosen action applies via the
         # regular ``update_task_status`` / ``append_corrective_tasks`` /
@@ -1128,6 +1253,11 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # ``budget_escalation`` but scoped to the plan-phase
         # architect retry loop.
         "plan_phase_budget_escalation",
+        # RECOVERY-CONTRACT §7 Step 2 (gate R4): resume-safe budget COUNTER.
+        # Audit-only; replay no-op. The counter lives in the in-memory
+        # ``BudgetEscalationTracker`` (rehydrated from these ops on construction
+        # via last-value-wins) — replay must NOT mutate plan state here.
+        "budget_cycle",
         # v0.32.0 Phase 2: review-tournament lifecycle ops. All
         # audit-only — they do NOT mutate plan state. The underlying
         # task status changes (retry / escalate / soft-block) flow
@@ -1196,6 +1326,11 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # ``update_phase_meta`` op emitted alongside (the
         # ``Phase.metadata["skip_corrective_count"]`` delta).
         "skip_corrective_loop_detected",
+        # F-2 (field-finding): phase-scoped non-convergence ceiling tripped.
+        # Audit-only no-op on replay — the per-phase counter is persisted via the
+        # regular ``update_phase_meta`` op and the terminal block via
+        # ``update_task_status``, both emitted alongside.
+        "corrective_nonconvergent_ceiling",
         # v0.38.0 I2 (HK4): ``autodev requeue --capped-phases`` audit
         # breadcrumb. Replay is a no-op — the per-task transitions live
         # in the ``update_task_status`` ops emitted alongside (one per
@@ -1229,6 +1364,48 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # alongside by the retry/escalation FSM; replay is a no-op
         # forensic breadcrumb.
         "containment_violation_autodev_paths",
+        # Step 5 (RECOVERY-CONTRACT §7 Part 4): terminal-block ledger-absence
+        # breadcrumb. Audit-only — the block re-raises so a genuine corruption
+        # still surfaces; this op only records WHERE it happened. Replay is a
+        # forensic no-op (and is tolerated even when plan is None, since this op
+        # is precisely the empty-ledger case).
+        "block_path_plan_uninitialized",
+        # Gate-closer A (G6): unsupported-language QA-gate-dispatch breadcrumb.
+        # Audit-only — never mutates plan state (the blocking detail it pairs
+        # with flows through the regular retry/escalate path's
+        # ``update_task_status`` op). Tolerated even when plan is None so the
+        # op is order-independent on replay, mirroring the other dispatch-time
+        # audit ops above.
+        "language_unsupported",
+        # v1.0 B1: planner-side over-engineering advisory. Audit-only — fired
+        # by ``plan_phase._advise_over_engineering`` after the plan is parsed.
+        # NEVER mutates plan state; replay is a forensic no-op. Tolerated even
+        # when plan is None so the op is order-independent on replay (it fires
+        # right after plan parsing, before the ``init_plan`` op in some code
+        # paths). Payload: ``{task_id, smell, source, attempt, ...}``.
+        "over_engineering_advisory",
+        # v1.0 B2: reviewer-side over-engineering advisory. Audit-only — fired
+        # by ``phase_review_runner._emit_reviewer_advisory`` after the phase-
+        # review tournament completes. NEVER mutates plan state or changes the
+        # verdict; replay is a forensic no-op. Payload:
+        # ``{phase_id, note, source}``.
+        "reviewer_over_engineering_advisory",
+        # F-7 (field-finding): plan-tournament cumulative wall-clock ceiling
+        # tripped. Audit-only no-op on replay — the runner re-raises a
+        # ``TournamentError`` after emitting this op and the salvage / fallback
+        # flows through the regular plan-phase code paths (no plan mutation
+        # here). Tolerated even when plan is None: the op fires during the plan
+        # phase and may precede ``init_plan``, mirroring the other plan-phase
+        # dispatch-time audit ops above.
+        "plan_phase_wall_budget_exceeded",
+        # F-4 (field-finding): apply-time edit-scope WARN breadcrumb. Audit-
+        # only — warn mode applies the diff regardless, so this op NEVER
+        # mutates plan state; replay is a forensic no-op. Tolerated even when
+        # plan is None (mirrors the other execute-time advisory ops), though
+        # in practice it fires during execute with the plan already
+        # persisted. Payload: ``{task_id, out_of_scope_files,
+        # effective_scope, policy}``.
+        "edit_scope_apply_violation",
     ):
         # v0.27 Phase 4-5: granular drop / persistent-error telemetry +
         # post-tournament structural-validity rejection.
@@ -1289,6 +1466,20 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
                     task.recovery_hint = _RecoveryHint.model_validate(raw_hint)
                 except Exception:  # noqa: BLE001 - tolerate legacy payloads
                     task.recovery_hint = None
+        # Step 5 (RECOVERY-CONTRACT §7 Part 3): replay the resolver guidance
+        # onto ``Task.metadata`` so a full ledger-replay (no-snapshot) path
+        # restores the same note the snapshot fast-path carries. Mirrors the
+        # write side in ``PlanManager.update_task_status``. Merge so other
+        # metadata keys survive; pre-Step-5 entries simply omit these keys.
+        for _mkey in ("resolver_note", "resolver_action"):
+            if _mkey not in payload:
+                continue
+            _new_md = dict(task.metadata or {})
+            if payload[_mkey] is None:
+                _new_md.pop(_mkey, None)
+            else:
+                _new_md[_mkey] = str(payload[_mkey])
+            task.metadata = _new_md
         return plan
 
     if op == "mark_blocked":

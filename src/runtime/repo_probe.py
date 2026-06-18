@@ -218,7 +218,7 @@ def _largest_directory(cwd: Path) -> tuple[str, int]:
     import os
     import subprocess
 
-    counter: dict[str, int] = collections.Counter()
+    counter: collections.Counter[str] = collections.Counter()
 
     git_dir = Path(cwd) / ".git"
     if git_dir.exists():

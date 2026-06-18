@@ -27,9 +27,6 @@ import pytest
 
 from orchestrator import execute_phase as ep
 from orchestrator.prm import (
-    CourseCorrection,
-    Pattern,
-    TrajectoryEvent,
     TrajectoryStore,
 )
 from state.plan_manager import PlanManager

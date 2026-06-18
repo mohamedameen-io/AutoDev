@@ -64,23 +64,88 @@ _LIVE_LOOP_METHODS: frozenset[str] = frozenset(
     {"dev_server_curl", "headless_browser", "hitl"}
 )
 
-# The diagnostician's scope markers signal whether the spec is a bug/regression.
-# Reuses the SAME lexical scope markers as ``spec_validator`` so the is-bug-fix
-# gate is consistent with the front-gate vocabulary. ``add``/``feature``/
-# ``implement``/``refactor`` are feature-shaped and do NOT count as a bug.
-_BUG_MARKERS: tuple[str, ...] = (
+# is-bug-fix vocabulary (WS2-15). Matching is WORD-ANCHORED (``\bmarker\b``), not
+# bare-substring, so a feature spec that merely *embeds* a bug-word as a substring
+# (``bugfix-tracker``, ``debug-mode``, ``errorpage``, ``crashlytics``, ``failsafe``,
+# ``wrongful``) is NOT misclassified as a bug. The vocabulary is split by strength:
+#
+#  - ``_STRONG_BUG_MARKERS`` describe a DEFECT directly. Their presence (as a whole
+#    word) means bug-fix unconditionally — even alongside a feature-shaped verb.
+#  - ``_SOFT_BUG_MARKERS`` (``error``/``fails``/``incorrect``/``wrong``…) appear in
+#    plenty of FEATURE intents ("add error handling", "report incorrect logins").
+#    A soft marker counts as a bug ONLY when the intent does NOT *lead* with a
+#    feature verb (see ``_FEATURE_LEAD_RE``).
+#
+# Two structured signals augment the word match: a verb-led ``fix …``
+# (``_FIX_VERB_RE``) is a strong bug intent, and a CamelCase exception class name
+# like ``NullPointerException`` / ``ValueError`` (``_EXC_CLASS_RE``) is a defect
+# even though it is a single token. All matching is deterministic.
+_STRONG_BUG_MARKERS: tuple[str, ...] = (
     "bug",
-    "fix",
+    "bugs",
     "regression",
-    "error",
+    "regressions",
     "crash",
-    "failure",
+    "crashes",
+    "crashing",
     "broken",
+    "traceback",
+    "npe",
+)
+_SOFT_BUG_MARKERS: tuple[str, ...] = (
+    "error",
+    "errors",
+    "failure",
+    "failures",
     "fails",
+    "failing",
+    "failed",
     "incorrect",
     "wrong",
     "exception",
-    "traceback",
+    "exceptions",
+)
+# Back-compat alias: the full marker set (used by tests / external callers that
+# want the lexical vocabulary). Order is strong-then-soft.
+_BUG_MARKERS: tuple[str, ...] = _STRONG_BUG_MARKERS + _SOFT_BUG_MARKERS
+
+# Feature-intent verbs that LEAD an intent line (optionally after a ``## Scope:``
+# heading). When the intent leads with one of these and the only bug signal is a
+# SOFT marker, the spec is feature work, not a bug fix.
+_FEATURE_VERBS: tuple[str, ...] = (
+    "add",
+    "implement",
+    "create",
+    "build",
+    "introduce",
+    "support",
+    "refactor",
+    "document",
+    "design",
+    "migrate",
+    "rename",
+    "extend",
+    "enable",
+)
+
+
+def _word_re(markers: tuple[str, ...]) -> re.Pattern[str]:
+    """Compile a word-anchored alternation over ``markers`` (case-insensitive)."""
+    alt = "|".join(re.escape(m) for m in markers)
+    return re.compile(rf"\b(?:{alt})\b", re.IGNORECASE)
+
+
+_STRONG_BUG_RE = _word_re(_STRONG_BUG_MARKERS)
+_SOFT_BUG_RE = _word_re(_SOFT_BUG_MARKERS)
+# Verb-led "fix/fixes/fixed/fixing …" — a defect-correction intent.
+_FIX_VERB_RE = re.compile(r"\bfix(?:es|ed|ing)?\b", re.IGNORECASE)
+# CamelCase exception/error class name: NullPointerException, ValueError, IOError.
+_EXC_CLASS_RE = re.compile(r"\b[A-Z][A-Za-z0-9]*(?:Exception|Error)\b")
+# Intent leads with a feature verb (allowing an optional "## Scope:" prefix),
+# anchored to the start of any line.
+_FEATURE_LEAD_RE = re.compile(
+    r"^\s*(?:##\s*Scope:?\s*)?(?:" + "|".join(_FEATURE_VERBS) + r")\b",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Structured-block parsing regexes (mirrors framing's skeptical line extraction).
@@ -164,35 +229,36 @@ def _check_diagnosis_disabled() -> bool:
     return os.environ.get("AUTODEV_DIAGNOSIS_DISABLED", "").strip() == "1"
 
 
-def _extract_scope_block(spec: str) -> str:
-    """Return the ``## Scope:`` block body if present, else the whole spec.
-
-    ADR-0046 gates on the spec's scope markers. Specs commonly carry a
-    ``## Scope:`` heading (see ``spec_validator``); when present we weight the
-    is-bug-fix decision toward that block but still fall back to the full text.
-    """
-    m = re.search(r"##\s*Scope:?\s*(.+?)(?:\n##\s|\Z)", spec, re.IGNORECASE | re.DOTALL)
-    return m.group(1) if m else spec
-
-
 def is_bug_fix(spec: str) -> bool:
-    """Heuristic is-bug-fix gate (FR / KD5).
+    """Anchored, scoped is-bug-fix gate (FR / KD5, WS2-15).
 
-    Reuses ``spec_validator``-style lexical markers: a spec is a bug fix when a
-    bug/regression marker appears in its ``## Scope:`` block (weighted) or
-    anywhere in the body. Conservative — a spec mentioning a bug marker counts as
-    a bug even if it also reads feature-ish (we'd rather diagnose than skip); a
-    spec with no bug marker at all (pure feature work) is NOT a bug fix.
+    Deterministic and WORD-ANCHORED (not bare-substring): a feature/refactor/docs
+    spec that merely *embeds* a bug-word as a substring (``bugfix-tracker``,
+    ``debug-mode``, ``errorpage``, ``crashlytics``, ``failsafe``, ``wrongful``) is
+    NOT misclassified as a bug. The decision is a small, ordered rule set:
+
+    1. A STRONG defect marker as a whole word (``bug``/``regression``/``crash``/
+       ``broken``/``traceback``/``npe``), a verb-led ``fix …``, or a CamelCase
+       exception class name (``NullPointerException``/``ValueError``) ⇒ bug fix.
+       These describe a defect directly, so a feature-shaped verb does not override.
+    2. Otherwise, a SOFT marker (``error``/``fails``/``incorrect``/``wrong``…) as
+       a whole word ⇒ bug fix UNLESS the intent *leads* with a feature verb
+       (``add``/``implement``/``refactor``…). "Add error handling" is a feature;
+       "the parser fails on empty input" is a bug.
+    3. No marker at all ⇒ pure feature/other work, not a bug fix.
+
+    Empty / whitespace-only specs are not bug fixes. NEVER raises.
     """
     if not spec or not spec.strip():
         return False
-    lower = spec.lower()
-    scope_lower = _extract_scope_block(spec).lower()
-    has_bug = any(m in scope_lower for m in _BUG_MARKERS) or any(
-        m in lower for m in _BUG_MARKERS
-    )
-    # No bug marker anywhere ⇒ pure feature/other work, not a bug fix.
-    return has_bug
+    # 1. Strong, defect-describing signals win unconditionally.
+    if _STRONG_BUG_RE.search(spec) or _FIX_VERB_RE.search(spec) or _EXC_CLASS_RE.search(spec):
+        return True
+    # 2. Soft markers count only when the intent is not feature-led.
+    if _SOFT_BUG_RE.search(spec):
+        return not bool(_FEATURE_LEAD_RE.search(spec))
+    # 3. No marker ⇒ not a bug fix.
+    return False
 
 
 def _parse_bool(value: str | None, *, default: bool = False) -> bool:

@@ -39,7 +39,7 @@ def test_passthrough_all_zero_scores() -> None:
     # via stdout or stderr (the script uses logging which goes to stderr
     # by default but may be captured in stdout if reconfigured).
     output = proc.stdout + proc.stderr
-    pair_lines = [l for l in output.splitlines() if l.startswith("[OK]")]
+    pair_lines = [line for line in output.splitlines() if line.startswith("[OK]")]
     assert pair_lines, f"No per-pair OK lines found in output:\n{output}"
     for line in pair_lines:
         m = re.search(r"slim=(\d+\.\d+)", line)

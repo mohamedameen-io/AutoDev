@@ -20,11 +20,12 @@ until each new op gets a handler.
 from __future__ import annotations
 
 import typing
+from pathlib import Path
 
 import pytest
 
 from errors import LedgerCorruptError
-from state.ledger import LedgerOp, _apply_op
+from state.ledger import LedgerOp, _apply_op, append_entry, replay_ledger
 
 from fixtures.ledger_ops import (
     make_entry,
@@ -129,3 +130,70 @@ def test_apply_op_unknown_label_still_raises() -> None:
     with pytest.raises(LedgerCorruptError) as exc_info:
         _apply_op(plan, entry)
     assert _is_unknown_op_error(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_replay_ledger_survives_advisory_ops(tmp_path: Path) -> None:
+    """Regression guard for the B2 class of bug: unregistered op → replay_ledger raises.
+
+    Writes a real chained ledger with:
+        1. ``init_plan``  — establishes the plan
+        2. ``over_engineering_advisory``  — planner-side advisory (B1)
+        3. ``reviewer_over_engineering_advisory``  — reviewer-side advisory (B2)
+
+    Then calls ``replay_ledger(tmp_path)`` and asserts:
+        * it does NOT raise
+        * it returns a non-None plan
+        * all 3 entries are in the returned list
+
+    This test WILL fail if either advisory op is removed from ``_apply_op``
+    (the removed op hits the fall-through ``LedgerCorruptError("unknown op=...")``
+    and replay_ledger propagates it).
+    """
+    plan = make_minimal_plan()
+    session = "sess-replay-test"
+
+    # 1. init_plan — establishes the plan in the ledger
+    await append_entry(
+        tmp_path,
+        "init_plan",
+        {"plan": plan.model_dump(mode="json")},
+        session_id=session,
+    )
+
+    # 2. over_engineering_advisory (B1: planner-side, fires after plan parse)
+    await append_entry(
+        tmp_path,
+        "over_engineering_advisory",
+        {
+            "task_id": "1.1",
+            "smell": "unnecessary abstraction",
+            "source": "planner_advisory",
+            "attempt": 0,
+        },
+        session_id=session,
+    )
+
+    # 3. reviewer_over_engineering_advisory (B2: reviewer-side, fires after phase review)
+    await append_entry(
+        tmp_path,
+        "reviewer_over_engineering_advisory",
+        {
+            "phase_id": "1",
+            "note": "Abstraction layer adds no value.",
+            "source": "reviewer_advisory",
+        },
+        session_id=session,
+    )
+
+    # replay_ledger must not raise
+    result_plan, entries = replay_ledger(tmp_path)
+
+    assert result_plan is not None, "replay_ledger returned None plan — advisory op may be unregistered"
+    assert len(entries) == 3, f"Expected 3 entries, got {len(entries)}"
+    ops = [e.op for e in entries]
+    assert ops == [
+        "init_plan",
+        "over_engineering_advisory",
+        "reviewer_over_engineering_advisory",
+    ]

@@ -18,12 +18,19 @@ pre-fix is rejected as not-reproducing"):
   loop and rejects it if it *passes* (a loop that never reproduced the bug is
   invalid as an acceptance signal).
 
-Graceful degradation (NFR2): when no persisted loop exists, the evidence is
-unreadable, the loop is ``fidelity="none"``, or the loop has no runnable
+Graceful degradation (NFR2): when no persisted loop exists (evidence file
+genuinely absent), the loop is ``fidelity="none"``, or the loop has no runnable
 command, the gate **soft-passes** (``severity="info"``) and logs — it never
 hard-crashes the dispatcher. A loop whose stated fidelity is ``live`` is also
 soft-passed in the sandbox (it cannot be the autonomous signal; the synthetic
 loop + delivered artifact carry the verdict — see ADR-0046 §5.2).
+
+Fail-loud (NOT graceful): when the diagnosis evidence file **exists but cannot
+be read** (corrupt JSON / IOError), the gate does NOT soft-pass — it returns
+``passed=False, severity="block"``. A gate that passes because it could not
+read its acceptance signal is the bug; missing (absent) and unreadable
+(present-but-corrupt) are deliberately distinguished (see
+``_read_persisted_loop``).
 """
 
 from __future__ import annotations
@@ -36,10 +43,28 @@ from pathlib import Path
 from autologging import get_logger
 from plugins.registry import GateResult
 from state.evidence import read_evidence
+from state.paths import evidence_path
 from state.schemas import DiagnosisEvidence, FeedbackLoop
 
 
 logger = get_logger(__name__)
+
+
+class _UnreadableEvidence:
+    """Sentinel: the diagnosis evidence file EXISTS but could not be read.
+
+    Distinct from ``None`` (no evidence on disk at all). A present-but-corrupt
+    or IOError-raising evidence file is the acceptance signal we *cannot read*
+    — it must fail loud (block), never silently soft-pass. See
+    ``_read_persisted_loop``.
+    """
+
+    __slots__ = ()
+
+
+# Singleton instance returned by ``_read_persisted_loop`` for the
+# unreadable-but-exists case.
+_UNREADABLE = _UnreadableEvidence()
 
 
 # Evidence locator for the diagnosis bundle (file
@@ -76,20 +101,83 @@ class LoopRunResult:
     timed_out: bool = False
 
 
-async def _read_persisted_loop(cwd: Path) -> FeedbackLoop | None:
-    """Return the persisted diagnosis :class:`FeedbackLoop`, or ``None``.
+async def _read_persisted_loop(
+    cwd: Path,
+) -> FeedbackLoop | None | _UnreadableEvidence:
+    """Load the persisted diagnosis loop, distinguishing missing vs unreadable.
 
-    ``None`` covers every "no usable loop" case: no diagnosis evidence on
-    disk, evidence of the wrong kind, or a diagnosis with ``loop=None``.
-    Never raises — a read/parse failure degrades to ``None``.
+    Three outcomes (the missing-vs-unreadable distinction is the whole point —
+    a gate that passes because it could NOT read its acceptance signal is the
+    bug; see WS3-reproduce-gate-soft-pass-on-ioerror):
+
+    * ``FeedbackLoop`` — a readable, valid diagnosis with a loop.
+    * ``None`` — no usable loop in the *legitimate* sense: the evidence file is
+      genuinely **absent**, or it is present-and-readable but has no loop
+      (wrong kind / ``loop=None``). These soft-pass.
+    * :data:`_UNREADABLE` — the evidence file **EXISTS** but could not be read
+      (corrupt JSON / IOError). This must fail loud (block), not soft-pass.
     """
+    path = evidence_path(cwd, _DIAGNOSIS_TASK_ID, _DIAGNOSIS_KIND)
+    try:
+        present = path.exists()
+    except OSError:
+        # Even ``exists()`` failing (e.g. a broken FS) is a present-but-unreadable
+        # signal, not a clean "absent": fail loud rather than soft-pass blind.
+        return _UNREADABLE
+
+    if not present:
+        # Legitimately absent → existing soft-pass behavior.
+        return None
+
+    # The file is on disk. A read/parse failure here is NOT "no evidence" — it
+    # is corrupt/unreadable evidence and must NOT be swallowed to a soft-pass.
     try:
         ev = await read_evidence(cwd, _DIAGNOSIS_TASK_ID, _DIAGNOSIS_KIND)
-    except Exception:  # noqa: BLE001 — evidence IO must never block the gate
-        return None
-    if ev is None or not isinstance(ev, DiagnosisEvidence):
+    except Exception:  # noqa: BLE001 — a raising read on a PRESENT file is corrupt
+        logger.warning(
+            "qa.reproduce_gate.unreadable_evidence",
+            path=str(path),
+            reason="read_evidence raised on a present file",
+        )
+        return _UNREADABLE
+
+    if ev is None:
+        # File present but ``read_evidence`` returned None → it could not be
+        # parsed/validated (OSError / JSONDecodeError / schema mismatch). The
+        # file exists, so this is unreadable-but-exists, not missing.
+        logger.warning(
+            "qa.reproduce_gate.unreadable_evidence",
+            path=str(path),
+            reason="evidence file present but unparseable",
+        )
+        return _UNREADABLE
+
+    if not isinstance(ev, DiagnosisEvidence):
+        # Present, parsed, but the wrong evidence kind — legitimately "no loop".
         return None
     return ev.loop
+
+
+def _corrupt_evidence_block() -> GateResult:
+    """Fail-loud verdict for a present-but-unreadable diagnosis evidence file.
+
+    ``severity`` is ``"block"`` (the dispatcher's halting severity) because the
+    ``GateResult`` schema has no ``"error"`` member — ``Literal["info","warn",
+    "block"]`` — and ``block`` is the value routed as "halt the task". The
+    intent matches the brief's ``severity="error"``: a corrupt acceptance signal
+    is a hard failure, never a soft-pass.
+    """
+    return GateResult(
+        passed=False,
+        severity="block",
+        details=(
+            "reproduce-gate: diagnosis evidence file is present but UNREADABLE "
+            "(corrupt JSON / IOError) — the acceptance signal could not be read, "
+            "so the gate fails loud rather than soft-passing. "
+            f"path: {_DIAGNOSIS_TASK_ID}-{_DIAGNOSIS_KIND}.json"
+        ),
+        metrics={"reproduce_gate_ran": False, "evidence_unreadable": True},
+    )
 
 
 async def _run_loop_command(
@@ -219,7 +307,10 @@ async def verify_loop_reproduces(
     loop is not sandbox-runnable.
     """
     if loop is None:
-        loop = await _read_persisted_loop(cwd)
+        loaded = await _read_persisted_loop(cwd)
+        if isinstance(loaded, _UnreadableEvidence):
+            return _corrupt_evidence_block()
+        loop = loaded
     if loop is None:
         return _soft_pass("no persisted diagnosis loop to verify")
 
@@ -280,7 +371,10 @@ async def run_reproduce_gate(
     loop's tool is unavailable / it times out in this sandbox.
     """
     if loop is None:
-        loop = await _read_persisted_loop(cwd)
+        loaded = await _read_persisted_loop(cwd)
+        if isinstance(loaded, _UnreadableEvidence):
+            return _corrupt_evidence_block()
+        loop = loaded
     if loop is None:
         return _soft_pass("no persisted diagnosis loop; reproduce-gate skipped")
 

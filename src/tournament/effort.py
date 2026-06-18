@@ -76,6 +76,81 @@ ROLE_TIER: dict[str, str] = {
 }
 
 
+# B3: effort→intensity mapping for developer prompt modulation.
+#
+# The necessity ladder (B1) is always injected; this table *modulates* its
+# intensity by effort level:
+#   low    → "lite":        bias hard toward the minimal change; suppress
+#             speculative optimization, refactoring, and scope expansion.
+#   medium → standard:      no extra text — the baseline necessity ladder is
+#             already the right instruction.
+#   high   → "deeper-work": refactors/optimizations that genuinely improve
+#             touched code are in scope (they are not "speculative" when the
+#             task involves working inside those files anyway).
+#   max    → same as high.
+#
+# NON-NEGOTIABLE (replicated in NECESSITY_LADDER_GUIDANCE): the safety /
+# input-validation / error-handling / security carve-out holds at EVERY
+# level. "minimal change" at low effort is NOT an excuse to drop security.
+_INTENSITY_LITE = """\
+
+## EFFORT INTENSITY: LITE (low effort)
+
+You are operating in **lite** mode. Bias strongly toward the **minimal change**
+that satisfies the task. Specifically:
+
+- Make the smallest diff that correctly solves the stated requirement.
+- Do NOT add speculative optimizations — improvements not required by the task.
+- Do NOT perform speculative refactoring — clean-ups not motivated by the task.
+- Do NOT expand scope beyond what the task explicitly requires.
+- When in doubt between a minimal fix and a larger improvement, choose the fix.
+
+SAFETY OVERRIDE (non-negotiable at every intensity level): safety, input
+validation, error handling, and security work are NEVER suppressed by lite
+mode. If the task requires fixing a security issue or adding validation,
+proceed at full depth — "minimal change" is not an excuse to skip safety.
+"""
+
+_INTENSITY_DEEPER_WORK = """\
+
+## EFFORT INTENSITY: DEEPER WORK (high/max effort)
+
+You are operating in **deeper-work** mode. Refactors and optimizations that
+genuinely improve the touched code are **in scope**:
+
+- If you are already modifying a file and see a clear, low-risk improvement
+  (a cleaner abstraction, a more efficient algorithm, better error handling),
+  you MAY include it — it is not "speculative" when you are already there.
+- Still apply the necessity ladder before adding new dependencies or modules.
+- Do NOT expand scope into unrelated files; "deeper" means higher quality on
+  what you already touch, not a wider blast radius.
+"""
+
+EFFORT_INTENSITY: dict[str, str] = {
+    "low":    _INTENSITY_LITE,
+    "medium": "",             # standard: necessity ladder alone is the baseline
+    "high":   _INTENSITY_DEEPER_WORK,
+    "max":    _INTENSITY_DEEPER_WORK,  # same as high
+}
+
+
+def effort_intensity_guidance(user_complexity: UserComplexity) -> str:
+    """Return the effort-intensity guidance string for the given effort level.
+
+    Maps ``user_complexity`` (``"low" | "medium" | "high" | "max"``) to an
+    instruction fragment that modulates the B1 necessity ladder:
+
+    - ``"low"``    → lite: minimal-change bias, suppress speculative work.
+    - ``"medium"`` → standard: empty string (necessity ladder is the baseline).
+    - ``"high"``   → deeper-work: refactors/optimizations in touched code OK.
+    - ``"max"``    → same as ``"high"``.
+
+    The safety/validation/security carve-out is **always** present regardless
+    of intensity level; it is never suppressed by "lite" mode.
+    """
+    return EFFORT_INTENSITY.get(user_complexity, "")
+
+
 def resolve_role_effort(
     role: str,
     agent_cfg: AgentConfig | None,
@@ -124,7 +199,9 @@ def resolve_role_effort(
 
 __all__ = [
     "ARCHITECT_EFFORT",
+    "EFFORT_INTENSITY",
     "EFFORT_MATRIX",
     "ROLE_TIER",
+    "effort_intensity_guidance",
     "resolve_role_effort",
 ]

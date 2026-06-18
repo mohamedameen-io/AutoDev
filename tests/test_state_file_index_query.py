@@ -7,7 +7,6 @@ from pathlib import Path
 
 from state.file_index import (
     CandidateDigest,
-    FileHit,
     IndexBuilder,
     IndexQuery,
     SymbolHit,

@@ -12,11 +12,7 @@ deferred to v0.23.0 C2.
 
 from __future__ import annotations
 
-import logging
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
-import pytest
 
 from config.schema import QAGatesConfig
 from runtime.repo_probe import RepoCapacity

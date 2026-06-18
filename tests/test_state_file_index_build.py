@@ -17,7 +17,6 @@ from state.file_index import (
     IndexBuildContentionError,
     _last_indexed_sha,
     _state_path,
-    _building_marker_path,
     _lock_path,
 )
 from state.paths import index_db_path

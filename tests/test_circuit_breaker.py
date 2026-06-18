@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import datetime as _dt
 
-import pytest
 
 
 def _utc(seconds_offset: float = 0.0) -> _dt.datetime:

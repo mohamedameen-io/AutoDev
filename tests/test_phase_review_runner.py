@@ -425,3 +425,146 @@ async def test_phase_review_runner_passes_configured_int_through_resolver(
     assert cfg is not None
     assert cfg.max_parallel_subprocesses == 2
     assert captured["configured"] == 2
+
+
+# ---------------------------------------------------------------------------
+# B2: reviewer over-engineering advisory — ledger op + non-blocking guarantee
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reviewer_advisory_emits_ledger_op_when_note_present(
+    tmp_path: Path,
+    capture_tournament: type[_FakeTournament],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the critic's text contains an OVER_ENGINEERING_ADVISORY section,
+    a ``reviewer_over_engineering_advisory`` ledger op is appended.
+
+    Wiring: monkeypatch ``_load_critic_text`` to return a fake critic text with
+    the advisory section, bypassing the on-disk artifact read.
+    """
+    pm = PlanManager(tmp_path, session_id="sess-init")
+    await pm.init_plan(_mk_plan())
+    orch = _make_orch(tmp_path)
+    capture_tournament.next_winner = "A"
+
+    # Patch the disk-read helper so it returns a critic text with advisory.
+    critic_with_advisory = (
+        "Some problems found.\n\n"
+        "OVER_ENGINEERING_ADVISORY: Unnecessary abstraction layer added.\n"
+    )
+    monkeypatch.setattr(prr, "_load_critic_text", lambda artifact_dir: critic_with_advisory)
+
+    plan = await orch.plan_manager.load()
+    phase = plan.phases[0]  # type: ignore[union-attr]
+    await prr.run_phase_review_tournament(
+        orch, phase, "aaaa1111", "bbbb2222", spec_md="my spec"
+    )
+
+    entries = await orch.plan_manager.read_ledger()
+    ops = [e.op for e in entries]
+    assert "reviewer_over_engineering_advisory" in ops
+
+    # Verify the payload contains the advisory note text.
+    advisory_entries = [e for e in entries if e.op == "reviewer_over_engineering_advisory"]
+    assert len(advisory_entries) == 1
+    payload = advisory_entries[0].payload
+    assert "note" in payload
+    assert "abstraction layer" in payload["note"]
+    assert payload.get("phase_id") == phase.id
+
+
+@pytest.mark.asyncio
+async def test_reviewer_advisory_no_op_when_note_absent(
+    tmp_path: Path,
+    capture_tournament: type[_FakeTournament],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the critic's output has no OVER_ENGINEERING_ADVISORY section,
+    no ``reviewer_over_engineering_advisory`` ledger op is appended."""
+    pm = PlanManager(tmp_path, session_id="sess-init")
+    await pm.init_plan(_mk_plan())
+    orch = _make_orch(tmp_path)
+    capture_tournament.next_winner = "A"
+
+    critic_without_advisory = "Problems found:\n- Acceptance criterion 1 not met.\n"
+    monkeypatch.setattr(prr, "_load_critic_text", lambda artifact_dir: critic_without_advisory)
+
+    plan = await orch.plan_manager.load()
+    phase = plan.phases[0]  # type: ignore[union-attr]
+    await prr.run_phase_review_tournament(
+        orch, phase, "aaaa1111", "bbbb2222", spec_md="my spec"
+    )
+
+    entries = await orch.plan_manager.read_ledger()
+    ops = [e.op for e in entries]
+    assert "reviewer_over_engineering_advisory" not in ops
+
+
+@pytest.mark.asyncio
+async def test_reviewer_advisory_non_blocking_verdict_unaffected(
+    tmp_path: Path,
+    capture_tournament: type[_FakeTournament],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advisory ledger op must NEVER change the verdict.
+
+    Even when the advisory note is present AND the winner is A (accept),
+    the outcome remains accept_phase=True.
+    """
+    pm = PlanManager(tmp_path, session_id="sess-init")
+    await pm.init_plan(_mk_plan())
+    orch = _make_orch(tmp_path)
+    capture_tournament.next_winner = "A"
+
+    critic_with_advisory = (
+        "Problems: none critical.\n\n"
+        "OVER_ENGINEERING_ADVISORY: Minor over-abstraction observed.\n"
+    )
+    monkeypatch.setattr(prr, "_load_critic_text", lambda artifact_dir: critic_with_advisory)
+
+    plan = await orch.plan_manager.load()
+    phase = plan.phases[0]  # type: ignore[union-attr]
+    outcome = await prr.run_phase_review_tournament(
+        orch, phase, "aaaa1111", "bbbb2222", spec_md="my spec"
+    )
+
+    # Advisory note present but must NOT flip verdict.
+    assert outcome.winner == "A"
+    assert outcome.accept_phase is True
+    assert outcome.corrective_direction is None
+
+
+@pytest.mark.asyncio
+async def test_reviewer_advisory_non_blocking_ledger_failure_ignored(
+    tmp_path: Path,
+    capture_tournament: type[_FakeTournament],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the advisory ledger write raises, the verdict path is unaffected.
+
+    This pins the best-effort guarantee: a failure in recording the advisory
+    note must NEVER propagate to the caller or change the outcome.
+    """
+    pm = PlanManager(tmp_path, session_id="sess-init")
+    await pm.init_plan(_mk_plan())
+    orch = _make_orch(tmp_path)
+    capture_tournament.next_winner = "A"
+
+    # Exploding _emit_reviewer_advisory — wraps the whole advisory path.
+    async def _exploding_emit(orch_arg: Any, phase_arg: Any, critic_text_arg: str) -> None:
+        raise RuntimeError("Simulated ledger failure in advisory emit")
+
+    monkeypatch.setattr(prr, "_emit_reviewer_advisory", _exploding_emit)
+
+    plan = await orch.plan_manager.load()
+    phase = plan.phases[0]  # type: ignore[union-attr]
+    # Must NOT raise despite the exploding emit.
+    outcome = await prr.run_phase_review_tournament(
+        orch, phase, "aaaa1111", "bbbb2222", spec_md="my spec"
+    )
+
+    # Verdict is still valid.
+    assert outcome.winner == "A"
+    assert outcome.accept_phase is True

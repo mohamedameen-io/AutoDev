@@ -26,7 +26,7 @@ import asyncio
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import click
 from rich.console import Console
@@ -486,6 +486,7 @@ def promote_subcommand(tournament_id: str, pass_num: int | None) -> None:
     PlanManager. This is the manual fallback for the automatic
     on-tournament-error recovery in ``run_plan_phase``.
     """
+    from orchestrator.dependency_inference import repair_phase_edit_scope
     from orchestrator.plan_parser import parse_plan_markdown
     from state.plan_manager import PlanManager
     from tournament.state import TournamentArtifactStore
@@ -535,6 +536,12 @@ def promote_subcommand(tournament_id: str, pass_num: int | None) -> None:
         sys.exit(2)
 
     async def _persist() -> None:
+        # Field-finding F-1: same scope repair that _validate_with_persistent_drop
+        # applies in the normal execute path.  The promote path bypasses
+        # _validate_with_persistent_drop, so we must run it here before
+        # init_plan — otherwise a salvaged plan whose phase edit_scope excludes
+        # a file one of its tasks declares reaches execute with the bug intact.
+        repair_phase_edit_scope(plan.phases, plan_edit_scope=plan.edit_scope)
         pm = PlanManager(cwd, session_id="cli-tournament-promote")
         await pm.init_plan(plan)
 
@@ -622,7 +629,8 @@ def phase_review_subcommand(
         from state.paths import autodev_root, spec_path
 
         adapter, selection_meta = await get_adapter(
-            cfg.platform,
+            # "inline" is rewritten to "claude_code" at config load; cast is a runtime no-op.
+            cast('Literal["claude_code", "cursor", "auto"]', cfg.platform),
             cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
@@ -771,7 +779,8 @@ async def _run_plan_tournament_cli(
         # tournament-driver invocations are forensics-skipped until a
         # standalone ledger plumbing exists.
         adapter, _selection_meta = await get_adapter(
-            cfg.platform,
+            # "inline" is rewritten to "claude_code" at config load; cast is a runtime no-op.
+            cast('Literal["claude_code", "cursor", "auto"]', cfg.platform),
             cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,
@@ -898,7 +907,8 @@ async def _run_impl_tournament_cli(
         # v0.38.0 HK10: see plan-tournament site above — same forensics
         # skip rationale (no Orchestrator on this CLI path).
         adapter, _selection_meta = await get_adapter(
-            cfg.platform,
+            # "inline" is rewritten to "claude_code" at config load; cast is a runtime no-op.
+            cast('Literal["claude_code", "cursor", "auto"]', cfg.platform),
             cwd=cwd,
             respect_trigger_context=cfg.adapter_respect_trigger_context,
             cursor_trigger_env_extra=cfg.cursor_trigger_env_extra,

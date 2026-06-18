@@ -127,6 +127,20 @@ def _next_rung(tried: list[str], ladder: list[ResolutionAction]) -> ResolutionAc
     return ladder[-1]
 
 
+def _budget_dedupe_key(ctx: BlockerContext) -> str:
+    """Stable shared-cap key for budget-widening dedupe (WS1-guardrail-double).
+
+    ``GUARDRAIL_EXCEEDED`` has TWO independent budget-widening mechanisms: this
+    resolver's ``escalate_budget`` rung and the in-loop
+    :class:`~orchestrator.budget_escalation.BudgetEscalationTracker` (keyed on
+    ``(task_id, role)``). Without a shared key they widen the SAME guardrail
+    budget twice per cycle. The resolver rung carries this key + ``defer_to_tracker``
+    so the actual turn/timeout widening is owned by the single tracker — the cap
+    is shared, widened once per cycle, not compounded.
+    """
+    return f"{ctx.task_id or '-'}:{ctx.failing_role or '-'}:{ctx.failure_class}"
+
+
 def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
     """Ladder-aware fast-path map for KNOWN failure classes.
 
@@ -138,16 +152,24 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
     Policy (one ladder per known class; the final rung is always a terminal
     ``ask_human`` so the ladder cannot run off the end):
 
-      * ``guardrail_exceeded``    -> escalate_budget -> ask_human
+      * ``guardrail_exceeded``    -> escalate_budget (defer_to_tracker; shared
+        budget_dedupe_key so the budget is widened once per cycle) -> ask_human
       * ``test_diagnosis_*``      -> consult_knowledge -> retry_with_changes -> ask_human
       * ``worker_exception``      -> retry_with_changes -> ask_human
       * ``conflict_*``            -> re_architect -> ask_human
-      * ``worktree_apply_failed`` -> repair_environment -> ask_human
-      * ``phase_degraded``        -> repair_environment -> ask_human  (the DOA conversion)
-      * ``soft_blocker``          -> consult_knowledge -> ask_human
+      * ``worktree_apply_failed``      -> repair_environment -> ask_human
+      * ``worktree_diff_check_failed`` -> repair_environment -> ask_human
+      * ``phase_degraded``             -> repair_environment -> ask_human  (the DOA conversion)
+      * ``soft_blocker``          -> consult_knowledge (no_immediate_reescalate;
+        min_cycle_gap so the re-enable can't churn in the same cycle) -> ask_human
       * ``dag_invalid`` /
         ``cross_phase_dag_invalid`` -> re_plan -> ask_human
       * ``edit_scope_violation``  -> narrow_scope -> re_plan -> ask_human
+      * ``qa_gate_failed`` /
+        ``tests_failed``          -> retry_with_changes -> ask_human
+      * ``review_rejected`` /
+        ``review_malformed``      -> retry_with_changes -> ask_human
+      * ``review_escalated``      -> consult_knowledge -> ask_human
       * ``infra_circuit_open``    -> fall_through  (legacy quarantine is intentional)
 
     Returns ``None`` for any class not in the map — the novel-failure path the
@@ -177,6 +199,16 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
                     "guardrail/decision-cost budget exhausted: widen the cap once "
                     "before giving up so a near-complete task can finish."
                 ),
+                # WS1-guardrail-double-budget-widen: the in-loop
+                # ``BudgetEscalationTracker`` already widens the turn/timeout
+                # budget for this (task, role) on the re-run this rung triggers.
+                # If the resolver ALSO widened independently the same guardrail
+                # budget would be bumped TWICE per cycle. ``defer_to_tracker``
+                # cedes the actual widening to that single tracker, and
+                # ``budget_dedupe_key`` is the shared cap key so both paths
+                # coordinate to one widening per cycle.
+                defer_to_tracker=True,
+                budget_dedupe_key=_budget_dedupe_key(ctx),
             ),
             _act(
                 "ask_human",
@@ -188,6 +220,41 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
                 question=(
                     "Task hit its guardrail/turn budget even after one escalation. "
                     "Widen the budget, rescope the task, or accept current state?"
+                ),
+            ),
+        ]
+    elif cls == fc.OVERSIZED_INPUT:
+        # RECOVERY-CONTRACT §7 Step 8 (the A4 root cause): the role (esp.
+        # ``critic_t``) hit ``error_max_turns`` because its prompt was
+        # OVERSIZED — it burned its turns digesting context bloat. The remedy
+        # is to BOUND the input (truncate / decompose / re-dispatch with reduced
+        # scope), NOT to widen the turn budget. ``escalate_budget`` is the WRONG
+        # direction here, so it is deliberately absent from this ladder; we use
+        # ``narrow_scope`` with a ``direction="bound_input"`` so the call site
+        # re-dispatches the same task against a smaller prompt rather than the
+        # same bloat with more turns.
+        ladder = [
+            _act(
+                "narrow_scope",
+                rationale=(
+                    "the role exhausted its turn budget on an OVERSIZED prompt "
+                    "(context-window bloat): bound the input — truncate / "
+                    "decompose / re-dispatch with reduced scope. Granting more "
+                    "turns is the wrong direction (it just re-reads the bloat)."
+                ),
+                direction="bound_input",
+            ),
+            _act(
+                "ask_human",
+                rationale=(
+                    "the input is still oversized after a bounding pass; it "
+                    "cannot be mechanically reduced enough to fit — ask the "
+                    "operator to decompose the task or raise the model's context."
+                ),
+                question=(
+                    "A role keeps exhausting its turns on an oversized prompt "
+                    "even after bounding the input. Should this task be split "
+                    "into smaller units, or does it need a larger-context model?"
                 ),
             ),
         ]
@@ -288,6 +355,31 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
                 ),
             ),
         ]
+    elif cls == fc.WORKTREE_DIFF_CHECK_FAILED:
+        # A failed diff-check means git/worktree state is unreadable — treat
+        # it as an environment problem (same root cause as apply failures) and
+        # walk the same deterministic ladder: repair first, then escalate to a
+        # human if the environment still cannot be read after repair.
+        ladder = [
+            _act(
+                "repair_environment",
+                rationale=(
+                    "worktree diff-check failed: the git state cannot be read; "
+                    "rebuild/reset the worktree to restore a readable base."
+                ),
+            ),
+            _act(
+                "ask_human",
+                rationale=(
+                    "the diff-check still fails after an environment repair; "
+                    "the worktree is in an irrecoverable state — ask the operator."
+                ),
+                question=(
+                    "A worktree diff-check failed even after resetting the environment. "
+                    "The git state appears irrecoverable — how should this be resolved?"
+                ),
+            ),
+        ]
     elif cls == fc.PHASE_DEGRADED:
         # The DOA conversion: a phase that silently degraded becomes an
         # actionable environment repair instead of a no-op.
@@ -320,6 +412,17 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
                     "soft-blocker handoff rung reached: consult past-failure memory "
                     "for a known unblock before escalating to a human."
                 ),
+                # WS1-soft-blocker-single-cycle-churn: a soft-blocker
+                # consult_knowledge re-enable resets the task's retry budget and
+                # transitions it back to in_progress. If the re-enabled task
+                # immediately re-soft-blocks it would re-escalate in the SAME
+                # cycle (the per-blocker cycle budget hasn't advanced yet),
+                # producing single-cycle churn. ``no_immediate_reescalate`` tells
+                # the call site to consume the cycle budget before re-engaging,
+                # and ``min_cycle_gap`` is the minimum number of cycles that must
+                # pass before this blocker may escalate again.
+                no_immediate_reescalate=True,
+                min_cycle_gap=1,
             ),
             _act(
                 "ask_human",
@@ -382,6 +485,84 @@ def deterministic_action(ctx: BlockerContext) -> ResolutionAction | None:
                 question=(
                     "Work keeps spilling outside the declared edit scope. Should the "
                     "scope be widened, or is the change touching the wrong module?"
+                ),
+            ),
+        ]
+    elif cls in (fc.QA_GATE_FAILED, fc.TESTS_FAILED):
+        # Step 5 (Part 2): the developer-side verification failures are
+        # RETRY-mappable (not structural). A QA gate / test failure that survived
+        # the in-loop retry budget gets ONE knowledge-informed retry through the
+        # resolver, then escalates to a human. Mapping them here makes recovery
+        # deterministic + testable (was None → LLM fallback).
+        ladder = [
+            _act(
+                "retry_with_changes",
+                rationale=(
+                    "a QA gate / test run failed past the in-loop retry budget: "
+                    "retry the implementation once more with the failure context "
+                    "spliced in before giving up."
+                ),
+            ),
+            _act(
+                "ask_human",
+                rationale=(
+                    "the QA gate / tests still fail after a context-informed retry; "
+                    "this is not mechanically recoverable — ask the operator."
+                ),
+                question=(
+                    "QA gate / tests keep failing after a retry. Is the test wrong, "
+                    "the fix wrong, or the environment broken?"
+                ),
+            ),
+        ]
+    elif cls in (fc.REVIEW_REJECTED, fc.REVIEW_MALFORMED):
+        # Reviewer-side failures: a rejected or malformed review is also
+        # retry-mappable — re-dispatch the developer with the review feedback,
+        # then escalate.
+        ladder = [
+            _act(
+                "retry_with_changes",
+                rationale=(
+                    "the reviewer rejected the change (or returned a malformed "
+                    "verdict): retry the implementation with the review feedback "
+                    "spliced in before escalating."
+                ),
+            ),
+            _act(
+                "ask_human",
+                rationale=(
+                    "the reviewer still rejects (or keeps returning malformed "
+                    "verdicts) after a feedback-informed retry — ask the operator "
+                    "to adjudicate the change or the reviewer signal."
+                ),
+                question=(
+                    "The reviewer keeps rejecting / returning malformed verdicts "
+                    "after a retry. Is the change wrong, or is the review signal "
+                    "unreliable?"
+                ),
+            ),
+        ]
+    elif cls == fc.REVIEW_ESCALATED:
+        # An explicitly-escalated review wants more context, not another blind
+        # retry: consult past-failure knowledge first, then ask the operator.
+        ladder = [
+            _act(
+                "consult_knowledge",
+                rationale=(
+                    "the reviewer escalated for a decision: consult past-failure "
+                    "memory for a known resolution on this signature before "
+                    "surfacing it to a human."
+                ),
+            ),
+            _act(
+                "ask_human",
+                rationale=(
+                    "no prior knowledge resolves the escalated review; it genuinely "
+                    "needs an operator decision — surface a precise question."
+                ),
+                question=(
+                    "The reviewer escalated this change for a decision and prior "
+                    "runs have no recorded resolution. What should happen?"
                 ),
             ),
         ]

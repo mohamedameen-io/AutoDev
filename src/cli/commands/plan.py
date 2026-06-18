@@ -278,8 +278,8 @@ def plan(
         try:
             from adapters.base import NetworkProbeFailure
         except Exception:  # noqa: BLE001
-            NetworkProbeFailure = ()  # type: ignore[assignment]
-        if NetworkProbeFailure and isinstance(exc, NetworkProbeFailure):
+            NetworkProbeFailure = ()  # type: ignore[misc,assignment]
+        if NetworkProbeFailure and isinstance(exc, NetworkProbeFailure):  # type: ignore[truthy-function]  # guards the () import-fallback; intentional
             console.print(
                 f"[red]autodev plan: network probe failed[/red] "
                 f"({exc.adapter}, {exc.attempts} attempts)"

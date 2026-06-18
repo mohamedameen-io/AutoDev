@@ -203,7 +203,8 @@ async def test_architect_refine_response_injects_corrective_tasks(
         )
     )
     orch = _make_orch(tmp_path, pm)
-    task = (await pm.get_task("1.1")) or pytest.fail("task not found")
+    # Side-effecting assertion: fetch the task and fail the test if absent.
+    (await pm.get_task("1.1")) or pytest.fail("task not found")
     # Move to in_progress so the FSM transition to ``skipped`` is allowed.
     await pm.update_task_status("1.1", "in_progress")
 
@@ -534,7 +535,8 @@ async def test_try_retry_dispatches_to_architect_consult_at_threshold(
     monkeypatch.setattr(ep, "_escalate_stuck_to_critic", fake_critic)
 
     await ep._try_retry_or_escalate(
-        orch, task, retry_limit=10, reason="failed"
+        orch, task, retry_limit=10, reason="failed",
+        failure_class="worker_exception",
     )
 
     assert dispatched["called"] is True, "architect-consult dispatch did not fire"

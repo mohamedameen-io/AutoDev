@@ -549,6 +549,20 @@ class ResolverConfig(BaseModel):
     # consumed this many resolver cycles without recovery, the resolver stops
     # recursing and falls through to a bounded ``ask_human`` (loop-safety B5).
     max_cycles_per_blocker: int = Field(default=3, ge=1, le=10)
+    # F-2 (field-finding): PHASE-scoped ceiling on consecutive same-failure-class
+    # corrective regeneration. ``max_cycles_per_blocker`` is keyed per (task_id,
+    # failure_class) and so never bounds the CROSS-corrective-task loop (each
+    # freshly-minted corrective has a NEW id => a fresh per-task counter). This
+    # sibling counter is keyed on the PHASE + failure_class, so corrective-task-id
+    # churn cannot reset it. Once this many consecutive same-class correctives are
+    # minted WITHOUT forward progress, the resolver STOPS minting and declines —
+    # emitting a LOUD, attributable ``corrective_nonconvergent_ceiling`` ledger op
+    # and letting the originating ``block_task`` commit the single terminal block
+    # (instead of churning to the 40-min execute wall). Mirrors
+    # ``max_cycles_per_blocker``'s default (3). Reset on forward progress (a task
+    # in the phase completing) or when a DIFFERENT failure_class occurs (a new
+    # distinct problem is not the same loop, since the counter is per-class).
+    max_corrective_cycles_per_phase: int = Field(default=3, ge=1, le=10)
     # When True, the resolver only engages at terminal recovery rungs or on
     # failure classes the deterministic ladder does not handle (keeps cost ≈ 0
     # for the common, already-recoverable case). When False, the resolver is
@@ -565,6 +579,7 @@ def _default_resolver_cfg() -> "ResolverConfig":
     return ResolverConfig(
         enabled=True,
         max_cycles_per_blocker=3,
+        max_corrective_cycles_per_phase=3,
         fast_path_only_on_known=True,
         model=None,
     )
@@ -766,6 +781,12 @@ class QAGatesConfig(BaseModel):
     # target's env (uv run / .venv); 120s is a safe ceiling. Threaded into
     # ``run_lint(timeout_s=...)``.
     lint_timeout_s: float = 120.0
+    # WS2-11: configurable build/typecheck-gate wall-clock timeout (seconds).
+    # The legacy hardcoded 60s (``build_check._DEFAULT_TIMEOUT_S``) could not
+    # finish a COLD cargo/Go build (dependency fetch + first compile), so the
+    # gate timed out and false-blocked. 120s is a safe floor; bump higher for
+    # large native projects. Threaded into ``run_build_check(timeout_s=...)``.
+    build_check_timeout_s: float = 120.0
 
 
 class GuardrailsConfig(BaseModel):
@@ -796,6 +817,25 @@ class GuardrailsConfig(BaseModel):
     max_duration_s_per_test_repair_task: int | None = None
     max_diff_bytes: int = 5_242_880
     cost_budget_usd_per_plan: float | None = None
+    # F-7 (field-finding): cumulative WALL-CLOCK budget (seconds) for the
+    # plan-tournament pass loop, analog of ``max_corrective_cycles_per_phase``
+    # (F-2) but bounding wall-clock instead of corrective-cycle count. The
+    # plan tournament runs through ``AdapterLLMClient`` which BYPASSES the
+    # guardrail enforcer's pre/post_invocation — so there is NO cumulative
+    # deadline anywhere in the plan-tournament loop. A slow OR wedged plan
+    # phase therefore has no fail-loud bound; it runs to
+    # ``max_rounds × judges × branches`` or until an EXTERNAL SIGKILL,
+    # surfacing as an opaque "timed out after 2400s" with no autodev-emitted
+    # reason. When set (> 0), ``tournament.core.Tournament.run`` checks
+    # cumulative elapsed BETWEEN passes (cheap; never mid-call) and, on
+    # breach, STOPS LOUD with the best on-disk incumbent (the existing
+    # plan-phase salvage path) while emitting the greppable, attributable
+    # ``plan_phase_wall_budget_exceeded`` ledger op. ``None`` (default) =
+    # OFF = byte-identical legacy behavior (no deadline). Set this BELOW an
+    # external / benchmark per-command timeout (e.g. the 2400s
+    # ``max_duration_s_per_task`` subprocess wall) so the plan phase fails
+    # LOUD with a reason BEFORE being killed.
+    plan_phase_wall_budget_s: float | None = None
 
 
 class PRMConfig(BaseModel):
@@ -976,6 +1016,16 @@ class BudgetEscalationConfig(BaseModel):
 
     max_turns_ceiling: int = Field(default=250, ge=1)
     timeout_s_ceiling: int = Field(default=3600, ge=1)
+    # RECOVERY-CONTRACT §7 Step 8 (the A4 root cause): inclusive char-length
+    # cutoff above which an ``error_max_turns`` failure is classified as
+    # ``OVERSIZED_INPUT`` rather than ``GUARDRAIL_EXCEEDED``. An oversized-input
+    # cause routes to BOUND_INPUT (re-dispatch with reduced scope) and does NOT
+    # widen the turn budget — granting more turns just burns budget re-reading
+    # the same bloat. The 200_000-char default ≈ ~50K tokens, a deliberately
+    # high floor so only genuine context-window bloat trips it (a normal
+    # developer/reviewer prompt is far smaller). Set higher to disable in
+    # practice; set lower to bound aggressively on a constrained model.
+    oversized_input_char_threshold: int = Field(default=200_000, ge=1)
 
 
 class AdaptersConfig(BaseModel):
@@ -1275,6 +1325,39 @@ class AutodevConfig(BaseModel):
     # older than 2.25. Default False — sparse-checkout speeds up huge
     # repos but breaks tasks that need files outside the declared scope.
     worktree_sparse_checkout_enabled: bool = False
+    # F-4 (field-finding): apply-time edit-scope enforcement policy. The
+    # apply-time gate in :meth:`WorktreeManager.apply_patch_to_main` checks
+    # the developer's ACTUAL worktree diff against the resolved edit-scope
+    # (``phase.edit_scope or plan.edit_scope`` UNION the task's own
+    # ``files`` / ``files_new`` / ``extended_scope``). For its entire
+    # history the gate was DORMANT in the execute flow — all three
+    # ``_apply_with_conflict_escalation`` call sites pass no scope — so a
+    # developer diff that strayed outside the declared scope was never
+    # caught at apply time (only the declaration-level pre-flight in
+    # ``dag.collect_edit_scope_violations`` ran, and it checks the
+    # ARCHITECT's ``task.files`` declaration, not the real diff).
+    #
+    # Default ``"warn"`` (advisory, NON-blocking): legitimate flows
+    # routinely edit beyond the declared ``task.files`` — new helper files
+    # land in ``task.files_new``; corrective tasks are minted with EMPTY
+    # ``files``; ``task.files`` is an architect declaration never reconciled
+    # against the real diff. A ``"block"`` default would manufacture
+    # failures on correct refactors/correctives, so activation is WARN-first
+    # behind this flag, and the effective scope INCLUDES ``files_new`` /
+    # ``extended_scope`` to minimise false warnings. When the resolved+union
+    # scope is EMPTY (e.g. an empty-``files`` corrective on a repo with no
+    # declared edit_scope) the check is skipped entirely (legacy whole-repo
+    # no-op) so empty-scope flows are never blocked.
+    #
+    #   * ``"off"``   — gate skipped (the pre-F-4 behaviour).
+    #   * ``"warn"``  — compute out-of-scope files, LOG
+    #     ``execute_phase.edit_scope_apply_violation`` + append a
+    #     best-effort ``edit_scope_apply_violation`` ledger breadcrumb,
+    #     then APPLY anyway (does NOT block).
+    #   * ``"block"`` — pass the effective scope to the apply gate, which
+    #     raises :class:`orchestrator.dag.EditScopeViolation` before any
+    #     ``git apply`` runs (main is never half-patched).
+    enforce_apply_time_edit_scope: Literal["off", "warn", "block"] = "warn"
     # v0.34.0 B2: when a sparse worktree edits a C/C++ source file, also
     # admit ``*.h``/``*.hpp``/``*.hh``/``*.hxx`` siblings in the same
     # directory so the QA gates retain include-chain context for symbol
@@ -1282,6 +1365,18 @@ class AutodevConfig(BaseModel):
     # :data:`orchestrator.worktree.WORKTREE_HEADER_EXPANSION_CAP` paths
     # — dense include trees regress to a full checkout otherwise.
     include_headers_for_sparse: bool = True
+    # F-6 (Fix 2): when a per-task worktree is sparse, also fold a small
+    # curated globset of TRACKED build/test-harness files (``package.json``
+    # /lockfiles, ``pyproject.toml``, ``pytest.ini``, ``conftest.py``,
+    # ``Cargo.toml``, ``go.mod``, …) and the task's RELEVANT test files
+    # (scoped to the package/dir tree of the cone — never a repo-wide test
+    # mountain) into the sparse checkout. Without this, the QA ``test_runner``
+    # gate (cwd=worktree) cannot see ``package.json``/the test files and
+    # false-blocks (e.g. ``npm test`` ENOENT). Shares the
+    # :data:`orchestrator.worktree.WORKTREE_HEADER_EXPANSION_CAP` bound: an
+    # over-cap expansion (monorepo manifest shards / a giant test tree) bails
+    # out so the cone stays sparse-for-scale. Default True.
+    worktree_sparse_include_harness: bool = True
     # v0.23.0 C1: huge-repo mode. ``"auto"`` keys off
     # ``runtime.repo_probe.RepoCapacity.is_huge`` (file_count > 20K OR
     # total_bytes > 5 GB) — when True, sparse-checkout becomes the

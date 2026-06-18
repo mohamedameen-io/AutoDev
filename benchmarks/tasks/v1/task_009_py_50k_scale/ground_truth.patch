@@ -1,0 +1,10 @@
+diff --git a/core/calc.py b/core/calc.py
+index b69d4fe..187ab59 100644
+--- a/core/calc.py
++++ b/core/calc.py
+@@ -10,4 +10,4 @@ def percentage(part: float, whole: float) -> float:
+     """
+     if whole == 0:
+         return 0.0
+-    return part / whole
++    return part / whole * 100

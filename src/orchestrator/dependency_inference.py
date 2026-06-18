@@ -190,4 +190,88 @@ def infer_plan_dependencies(phases: list[Phase]) -> list[Phase]:
     return phases
 
 
-__all__ = ["infer_dependencies", "infer_plan_dependencies"]
+def repair_phase_edit_scope(
+    phases: list[Phase], *, plan_edit_scope: list[str]
+) -> list[Phase]:
+    """Field-finding F-1: make each phase's ``edit_scope`` self-consistent
+    with the files its own tasks declare.
+
+    A plan is internally inconsistent when a phase declares a narrowing
+    ``edit_scope`` (e.g. ``["index.js"]``) but tasks an edit to a file the
+    scope does not list (e.g. a task whose ``files`` is ``["test_index.js"]``).
+    The pre-flight per-task check
+    (:func:`orchestrator.dag.collect_edit_scope_violations`) then raises
+    ``edit_scope_violation`` and the task is blocked with an empty diff — it
+    cannot deliver a file the plan itself asked it to edit.
+
+    A task is, by definition, permitted to edit the files IT (or another task
+    in the same phase) declares — those files ARE the plan's intent. This
+    repair extends each phase's effective ``edit_scope`` to admit the
+    concrete files its tasks declare (``files`` ∪ ``files_new``), so every
+    downstream consumer (the pre-flight check, the sparse-checkout cone, the
+    developer-prompt EDIT SCOPE addendum, and the recovery path) sees one
+    self-consistent scope. Mutates phases in place and returns the same list.
+
+    Resolution mirrors :func:`orchestrator.dag.validate_edit_scope`:
+
+    * ``Phase.edit_scope`` non-None → that is the phase's resolved scope.
+    * ``Phase.edit_scope is None`` → inherit ``plan_edit_scope``.
+    * Resolved scope empty → whole-repo (no constraint). The repair is a
+      **no-op** for such phases: materializing a scope here would silently
+      narrow a whole-repo phase, the opposite of the intent.
+
+    Safety boundary (preserved): only files SOME task in the phase declares
+    are admitted. A path no task declares is never added, so the boundary
+    against genuinely-undeclared files still holds — and the developer's
+    ACTUAL edits are independently re-checked at apply time by
+    :meth:`orchestrator.worktree.WorktreeManager.apply_patch_to_main`, which
+    this repair does not touch.
+
+    Glob entries in ``Task.files`` are skipped (consistent with
+    dependency inference and with :func:`orchestrator.dag.is_in_scope`, which
+    does prefix matching, not glob matching). A task that needs a glob beyond
+    its scope still uses ``extended_scope``, which the validator unions in.
+    """
+    from orchestrator.dag import is_in_scope
+
+    plan_scope = list(plan_edit_scope)
+    for phase in phases:
+        resolved = (
+            list(phase.edit_scope) if phase.edit_scope is not None else plan_scope
+        )
+        # Empty resolved scope == whole-repo (legacy no-op). Never narrow it.
+        if not resolved:
+            continue
+
+        declared: set[str] = set()
+        for task in phase.tasks:
+            # Union of files ∪ files_new: the full set of paths this task is
+            # granted scope to edit (not created-only). _produced_paths and
+            # _consumed_paths are identical here — a file the task edits is
+            # also a file the task must be allowed to touch for scope purposes.
+            declared |= _produced_paths(task)
+        # Admit only the declared files not already covered by the scope,
+        # in deterministic (sorted) order for stable diffs/ledgers.
+        extra = sorted(p for p in declared if not is_in_scope(p, resolved))
+        if not extra:
+            continue
+
+        # Trailing-slash normalization keeps these entries byte-identical to
+        # what the schema validator would emit for an explicit EDIT_SCOPE
+        # block (assignment does not re-run field validators on this model).
+        new_scope = list(resolved) + [p.rstrip("/") for p in extra]
+        if new_scope != phase.edit_scope:
+            phase.edit_scope = new_scope
+            logger.info(
+                "dependency_inference.edit_scope_repaired",
+                phase_id=phase.id,
+                admitted=extra,
+            )
+    return phases
+
+
+__all__ = [
+    "infer_dependencies",
+    "infer_plan_dependencies",
+    "repair_phase_edit_scope",
+]

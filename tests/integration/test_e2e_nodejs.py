@@ -83,7 +83,8 @@ def _make_stub(extras: Iterable[tuple[str, object]] | None = None) -> StubAdapte
 @pytest.mark.asyncio
 async def test_nodejs_init_produces_config(tmp_git_repo_nodejs: Path) -> None:
     """autodev init writes .autodev/config.json for a NodeJS repo."""
-    cfg = make_autodev_config(tmp_git_repo_nodejs)
+    # Side-effecting call: writes .autodev/config.json (asserted below).
+    make_autodev_config(tmp_git_repo_nodejs)
     config_path = tmp_git_repo_nodejs / ".autodev" / "config.json"
     assert config_path.exists()
     raw = json.loads(config_path.read_text())

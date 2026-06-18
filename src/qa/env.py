@@ -76,6 +76,60 @@ def resolve_tool(cwd: Path, tool: str) -> list[str]:
     return [tool]
 
 
+def detect_js_package_manager(cwd: Path) -> str:
+    """Return the JS package manager the repo at *cwd* uses.
+
+    Resolution is lockfile-driven (the lockfile is the authoritative record of
+    which manager actually installed ``node_modules``), first match wins:
+
+    * ``pnpm-lock.yaml`` → ``"pnpm"``
+    * ``yarn.lock``      → ``"yarn"``
+    * ``package-lock.json`` (or no lockfile at all) → ``"npm"``
+
+    npm is the default because it is the universally-available baseline shipped
+    with Node itself, so a repo with no lockfile is still runnable.
+    """
+    if (cwd / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if (cwd / "yarn.lock").exists():
+        return "yarn"
+    return "npm"
+
+
+def resolve_js_tool(cwd: Path, tool: str) -> list[str]:
+    """Return the argv prefix used to invoke a JS *tool* inside the repo at *cwd*.
+
+    The JS gates (eslint, tsc, …) previously hardcoded ``npx``/``npm``, which
+    ignored project-local installs and non-npm workspaces. This resolver fixes
+    both (WS2-20).
+
+    Cascade (first match wins):
+
+    * ``node_modules/.bin/<tool>`` exists → run the project-pinned binary
+      directly (no package-manager indirection, deterministic, offline-safe).
+    * lockfile names a workspace manager available on PATH →
+      ``pnpm exec <tool>`` / ``yarn exec <tool>`` / ``npm exec <tool>``
+      (per :func:`detect_js_package_manager`).
+    * ``npx`` on PATH → ``npx --no-install <tool>`` (uses a local/cached copy
+      only; never auto-installs).
+    * otherwise → the bare ``[<tool>]`` (relies on PATH / graceful skip).
+    """
+    local_bin = cwd / "node_modules" / ".bin" / tool
+    if local_bin.exists():
+        return [str(local_bin)]
+
+    manager = detect_js_package_manager(cwd)
+    if shutil.which(manager):
+        # ``<pm> exec <tool>`` runs the project-local binary across all three
+        # managers (npm>=7, yarn classic+berry, pnpm), respecting workspace
+        # hoisting that a bare ``node_modules/.bin`` lookup may miss.
+        return [manager, "exec", tool]
+
+    if shutil.which("npx"):
+        return ["npx", "--no-install", tool]
+    return [tool]
+
+
 def detect_python_linter(cwd: Path) -> str:
     """Return the Python linter the repo at *cwd* uses: ``"ruff"`` or ``"flake8"``.
 
@@ -104,4 +158,9 @@ def detect_python_linter(cwd: Path) -> str:
     return "ruff"
 
 
-__all__ = ["detect_python_linter", "resolve_tool"]
+__all__ = [
+    "detect_js_package_manager",
+    "detect_python_linter",
+    "resolve_js_tool",
+    "resolve_tool",
+]

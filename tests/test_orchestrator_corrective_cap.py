@@ -15,13 +15,12 @@ round's parsed bullets must NEVER exceed ``cfg.max_corrective_tasks_per_phase``.
 from __future__ import annotations
 
 import datetime as _dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from orchestrator import execute_phase as execute_phase_mod
 from orchestrator import phase_review_runner as prr
 from orchestrator.execute_phase import _run_phase_review
 from orchestrator.phase_review_runner import PhaseReviewOutcome
