@@ -837,6 +837,14 @@ class WorktreeManager:
             return
 
         # v0.14.0: pre-flight scope check before any git apply runs.
+        # KNOWN LATENT GAP (pre-existing, tracked under F-4 apply-time scope
+        # enforcement): ``extract_files_from_diff`` parses only ``+++ b/``
+        # lines, so BINARY file changes (no ``+++ b/`` line) are invisible
+        # here — binary edits are NOT scope-gated. Now that F-5 makes binary
+        # patches apply, any future activation of apply-time enforcement must
+        # also teach ``extract_files_from_diff`` to parse the ``diff --git
+        # a/.. b/..`` header (or the ``Binary files .. differ`` line) so
+        # binary targets are gated too.
         if edit_scope:
             from adapters.git_utils import extract_files_from_diff
             from orchestrator.dag import EditScopeViolation, is_in_scope
