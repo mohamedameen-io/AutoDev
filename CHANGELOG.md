@@ -4,6 +4,8 @@ All notable changes to AutoDev. Format based on [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-06-19
+
 ### v1.0 "any task, any repo" stabilization (release candidate on `stabilization-v1`)
 
 Resolves the stabilization charter (`thoughts/plans/autodev-stabilization-implementation.md`): the build now
@@ -43,6 +45,34 @@ check src tests` + `mypy src` exit 0 and are enforced CI jobs.
 - Trust infrastructure: `STUB_STRICT` strict-mode, an unmocked intake→diagnosis→framing→execute e2e test, the
   failure-class AST wiring gate (all `_fcls.*` sites), and the behavioral release-preflight (`preflight_v100`
   runs `pytest -m resolver_enabled`, fails on 0-collected) wired into release CI.
+
+#### Phase-4 field re-validation + post-run fixes (`resolve-revalidation-findings` plan; A1–A5, B1–B3, F-1–F-7)
+- **The WS-4 binding constraint is resolved.** The recurring `conflict_3way_failed → re_architect → "no plan
+  initialized" → no delivery` cascade no longer reproduces (language-general). Root cause was twofold:
+  `abort_failed_apply` ran a repo-wide `git clean` that wiped the main-repo `.autodev/` ledger mid-run — now
+  excluded (A1) — and trivial fixes hit **spurious** 3-way conflicts because the apply path never first attempted
+  `git apply --3way` before consulting the critic (A2). A hard feature probe that previously timed out in a
+  `.pyc`-conflict loop now delivers cleanly.
+- **Curated minimalism (ponytail-inspired):** a necessity-ladder ("laziness ladder") is injected into the
+  architect + developer roles — do the least that fully satisfies the task, never skipping safety / validation /
+  security (B1); a **non-blocking** reviewer over-engineering / tech-debt advisory ledger op (B2); effort-modulated
+  intensity — minimal at low effort, deeper at high/max (B3).
+- **Delivery + metrics hardening:** a delivered + `APPROVED` fix now finalizes, commits, and exits `0` instead of
+  exiting `2` (A4); execute-phase invocation-cost is recorded as a metric (A5).
+- **Field findings (F-1–F-7), each reproduce-first + reviewed:** plan-repair admits a task's own declared files
+  into its phase `edit_scope`, so a correct plan no longer self-inflicts an `edit_scope_violation` (F-1); a
+  phase-scoped non-convergence ceiling fails **loud** instead of churning corrective tasks to the wall-clock
+  (F-2); the benchmark harness emits result JSON safely on timeout / non-UTF-8 output (F-3); apply-time
+  edit-scope enforcement is wired (was dormant — callers passed `edit_scope=None`) with a `warn`-default config
+  knob and **binary-aware** diff parsing (F-4); delivered diffs are self-contained (`git diff --binary
+  --full-index`) and exclude generated cruft (`__pycache__/*.pyc`, lockfiles, `*.min.*`), fixing a binary-`.pyc`
+  defect that surfaced as a spurious `conflict_3way_failed` loop (F-5); the per-task sparse worktree now includes
+  a capped, tracked-only, scoped test-harness globset and skips `npm test` when there is no `package.json`, so
+  graders resolve in the huge-repo path (F-6); a default-off plan-phase wall-clock ceiling salvages the incumbent
+  and emits a typed op instead of an opaque external `SIGKILL` (F-7).
+- **CI:** `ruff` is now a **declared** dev dependency (`ruff>=0.15.11,<0.16`); the Lint gate's `uv run ruff check
+  src tests` could not spawn `ruff` on a clean runner where it was not on `PATH`. Full suite **4352 passed / 6
+  skipped**; `ruff check src tests` + `mypy src` exit `0`.
 
 ## [0.42.1] - 2026-06-16
 
