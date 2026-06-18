@@ -4977,6 +4977,11 @@ async def _execute_one(
                 include_headers_for_sparse=bool(
                     getattr(orch.cfg, "include_headers_for_sparse", True)
                 ),
+                # F-6 (Fix 2): fold tracked build/test-harness files into the
+                # cone so the QA gate (cwd=worktree) can actually run tests.
+                include_harness_for_sparse=bool(
+                    getattr(orch.cfg, "worktree_sparse_include_harness", True)
+                ),
             )
         except WorktreeError as exc:
             logger.warning(

@@ -1313,6 +1313,18 @@ class AutodevConfig(BaseModel):
     # :data:`orchestrator.worktree.WORKTREE_HEADER_EXPANSION_CAP` paths
     # — dense include trees regress to a full checkout otherwise.
     include_headers_for_sparse: bool = True
+    # F-6 (Fix 2): when a per-task worktree is sparse, also fold a small
+    # curated globset of TRACKED build/test-harness files (``package.json``
+    # /lockfiles, ``pyproject.toml``, ``pytest.ini``, ``conftest.py``,
+    # ``Cargo.toml``, ``go.mod``, …) and the task's RELEVANT test files
+    # (scoped to the package/dir tree of the cone — never a repo-wide test
+    # mountain) into the sparse checkout. Without this, the QA ``test_runner``
+    # gate (cwd=worktree) cannot see ``package.json``/the test files and
+    # false-blocks (e.g. ``npm test`` ENOENT). Shares the
+    # :data:`orchestrator.worktree.WORKTREE_HEADER_EXPANSION_CAP` bound: an
+    # over-cap expansion (monorepo manifest shards / a giant test tree) bails
+    # out so the cone stays sparse-for-scale. Default True.
+    worktree_sparse_include_harness: bool = True
     # v0.23.0 C1: huge-repo mode. ``"auto"`` keys off
     # ``runtime.repo_probe.RepoCapacity.is_huge`` (file_count > 20K OR
     # total_bytes > 5 GB) — when True, sparse-checkout becomes the

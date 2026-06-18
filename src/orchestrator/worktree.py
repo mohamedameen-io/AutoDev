@@ -22,7 +22,7 @@ import asyncio
 import re
 import shutil
 from contextlib import suppress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 from errors import AutodevError
@@ -99,6 +99,212 @@ def _sibling_header_paths(
                 line = line.strip()
                 if line:
                     out.add(line)
+    return out
+
+
+# F-6 (Fix 2): curated TRACKED build/test-harness files folded into the
+# per-task sparse cone so the QA ``test_runner`` gate (cwd=worktree) can
+# actually run tests. Two shapes:
+#
+# * ``_HARNESS_MANIFEST_NAMES`` — exact basenames of build/test manifests &
+#   lockfiles. These conventionally sit at the repo root or a package root, so
+#   matching them everywhere (a repo-wide ``ls-files '**/package.json'``) would
+#   be UNBOUNDED on a monorepo with thousands of shards. We therefore match
+#   them only at the repo root AND along the ancestor chain of the task's files
+#   (the package roots the task actually touches) — see
+#   :func:`_harness_paths_for_sparse`.
+# * ``conftest.py`` is handled the same ancestor-chain way: pytest collection
+#   requires the ``conftest.py`` in every ANCESTOR directory of a test, so we
+#   pull the root + each ancestor of the task's dir tree.
+#
+# ``node_modules`` / ``site-packages`` / ``.venv`` are gitignored → never
+# tracked → never matched here (dependency install is out of scope).
+_HARNESS_MANIFEST_NAMES: frozenset[str] = frozenset(
+    {
+        # nodejs
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "tsconfig.json",
+        # python
+        "pyproject.toml",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+        "setup.py",
+        "conftest.py",
+        # rust
+        "Cargo.toml",
+        "Cargo.lock",
+        # go
+        "go.mod",
+        "go.sum",
+    }
+)
+
+# Test-file/dir conventions. The riskiest entry is the broad ``tests/`` tree, so
+# test inclusion is SCOPED to the package/dir tree containing the task's files
+# (never repo-wide) and bounded by ``WORKTREE_HEADER_EXPANSION_CAP``: we pull the
+# RELEVANT tests, not a repo-wide test mountain.
+#   * directory names: ``tests`` / ``test`` / ``__tests__``
+#   * file patterns: ``test_*.py``, ``*_test.go``, ``*.test.{js,ts,jsx,tsx}``,
+#     ``*.spec.{js,ts,jsx,tsx}``
+_HARNESS_TEST_DIR_NAMES: frozenset[str] = frozenset({"tests", "test", "__tests__"})
+
+
+def _is_harness_test_file(name: str) -> bool:
+    """True when basename *name* matches a cross-language test-file convention."""
+    if name.startswith("test_") and name.endswith(".py"):
+        return True
+    if name.endswith("_test.go"):
+        return True
+    for ext in (".js", ".ts", ".jsx", ".tsx"):
+        if name.endswith(".test" + ext) or name.endswith(".spec" + ext):
+            return True
+    return False
+
+
+def _ancestor_rel_dirs(rel_files: Iterable[str]) -> list[str]:
+    """Return the repo-relative ancestor directories of *rel_files* (incl. root).
+
+    For ``["pkg/sub/foo.py"]`` returns ``["", "pkg", "pkg/sub"]`` (root first).
+    Deduplicated, order-stable. The root is represented as ``""``. Absolute
+    paths and ``..`` escapes are skipped (the cone only admits in-repo paths).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(d: str) -> None:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+
+    _add("")  # repo root
+    for rel in rel_files:
+        if not rel or rel.startswith("/"):
+            continue
+        parts = PurePosixPath(rel).parts
+        if any(p == ".." for p in parts):
+            continue
+        # Drop the filename; walk the directory parts.
+        acc: list[str] = []
+        for part in parts[:-1]:
+            acc.append(part)
+            _add("/".join(acc))
+    return out
+
+
+def _harness_paths_for_sparse(
+    git_root: Path,
+    scope_files: Iterable[str],
+) -> set[str]:
+    """F-6 (Fix 2): repo-relative TRACKED test-harness paths for the sparse cone.
+
+    Resolution is bounded by construction — it never does a repo-wide glob:
+
+    * **Manifests / conftest** (``_HARNESS_MANIFEST_NAMES``): matched at the repo
+      ROOT and at each ANCESTOR directory of *scope_files* (the package roots the
+      task touches). A monorepo's thousands of unrelated ``package.json`` shards
+      are therefore NOT pulled in — only those on the task's own path.
+    * **Test files/dirs**: SCOPED to the directory tree of each scope file. For a
+      scope file ``pkg/foo.py`` we admit (a) any tracked file under a
+      ``tests``/``test``/``__tests__`` sibling dir of ``pkg`` (and of its
+      ancestors), and (b) tracked test-pattern files (``test_*.py`` etc.) under
+      the task's dir tree (recursive, capped). This pulls the RELEVANT tests, not
+      a repo-wide test tree.
+    * **Root-leaf skip**: the leaf-dir test-pattern scan is SKIPPED when the task's
+      scope file is at the repo root (``leaf dir == ""``). A repo-root pathspec
+      ``git ls-files "*"`` is recursive across the entire repo; on a million-file
+      monorepo that exhausts memory before the cap bail ever fires. Root manifests/
+      conftest are already pulled by the ancestor scan. Non-root leaf dirs keep the
+      scan (bounded by that package's subtree).
+    * **Early-exit**: after each scan loop, if the accumulated ``out`` set exceeds
+      ``WORKTREE_HEADER_EXPANSION_CAP`` we return immediately — the caller bails at
+      the same threshold, so returning early is equivalent and avoids scanning
+      further specs needlessly (bounds the many-specs case too).
+
+    Only TRACKED files are returned (resolved via ``git ls-files`` — the same
+    tracked-files helper the sibling-header union uses), so the result is always
+    a strict subset of what the worktree already knows about; untracked /
+    gitignored paths (``node_modules`` …) are never admitted.
+    """
+    scope = [s for s in scope_files if s and not s.startswith("/")]
+    out: set[str] = set()
+    anc_dirs = _ancestor_rel_dirs(scope)
+
+    # 1) Manifests + conftest at the root and each ancestor dir of the scope.
+    for d in anc_dirs:
+        for name in _HARNESS_MANIFEST_NAMES:
+            spec = f"{d}/{name}" if d else name
+            try:
+                listing = subprocess_run_ls_files(git_root, spec)
+            except OSError:
+                continue
+            for line in listing.splitlines():
+                line = line.strip()
+                if line:
+                    out.add(line)
+        # Early-exit: stop scanning if we've already exceeded the cap; the caller
+        # bails the entire harness set at WORKTREE_HEADER_EXPANSION_CAP anyway.
+        if len(out) > WORKTREE_HEADER_EXPANSION_CAP:
+            return out
+
+    # 2) Test dirs/files scoped to the task's directory tree. For each ancestor
+    #    dir we look for sibling test directories; for the task's own dir we
+    #    also admit test-pattern files. ``git ls-files <dir>/`` lists the
+    #    tracked files under that dir (recursively) — we then filter.
+    test_dir_specs: set[str] = set()
+    for d in anc_dirs:
+        for tname in _HARNESS_TEST_DIR_NAMES:
+            test_dir_specs.add(f"{d}/{tname}" if d else tname)
+    for spec in test_dir_specs:
+        try:
+            listing = subprocess_run_ls_files(git_root, spec)
+        except OSError:
+            continue
+        for line in listing.splitlines():
+            line = line.strip()
+            if line:
+                out.add(line)
+        # Early-exit: same rationale as section 1 above.
+        if len(out) > WORKTREE_HEADER_EXPANSION_CAP:
+            return out
+
+    # Also admit test-pattern files under the task's dir tree (recursive, capped),
+    # so a co-located ``foo.test.js`` / ``test_foo.py`` next to the edited source
+    # is pulled in even without a tests/ subdir.
+    leaf_dirs = {str(PurePosixPath(s).parent) for s in scope}
+    leaf_dirs = {"" if d == "." else d for d in leaf_dirs}
+    for d in leaf_dirs:
+        # Skip the repo-root leaf-dir scan entirely. When the task's scope file
+        # sits at the repo root, ``d == ""`` and the pathspec becomes ``"*"``,
+        # which git ls-files resolves RECURSIVELY across the entire repo (it
+        # matches slashes). On a million-file monorepo that loads the whole file
+        # list into memory before the caller's cap bail ever triggers, defeating
+        # the sparse-for-scale design. Root-level co-located test files are also
+        # unusual; root manifests/conftest are already pulled by the ancestor
+        # scan above. Non-root leaf dirs keep the scan (bounded by that package's
+        # subtree).
+        if d == "":
+            continue
+        spec = f"{d}/*"
+        try:
+            listing = subprocess_run_ls_files(git_root, spec)
+        except OSError:
+            continue
+        for line in listing.splitlines():
+            line = line.strip()
+            if line and _is_harness_test_file(PurePosixPath(line).name):
+                out.add(line)
+        # Early-exit: if the accumulated set already exceeds the cap, stop
+        # scanning further specs. The caller in create_per_task already bails
+        # when the harness set exceeds WORKTREE_HEADER_EXPANSION_CAP, so
+        # returning an over-cap set early is equivalent — it just avoids
+        # continuing to scan and accumulate across many leaf dirs.
+        if len(out) > WORKTREE_HEADER_EXPANSION_CAP:
+            return out
+
     return out
 
 
@@ -195,6 +401,11 @@ class WorktreeManager:
         # so the ledger write stays at the orchestrator's PlanManager
         # site (the manager does not own ledger access).
         self.last_sparse_headers_added: int = 0
+        # F-6 (Fix 2): count of tracked test-harness files folded into the
+        # most recent sparse ``create_per_task`` (package.json, conftest.py,
+        # the task's tests, …). 0 when harness inclusion was disabled or
+        # bailed because it exceeded WORKTREE_HEADER_EXPANSION_CAP.
+        self.last_sparse_harness_added: int = 0
 
     def _create_timeout_s(self) -> float:
         """Per-call timeout for slow ``git worktree add`` operations.
@@ -350,6 +561,7 @@ class WorktreeManager:
         sparse_paths: list[str] | None = None,
         *,
         include_headers_for_sparse: bool = True,
+        include_harness_for_sparse: bool = True,
     ) -> Path:
         """Create a per-task worktree at ``tournament_dir/tasks/<task_id>``.
 
@@ -364,6 +576,22 @@ class WorktreeManager:
         v0.17.0 S6: ``sparse_paths`` is forwarded into the same
         sparse-checkout machinery used by :meth:`create`. ``None`` (or
         an empty list) preserves legacy full-checkout behavior.
+
+        F-6 (Fix 2): when ``include_harness_for_sparse`` is True (the
+        default), a small curated globset of TRACKED build/test-harness
+        files (``package.json``/lockfiles, ``pyproject.toml``,
+        ``pytest.ini``, ``conftest.py``, ``Cargo.toml``, ``go.mod``, …) and
+        the task's RELEVANT test files (scoped to the package/dir tree of
+        ``sparse_paths`` — never a repo-wide test mountain) are folded into
+        the sparse cone alongside the sibling-header union. Without this,
+        the QA ``test_runner`` gate (which runs with ``cwd=worktree``) could
+        not see ``package.json``/the test files and false-blocked (e.g.
+        ``npm test`` ENOENT). The harness expansion shares the
+        ``WORKTREE_HEADER_EXPANSION_CAP`` bound: if it would add more than
+        the cap (a monorepo with thousands of manifest shards or a giant
+        test tree), it BAILS OUT entirely (logs + proceeds without it) so
+        the cone stays sparse-for-scale. ``False`` preserves the legacy
+        scope-only cone.
 
         v0.39.0 (huge-repo follow-up): both the sparse ``--no-checkout``
         and the non-sparse fallback ``git worktree add`` now pass
@@ -427,6 +655,28 @@ class WorktreeManager:
                 else:
                     effective_paths.extend(new_paths)
                     added_headers = len(new_paths)
+            # F-6 (Fix 2): fold curated TRACKED test-harness files into the
+            # cone so the QA gate (cwd=worktree) can run tests. Computed from
+            # the ORIGINAL scope (``sparse_paths``), not the header-expanded
+            # set, so a stray header dir can't widen the harness search. Shares
+            # the header cap: an over-cap harness set (monorepo manifest shards
+            # / a giant test tree) BAILS OUT so the cone stays bounded.
+            added_harness = 0
+            if include_harness_for_sparse and (sparse_paths or []):
+                harness = _harness_paths_for_sparse(
+                    self._main, list(sparse_paths or [])
+                )
+                new_harness = sorted(harness - set(effective_paths))
+                if len(new_harness) > WORKTREE_HEADER_EXPANSION_CAP:
+                    self._log.warning(
+                        "worktree.sparse_harness_expansion.capped",
+                        task_id=task_id,
+                        proposed=len(new_harness),
+                        cap=WORKTREE_HEADER_EXPANSION_CAP,
+                    )
+                else:
+                    effective_paths.extend(new_harness)
+                    added_harness = len(new_harness)
             for cmd in (
                 ["sparse-checkout", "init", "--cone"],
                 ["sparse-checkout", "set", *effective_paths],
@@ -455,6 +705,16 @@ class WorktreeManager:
                     task_id=task_id,
                     added_paths=added_headers,
                     mode="sibling_headers",
+                )
+            self.last_sparse_harness_added = added_harness
+            if added_harness:
+                # F-6 (Fix 2): telemetry breadcrumb for test-harness inclusion
+                # (same shape as the sibling-header breadcrumb above).
+                self._log.info(
+                    "sparse_worktree_expanded",
+                    task_id=task_id,
+                    added_paths=added_harness,
+                    mode="test_harness",
                 )
             worktree_state.record_create(
                 self._autodev_root,
