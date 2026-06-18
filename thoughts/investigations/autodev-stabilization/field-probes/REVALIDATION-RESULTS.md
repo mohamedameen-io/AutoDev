@@ -43,14 +43,14 @@ This SUPERSEDES the prior verdict's "WS-4 NOT resolved."
 - **F-1** (**FIXED `a5c9bb1`**): `edit_scope_violation` + ineffective `narrow_scope` recovery. Plan repair (`repair_phase_edit_scope`) now admits a phase's tasks' declared concrete files into `edit_scope`; run after the drop/empty-guard pass; P0 empty-guard preserved; `tournament promote` CLI bypass also closed. Reproduce-first + reviewed. Resolves the P1 scope-block.
 - **F-2** (**FIXED `9ecf8ee`**): Hard-task budget-churn → 40–56 min execute timeouts (P4/P5/P6). Phase-scoped non-convergence ceiling (`max_corrective_cycles_per_phase`=3) bounds same-failure-class corrective regeneration — emits loud `corrective_nonconvergent_ceiling` op + terminal block instead of churning to the 40-min execute timeout. Resets on a different `failure_class` or forward progress (legitimate recovery preserved). Reproduce-first + reviewed, replay-safe. **NOTE:** makes hard tasks fail-loud-fast; does NOT make them deliver (see F-5).
 - **F-3** (FIXED `e87fb5f` / infra): Benchmark harness crashed (`TypeError: Object of type bytes is not JSON serializable`) on `subprocess.TimeoutExpired` — raw bytes from stdout/stderr not decoded before JSON serialization. Fixed.
-- **F-4** (OPEN / high / deferred): Execute-flow apply-time scope enforcement is **dormant** — all 3 `apply_patch_to_main` callers pass `edit_scope=None`, so the developer's actual diff is never scope-checked at apply time. Only declaration-level pre-flight guards scope. Activating real diff-level enforcement is a separate, higher-risk change (could surface latent violations in existing plans). Deferred.
-- **F-5** (OPEN / high / candidate next): Genuine-conflict non-convergence — corrective tasks on hard tasks repeatedly collide with the same accumulated worktree state. F-2 bounds the loop and makes failure loud/fast, but the deeper cause (worktree-state accumulation / merge-base divergence) is unsolved → hard tasks still produce 0 diff (fail-loud-fast but do NOT deliver). Next candidate fix for hard-task DELIVERY.
+- **F-4** (OPEN / high / deferred): Execute-flow apply-time scope enforcement is **dormant** — all 3 `apply_patch_to_main` callers pass `edit_scope=None`, so the developer's actual diff is never scope-checked at apply time. Only declaration-level pre-flight guards scope. Activating real diff-level enforcement is a separate, higher-risk change (could surface latent violations in existing plans). Deferred. **Additional gap (surfaced by F-5):** `extract_files_from_diff` ignores binary file headers (`Binary files … differ`), so binary edits are invisible to the edit_scope gate entirely. Breadcrumb at `worktree.py` gate (commit `81d9438`).
+- **F-5** (**FIXED `fca31b3` + `c925962` + `81d9438`** — MISDIAGNOSIS CORRECTED): What was recorded as genuine-conflict non-convergence was in fact a **binary-.pyc diff defect** — `get_diff_vs_base` ran `git diff` without `--binary --full-index`, causing `.pyc` binary hunks to fail `git apply --check --3way` (rc=1 "cannot apply binary patch without full index line") → spurious `conflict_3way_failed`. The source `.py` change always applied cleanly; main never drifted; TS task (no `.pyc`) delivered. Fix: `--binary --full-index` + `filter_generated_from_diff` seam + fixture `.gitignore` seeding. Expected field effect: hard tasks should now deliver (or fail-loud-fast via F-2). Field re-run PENDING.
 
 ### What the stabilization commits validated
 
 A3 lint: validated in production (lint ENABLED, 0 lint-block events).
 A5: confirmed prior `cost_usd 0.0` was a symptom of the ledger-wipe (watermark already correct after A1).
-A4/B1/B2/B3: landed; full unit gate green (4299 passed / 6 skipped, ruff + mypy clean).
+A4/B1/B2/B3: landed; full unit gate green (4299 passed / 6 skipped, ruff + mypy clean at original re-run; 4320 passed / 6 skipped after F-1/F-2/F-5 fixes).
 A1 (`7b40ce4`): exclude `.autodev/` from `git clean -fd` + idempotent reload-retry — the ledger-wipe root cause.
 A2 (`491382e`): auto `--3way` before critic, removing the *spurious*-conflict trigger (trivial tasks); genuine conflicts on hard tasks' corrective regeneration persist → F-2/F-5.
 
@@ -60,7 +60,7 @@ The 11 commits (589b2bf..HEAD): `ec293c5` A3 lint, `7c5d9f3` B1 necessity-ladder
 
 ## POST-RE-RUN FIXES — 2026-06-18
 
-**Build:** `stabilization-v1` @ `9ecf8ee` · **Unit gate:** 4315 passed / 6 skipped (ruff + mypy clean) · **Field re-run:** PENDING
+**Build:** `stabilization-v1` @ `81d9438` · **Unit gate:** 4320 passed / 6 skipped (ruff + mypy clean) · **Field re-run:** PENDING
 
 ### Correction: `conflict_3way_failed` was NOT zero across all probes
 
@@ -74,13 +74,27 @@ Plan repair (`repair_phase_edit_scope`) admits a phase's tasks' declared concret
 
 Phase-scoped non-convergence ceiling (`max_corrective_cycles_per_phase`=3) bounds same-`failure_class` corrective regeneration — emits loud `corrective_nonconvergent_ceiling` op + terminal block instead of churning to the 40-min execute timeout. Resets on a different `failure_class` or forward progress (legitimate recovery preserved). Reproduce-first + reviewed, replay-safe. **NOTE: makes hard tasks fail-loud-fast; does NOT make them deliver (see F-5).**
 
-### F-4 — OPEN / DEFERRED
+### F-4 — OPEN / DEFERRED (expanded 2026-06-18)
 
 Apply-time edit_scope enforcement is dormant: all 3 `apply_patch_to_main` callers pass `edit_scope=None`. Only declaration-level pre-flight guards scope. Activating real diff-level enforcement is a separate, higher-risk change (could surface latent violations in existing plans). Deferred.
 
-### F-5 — OPEN / CANDIDATE NEXT (hard-task delivery)
+**Additional gap surfaced by F-5 investigation:** `extract_files_from_diff` (called by the apply-time scope gate) only matches `--- a/` lines — it silently ignores `Binary files a/... and b/... differ` headers. Binary edits are therefore **invisible to `edit_scope` gating entirely**. Now that F-5 makes binary patches apply cleanly, activating apply-time enforcement must also teach the parser the `diff --git`/`Binary files…differ` header format. A breadcrumb comment marks this gap at `worktree.py`'s edit_scope gate (commit `81d9438`).
 
-Genuine-conflict non-convergence: corrective tasks on hard tasks repeatedly collide with the same accumulated worktree state. F-2 bounds the churn loop and makes failure loud/fast, but the underlying cause (worktree-state accumulation / merge-base divergence between corrective attempts) is unsolved. Hard tasks still produce 0 diff. This is the next candidate fix for hard-task DELIVERY.
+### F-5 — FIXED (`fca31b3` + `c925962` + `81d9438`) — MISDIAGNOSIS CORRECTED
+
+**Was recorded as:** genuine-conflict non-convergence — hard tasks fail-loud-fast but don't deliver.
+
+**Debunked by read-only investigation.** The recurring `conflict_3way_failed` on hard tasks was NOT a genuine source merge conflict / convergence problem. Root cause: `get_diff_vs_base` (`src/orchestrator/worktree.py`) ran `git diff` **without `--binary --full-index`**. A changed tracked binary — the benchmark fixture's pytest-regenerated `__pycache__/*.pyc` — emitted a malformed binary hunk with an abbreviated index line. `git apply --check --3way` returned rc=1 (`"cannot apply binary patch … without full index line"`) producing spurious `conflict_3way_failed` in a loop.
+
+Three independent observations refuted the convergence hypothesis: (1) the source `.py` change always applied cleanly (critic saw `conflict_files=[]`); (2) main never drifted between corrective attempts; (3) the TS task (no `.pyc`) delivered cleanly.
+
+**Fix (reproduce-first, git-only, reviewed):**
+1. Added `--binary --full-index` to `get_diff_vs_base` (`fca31b3`).
+2. Excluded generated cruft (`__pycache__/*.pyc`, lockfiles, `*.min.*`) from delivered diffs via a single seam `filter_generated_from_diff` in new `src/adapters/git_utils.py` (consolidated source of truth, replacing `execute_phase.py`'s local predicate) (`fca31b3`).
+3. Seeded `.gitignore` in the benchmark fixture init (`benchmarks/runner/task_runner.py:_init_git_repo`) since a bare `git add .` had swept the fixture `.pyc` into the initial commit (`c925962`).
+4. Added binary `edit_scope` breadcrumb in `worktree.py` + cleanups (`81d9438`).
+
+**Expected field effect:** hard tasks (P4/P5/P6) should now deliver (the binary-.pyc apply blocker is removed), or fail-loud-fast via the F-2 ceiling if genuine convergence issues remain. Field re-run PENDING to confirm.
 
 ### Overall status
 
@@ -89,11 +103,11 @@ Genuine-conflict non-convergence: corrective tasks on hard tasks repeatedly coll
 | F-1 (scope recovery) | **FIXED** `a5c9bb1` |
 | F-2 (non-convergence ceiling) | **FIXED** `9ecf8ee` |
 | F-3 (harness bytes-JSON) | **FIXED** `e87fb5f` |
-| F-4 (apply-time enforcement dormant) | **OPEN** / deferred |
-| F-5 (genuine-conflict non-convergence) | **OPEN** / candidate next |
-| Unit gate | **GREEN** (4315 passed / 6 skipped) |
-| Field re-run | **PENDING** (F-1/F-2 unit-validated only) |
-| v1.0 tag | **NOT READY** — F-4, F-5 open; field re-run pending |
+| F-4 (apply-time enforcement dormant + binary-blindness) | **OPEN** / deferred |
+| F-5 (binary-.pyc diff defect — was misdiagnosed as non-convergence) | **FIXED** `fca31b3;c925962;81d9438` |
+| Unit gate | **GREEN** (4320 passed / 6 skipped, ruff + mypy clean) |
+| Field re-run | **PENDING** (F-1/F-2/F-5 unit-validated only) |
+| v1.0 tag | **NOT READY** — field re-run pending; F-4 open (decision required) |
 
 ---
 
