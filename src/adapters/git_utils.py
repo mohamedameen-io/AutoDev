@@ -454,6 +454,102 @@ def _git_diff_range(cwd: Path, from_sha: str, to_sha: str) -> str | None:
     return out.stdout or None
 
 
+def _sanitize_diff_path(path: str) -> str | None:
+    """Return a cleaned diff path, or ``None`` if it is pathological.
+
+    Bug #3 (v0.25.1): reject paths that are never real. A 4000-char blob
+    with embedded newlines / NUL bytes (a JSON-escaped code listing that
+    leaked into a ``+++ b/`` line) is not a path; the downstream QA helpers'
+    ``Path.is_file()`` raises ``OSError [Errno 63] File name too long`` on
+    it. Applied to BOTH the ``+++ b/`` path and the binary header-fallback
+    path so the two routes share one sanitiser (F-4).
+    """
+    path = path.strip()
+    if not path:
+        return None
+    reason: str | None = None
+    if len(path) > _MAX_PATH_LEN:
+        reason = f"len={len(path)} > {_MAX_PATH_LEN}"
+    elif "\n" in path or "\\n" in path:
+        reason = "embedded newline"
+    elif "\x00" in path:
+        reason = "embedded NUL"
+    if reason is not None:
+        _log.warning(
+            "extract_files_from_diff.rejected_path",
+            extra={
+                "reason": reason,
+                "path_prefix": path[:80],
+            },
+        )
+        return None
+    return path
+
+
+def _section_is_binary(section: list[str]) -> bool:
+    """Return ``True`` iff the section is a GENUINELY-binary diff section.
+
+    A section qualifies only on a POSITIVE binary marker — a ``GIT binary
+    patch`` payload line (``git diff --binary``) or a ``Binary files a/<x>
+    and b/<y> differ`` line (``git diff`` without ``--binary``). This
+    deliberately does NOT treat "a ``diff --git`` header with no ``+++ b/``"
+    as binary: a header cut off before its ``+++ b/`` / hunks is a TRUNCATED
+    or hallucinated text diff, which the QA-gate fail-closed contract (v0.27)
+    requires to parse as "no files" — not as a binary edit. Only the explicit
+    marker promotes a header-only section to the binary header fallback.
+    """
+    for line in section:
+        if line.startswith("GIT binary patch"):
+            return True
+        if line.startswith("Binary files ") and line.rstrip().endswith(
+            " differ"
+        ):
+            return True
+    return False
+
+
+def _binary_section_target(section: list[str]) -> str | None:
+    """Resolve the post-change path of a GENUINELY-binary section.
+
+    Precondition: :func:`_section_is_binary` is ``True`` for ``section`` —
+    i.e. it carries a ``GIT binary patch`` payload or a ``Binary files ..
+    differ`` line and has NO ``+++ b/`` header. F-4: fall back to the b-side
+    path so binary edits are still visible to scope gating. Prefers the
+    ``Binary files .. and <b> differ`` line (carries the canonical
+    ``/dev/null`` deletion sentinel), then the ``diff --git a/<x> b/<y>``
+    header. ``/dev/null`` targets (binary deletions) contribute no path,
+    mirroring the ``+++ /dev/null`` exclusion for text deletions. The
+    resolved path passes through :func:`_sanitize_diff_path`.
+    """
+    header = section[0]
+    # 1. ``Binary files a/<x> and b/<y> differ`` — the b-side after " and ".
+    for line in section:
+        if line.startswith("Binary files ") and line.rstrip().endswith(
+            " differ"
+        ):
+            body = line[len("Binary files "):].rstrip()
+            body = body[: -len(" differ")]
+            # Split on the literal " and " separating the a/ and b/ sides.
+            if " and " in body:
+                b_side = body.rsplit(" and ", 1)[1].strip()
+                if b_side == "/dev/null":
+                    return None
+                if b_side.startswith("b/"):
+                    b_side = b_side[len("b/"):]
+                return _sanitize_diff_path(b_side)
+            break
+    # 2. ``diff --git a/<x> b/<y>`` header — prefer the b-side token.
+    parts = header.strip().split()
+    if len(parts) >= 4:
+        b_token = parts[3]
+        if b_token.startswith("b/"):
+            b_token = b_token[len("b/"):]
+        if b_token == "dev/null" or b_token == "/dev/null":
+            return None
+        return _sanitize_diff_path(b_token)
+    return None
+
+
 def extract_files_from_diff(diff: str, *, strict: bool = False) -> list[str]:
     """Pull file paths from a unified diff (lightweight, deterministic).
 
@@ -474,10 +570,25 @@ def extract_files_from_diff(diff: str, *, strict: bool = False) -> list[str]:
     tasks declared as ``produces_diff=True`` rather than silently passing
     every diff-scoped gate with ``paths=[]``.
 
+    F-4: the parse is SECTION-AWARE with ``+++ b/`` PRECEDENCE. The diff is
+    split on ``diff --git `` headers (the same split
+    :func:`filter_generated_from_diff` uses). For each section: if it has a
+    ``+++ b/<path>`` line, THAT path is used (existing sanitisation +
+    ``/dev/null`` skip intact). ONLY when a section has NO ``+++ b/`` (a
+    genuinely-binary section — ``GIT binary patch`` payload or
+    ``Binary files .. differ``) does it fall back to the b-side path from
+    the ``diff --git`` header / ``Binary files .. differ`` line (same
+    sanitisation). Precedence matters: a section pairing a clean header with
+    a deliberately-malformed ``+++ b/`` line must use the malformed line (it
+    is rejected by the sanitiser → contributes nothing) and must NOT parse
+    the header as a fallback — so every text-diff result stays
+    byte-identical and binary coverage is purely additive.
+
     Args:
         diff: Unified diff text. May be empty.
         strict: When ``True``, raise :class:`errors.DiffParseError` if the
-            diff text is non-empty but no ``+++ b/`` header is parseable.
+            diff text is non-empty but no path (text OR binary) is
+            parseable.
 
     Returns:
         Repo-relative paths for each file the diff modifies. Empty list
@@ -488,33 +599,56 @@ def extract_files_from_diff(diff: str, *, strict: bool = False) -> list[str]:
         return []
     files: list[str] = []
     seen: set[str] = set()
-    for line in diff.splitlines():
-        if line.startswith("+++ b/"):
-            path = line[len("+++ b/"):].strip()
-            if not path or path in seen:
-                continue
-            # Bug #3 (v0.25.1): reject pathological paths. A 4000-char blob
-            # with embedded newlines / NUL bytes is never a real path; the
-            # downstream QA helpers' ``Path.is_file()`` raises
-            # ``OSError [Errno 63] File name too long`` on it.
-            reason: str | None = None
-            if len(path) > _MAX_PATH_LEN:
-                reason = f"len={len(path)} > {_MAX_PATH_LEN}"
-            elif "\n" in path or "\\n" in path:
-                reason = "embedded newline"
-            elif "\x00" in path:
-                reason = "embedded NUL"
-            if reason is not None:
-                _log.warning(
-                    "extract_files_from_diff.rejected_path",
-                    extra={
-                        "reason": reason,
-                        "path_prefix": path[:80],
-                    },
-                )
-                continue
+
+    def _add(path: str | None) -> None:
+        if path and path not in seen:
             files.append(path)
             seen.add(path)
+
+    # Split into per-file sections keyed on the ``diff --git`` header so a
+    # binary section (no ``+++ b/``) can fall back to its header b-side
+    # WITHOUT ever overriding a section that does carry a ``+++ b/`` line.
+    # Lines before the first ``diff --git`` (rare; a bare ``+++ b/`` diff
+    # with no header — e.g. the legacy phase-review dedupe fixtures) collect
+    # into a single header-less "preamble" section so their ``+++ b/`` lines
+    # are still parsed exactly as before. A preamble section never triggers
+    # the binary header fallback (its first line is not a ``diff --git``
+    # header), so a bare ``+++ b/`` diff behaves byte-identically.
+    sections: list[list[str]] = []
+    current: list[str] = []  # accumulates the header-less preamble first
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            if current:
+                sections.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        sections.append(current)
+
+    for section in sections:
+        # ``+++ b/`` PRECEDENCE: if the section declares any ``+++ b/`` line,
+        # those are authoritative for this section (binary fallback skipped).
+        has_plus_b = False
+        for line in section:
+            if line.startswith("+++ b/"):
+                has_plus_b = True
+                _add(_sanitize_diff_path(line[len("+++ b/"):]))
+        if has_plus_b:
+            continue
+        # No ``+++ b/`` in this section. The binary header fallback fires
+        # ONLY for a real ``diff --git`` header (preamble sections do not
+        # qualify) AND only when the section carries a positive binary
+        # marker. A header-only section with NO marker is a truncated /
+        # hallucinated text diff: it contributes nothing, preserving the
+        # v0.27 fail-closed QA-gate contract (``strict`` then raises).
+        if (
+            section
+            and section[0].startswith("diff --git ")
+            and _section_is_binary(section)
+        ):
+            _add(_binary_section_target(section))
+
     if not files and strict:
         from errors import DiffParseError
 

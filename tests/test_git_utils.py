@@ -361,3 +361,102 @@ def test_extract_files_from_diff_phase_review_alias_unchanged() -> None:
     from orchestrator import phase_review_runner
 
     assert phase_review_runner._extract_files_from_diff is extract_files_from_diff
+
+
+# ---------------------------------------------------------------------------
+# F-4: extract_files_from_diff is binary-aware (``+++ b/`` precedence,
+# ``diff --git`` header / ``Binary files .. differ`` fallback for binary
+# sections that carry no ``+++ b/`` line). A binary edit produced by
+# ``git diff --binary`` has a ``GIT binary patch`` payload (or, without
+# ``--binary``, a ``Binary files a/x and b/x differ`` line) and NO
+# ``+++ b/<path>`` header — so the legacy parser returned [] for it,
+# leaving binary edits invisible to apply-time scope gating.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_files_from_diff_binary_only_uses_header_fallback() -> None:
+    """A binary-only section (no ``+++ b/``) falls back to the b-side header."""
+    diff = (
+        "diff --git a/x.bin b/x.bin\n"
+        "index 0000000000000000000000000000000000000000..1111111111111111111111111111111111111111 100644\n"
+        "GIT binary patch\n"
+        "literal 4\n"
+        "Mc${NkU|<4b00031\n"
+        "\n"
+    )
+    assert extract_files_from_diff(diff) == ["x.bin"]
+
+
+def test_extract_files_from_diff_binary_files_differ_uses_header_fallback() -> None:
+    """The abbreviated ``Binary files .. differ`` form (no ``+++ b/``)
+    still resolves to the b-side path via the ``diff --git`` header."""
+    diff = (
+        "diff --git a/logo.png b/logo.png\n"
+        "index 1111111..2222222 100644\n"
+        "Binary files a/logo.png and b/logo.png differ\n"
+    )
+    assert extract_files_from_diff(diff) == ["logo.png"]
+
+
+def test_extract_files_from_diff_mixed_text_and_binary() -> None:
+    """A diff with one text section and one binary section returns BOTH
+    paths — the text path from its ``+++ b/`` line, the binary path from
+    its header fallback. Order is first-seen (text, then binary)."""
+    diff = (
+        "diff --git a/keep.py b/keep.py\n"
+        "--- a/keep.py\n"
+        "+++ b/keep.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+x = 1\n"
+        "diff --git a/img.png b/img.png\n"
+        "index 0000000..2222222 100644\n"
+        "GIT binary patch\n"
+        "literal 8\n"
+        "Mc${NkU|<4b00031\n"
+    )
+    assert extract_files_from_diff(diff) == ["keep.py", "img.png"]
+
+
+def test_extract_files_from_diff_plus_b_takes_precedence_over_header() -> None:
+    """PRECEDENCE GUARD: a section that HAS a (malformed) ``+++ b/`` line
+    must use THAT line, not the clean ``diff --git`` header. The malformed
+    path (>255 chars) is rejected by the sanitiser, so the section
+    contributes nothing — the clean header must NOT be parsed as a
+    fallback. This pins the ``+++ b/``-wins rule that keeps every existing
+    sanitisation test byte-identical."""
+    long_segment = "a" * 256
+    diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "--- a/foo.py\n"
+        f"+++ b/{long_segment}\n"
+        "@@ -0,0 +1 @@\n"
+        "+x = 1\n"
+    )
+    assert extract_files_from_diff(diff) == []
+
+
+def test_extract_files_from_diff_binary_header_sanitizes_path() -> None:
+    """The header-fallback path is subject to the SAME sanitisation as the
+    ``+++ b/`` path: an over-length b-side header path is rejected."""
+    long_segment = "a" * 256
+    diff = (
+        f"diff --git a/{long_segment} b/{long_segment}\n"
+        "index 1111..2222 100644\n"
+        f"Binary files a/{long_segment} and b/{long_segment} differ\n"
+    )
+    assert extract_files_from_diff(diff) == []
+
+
+def test_extract_files_from_diff_binary_skips_dev_null_header() -> None:
+    """A binary DELETION (b-side is ``/dev/null``) contributes no path —
+    mirrors the ``+++ /dev/null`` exclusion for text deletions."""
+    diff = (
+        "diff --git a/gone.bin b/dev/null\n"
+        "deleted file mode 100644\n"
+        "index 1111..0000\n"
+        "Binary files a/gone.bin and /dev/null differ\n"
+    )
+    # The header b-side is literally ``dev/null`` (git strips the leading
+    # slash in ``b/dev/null``); the ``Binary files .. and /dev/null differ``
+    # line carries the canonical ``/dev/null`` sentinel which we skip.
+    assert extract_files_from_diff(diff) == []
