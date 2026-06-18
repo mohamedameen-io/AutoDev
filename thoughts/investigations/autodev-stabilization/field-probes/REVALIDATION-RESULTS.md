@@ -8,7 +8,7 @@
 
 **F-5 FIELD-VALIDATED.** P4 (task_007 Python feature): 40-min timeout in v1 → 136-line clean delivery in ~18 min in v2. `BINARY_PATCH_ERR = 0` across **all 5 probes** (P1/P2/P4/P5/P6). The binary-`.pyc` defect that dominated hard-task non-delivery is fully removed. F-2 bounded churn held. WS-4 residual absent.
 
-**Bar NOT a clean sweep: 2/5 delivered (P2, P4). v1.0 NOT READY.** Two new findings: **F-6** (per-task sparse worktree omits test-harness files → spurious `qa_gate_failed`) and **F-7** (plan-phase 40-min timeout on complex tasks under high latency). P6 execute non-convergence persists under bounded genuine churn. All F-6/F-7/P6 issues are aggravated by unusually high claude latency this session — re-measure under normal latency before concluding they are code issues.
+**Bar NOT a clean sweep: 2/5 delivered (P2, P4). v1.0 NOT READY.** Two new findings at time of run: **F-6** (per-task sparse worktree omits test-harness files → spurious `qa_gate_failed`) and **F-7** (plan-phase 40-min timeout on complex tasks under high latency). P6 execute non-convergence persists under bounded genuine churn. F-6 subsequently **FIXED** (`6952b82;e1ba4bf` — npm manifest guard + capped tracked test-harness in sparse cone). Remaining open: **F-7, F-4**.
 
 ### v2 Scorecard
 
@@ -37,7 +37,7 @@
 ### v2 Findings
 
 - **F-5** (**FIELD-VALIDATED** `fca31b3;c925962;81d9438`): P4 delivers 136-line clean feature in ~18 m. `BINARY_PATCH_ERR=0` across all 5 probes. The binary-`.pyc` diff defect (`git diff` missing `--binary --full-index`) was the root cause of hard-task non-delivery in v1. **Fully resolved.**
-- **F-6** (OPEN / high): Per-task sparse worktree omits test-harness files outside `edit_scope`. `package.json` / test files / deps absent → `npm test` ENOENT → `qa_gate_failed ×3` → circuit open. Under-scope mirror of F-1: the QA gate needs read-only test-harness files that are orthogonal to the edit scope. Fix: ensure sparse worktree always includes the full test harness regardless of `edit_scope`.
+- **F-6** (**FIXED `6952b82;e1ba4bf`**): (A) `_run_npm_test` ran `npm test` with no `package.json` guard → spurious ENOENT → `qa_gate_failed`; now returns non-blocking skip when manifest absent, mirroring build gate. (B) sparse worktree omitted test-harness files outside `edit_scope`; `create_per_task` now folds a capped tracked harness glob set into the sparse cone behind `worktree_sparse_include_harness` (default on), bounded for huge repos. Full suite 4328/6, ruff+mypy clean. Closes P1/task_002 ENOENT block and huge-repo harness-omission class.
 - **F-7** (OPEN / medium — LATENCY CONFOUND): Plan-phase can exceed the 40-min per-command timeout on complex tasks. P5 plan timed out at 2400 s; claude latency was ~80 s/call this session. Re-measure under normal latency (<30 s/call) before concluding this is a code issue. If confirmed: investigate plan tournament budget / adaptive timeout for complex refactor tasks.
 - **P6 execute non-convergence**: 0 `.pyc` errors (F-5 holds); genuine conflict churn (2 `conflict_abandon` + 3 `conflict_3way`, 3 correctives) did not converge within the 40-min execute budget at this session's latency. Same latency confound as F-7 — re-measure before treating as a code issue.
 
@@ -50,11 +50,11 @@
 | F-3 (harness bytes-JSON) | **FIXED** `e87fb5f` |
 | F-4 (apply-time enforcement dormant + binary-blindness) | **OPEN** / deferred |
 | F-5 (binary-.pyc diff defect) | **FIXED + FIELD-VALIDATED** `fca31b3;c925962;81d9438` |
-| F-6 (sparse worktree omits test harness) | **OPEN** / high / new in v2 |
+| F-6 (npm manifest guard + capped test-harness in sparse cone) | **FIXED** `6952b82;e1ba4bf` — 2026-06-18 |
 | F-7 (plan-phase timeout under high latency) | **OPEN** / medium / new in v2 — latency confound |
-| Unit gate | **GREEN** (4320 passed / 6 skipped, ruff + mypy clean) |
-| Field bar | **NOT CLEARED** — 2/5; F-6, F-7, P6 non-convergence remain |
-| v1.0 tag | **NOT READY** — fix F-6; confirm F-7/P6 under normal latency |
+| Unit gate | **GREEN** (4328 passed / 6 skipped, ruff + mypy clean) |
+| Field bar | **NOT CLEARED** — 2/5; remaining: F-7, F-4, P6 non-convergence |
+| v1.0 tag | **NOT READY** — confirm F-7/P6 under normal latency; remaining: F-7, F-4 |
 
 ---
 
@@ -103,7 +103,7 @@ This SUPERSEDES the prior verdict's "WS-4 NOT resolved."
 - **F-3** (FIXED `e87fb5f` / infra): Benchmark harness crashed (`TypeError: Object of type bytes is not JSON serializable`) on `subprocess.TimeoutExpired` — raw bytes from stdout/stderr not decoded before JSON serialization. Fixed.
 - **F-4** (OPEN / high / deferred): Execute-flow apply-time scope enforcement is **dormant** — all 3 `apply_patch_to_main` callers pass `edit_scope=None`, so the developer's actual diff is never scope-checked at apply time. Only declaration-level pre-flight guards scope. Activating real diff-level enforcement is a separate, higher-risk change (could surface latent violations in existing plans). Deferred. **Additional gap (surfaced by F-5):** `extract_files_from_diff` ignores binary file headers (`Binary files … differ`), so binary edits are invisible to the edit_scope gate entirely. Breadcrumb at `worktree.py` gate (commit `81d9438`).
 - **F-5** (**FIXED `fca31b3` + `c925962` + `81d9438`** — **FIELD-VALIDATED v2 2026-06-18**): What was recorded as genuine-conflict non-convergence was in fact a **binary-.pyc diff defect** — `get_diff_vs_base` ran `git diff` without `--binary --full-index`, causing `.pyc` binary hunks to fail `git apply --check --3way` (rc=1 "cannot apply binary patch without full index line") → spurious `conflict_3way_failed`. Fix: `--binary --full-index` + `filter_generated_from_diff` seam + fixture `.gitignore` seeding. **v2 evidence:** P4 (Py feature) delivered 136-line diff in ~18 m (was 40-min timeout in v1). `BINARY_PATCH_ERR=0` across all 5 probes. F-5 holds at 50k scale (P6: 0 `.pyc` errors). **Fully resolved.**
-- **F-6** (OPEN / high — **NEW v2 2026-06-18**): Per-task sparse worktree omits test-harness files outside `edit_scope`. Architect scoped P1 to `files=[index.js]`; `package.json` absent → `npm test` ENOENT → `qa_gate_failed ×3` → `infra_circuit_open`. Under-scope mirror of F-1: the QA gate requires read-only test-harness files (package.json, test files, deps) that are outside the edit scope. Fix: sparse worktree must include the full test harness regardless of `edit_scope`.
+- **F-6** (**FIXED `6952b82;e1ba4bf` — 2026-06-18** / was OPEN / high — **NEW v2 2026-06-18**): Two compounding bugs closed the full failure chain: **(A) PRIMARY — npm-test manifest guard (`6952b82`):** `_run_npm_test` ran `npm test` with no `package.json` existence check (its sibling `_run_nodejs_build` already had one). Any repo without a manifest (benchmark task_002, grader = `node test_index.js`) got a spurious ENOENT → `qa_gate_failed` → blocked — reproduces even on a full checkout, not a sparse problem. Fix: `_run_npm_test` returns a non-blocking skip when `package.json` is absent, mirroring the build gate; genuine failures still block. **(B) SECONDARY — capped tracked test-harness in sparse cone (`e1ba4bf`):** Per-task sparse worktree omitted build/test-harness files outside `edit_scope` (package.json, lockfiles, pytest.ini, conftest.py, test files) — also the likely class behind P5's pytest collection errors on huge repos. Fix: `WorktreeManager.create_per_task` folds a CAPPED, TRACKED-ONLY, scoped test-harness glob set (repo-root + task ancestor dirs — never a repo-wide `**/package.json`) into the sparse cone behind default-on config flag `worktree_sparse_include_harness`; reuses `WORKTREE_HEADER_EXPANSION_CAP` (bails over cap); intermediate `git ls-files` listing bounded (root-leaf recursive scan skipped + early-exit) so it stays sparse-for-scale on huge repos. Full suite 4328 passed/6 skipped, ruff+mypy clean. Closes P1/task_002 ENOENT block and the huge-repo harness-omission class.
 - **F-7** (OPEN / medium — **NEW v2 2026-06-18 — LATENCY CONFOUND**): Plan-phase can exceed the 40-min per-command timeout on complex tasks under high claude latency. P5 (Py refactor) plan timed out at 2400 s; session latency was ~80 s/call. 0 `.pyc` errors; 0 execute churn (F-5 removed prior churn). Re-measure under normal latency (<30 s/call) before treating as a code issue.
 
 ### What the stabilization commits validated
@@ -165,11 +165,11 @@ Three independent observations refuted the convergence hypothesis: (1) the sourc
 | F-3 (harness bytes-JSON) | **FIXED** `e87fb5f` |
 | F-4 (apply-time enforcement dormant + binary-blindness) | **OPEN** / deferred |
 | F-5 (binary-.pyc diff defect) | **FIXED + FIELD-VALIDATED** `fca31b3;c925962;81d9438` |
-| F-6 (sparse worktree omits test harness) | **OPEN** / high / new v2 |
+| F-6 (npm manifest guard + capped test-harness in sparse cone) | **FIXED** `6952b82;e1ba4bf` — 2026-06-18 |
 | F-7 (plan-phase timeout under high latency) | **OPEN** / medium / new v2 — latency confound |
-| Unit gate | **GREEN** (4320 passed / 6 skipped, ruff + mypy clean) |
-| Field re-run | **DONE v2** — 2/5 delivered (P2, P4); F-6/F-7/P6 remain |
-| v1.0 tag | **NOT READY** — fix F-6; confirm F-7/P6 under normal latency |
+| Unit gate | **GREEN** (4328 passed / 6 skipped, ruff + mypy clean) |
+| Field re-run | **DONE v2** — 2/5 delivered (P2, P4); F-6 fixed; remaining: F-7, F-4 |
+| v1.0 tag | **NOT READY** — confirm F-7/P6 under normal latency; remaining: F-7, F-4 |
 
 ---
 
