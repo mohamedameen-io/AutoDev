@@ -460,3 +460,40 @@ def test_extract_files_from_diff_binary_skips_dev_null_header() -> None:
     # slash in ``b/dev/null``); the ``Binary files .. and /dev/null differ``
     # line carries the canonical ``/dev/null`` sentinel which we skip.
     assert extract_files_from_diff(diff) == []
+
+
+def test_extract_files_from_diff_binary_header_path_with_space() -> None:
+    """A binary asset whose path contains a SPACE, edited IN PLACE (a == b),
+    must resolve to the full spaced path — not a whitespace-split fragment.
+
+    ``git diff --binary`` emits ``GIT binary patch`` with NO ``+++ b/`` and
+    NO ``Binary files .. differ`` line, so the only path source is the
+    ``diff --git a/<p> b/<p>`` header. Git does NOT quote plain spaces in
+    that header, so a naive ``.split()`` mis-recovers ``my asset.bin`` as
+    the fragment ``my`` (or ``asset.bin``). Because this is the common
+    NON-RENAME case (both halves equal), the header is unambiguous: the b
+    side is recoverable as the full ``dir/my asset.bin``.
+    """
+    diff = (
+        "diff --git a/dir/my asset.bin b/dir/my asset.bin\n"
+        "index 0000000..1111111 100644\n"
+        "GIT binary patch\n"
+        "literal 4\n"
+        "Mc${NkU|<4b00031\n"
+        "\n"
+    )
+    assert extract_files_from_diff(diff) == ["dir/my asset.bin"]
+
+
+def test_extract_files_from_diff_binary_header_no_space_still_works() -> None:
+    """Regression guard: the spaced-path handling must NOT break the
+    common no-space binary header (``a/x.bin b/x.bin``)."""
+    diff = (
+        "diff --git a/x.bin b/x.bin\n"
+        "index 0000000..1111111 100644\n"
+        "GIT binary patch\n"
+        "literal 4\n"
+        "Mc${NkU|<4b00031\n"
+        "\n"
+    )
+    assert extract_files_from_diff(diff) == ["x.bin"]

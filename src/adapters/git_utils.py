@@ -520,9 +520,25 @@ def _binary_section_target(section: list[str]) -> str | None:
     header. ``/dev/null`` targets (binary deletions) contribute no path,
     mirroring the ``+++ /dev/null`` exclusion for text deletions. The
     resolved path passes through :func:`_sanitize_diff_path`.
+
+    Path-with-spaces caveat: git does NOT quote plain spaces in the
+    ``diff --git a/<x> b/<y>`` header, so for a binary deletion or rename
+    that header is genuinely ambiguous to whitespace-split. The header is,
+    however, unambiguous for the overwhelmingly-common NON-RENAME case
+    (a == b: the same file edited in place), where the remainder after the
+    ``diff --git `` prefix has the shape ``a/P b/P`` with both halves equal —
+    :func:`_recover_inplace_header_path` recovers the full spaced ``P`` from
+    it. A header that does NOT match the equal-halves shape (a genuine rename
+    whose path contains a space, or an otherwise un-disambiguatable header)
+    falls through to a best-effort whitespace split — renames of
+    space-bearing binaries are vanishingly rare, and the default scope-gate
+    mode is advisory (WARN), so a mis-recovered rename path is at worst a
+    spurious advisory, never a crash.
     """
     header = section[0]
     # 1. ``Binary files a/<x> and b/<y> differ`` — the b-side after " and ".
+    #    This line IS unambiguous even with spaces: the literal " and "
+    #    separates the two sides regardless of spaces inside either path.
     for line in section:
         if line.startswith("Binary files ") and line.rstrip().endswith(
             " differ"
@@ -538,7 +554,17 @@ def _binary_section_target(section: list[str]) -> str | None:
                     b_side = b_side[len("b/"):]
                 return _sanitize_diff_path(b_side)
             break
-    # 2. ``diff --git a/<x> b/<y>`` header — prefer the b-side token.
+    # 2. ``diff --git a/<x> b/<y>`` header. Try the unambiguous non-rename
+    #    (a == b) recovery first so paths with spaces survive intact; only
+    #    fall back to the best-effort whitespace split when the header is
+    #    not of the equal-halves shape (e.g. a rename with spaces).
+    if header.startswith("diff --git "):
+        remainder = header[len("diff --git "):].rstrip()
+        b_path = _recover_inplace_header_path(remainder)
+        if b_path is not None:
+            if b_path == "dev/null" or b_path == "/dev/null":
+                return None
+            return _sanitize_diff_path(b_path)
     parts = header.strip().split()
     if len(parts) >= 4:
         b_token = parts[3]
@@ -547,6 +573,40 @@ def _binary_section_target(section: list[str]) -> str | None:
         if b_token == "dev/null" or b_token == "/dev/null":
             return None
         return _sanitize_diff_path(b_token)
+    return None
+
+
+def _recover_inplace_header_path(remainder: str) -> str | None:
+    """Recover the b-side path from an in-place ``diff --git`` header.
+
+    ``remainder`` is the text after the ``diff --git `` prefix, i.e.
+    ``a/<x> b/<y>``. Git leaves plain spaces UNQUOTED here, so the header is
+    ambiguous to a whitespace split when a path contains a space. This helper
+    handles only the unambiguous NON-RENAME case where ``x == y`` (the same
+    file edited in place): the remainder then has the exact shape
+    ``a/P b/P`` with ``len(remainder) == len("a/") + len(P) + len(" b/") +
+    len(P)``. We compute ``P`` from that length and verify the remainder
+    reconstructs to ``a/{P} b/{P}`` before returning it (the b-side, stripped
+    of its ``b/`` prefix). Returns ``None`` for anything that is not an
+    equal-halves in-place header (a rename with differing sides, or a
+    malformed remainder), leaving the caller to fall back to its best-effort
+    whitespace split. The recovered path is NOT sanitised here — the caller
+    owns the ``/dev/null`` skip and :func:`_sanitize_diff_path` pass.
+    """
+    if not remainder.startswith("a/"):
+        return None
+    # len(remainder) = len("a/") + len(P) + len(" b/") + len(P)
+    #               = 2 + len(P) + 3 + len(P) = 5 + 2*len(P)
+    fixed = len("a/") + len(" b/")  # == 5
+    inner = len(remainder) - fixed
+    if inner <= 0 or inner % 2 != 0:
+        return None
+    p_len = inner // 2
+    candidate = remainder[len("a/"): len("a/") + p_len]
+    # Verify the remainder is exactly ``a/{candidate} b/{candidate}``. This
+    # rejects renames (a != b) and any header that does not fit the shape.
+    if remainder == f"a/{candidate} b/{candidate}":
+        return candidate
     return None
 
 
