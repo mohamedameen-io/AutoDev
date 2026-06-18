@@ -1,5 +1,63 @@
 # REVALIDATION-RESULTS.md — Phase 4 field re-validation of `stabilization-v1`
 
+## ✓ v2 VALIDATION RE-RUN — 2026-06-18 (HEAD 569bda5, F-1/F-2/F-5 verified)
+
+**Build under test:** `stabilization-v1` @ `569bda5` · Isolated venv rebuilt from HEAD; F-1/F-2/F-5 fix markers verified present · **Adapter:** `claude_code` · **Method:** serial, lint ENABLED · P3 (Rust) DEFERRED — no `cargo` on host.
+
+### TL;DR
+
+**F-5 FIELD-VALIDATED.** P4 (task_007 Python feature): 40-min timeout in v1 → 136-line clean delivery in ~18 min in v2. `BINARY_PATCH_ERR = 0` across **all 5 probes** (P1/P2/P4/P5/P6). The binary-`.pyc` defect that dominated hard-task non-delivery is fully removed. F-2 bounded churn held. WS-4 residual absent.
+
+**Bar NOT a clean sweep: 2/5 delivered (P2, P4). v1.0 NOT READY.** Two new findings: **F-6** (per-task sparse worktree omits test-harness files → spurious `qa_gate_failed`) and **F-7** (plan-phase 40-min timeout on complex tasks under high latency). P6 execute non-convergence persists under bounded genuine churn. All F-6/F-7/P6 issues are aggravated by unusually high claude latency this session — re-measure under normal latency before concluding they are code issues.
+
+### v2 Scorecard
+
+| Probe | Lang / type | Outcome | Diff | Wall | Cause |
+|---|---|---|---|---|---|
+| **P1** `task_002` | JS / bug | **FAIL** (empty diff) | 0 | ~9 m | **F-6 NEW**: architect scoped to `files=[index.js]`; sparse worktree lacked `package.json` → `npm test` ENOENT → `qa_gate_failed ×3` → `error_max_turns` → `infra_circuit_open` → blocked. F-1's violation did NOT recur (variance gave a cleaner plan). |
+| **P2** `task_004` | Go / bug | **PASS** | 1-line | ~7 m | Clean control; environment healthy. |
+| **P3** `task_006` | Rust / bug | **DEFERRED** | — | — | No `cargo` on host. |
+| **P4** `task_007` | Python / feature | **PASS** | 136-line | ~18 m | **F-5 field-validated headline**: was 40-min `.pyc`-conflict-loop TIMEOUT in v1; delivers cleanly in v2. |
+| **P5** `task_008` | Python / refactor | **FAIL** (timeout) | 0 | ~40 m | **F-7 NEW**: PLAN command timed out at 2400 s — heavy refactor tournament + ~80 s/call claude latency. 0 `.pyc` errors. 0 execute churn (F-5 removed prior execute-churn). |
+| **P6** `task_009` | Python / 50k | **FAIL** (timeout) | 0 | ~40 m | Execute timed out on bounded genuine churn (2 `conflict_abandon` + 3 `conflict_3way`, 3 correctives). **0 `.pyc` errors** (F-5 held at 50k scale). Did not converge within budget + latency. |
+
+**Result: 2/5 delivered (P2, P4). P3 deferred. P1/P5/P6 FAIL.**
+
+### Cross-probe scan (all 5 probes)
+
+| Signal | Count | Notes |
+|---|---|---|
+| `BINARY_PATCH_ERR` | **0** | F-5 fully removed the binary-`.pyc` apply defect — holds at 50k scale (P6). |
+| `block_path_plan_uninitialized` | **0** | WS-4 residual stays gone (A1 fix holds). |
+| `worker_exception` | **0** | Genuinely absent across all 5 probes. |
+| `.pyc` conflict errors | **0** | No `.pyc` churn on any probe (P4/P5/P6 all clean). |
+| `corrective_nonconvergent_ceiling` | 0 (did not fire) | F-2 ceiling not needed — no unbounded loop; genuine churn in P6 stayed bounded. |
+| `infra_circuit_open` | 1 (P1 only) | Consequence of F-6 ENOENT qa_gate chain. |
+
+### v2 Findings
+
+- **F-5** (**FIELD-VALIDATED** `fca31b3;c925962;81d9438`): P4 delivers 136-line clean feature in ~18 m. `BINARY_PATCH_ERR=0` across all 5 probes. The binary-`.pyc` diff defect (`git diff` missing `--binary --full-index`) was the root cause of hard-task non-delivery in v1. **Fully resolved.**
+- **F-6** (OPEN / high): Per-task sparse worktree omits test-harness files outside `edit_scope`. `package.json` / test files / deps absent → `npm test` ENOENT → `qa_gate_failed ×3` → circuit open. Under-scope mirror of F-1: the QA gate needs read-only test-harness files that are orthogonal to the edit scope. Fix: ensure sparse worktree always includes the full test harness regardless of `edit_scope`.
+- **F-7** (OPEN / medium — LATENCY CONFOUND): Plan-phase can exceed the 40-min per-command timeout on complex tasks. P5 plan timed out at 2400 s; claude latency was ~80 s/call this session. Re-measure under normal latency (<30 s/call) before concluding this is a code issue. If confirmed: investigate plan tournament budget / adaptive timeout for complex refactor tasks.
+- **P6 execute non-convergence**: 0 `.pyc` errors (F-5 holds); genuine conflict churn (2 `conflict_abandon` + 3 `conflict_3way`, 3 correctives) did not converge within the 40-min execute budget at this session's latency. Same latency confound as F-7 — re-measure before treating as a code issue.
+
+### v2 Overall status
+
+| Item | Status |
+|---|---|
+| F-1 (scope recovery) | **FIXED** `a5c9bb1` — unit-validated; not field-exercised v2 (variance) |
+| F-2 (non-convergence ceiling) | **FIXED** `9ecf8ee` — bounded churn held; ceiling not needed in v2 |
+| F-3 (harness bytes-JSON) | **FIXED** `e87fb5f` |
+| F-4 (apply-time enforcement dormant + binary-blindness) | **OPEN** / deferred |
+| F-5 (binary-.pyc diff defect) | **FIXED + FIELD-VALIDATED** `fca31b3;c925962;81d9438` |
+| F-6 (sparse worktree omits test harness) | **OPEN** / high / new in v2 |
+| F-7 (plan-phase timeout under high latency) | **OPEN** / medium / new in v2 — latency confound |
+| Unit gate | **GREEN** (4320 passed / 6 skipped, ruff + mypy clean) |
+| Field bar | **NOT CLEARED** — 2/5; F-6, F-7, P6 non-convergence remain |
+| v1.0 tag | **NOT READY** — fix F-6; confirm F-7/P6 under normal latency |
+
+---
+
 ## ⟲ RE-RUN VERDICT — 2026-06-17 (post-stabilization-fixes, HEAD 95ae3b2)
 
 **Build under test:** `stabilization-v1` @ `95ae3b2` (10 stabilization commits; harness fix `e87fb5f` added after for tooling) ·
@@ -38,13 +96,15 @@ This SUPERSEDES the prior verdict's "WS-4 NOT resolved."
 | `init_plan` present | all 5 | |
 | `task_blocked_scope_violation` | 1 (P1 only) | |
 
-### Findings (status as of 2026-06-18)
+### Findings (status as of 2026-06-18, updated v2 re-run)
 
-- **F-1** (**FIXED `a5c9bb1`**): `edit_scope_violation` + ineffective `narrow_scope` recovery. Plan repair (`repair_phase_edit_scope`) now admits a phase's tasks' declared concrete files into `edit_scope`; run after the drop/empty-guard pass; P0 empty-guard preserved; `tournament promote` CLI bypass also closed. Reproduce-first + reviewed. Resolves the P1 scope-block.
-- **F-2** (**FIXED `9ecf8ee`**): Hard-task budget-churn → 40–56 min execute timeouts (P4/P5/P6). Phase-scoped non-convergence ceiling (`max_corrective_cycles_per_phase`=3) bounds same-failure-class corrective regeneration — emits loud `corrective_nonconvergent_ceiling` op + terminal block instead of churning to the 40-min execute timeout. Resets on a different `failure_class` or forward progress (legitimate recovery preserved). Reproduce-first + reviewed, replay-safe. **NOTE:** makes hard tasks fail-loud-fast; does NOT make them deliver (see F-5).
+- **F-1** (**FIXED `a5c9bb1`**): `edit_scope_violation` + ineffective `narrow_scope` recovery. Plan repair (`repair_phase_edit_scope`) now admits a phase's tasks' declared concrete files into `edit_scope`; run after the drop/empty-guard pass; P0 empty-guard preserved; `tournament promote` CLI bypass also closed. Reproduce-first + reviewed. Resolves the P1 scope-block. *(Not field-exercised in v2 — variance gave a cleaner plan.)*
+- **F-2** (**FIXED `9ecf8ee`**): Hard-task budget-churn → 40–56 min execute timeouts (P4/P5/P6). Phase-scoped non-convergence ceiling (`max_corrective_cycles_per_phase`=3) bounds same-failure-class corrective regeneration — emits loud `corrective_nonconvergent_ceiling` op + terminal block instead of churning to the 40-min execute timeout. Resets on a different `failure_class` or forward progress (legitimate recovery preserved). Reproduce-first + reviewed, replay-safe. *(Ceiling did not need to fire in v2 — no unbounded loop observed; bounded genuine churn in P6 is a separate phenomenon.)*
 - **F-3** (FIXED `e87fb5f` / infra): Benchmark harness crashed (`TypeError: Object of type bytes is not JSON serializable`) on `subprocess.TimeoutExpired` — raw bytes from stdout/stderr not decoded before JSON serialization. Fixed.
 - **F-4** (OPEN / high / deferred): Execute-flow apply-time scope enforcement is **dormant** — all 3 `apply_patch_to_main` callers pass `edit_scope=None`, so the developer's actual diff is never scope-checked at apply time. Only declaration-level pre-flight guards scope. Activating real diff-level enforcement is a separate, higher-risk change (could surface latent violations in existing plans). Deferred. **Additional gap (surfaced by F-5):** `extract_files_from_diff` ignores binary file headers (`Binary files … differ`), so binary edits are invisible to the edit_scope gate entirely. Breadcrumb at `worktree.py` gate (commit `81d9438`).
-- **F-5** (**FIXED `fca31b3` + `c925962` + `81d9438`** — MISDIAGNOSIS CORRECTED): What was recorded as genuine-conflict non-convergence was in fact a **binary-.pyc diff defect** — `get_diff_vs_base` ran `git diff` without `--binary --full-index`, causing `.pyc` binary hunks to fail `git apply --check --3way` (rc=1 "cannot apply binary patch without full index line") → spurious `conflict_3way_failed`. The source `.py` change always applied cleanly; main never drifted; TS task (no `.pyc`) delivered. Fix: `--binary --full-index` + `filter_generated_from_diff` seam + fixture `.gitignore` seeding. Expected field effect: hard tasks should now deliver (or fail-loud-fast via F-2). Field re-run PENDING.
+- **F-5** (**FIXED `fca31b3` + `c925962` + `81d9438`** — **FIELD-VALIDATED v2 2026-06-18**): What was recorded as genuine-conflict non-convergence was in fact a **binary-.pyc diff defect** — `get_diff_vs_base` ran `git diff` without `--binary --full-index`, causing `.pyc` binary hunks to fail `git apply --check --3way` (rc=1 "cannot apply binary patch without full index line") → spurious `conflict_3way_failed`. Fix: `--binary --full-index` + `filter_generated_from_diff` seam + fixture `.gitignore` seeding. **v2 evidence:** P4 (Py feature) delivered 136-line diff in ~18 m (was 40-min timeout in v1). `BINARY_PATCH_ERR=0` across all 5 probes. F-5 holds at 50k scale (P6: 0 `.pyc` errors). **Fully resolved.**
+- **F-6** (OPEN / high — **NEW v2 2026-06-18**): Per-task sparse worktree omits test-harness files outside `edit_scope`. Architect scoped P1 to `files=[index.js]`; `package.json` absent → `npm test` ENOENT → `qa_gate_failed ×3` → `infra_circuit_open`. Under-scope mirror of F-1: the QA gate requires read-only test-harness files (package.json, test files, deps) that are outside the edit scope. Fix: sparse worktree must include the full test harness regardless of `edit_scope`.
+- **F-7** (OPEN / medium — **NEW v2 2026-06-18 — LATENCY CONFOUND**): Plan-phase can exceed the 40-min per-command timeout on complex tasks under high claude latency. P5 (Py refactor) plan timed out at 2400 s; session latency was ~80 s/call. 0 `.pyc` errors; 0 execute churn (F-5 removed prior churn). Re-measure under normal latency (<30 s/call) before treating as a code issue.
 
 ### What the stabilization commits validated
 
@@ -96,18 +156,20 @@ Three independent observations refuted the convergence hypothesis: (1) the sourc
 
 **Expected field effect:** hard tasks (P4/P5/P6) should now deliver (the binary-.pyc apply blocker is removed), or fail-loud-fast via the F-2 ceiling if genuine convergence issues remain. Field re-run PENDING to confirm.
 
-### Overall status
+### Overall status (updated after v2 re-run 2026-06-18)
 
 | Item | Status |
 |---|---|
-| F-1 (scope recovery) | **FIXED** `a5c9bb1` |
-| F-2 (non-convergence ceiling) | **FIXED** `9ecf8ee` |
+| F-1 (scope recovery) | **FIXED** `a5c9bb1` — unit-validated; not field-exercised v2 (variance) |
+| F-2 (non-convergence ceiling) | **FIXED** `9ecf8ee` — ceiling held; bounded P6 churn is separate |
 | F-3 (harness bytes-JSON) | **FIXED** `e87fb5f` |
 | F-4 (apply-time enforcement dormant + binary-blindness) | **OPEN** / deferred |
-| F-5 (binary-.pyc diff defect — was misdiagnosed as non-convergence) | **FIXED** `fca31b3;c925962;81d9438` |
+| F-5 (binary-.pyc diff defect) | **FIXED + FIELD-VALIDATED** `fca31b3;c925962;81d9438` |
+| F-6 (sparse worktree omits test harness) | **OPEN** / high / new v2 |
+| F-7 (plan-phase timeout under high latency) | **OPEN** / medium / new v2 — latency confound |
 | Unit gate | **GREEN** (4320 passed / 6 skipped, ruff + mypy clean) |
-| Field re-run | **PENDING** (F-1/F-2/F-5 unit-validated only) |
-| v1.0 tag | **NOT READY** — field re-run pending; F-4 open (decision required) |
+| Field re-run | **DONE v2** — 2/5 delivered (P2, P4); F-6/F-7/P6 remain |
+| v1.0 tag | **NOT READY** — fix F-6; confirm F-7/P6 under normal latency |
 
 ---
 
