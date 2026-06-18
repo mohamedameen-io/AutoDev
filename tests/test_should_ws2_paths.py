@@ -169,6 +169,9 @@ async def test_rust_unresolvable_crate_falls_back_to_workspace(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_nodejs_paths_scoped_to_changed_test_file(tmp_path: Path) -> None:
     (tmp_path / ".git").mkdir()
+    # F-6 Fix 1: ``npm test`` now requires a ``package.json`` (mirrors the
+    # build gate); provide one so these argv-scoping assertions reach the runner.
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}\n', encoding="utf-8")
     # The changed test file must exist on disk to be forwarded.
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "foo.test.js").write_text("test('x', () => {})\n", encoding="utf-8")
@@ -196,6 +199,8 @@ async def test_nodejs_paths_scoped_to_changed_test_file(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_nodejs_paths_none_keeps_whole_suite(tmp_path: Path) -> None:
+    # F-6 Fix 1: provide a package.json so the npm-test runner is reached.
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}\n', encoding="utf-8")
     proc = _make_proc(0, stdout=b"5 passed")
     with patch(
         "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
@@ -209,6 +214,8 @@ async def test_nodejs_source_only_change_keeps_whole_suite(tmp_path: Path) -> No
     # A non-test source change (no recognizable test file) → keep the whole
     # suite (conservative; never a vacuous empty scope).
     (tmp_path / ".git").mkdir()
+    # F-6 Fix 1: provide a package.json so the npm-test runner is reached.
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}\n', encoding="utf-8")
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "foo.js").write_text("export const x = 1\n", encoding="utf-8")
     proc = _make_proc(0, stdout=b"5 passed")
@@ -225,6 +232,8 @@ async def test_nodejs_changed_test_absent_on_disk_keeps_whole_suite(tmp_path: Pa
     # forwarded (it would make the runner error on a missing file); fall back
     # to the whole suite.
     (tmp_path / ".git").mkdir()
+    # F-6 Fix 1: provide a package.json so the npm-test runner is reached.
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}\n', encoding="utf-8")
     proc = _make_proc(0, stdout=b"5 passed")
     with patch(
         "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)

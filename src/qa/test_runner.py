@@ -359,6 +359,20 @@ def _npm_test_args(cwd: Path, paths: list[Path] | None) -> list[str]:
 async def _run_npm_test(
     cwd: Path, *, timeout_s: float, paths: list[Path] | None = None
 ) -> GateResult:
+    # F-6 (Fix 1): ``npm test`` requires a ``package.json``. Without one, npm
+    # exits ENOENT — rc≠0 → ``_run_subprocess`` would FALSE-BLOCK as if the
+    # tests failed (field-observed on the task_002 benchmark, whose grader is
+    # ``node test_index.js``, not npm). Mirror the sibling build gate
+    # (``build_check._run_nodejs_build``), which already guards on
+    # ``package.json`` existence before ``npm run build``: an absent manifest
+    # is a NON-BLOCKING skip (passed=True), NOT a spurious ENOENT block. A
+    # genuine test failure (package.json PRESENT, tests fail) still blocks via
+    # the runner below — only the absent-manifest case is skipped.
+    if not (cwd / "package.json").exists():
+        return GateResult(
+            passed=True,
+            details="no package.json — skipping npm test (no npm project configured)",
+        )
     return await _run_subprocess(
         _npm_test_args(cwd, paths),
         cwd,

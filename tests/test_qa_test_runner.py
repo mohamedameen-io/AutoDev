@@ -57,6 +57,9 @@ async def test_run_tests_python_fails(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_run_tests_nodejs(tmp_path: Path) -> None:
+    # F-6 Fix 1: ``npm test`` now requires a ``package.json`` (mirrors the
+    # build gate). Provide one so this test still exercises the runner path.
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}\n')
     proc = _make_proc(0)
     with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as mock_exec:
         result = await run_tests(tmp_path, language="nodejs")
@@ -154,3 +157,65 @@ async def test_run_tests_paths_no_python(tmp_path: Path) -> None:
     assert result.passed
     assert "no python changes" in result.details
     mock_exec.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# F-6 Fix 1: ``npm test`` manifest guard
+#
+# Mirrors ``build_check._run_nodejs_build``'s ``package.json`` existence check.
+# A nodejs repo with NO ``package.json`` (e.g. the task_002 benchmark, whose
+# grader is ``node test_index.js``, not npm) must NOT run ``npm test`` — that
+# exits ENOENT (rc≠0 → passed=False) and FALSE-BLOCKS as if a code failure.
+# The absent-manifest case degrades to a non-blocking skip; a present-manifest
+# genuine test failure must still block.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_tests_nodejs_no_package_json_skips(tmp_path: Path) -> None:
+    # RED on current HEAD: a nodejs repo (a stray ``index.js`` makes
+    # detect_language → "nodejs") with NO package.json used to run ``npm test``
+    # unconditionally → ENOENT → passed=False (spurious block). The manifest
+    # guard now returns a NON-BLOCKING skip without ever invoking the runner.
+    (tmp_path / "index.js").write_text("console.log('hi');\n")
+    (tmp_path / "test_index.js").write_text("// harness grader, not npm\n")
+    assert not (tmp_path / "package.json").exists()
+    with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as mock_exec:
+        result = await run_tests(tmp_path, language="nodejs")
+    assert result.passed
+    assert "package.json" in result.details
+    # The skip must short-circuit BEFORE any subprocess is spawned.
+    mock_exec.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_tests_nodejs_with_package_json_failing_still_blocks(
+    tmp_path: Path,
+) -> None:
+    # POSITIVE case unaffected: package.json present + a failing test → the
+    # guard must NOT swallow a genuine failure into a skip.
+    (tmp_path / "index.js").write_text("console.log('hi');\n")
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}\n')
+    proc = _make_proc(1, stdout=b"1 failed, 0 passed")
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
+        result = await run_tests(tmp_path, language="nodejs")
+    assert not result.passed
+    assert "failed" in result.details
+    # The runner WAS invoked (no skip) — package.json is present.
+    assert mock_exec.call_args.args[0] == "npm"
+
+
+@pytest.mark.asyncio
+async def test_run_tests_nodejs_with_package_json_passing(tmp_path: Path) -> None:
+    # package.json present + passing tests → normal pass via the runner.
+    (tmp_path / "index.js").write_text("console.log('hi');\n")
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}\n')
+    proc = _make_proc(0, stdout=b"5 passed")
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
+        result = await run_tests(tmp_path, language="nodejs")
+    assert result.passed
+    assert mock_exec.call_args.args[0] == "npm"
