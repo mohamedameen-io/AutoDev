@@ -256,6 +256,27 @@ preflight_v042_1() {
   check "v0.42.1 F5 engagement"       tests/test_resolver_engagement.py            "assert_no_silent_dead_ends"
 }
 
+preflight_v043() {
+  # v0.43.0 — Phase-4 stabilization: the WS-4 binding constraint resolved + the
+  # field findings (F-1..F-7). Cheap presence tripwires locking each fix's
+  # integration anchor against accidental removal (a first tripwire only).
+  # F-1 — plan-repair admits a task's own declared files into its edit_scope
+  check "v0.43 F-1 scope repair"      src/orchestrator/plan_phase.py               "repair_phase_edit_scope"
+  # F-2 — phase-scoped corrective non-convergence ceiling (fail-loud, not churn)
+  check "v0.43 F-2 ceiling cfg"       src/config/schema.py                         "max_corrective_cycles_per_phase"
+  check "v0.43 F-2 ceiling op"        src/state/ledger.py                          "corrective_nonconvergent_ceiling"
+  # F-4 — apply-time edit-scope enforcement (warn-default) + binary-aware diff
+  check "v0.43 F-4 apply-scope cfg"   src/config/schema.py                         "enforce_apply_time_edit_scope"
+  check "v0.43 F-4 apply-scope op"    src/state/ledger.py                          "edit_scope_apply_violation"
+  # F-5 — self-contained binary diffs + generated-cruft exclusion (the .pyc fix)
+  check "v0.43 F-5 diff filter"       src/adapters/git_utils.py                    "filter_generated_from_diff"
+  # F-6 — per-task worktree includes a capped, scoped test-harness globset
+  check "v0.43 F-6 harness cone cfg"  src/config/schema.py                         "worktree_sparse_include_harness"
+  # F-7 — default-off plan-phase wall-clock ceiling (salvage, not opaque SIGKILL)
+  check "v0.43 F-7 plan wall cfg"     src/config/schema.py                         "plan_phase_wall_budget_s"
+  check "v0.43 F-7 plan wall op"      src/state/ledger.py                          "plan_phase_wall_budget_exceeded"
+}
+
 # ---------------------------------------------------------------------------
 # v1.0.0 — the BEHAVIORAL engagement gate (Phase 0 / B6, gate N2).
 #
@@ -329,6 +350,10 @@ case "$target" in
   v0.41) preflight_v041 ;;
   v0.42) preflight_v042 ;;
   v0.42.1) preflight_v042_1 ;;
+  # v0.43.0 — Phase-4 stabilization. release.yml passes the bare X.Y.Z version,
+  # so match both the bare and v-prefixed forms. Runs only this release's block
+  # (per the per-version pattern); the engagement suite is a separate release step.
+  0.43.0|v0.43.0|v0.43) preflight_v043 ;;
   # The v1.0 release gate. ``v1.0.0``/``v1.0`` AND any plain ``1.0.0``-style
   # input (release.yml passes the bare X.Y.Z version) run the BEHAVIORAL
   # engagement gate on top of every cheap presence tripwire.
@@ -336,7 +361,7 @@ case "$target" in
     preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ; preflight_v041 ; preflight_v042 ; preflight_v042_1 ; preflight_v100 ;;
   all)   preflight_v032 ; preflight_v033 ; preflight_v034 ; preflight_v035 ; preflight_v036 ; preflight_v037 ; preflight_v038 ; preflight_v039 ; preflight_v040 ; preflight_v041 ; preflight_v042 ; preflight_v042_1 ; preflight_v100 ;;
   *)
-    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | v0.41 | v0.42 | v0.42.1 | v1.0.0 | all)" >&2
+    echo "Unknown target: $target (expected v0.32 | v0.33 | v0.34 | v0.35 | v0.36 | v0.37 | v0.38 | v0.39 | v0.40 | v0.41 | v0.42 | v0.42.1 | v0.43.0 | v1.0.0 | all)" >&2
     exit 2
     ;;
 esac
