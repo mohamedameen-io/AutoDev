@@ -85,6 +85,13 @@ code-size = [
     "vulture>=2.10",
     "pylint>=3.0",
 ]
+# Phase-1 external-benchmark tripwire (SWE-bench-Lite): sb-cli submits
+# predictions and parses `resolved_ids`. Deliberately NOT `datasets` or
+# `huggingface_hub` here — the dataset loader lazy-imports and degrades
+# gracefully when those aren't installed. Opt-in only; not folded into `dev`.
+swebench = [
+    "sb-cli>=0.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/mohamedameen/autodev"
@@ -166,6 +173,8 @@ asyncio_mode = "auto"
 pythonpath = ["src", "."]
 markers = [
     "resolver_enabled: opt the test back into the ADR-0047 blocker-resolver chokepoint (disabled by default in the suite via the autouse fixture in tests/conftest.py)",
+    "swebench: SWE-bench-Lite host-arm64 solve/score tests (slow / opt-in)",
+    "bench_external: external-benchmark tests needing sb-cli or network (deselect in CI)",
 ]
 filterwarnings = [
     "ignore:coroutine 'create_subprocess_exec' was never awaited:RuntimeWarning",

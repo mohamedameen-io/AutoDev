@@ -22,18 +22,22 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .scorer import (
-    diff_since_commit,
-    extract_diff_from_ledger,
     iter_task_dirs,
     score_task_with_patch,
+)
+from .solve import (
+    SolveInvoker,
+    SolveProfile,
+    _SubprocessResult,
+    _git,
+    _run,
+    solve,
 )
 
 DEFAULT_TIMEOUT_SECONDS: int = 600  # per-autodev-command wall-clock cap
@@ -92,63 +96,13 @@ def filter_tasks(all_tasks: Sequence[Path], selector: str | None) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess helper
+# Git repo init
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _SubprocessResult:
-    returncode: int
-    stdout: str
-    stderr: str
-    timed_out: bool
-    elapsed_seconds: float
-
-
-def _run(
-    cmd: Sequence[str],
-    *,
-    cwd: Path,
-    timeout: int,
-    env: dict[str, str] | None = None,
-) -> _SubprocessResult:
-    start = time.perf_counter()
-    try:
-        proc = subprocess.run(
-            list(cmd),
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        # TimeoutExpired.stdout/.stderr are bytes even when text=True was
-        # requested (Python captures them before decoding on timeout).  Decode
-        # here so the result fields are always str and JSON-serialisable.
-        def _decode(v: bytes | str | None) -> str:
-            if isinstance(v, bytes):
-                return v.decode("utf-8", errors="replace")
-            return v or ""
-
-        return _SubprocessResult(
-            returncode=-1,
-            stdout=_decode(exc.stdout),
-            stderr=_decode(exc.stderr),
-            timed_out=True,
-            elapsed_seconds=time.perf_counter() - start,
-        )
-    return _SubprocessResult(
-        returncode=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-        timed_out=False,
-        elapsed_seconds=time.perf_counter() - start,
-    )
-
-
-def _git(args: Sequence[str], *, cwd: Path) -> _SubprocessResult:
-    return _run(["git", *args], cwd=cwd, timeout=60)
+#
+# The low-level subprocess primitives (``_SubprocessResult``, ``_run``, ``_git``,
+# ``_git_diff_head``) now live in ``solve`` — the shared solve-half foundation —
+# and are imported above (and re-exported here for the existing test-suite
+# imports ``from benchmarks.runner.task_runner import _SubprocessResult, _git``).
 
 
 def _init_git_repo(repo_dir: Path) -> str:
@@ -184,12 +138,6 @@ def _init_git_repo(repo_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 # Diff helpers
 # ---------------------------------------------------------------------------
-
-
-def _git_diff_head(repo_dir: Path) -> str:
-    """Capture ``git diff HEAD`` for a repo (uncommitted + committed-since)."""
-    res = _run(["git", "diff", "HEAD"], cwd=repo_dir, timeout=60)
-    return res.stdout if res.returncode == 0 else ""
 
 
 def _is_behavior_preserving(meta: dict) -> bool:
@@ -238,27 +186,18 @@ def _diff_size(text: str) -> int:
 _DISABLE_LINT_ENV = "AUTODEV_BENCH_DISABLE_LINT"
 
 
-def _maybe_relax_env_fragile_gates(agent_repo: Path) -> None:
-    """Turn off the lint QA gate in the freshly-``init``-ed config when
-    ``AUTODEV_BENCH_DISABLE_LINT`` is set (best-effort; no-op otherwise)."""
-    if not os.environ.get(_DISABLE_LINT_ENV):
-        return
-    cfg_path = agent_repo / ".autodev" / "config.json"
-    if not cfg_path.is_file():
-        return
-    try:
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    gates = cfg.get("qa_gates")
-    if not isinstance(gates, dict):
-        gates = {}
-        cfg["qa_gates"] = gates
-    gates["lint"] = False
-    try:
-        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+def _bench_config_patch() -> dict:
+    """Build the ``config_patch`` applied to the freshly-``init``-ed config.
+
+    Preserves the historical ``AUTODEV_BENCH_DISABLE_LINT`` behaviour (turn the
+    environment-fragile lint QA gate off) via the generalised ``config_patch``
+    mechanism on :class:`SolveProfile`, replacing the old bespoke
+    ``_maybe_relax_env_fragile_gates`` hook. Returns ``{}`` when unset, so the
+    default committed behaviour is unchanged (an empty patch writes no config).
+    """
+    if os.environ.get(_DISABLE_LINT_ENV):
+        return {"qa_gates": {"lint": False}}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +205,9 @@ def _maybe_relax_env_fragile_gates(agent_repo: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-# Type for the autodev invoker — extracted so tests can stub it.
+# Type for the autodev invoker — extracted so tests can stub it. This is the
+# legacy 3-positional-arg form ``(args, cwd, timeout)``; ``run_task`` adapts it
+# to the env-carrying :class:`SolveInvoker` via ``_as_solve_invoker`` below.
 AutodevInvoker = Callable[[Sequence[str], Path, int], _SubprocessResult]
 
 
@@ -274,6 +215,27 @@ def _default_autodev_invoker(
     args: Sequence[str], cwd: Path, timeout: int
 ) -> _SubprocessResult:
     return _run(["autodev", *args], cwd=cwd, timeout=timeout)
+
+
+def _as_solve_invoker(three_arg: AutodevInvoker) -> SolveInvoker:
+    """Adapt a legacy 3-arg :data:`AutodevInvoker` to the env-carrying
+    :class:`SolveInvoker`.
+
+    The legacy form has no ``env`` parameter, so it runs under the inherited
+    process environment — identical to the pre-refactor ``run_task`` path, which
+    never passed an env overlay (``solve`` therefore hands it ``env=None``).
+    """
+
+    def invoker(
+        command_args: Sequence[str],
+        *,
+        env: Mapping[str, str] | None,
+        cwd: Path,
+        timeout: int,
+    ) -> _SubprocessResult:
+        return three_arg(command_args, cwd, timeout)
+
+    return invoker
 
 
 def run_task(
@@ -299,9 +261,6 @@ def run_task(
     if not spec_path.is_file():
         return TaskResult(task_id=task_id, status="ERROR", error="missing spec.md")
 
-    invocations = 0
-    cumulative_wall = 0.0
-
     cleanup_dir: Path | None = None
     try:
         if workdir_root is None:
@@ -325,65 +284,36 @@ def run_task(
         if agent_repo.exists():
             shutil.rmtree(agent_repo)
         shutil.copytree(task_dir / "repo", agent_repo)
-        initial_commit = _init_git_repo(agent_repo)
+        # Prepare the git repo at the broken baseline (solve() reads HEAD as the
+        # base the diff is recovered against, so a COMMITTED fix is still seen).
+        _init_git_repo(agent_repo)
 
-        # Step 2: invoke autodev init/plan/execute.
-        #
-        # ``plan`` takes the intent/spec as a POSITIONAL argument (click:
-        # ``plan [OPTIONS] INTENT``); there is NO ``--spec`` flag — the spec
-        # TEXT *is* the intent (the plan phase writes it to ``.autodev/spec.md``).
-        # The historical ``["plan", "--spec", <path>]`` invocation made click
-        # exit 2 (unknown option) in <1s, before any planning ran. We pass the
-        # spec file's CONTENTS as the intent and ``--assume-defaults`` so headless
-        # intake applies recommended defaults instead of hanging on a question.
+        # Step 2: run the solve-half via the shared, env/config-carrying
+        # ``solve`` — genuine reuse of the SAME autodev-driving loop and
+        # diff-recovery ladder the external SWE-bench adapter uses. The legacy
+        # 3-arg ``invoker`` is adapted to the env-carrying SolveInvoker;
+        # ``run_task`` passes no env overlay (env=None → inherited process env,
+        # exactly as before) and a ``config_patch`` derived from the environment
+        # (AUTODEV_BENCH_DISABLE_LINT). ``plan`` takes the spec TEXT as its
+        # positional intent (there is NO ``--spec`` flag) with ``--assume-defaults``
+        # so headless intake never hangs; the ladder is ledger → commit-based
+        # initial→final (recovers a COMMITTED fix; the P1 fix) → ``git diff HEAD``.
         spec_text = spec_path.read_text(encoding="utf-8")
-        autodev_failed_reason: str | None = None
-        autodev_calls: list[tuple[str, int, float]] = []
-        autodev_fail_stdout = ""
-        autodev_fail_stderr = ""
-        for args, label in (
-            (["init"], "init"),
-            (
-                ["plan", spec_text, "--assume-defaults"],
-                f"plan <spec:{len(spec_text)}c> --assume-defaults",
-            ),
-            (["execute"], "execute"),
-        ):
-            res = invoker(args, agent_repo, autodev_timeout_seconds)
-            invocations += 1
-            cumulative_wall += res.elapsed_seconds
-            autodev_calls.append((label, res.returncode, round(res.elapsed_seconds, 3)))
-            if res.timed_out:
-                autodev_failed_reason = (
-                    f"autodev {label} timed out after {autodev_timeout_seconds}s"
-                )
-                autodev_fail_stdout = res.stdout[-2000:]
-                autodev_fail_stderr = res.stderr[-2000:]
-                break
-            if res.returncode != 0:
-                autodev_failed_reason = f"autodev {label} exited {res.returncode}"
-                autodev_fail_stdout = res.stdout[-2000:]
-                autodev_fail_stderr = res.stderr[-2000:]
-                break
-            # init just wrote .autodev/config.json — optionally relax the
-            # environment-fragile lint gate before plan/execute run.
-            if label == "init":
-                _maybe_relax_env_fragile_gates(agent_repo)
-
-        # Step 3: extract the agent's diff.
-        #
-        # Precedence: an explicit ledger diff (when present) → the commit-based
-        # initial→final diff (recovers a COMMITTED fix; the P1 fix) → a plain
-        # `git diff HEAD` as a last resort. AutoDev commits its fixes, so the
-        # commit-based diff is the load-bearing path; `git diff HEAD` alone
-        # would false-FAIL every committed fix.
-        ledger_diff = extract_diff_from_ledger(
-            agent_repo / ".autodev" / "plan-ledger.jsonl"
+        profile = SolveProfile(
+            config_patch=_bench_config_patch(),
+            timeout=autodev_timeout_seconds,
         )
-        commit_diff = diff_since_commit(agent_repo, initial_commit)
-        agent_diff = ledger_diff or commit_diff or _git_diff_head(agent_repo)
+        outcome = solve(agent_repo, spec_text, profile, _as_solve_invoker(invoker))
 
-        # Step 4: ground truth + diff size delta (best-effort metric).
+        invocations = outcome.invocations
+        cumulative_wall = outcome.wall_time_s
+        autodev_calls = outcome.calls
+        autodev_failed_reason = outcome.failed_reason
+        autodev_fail_stdout = outcome.fail_stdout_tail
+        autodev_fail_stderr = outcome.fail_stderr_tail
+        agent_diff = outcome.diff
+
+        # Step 3: ground truth + diff size delta (best-effort metric).
         gt_path = task_dir / "ground_truth.patch"
         gt_size = _diff_size(gt_path.read_text(encoding="utf-8")) if gt_path.is_file() else 0
         agent_size = _diff_size(agent_diff)
@@ -404,7 +334,7 @@ def run_task(
         if autodev_fail_stderr:
             secondary["autodev_fail_stderr_tail"] = autodev_fail_stderr
 
-        # Step 5: score in a fresh copy (so we don't conflate agent's
+        # Step 4: score in a fresh copy (so we don't conflate agent's
         # uncommitted changes with our patch application).
         score_dir = tmp_root / "score"
         score_dir.mkdir(parents=True, exist_ok=True)

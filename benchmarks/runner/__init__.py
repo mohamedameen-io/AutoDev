@@ -7,6 +7,11 @@ from .scorer import (
     score_benchmark_results,
     score_task_with_patch,
 )
+from .solve import (
+    SolveOutcome,
+    SolveProfile,
+    solve,
+)
 from .task_runner import (
     DEFAULT_TIMEOUT_SECONDS,
     TaskResult,
@@ -20,6 +25,9 @@ __all__ = [
     "extract_diff_from_ledger",
     "score_benchmark_results",
     "score_task_with_patch",
+    "solve",
+    "SolveProfile",
+    "SolveOutcome",
     "discover_tasks",
     "run_task",
     "TaskResult",
