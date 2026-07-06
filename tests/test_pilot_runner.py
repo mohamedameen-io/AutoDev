@@ -250,6 +250,71 @@ def test_select_candidates_prefers_pure_python_when_truncating(tmp_path: Path):
     assert "numpy__numpy-1" not in ids
 
 
+def test_heavy_lite_repos_classified_heavy_even_without_depname_in_slug():
+    """Regression for the Phase-1 smoke (all 3 picks were astropy, all blind):
+    numpy/C-extension Lite repos whose SLUG doesn't contain a dep-name hint
+    (astropy, seaborn, xarray) must still be heavy; pure-python Lite repos must
+    stay in the friendly tier."""
+    from benchmarks.runner.pilot import HEAVY_DEP_REPO_HINTS, _is_heavy_repo
+
+    for repo in (
+        "astropy/astropy",
+        "mwaskom/seaborn",
+        "pydata/xarray",
+        "matplotlib/matplotlib",
+        "scikit-learn/scikit-learn",
+    ):
+        assert _is_heavy_repo({"repo": repo}, HEAVY_DEP_REPO_HINTS) is True, repo
+    for repo in (
+        "pallets/flask",
+        "psf/requests",
+        "django/django",
+        "sympy/sympy",
+        "pytest-dev/pytest",
+        "sphinx-doc/sphinx",
+        "pylint-dev/pylint",
+    ):
+        assert _is_heavy_repo({"repo": repo}, HEAVY_DEP_REPO_HINTS) is False, repo
+
+
+def test_select_candidates_deprioritizes_astropy_below_pure_python():
+    """astropy sorts first alphabetically and was previously mis-classified light,
+    so a tight count picked it; now a pure-python repo outranks it."""
+    from benchmarks.runner.pilot import select_candidate_instances
+
+    instances = [
+        {"instance_id": "astropy__astropy-1", "repo": "astropy/astropy"},
+        {"instance_id": "astropy__astropy-2", "repo": "astropy/astropy"},
+        {"instance_id": "pallets__flask-1", "repo": "pallets/flask"},
+    ]
+    ids = [s["instance_id"] for s in select_candidate_instances(instances, count=1)]
+    assert ids == ["pallets__flask-1"]
+
+
+def test_select_candidates_round_robin_spreads_across_repos():
+    """A tight count samples multiple friendly repos instead of exhausting the
+    first (largest) one; heavy repos are still dropped first."""
+    from benchmarks.runner.pilot import select_candidate_instances
+
+    instances = (
+        [
+            {"instance_id": f"django__django-{i}", "repo": "django/django"}
+            for i in range(5)
+        ]
+        + [
+            {"instance_id": f"pallets__flask-{i}", "repo": "pallets/flask"}
+            for i in range(5)
+        ]
+        + [{"instance_id": "astropy__astropy-1", "repo": "astropy/astropy"}]
+    )
+    selected = select_candidate_instances(instances, count=4)
+    repos = [s["repo"] for s in selected]
+    assert "astropy/astropy" not in repos  # heavy dropped first
+    assert repos.count("django/django") == 2  # spread, not 4-of-django
+    assert repos.count("pallets/flask") == 2
+    assert repos[0] != repos[1]  # interleaved, not clustered
+
+
 # ---------------------------------------------------------------------------
 # 4. a mocked healthy full run → report w/ per-instance status+wall-time + baseline
 # ---------------------------------------------------------------------------

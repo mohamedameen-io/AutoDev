@@ -109,13 +109,69 @@ HEAVY_DEP_REPO_HINTS: frozenset[str] = frozenset(
     }
 )
 
+# Exact SWE-bench-Lite repo slugs whose native / transitive (numpy, C-extension,
+# freetype/openmp) build chains empirically fail a per-instance arm64 venv build,
+# so their instances only ever solve *blind*. HEAVY_DEP_REPO_HINTS above only
+# catches repos whose slug literally contains the dep name (matplotlib,
+# scikit-learn); these slugs catch the rest — astropy proved this in the Phase-1
+# smoke (all 3 picks were astropy, all blind), seaborn pulls matplotlib+scipy,
+# xarray pulls numpy+pandas. Injectable like the hints. django/sympy/flask/
+# requests/pylint/pytest/sphinx are pure-python and stay in the friendly tier.
+HEAVY_LITE_REPOS: frozenset[str] = frozenset(
+    {
+        "astropy/astropy",
+        "matplotlib/matplotlib",
+        "mwaskom/seaborn",
+        "scikit-learn/scikit-learn",
+        "pydata/xarray",
+    }
+)
 
-def _is_heavy_repo(instance: Instance, heavy_hints: frozenset[str]) -> bool:
-    """True iff the instance's ``repo`` matches a known heavy native-build hint."""
+
+def _is_heavy_repo(
+    instance: Instance,
+    heavy_hints: frozenset[str],
+    heavy_repos: frozenset[str] = HEAVY_LITE_REPOS,
+) -> bool:
+    """True iff the instance's ``repo`` is a known heavy native-build repo.
+
+    Two signals: an exact ``heavy_repos`` slug match (the reliable one for the
+    fixed SWE-bench-Lite repo set), OR a ``heavy_hints`` dependency-name substring
+    match (a coarse fallback for arbitrary datasets).
+    """
     repo = str(instance.get("repo", "")).lower()
     if not repo:
         return False
+    if repo in heavy_repos:
+        return True
     return any(hint in repo for hint in heavy_hints)
+
+
+def _round_robin_by_repo(instances: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Interleave instances across their ``repo`` (repo insertion order preserved)
+    so a tight ``count`` spreads the slice across repos instead of exhausting the
+    first (alphabetically-earliest, often largest) repo — a more representative
+    benchmark slice and a broader arm64-buildability signal."""
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for inst in instances:
+        repo = str(inst.get("repo", "")).lower()
+        if repo not in buckets:
+            buckets[repo] = []
+            order.append(repo)
+        buckets[repo].append(inst)
+    out: list[dict[str, Any]] = []
+    depth = 0
+    remaining = True
+    while remaining:
+        remaining = False
+        for repo in order:
+            bucket = buckets[repo]
+            if depth < len(bucket):
+                out.append(bucket[depth])
+                remaining = True
+        depth += 1
+    return out
 
 
 def select_candidate_instances(
@@ -123,6 +179,7 @@ def select_candidate_instances(
     *,
     count: int = DEFAULT_CANDIDATE_COUNT,
     heavy_hints: frozenset[str] = HEAVY_DEP_REPO_HINTS,
+    heavy_repos: frozenset[str] = HEAVY_LITE_REPOS,
 ) -> list[dict[str, Any]]:
     """Pick up to ``count`` arm64-friendly candidate instances.
 
@@ -130,12 +187,15 @@ def select_candidate_instances(
 
     1. **De-duplicate** by ``instance_id`` (first occurrence wins); drop records
        with an empty ``instance_id`` (they cannot be scored).
-    2. **Prefer pure-python repos**: stable-sort so instances on repos WITHOUT a
-       :data:`HEAVY_DEP_REPO_HINTS` match come first (original order preserved
-       within each group), so a tight ``count`` drops the heavy native-build repos
-       first — they are the ones most likely to fail an arm64 venv build and only
-       ever solve blind.
-    3. **Truncate** to ``count``.
+    2. **Prefer pure-python repos**: partition into a friendly tier and a heavy
+       native-build tier (see :func:`_is_heavy_repo` — exact :data:`HEAVY_LITE_REPOS`
+       slug match OR :data:`HEAVY_DEP_REPO_HINTS` dep-name substring). The friendly
+       tier comes first, so a tight ``count`` drops the heavy repos (most likely to
+       fail an arm64 venv build and only ever solve blind) first.
+    3. **Spread across repos**: round-robin within each tier so a tight ``count``
+       samples many repos instead of exhausting the first (often largest) one — a
+       more representative slice and a broader arm64-buildability signal.
+    4. **Truncate** to ``count``.
 
     Returns plain dicts (a shallow copy of each selected instance) so downstream
     mutation never aliases the caller's dataset. Never hits the network — the
@@ -151,11 +211,15 @@ def select_candidate_instances(
         seen.add(iid)
         deduped.append(dict(inst))
 
-    # Stable sort → pure-python (non-heavy) first, original order within a group.
-    deduped.sort(key=lambda inst: _is_heavy_repo(inst, heavy_hints))
+    # Partition by arm64-friendliness (pure-python first), then round-robin within
+    # each tier so a tight count both drops heavy native-build repos first AND
+    # spreads across repos rather than exhausting one big repo.
+    light = [i for i in deduped if not _is_heavy_repo(i, heavy_hints, heavy_repos)]
+    heavy = [i for i in deduped if _is_heavy_repo(i, heavy_hints, heavy_repos)]
+    ordered = _round_robin_by_repo(light) + _round_robin_by_repo(heavy)
     if count >= 0:
-        return deduped[:count]
-    return deduped
+        return ordered[:count]
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +658,7 @@ __all__ = [
     "DEFAULT_CANDIDATE_COUNT",
     "GO_NOGO_MIN_CLEAN",
     "HEAVY_DEP_REPO_HINTS",
+    "HEAVY_LITE_REPOS",
     "PilotInstanceOutcome",
     "PilotReport",
     "main",
