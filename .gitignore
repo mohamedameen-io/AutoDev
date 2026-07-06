@@ -66,6 +66,12 @@ Thumbs.db
 .cache/
 *.log
 
+# Phase-1 benchmark pilot output — transient per-run reports/workdirs; the
+# operator commits only the baseline JSON + locked slice (see
+# benchmarks/RUNBOOK-phase1-pilot.md), never the raw run output. Root-anchored so
+# it never matches the tracked benchmarks/results/.gitkeep.
+/results/
+
 # AI agent files
 .cursor/
 .claude/
