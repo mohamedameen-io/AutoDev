@@ -266,6 +266,15 @@ async def test_speculative_dispatcher_starts_child_during_parent_inflight(
     cfg.speculative_execution_enabled = True
 
     class FakeGuard:
+        def start_execute_phase(self, *a, **k):
+            return None
+
+        def execute_phase_wall_budget_exceeded(self, *a, **k):
+            return False
+
+        def check_execute_phase_wall_budget(self, *a, **k):
+            return None
+
         def start_task(self, t: str) -> None:
             pass
 

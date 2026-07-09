@@ -836,6 +836,65 @@ class GuardrailsConfig(BaseModel):
     # ``max_duration_s_per_task`` subprocess wall) so the plan phase fails
     # LOUD with a reason BEFORE being killed.
     plan_phase_wall_budget_s: float | None = None
+    # Task 1 (wall-budget fix, sibling of F-7): cumulative WALL-CLOCK budget
+    # (seconds) for the impl-tournament pass loop. ``run_impl_tournament``
+    # (see ``orchestrator.impl_tournament_runner``) calls
+    # ``orch.adapter.execute()`` DIRECTLY via ``_CoderRunner`` for the
+    # developer / test_engineer round-trips, bypassing ``delegate()``
+    # entirely — so ``GuardrailEnforcer.pre_invocation``/``post_invocation``
+    # (and therefore ``max_duration_s_per_task``) never see these calls
+    # either. A slow OR wedged impl tournament therefore has no cumulative
+    # fail-loud bound of its own; it runs to ``max_rounds`` (default 3, each
+    # pass ~10 serialized agent calls) or until an EXTERNAL SIGKILL,
+    # surfacing as an opaque "timed out after Ns" with no autodev-emitted
+    # reason — the same failure shape F-7 fixed for the plan tournament.
+    # When set (> 0), the SAME engine ``plan_phase_wall_budget_s`` uses
+    # (``tournament.core.Tournament.run``) checks cumulative elapsed
+    # BETWEEN passes (cheap; never mid-call) and, on breach, STOPS LOUD
+    # with the best on-disk incumbent while emitting the greppable,
+    # attributable ``impl_phase_wall_budget_exceeded`` ledger op. ``None``
+    # (default) = OFF = byte-identical legacy behavior (no deadline). Note
+    # this bounds a SINGLE impl tournament's own pass loop only — it does
+    # NOT bound an entire ``autodev execute`` invocation across many
+    # tasks/tournaments (a separate, larger fix, ``execute_phase_wall_budget_s``,
+    # addresses that DAG-wide ceiling).
+    impl_phase_wall_budget_s: float | None = None
+    # Task 2 (wall-budget fix, DAG-wide sibling of the two above): cumulative
+    # WALL-CLOCK budget (seconds) spanning the ENTIRE execute-phase DAG within
+    # ONE ``autodev execute`` / ``autodev resume`` invocation — across however
+    # many tasks, retries, and tournaments run serially before the command
+    # returns. This is genuinely SEPARATE from both:
+    #   * ``max_duration_s_per_task`` bounds ONE task's agent round-trips via
+    #     ``delegate()``'s ``GuardrailEnforcer.pre/post_invocation`` hooks —
+    #     but the impl tournament calls ``orch.adapter.execute()`` DIRECTLY,
+    #     bypassing ``delegate()`` entirely, so ``max_duration_s_per_task``
+    #     structurally cannot see impl-tournament time; and it only ever
+    #     bounds a single task, never the SUM.
+    #   * ``impl_phase_wall_budget_s`` bounds ONE impl tournament's own pass
+    #     loop only.
+    # Nothing bounds the CUMULATIVE time across the many tasks/retries/
+    # tournaments a single ``execute`` DAG runs serially — the exact shape of
+    # the SWE-bench-Lite pilot that timed out at an opaque external 1800s
+    # SIGKILL (4 impl tournaments across 4 tasks, serial under
+    # ``max_parallel_subprocesses=1``). Tune this against an EXTERNAL
+    # per-command timeout (a CI kill-after, a benchmark harness's subprocess
+    # timeout) — NOT against ``max_duration_s_per_task``; the two numbers are
+    # independently meaningful (one is per-task, this is whole-command). The
+    # enforcer (``GuardrailEnforcer.start_execute_phase`` /
+    # ``execute_phase_wall_budget_exceeded`` / ``check_execute_phase_wall_budget``)
+    # checks cumulative elapsed CHEAPLY between tasks/retries/rounds (never
+    # mid-call). On breach it raises
+    # ``errors.ExecutePhaseWallBudgetExceededError`` and emits the greppable,
+    # attributable ``execute_phase_wall_budget_exceeded`` ledger op. The task
+    # in flight at breach time is left EXACTLY as-is (NOT stamped blocked /
+    # quarantined) — the existing orphan-reap sweep
+    # (``PlanManager.reap_orphans()``, which already runs at the top of every
+    # ``run_execute_phase()`` call) reverts it to ``pending`` so a normal
+    # ``autodev resume`` picks it back up; no new salvage machinery required.
+    # ``None`` (default) = OFF = byte-identical legacy behavior (no deadline).
+    # Set this BELOW an external / benchmark per-command timeout so the whole
+    # execute phase fails LOUD with a reason BEFORE being killed.
+    execute_phase_wall_budget_s: float | None = None
 
 
 class PRMConfig(BaseModel):

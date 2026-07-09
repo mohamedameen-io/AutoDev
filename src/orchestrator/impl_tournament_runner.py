@@ -55,6 +55,15 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# Task 1 (wall-budget fix): single source of truth for the impl-phase
+# wall-budget marker, referenced at both the producer site (the
+# ``TournamentConfig(wall_budget_marker=...)`` override passed into the
+# engine) and the consumer sites (the ``except`` guard string-match, plus
+# the ledger op name). A drift between producer and consumer here would
+# silently reintroduce the exact bug this fix closed (the engine emitting
+# a marker the guard never matches) — one constant makes that impossible.
+_IMPL_WALL_BUDGET_MARKER = "impl_phase_wall_budget_exceeded"
+
 
 # Tournament roles are called in this order each pass; the judge model is the
 # most consequential because it drives the Borda aggregation.
@@ -460,6 +469,15 @@ async def run_impl_tournament(
         len(judge_roles_resolved) if judge_roles_resolved else cfg.num_judges
     )
 
+    # Task 1 (wall-budget fix, sibling of F-7): thread the optional impl-phase
+    # wall-clock budget into the tournament loop. ``None`` (default) → OFF →
+    # byte-identical legacy behavior (no cumulative deadline). When set below
+    # an external/benchmark per-command timeout, the loop fails LOUD
+    # (emitting ``impl_phase_wall_budget_exceeded``) BEFORE being SIGKILLed.
+    impl_phase_wall_budget_s = getattr(
+        orch.cfg.guardrails, "impl_phase_wall_budget_s", None
+    )
+
     tcfg = TournamentConfig(
         num_judges=effective_num_judges,
         convergence_k=cfg.convergence_k,
@@ -484,6 +502,15 @@ async def run_impl_tournament(
         oversized_demotion_token_threshold=getattr(
             cfg, "oversized_demotion_token_threshold", 0
         ),
+        wall_budget_s=impl_phase_wall_budget_s,
+        # Code-review finding: the shared engine's raise site is hardcoded to
+        # the plan-phase marker by default (``TournamentConfig.wall_budget_marker``
+        # defaults to ``"plan_phase_wall_budget_exceeded"``) — without this
+        # override an impl-tournament breach would raise carrying the WRONG
+        # (plan-phase) marker, and the guard below would never match in
+        # production. Override to the impl-specific marker so the engine
+        # emits the correctly-attributed string for this call site.
+        wall_budget_marker=_IMPL_WALL_BUDGET_MARKER,
     )
 
     # v0.40.0 (huge-repo Gap 3): build the tournament WorktreeManager
@@ -606,6 +633,23 @@ async def run_impl_tournament(
             task_prompt=task.description,
             initial=initial_bundle,
         )
+    except TournamentError as exc:
+        # Task 1 (wall-budget fix, sibling of F-7): the cumulative wall-clock
+        # ceiling tripped inside the loop. Emit the LOUD, attributable
+        # ``impl_phase_wall_budget_exceeded`` ledger op (the greppable reason
+        # that replaces an opaque external timeout), then re-raise so the
+        # caller's existing recovery path handles it. Other ``TournamentError``
+        # shapes (survivor floor, etc.) propagate unchanged — we only
+        # annotate the wall-budget breach.
+        if _IMPL_WALL_BUDGET_MARKER in str(exc):
+            await _emit_impl_wall_budget_exceeded(
+                orch,
+                tournament_id=tournament_id,
+                task_id=task.id,
+                budget_s=impl_phase_wall_budget_s,
+                reason=str(exc),
+            )
+        raise
     finally:
         await wt_mgr.cleanup_all()
 
@@ -652,6 +696,51 @@ async def run_impl_tournament(
     )
 
     return final_bundle
+
+
+async def _emit_impl_wall_budget_exceeded(
+    orch: "Orchestrator",
+    *,
+    tournament_id: str,
+    task_id: str,
+    budget_s: float | None,
+    reason: str,
+) -> None:
+    """Task 1 (wall-budget fix) fail-loud signal: the impl-tournament
+    wall-clock ceiling tripped.
+
+    Mirrors :func:`plan_tournament_runner._emit_wall_budget_exceeded`. Emits
+    a LOUD, attributable ``impl_phase_wall_budget_exceeded`` ledger op — the
+    distinct, greppable reason in place of an opaque "timed out after Ns"
+    external SIGKILL. The caller re-raises the ``TournamentError`` afterwards
+    so its existing recovery path (retry / escalate / fall back to the
+    pre-tournament bundle) takes over; this breadcrumb does NOT itself
+    mutate plan state.
+
+    Best-effort: a breadcrumb failure must never mask the (re-raised) error.
+    """
+    logger.warning(
+        "impl_tournament.wall_budget_exceeded",
+        tournament_id=tournament_id,
+        task_id=task_id,
+        budget_s=budget_s,
+    )
+    try:
+        await orch.plan_manager.ledger_append(
+            op=_IMPL_WALL_BUDGET_MARKER,
+            payload={
+                "tournament_id": tournament_id,
+                "task_id": task_id,
+                "budget_s": budget_s,
+                "reason": reason,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - breadcrumb best-effort; never mask
+        logger.warning(
+            "impl_tournament.ledger_append_failed",
+            op=_IMPL_WALL_BUDGET_MARKER,
+            err=str(exc),
+        )
 
 
 async def run_multi_branch_impl_tournament(

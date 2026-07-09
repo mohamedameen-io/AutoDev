@@ -153,6 +153,15 @@ async def test_delegate_threads_cwd_override(tmp_path: Path) -> None:
             )
 
     class FakeGuardrails:
+        def start_execute_phase(self, *a, **k):
+            return None
+
+        def execute_phase_wall_budget_exceeded(self, *a, **k):
+            return False
+
+        def check_execute_phase_wall_budget(self, *a, **k):
+            return None
+
         def pre_invocation(self, *_a, **_k):
             pass
 
@@ -239,6 +248,15 @@ async def test_delegate_default_cwd_is_orch_cwd(tmp_path: Path) -> None:
             )
 
     class FakeGuardrails:
+        def start_execute_phase(self, *a, **k):
+            return None
+
+        def execute_phase_wall_budget_exceeded(self, *a, **k):
+            return False
+
+        def check_execute_phase_wall_budget(self, *a, **k):
+            return None
+
         def pre_invocation(self, *_a, **_k):
             pass
 

@@ -20,7 +20,7 @@ from autologging import get_logger
 from cli._blocked_banner import _maybe_print_blocked_banner
 from cli.commands.resume import _print_preflight_failure
 from config.loader import load_config
-from errors import AutodevError, PhaseStuckError
+from errors import AutodevError, ExecutePhaseWallBudgetExceededError, PhaseStuckError
 from orchestrator import Orchestrator
 from state.paths import config_path, index_db_path
 from state.plan_manager import PlanManager
@@ -211,6 +211,20 @@ def execute(
         # something but stalled" from "the adapter or plan was broken."
         console.print(
             f"[yellow]autodev execute interrupted[/yellow]: {exc}"
+        )
+        sys.exit(1)
+    except ExecutePhaseWallBudgetExceededError as exc:
+        # Task 2: the cumulative execute-phase wall-clock budget tripped —
+        # the run was INTERRUPTED (not broken). Exit 1 (matching
+        # PhaseStuckError's "interrupted, please resume" contract), NOT 2
+        # (genuine failure): the in-flight task is left non-terminal and the
+        # orphan-reap sweep reverts it to pending, so `autodev resume`
+        # continues cleanly. MUST precede the generic ``AutodevError`` handler
+        # below (this is a subclass of it).
+        console.print(
+            f"[yellow]autodev execute stopped[/yellow]: wall-clock budget "
+            f"exceeded after {exc.elapsed_s:.0f}s — run "
+            f"[bold]autodev resume[/bold] to continue."
         )
         sys.exit(1)
     except AutodevError as exc:

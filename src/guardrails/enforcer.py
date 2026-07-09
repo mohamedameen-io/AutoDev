@@ -32,11 +32,11 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from adapters.types import AgentInvocation, AgentResult
 from config.schema import GuardrailsConfig
-from errors import GuardrailExceededError
+from errors import ExecutePhaseWallBudgetExceededError, GuardrailExceededError
 from autologging import get_logger
 
 
@@ -106,6 +106,17 @@ class GuardrailEnforcer:
         self.cfg = cfg
         self._metrics: dict[str, TaskMetrics] = {}
         self.plan_cost_usd: float = 0.0
+
+        # Task 2: cross-call cumulative wall-clock state for the WHOLE
+        # execute-phase DAG (bounds one ``run_execute_phase`` invocation
+        # across every task/retry/tournament). Lives on the instance — like
+        # ``plan_cost_usd`` — so it survives the per-task ``start_task`` /
+        # ``end_task`` churn. ``_execute_phase_start_time`` is None until
+        # ``start_execute_phase`` arms it (so an un-armed enforcer never
+        # reports a breach); ``_execute_phase_clock`` defaults to
+        # ``time.monotonic`` and is swapped for a fake clock in tests.
+        self._execute_phase_start_time: float | None = None
+        self._execute_phase_clock: Callable[[], float] = time.monotonic
 
         # v0.38.0 I1: resolve huge-repo-scaled caps ONCE at construction.
         # Uses the sync resolver — enforcer init is on the sync path
@@ -187,6 +198,68 @@ class GuardrailEnforcer:
     def end_task(self, task_id: str) -> None:
         """Drop tracking for ``task_id``. Safe to call even if never started."""
         self._metrics.pop(task_id, None)
+
+    # --- execute-phase cumulative wall-clock budget ------------------------
+    #
+    # Task 2: distinct from the per-task metrics above. This bounds the
+    # CUMULATIVE wall-clock time of a whole ``run_execute_phase()``
+    # invocation (across every task, retry, and tournament that runs
+    # serially before the command returns), keyed off
+    # ``cfg.execute_phase_wall_budget_s``. Checked cheaply BETWEEN units of
+    # work — never mid-call.
+
+    def start_execute_phase(
+        self, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        """Record the wall-clock start of a ``run_execute_phase()`` invocation.
+
+        Idempotent — records a fresh start on each call (mirrors
+        :meth:`start_task`'s "resets on re-entry" semantics), so it is safe
+        to call once at the top of every ``run_execute_phase``: each
+        invocation gets its own budget window. Cheap even when
+        ``cfg.execute_phase_wall_budget_s`` is unset (just stores two
+        fields). The ``clock`` seam exists for deterministic tests;
+        production always uses ``time.monotonic``.
+        """
+        self._execute_phase_clock = clock
+        self._execute_phase_start_time = clock()
+
+    def execute_phase_wall_budget_exceeded(self) -> bool:
+        """Non-raising query: has the execute-phase wall budget been breached?
+
+        Returns ``False`` when the budget is unset OR
+        :meth:`start_execute_phase` was never called (an un-armed enforcer
+        never reports a breach). Used by the DAG dispatch loops to GATE new
+        work (stop spawning) WITHOUT raising while sibling in-flight tasks
+        are still legitimately running.
+        """
+        budget = self.cfg.execute_phase_wall_budget_s
+        if budget is None or self._execute_phase_start_time is None:
+            return False
+        elapsed = self._execute_phase_clock() - self._execute_phase_start_time
+        return elapsed > budget
+
+    def check_execute_phase_wall_budget(self) -> None:
+        """Raise :class:`errors.ExecutePhaseWallBudgetExceededError` on breach.
+
+        No-op when the budget is unset, :meth:`start_execute_phase` was never
+        called, or the budget is not yet exceeded. Call at the TOP of any
+        execute-phase loop iteration that is about to do MORE work — never
+        mid-call. Computes elapsed once so the raised ``elapsed_s`` matches
+        the breach decision exactly.
+        """
+        budget = self.cfg.execute_phase_wall_budget_s
+        if budget is None or self._execute_phase_start_time is None:
+            return
+        elapsed = self._execute_phase_clock() - self._execute_phase_start_time
+        if elapsed > budget:
+            raise ExecutePhaseWallBudgetExceededError(
+                f"execute-phase wall-clock budget of {budget}s exceeded "
+                f"after {elapsed:.1f}s; stopping LOUD (the in-flight task "
+                f"reverts to pending on the next `autodev resume`).",
+                budget_s=float(budget),
+                elapsed_s=elapsed,
+            )
 
     # --- hooks -------------------------------------------------------------
 

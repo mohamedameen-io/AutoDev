@@ -198,6 +198,16 @@ class TournamentConfig:
     # plan phase fail LOUD (with an attributable reason) before being killed.
     # Analog of F-2's ``corrective_nonconvergent_ceiling``.
     wall_budget_s: float | None = None
+    # Task 1 (wall-budget fix, sibling of F-7): the marker embedded in the
+    # raised ``TournamentError`` message and consumed as the ledger-op name
+    # by whichever per-phase runner catches it. Defaults to the original
+    # F-7 plan-phase string so ``plan_tournament_runner`` needs ZERO
+    # changes — existing plan-phase behavior (message text, ledger op name)
+    # is byte-for-byte preserved. ``run_impl_tournament`` overrides this to
+    # ``"impl_phase_wall_budget_exceeded"`` so the SAME shared engine loop
+    # emits a distinct, correctly-attributed marker for impl-tournament
+    # breaches instead of the plan-phase string leaking into impl context.
+    wall_budget_marker: str = "plan_phase_wall_budget_exceeded"
     # F-7: injectable monotonic clock for the wall-budget check. Defaults to
     # ``time.monotonic`` in production; tests inject a fake clock that
     # advances deterministically so the ceiling can be exercised without
@@ -949,6 +959,13 @@ class Tournament(Generic[T]):
         wall_budget_s = getattr(self.cfg, "wall_budget_s", None)
         clock: Callable[[], float] = getattr(self.cfg, "clock", time.monotonic)
         wall_start = clock()
+        # Task 1 (wall-budget fix): the marker embedded in the breach message
+        # below. Defaults to the original F-7 plan-phase string via getattr
+        # so a legacy/duck-typed cfg missing the field still gets the exact
+        # pre-existing message — byte-identical plan-phase behavior.
+        wall_budget_marker = getattr(
+            self.cfg, "wall_budget_marker", "plan_phase_wall_budget_exceeded"
+        )
 
         # If we resumed with an A-win streak already meeting convergence,
         # short-circuit before the loop body. (Equivalent to the "already
@@ -990,7 +1007,7 @@ class Tournament(Generic[T]):
                         self.handler.render_as_markdown(incumbent), history
                     )
                     raise TournamentError(
-                        "plan_phase_wall_budget_exceeded: tournament wall-clock "
+                        f"{wall_budget_marker}: tournament wall-clock "
                         f"budget of {wall_budget_s}s exceeded after "
                         f"{round(elapsed, 1)}s ({len(history)} pass(es) "
                         "completed); stopping LOUD with the best on-disk "

@@ -18,7 +18,7 @@ from agents import build_registry
 from autologging import get_logger
 from cli._blocked_banner import _maybe_print_blocked_banner
 from config.loader import load_config
-from errors import AutodevError, PhaseStuckError
+from errors import AutodevError, ExecutePhaseWallBudgetExceededError, PhaseStuckError
 from orchestrator import Orchestrator
 from state.paths import config_path, index_db_path
 
@@ -145,6 +145,18 @@ def resume(platform: str | None) -> None:
         # something but stalled" from "the adapter or plan was broken."
         console.print(
             f"[yellow]autodev resume interrupted[/yellow]: {exc}"
+        )
+        sys.exit(1)
+    except ExecutePhaseWallBudgetExceededError as exc:
+        # Task 2: the cumulative execute-phase wall-clock budget tripped —
+        # INTERRUPTED, not broken. Exit 1 (matching PhaseStuckError's
+        # "interrupted, please resume" contract), NOT 2: the in-flight task is
+        # left non-terminal and reverts to pending on the next resume. MUST
+        # precede the generic ``AutodevError`` handler (this subclasses it).
+        console.print(
+            f"[yellow]autodev resume stopped[/yellow]: wall-clock budget "
+            f"exceeded after {exc.elapsed_s:.0f}s — run "
+            f"[bold]autodev resume[/bold] to continue."
         )
         sys.exit(1)
     except AutodevError as exc:

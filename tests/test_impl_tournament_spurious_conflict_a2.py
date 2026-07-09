@@ -130,6 +130,15 @@ def _make_orch(tmp_path: Path, pm: PlanManager, critic_resolution: str) -> Any:
             return ""
 
     class FakeGuard:
+        def start_execute_phase(self, *a, **k):
+            return None
+
+        def execute_phase_wall_budget_exceeded(self, *a, **k):
+            return False
+
+        def check_execute_phase_wall_budget(self, *a, **k):
+            return None
+
         def start_task(self, tid):
             pass
 

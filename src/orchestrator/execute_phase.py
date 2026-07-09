@@ -32,7 +32,12 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from adapters.git_utils import _git_rev_parse_head, extract_files_from_diff
 from adapters.types import AgentInvocation, AgentResult
-from errors import AutodevError, GuardrailExceededError, TournamentError
+from errors import (
+    AutodevError,
+    ExecutePhaseWallBudgetExceededError,
+    GuardrailExceededError,
+    TournamentError,
+)
 from autologging import get_logger
 from orchestrator import failure_classes as _fcls
 from orchestrator.blocker_guard import block_task
@@ -3037,6 +3042,14 @@ async def run_execute_phase(
     except Exception:  # noqa: BLE001 - best-effort registration; never fatal
         pass
 
+    # Task 2: arm the cumulative execute-phase wall-clock budget for THIS
+    # ``run_execute_phase`` invocation. Idempotent (records a fresh window on
+    # each call) and cheap when ``cfg.guardrails.execute_phase_wall_budget_s``
+    # is unset. Placed before the single-task branch so BOTH the single-task
+    # (``task_id`` set) and whole-plan DAG paths are bounded — the check at
+    # the top of ``_execute_one``'s retry loop reads this window in either.
+    orch.guardrails.start_execute_phase()
+
     if task_id is not None:
         task = await orch.plan_manager.get_task(task_id)
         if task is None:
@@ -3051,6 +3064,31 @@ async def run_execute_phase(
         await _maybe_record_phase_entry(orch, task.phase_id)
         try:
             processed.append(await _execute_one(orch, task))
+            # Task 2 (code-review finding, 2nd round): phase-review runs
+            # its OWN tournament — it must not START once the wall budget
+            # is blown, on this path exactly as on the whole-plan loop's
+            # equivalent checkpoint below. Without this, a budget crossed
+            # during the single task's own retry loop (which only checks
+            # at the TOP of the loop) could still let this task's
+            # phase-review fire unbounded. Placed INSIDE the try (not
+            # after it) so the EXISTING except clause right below routes
+            # it through the same halt + ledger-breadcrumb path as every
+            # other checkpoint — a first attempt placed this check after
+            # the try/except and the exception propagated uncaught,
+            # silently skipping the ledger breadcrumb (caught by code
+            # review, verified by reproduction before/after).
+            orch.guardrails.check_execute_phase_wall_budget()
+        except ExecutePhaseWallBudgetExceededError as exc:
+            # Task 2: the cumulative execute-phase wall-clock budget tripped
+            # inside this single task's retry loop (or, per above, right
+            # after it completed but before phase-review could start).
+            # Emit the LOUD, attributable breadcrumb, then re-raise. Do NOT
+            # quarantine/block the task (the auth/infra handler below does
+            # that) — the budget contract leaves the in-flight (or just-
+            # completed) task EXACTLY as-is so the orphan-reap sweep on the
+            # next resume reverts any non-terminal status to pending.
+            await _halt_for_execute_phase_wall_budget(orch, exc, processed)
+            raise
         except (AuthenticationFailedError, InfrastructureCircuitOpenError) as exc:
             # v0.29.0 Bug 7 / v0.30.0 Bug 5: typed halt on auth failure
             # OR a tripped cross-task infrastructure circuit breaker.
@@ -3364,6 +3402,9 @@ async def run_execute_phase(
             processed.extend(cross_processed)
         else:
             for phase in plan.phases:
+                # Task 2: do not START a new phase once the cumulative
+                # execute-phase wall budget is blown (never mid-call).
+                orch.guardrails.check_execute_phase_wall_budget()
                 await _maybe_record_phase_entry(orch, phase.id)
                 # Run the worker pool for this phase, then phase-review.
                 # If phase-review injects corrective tasks (review_status
@@ -3372,10 +3413,19 @@ async def run_execute_phase(
                 # to the next. Cap at a small number of iterations as a
                 # defensive net against pathological architect_b output.
                 for _round in range(3):
+                    # Task 2: do not START a new corrective round once the
+                    # wall budget is blown.
+                    orch.guardrails.check_execute_phase_wall_budget()
                     phase_processed = await _execute_phase_dag(
                         orch, phase.id, worktree_mgr, parallelism
                     )
                     processed.extend(phase_processed)
+                    # Task 2: phase-review runs its OWN tournament — it must
+                    # not START once the wall budget is blown. Check AFTER the
+                    # DAG returns (so a phase that finished its task work
+                    # exactly at the boundary still recorded ``processed``)
+                    # but BEFORE the phase-review call.
+                    orch.guardrails.check_execute_phase_wall_budget()
                     await _maybe_run_phase_review(orch, phase.id)
                     # Did phase-review accept? If so we're done with this
                     # phase. Otherwise (corrective_required) the next loop
@@ -3401,6 +3451,20 @@ async def run_execute_phase(
                     # Any new pending tasks? If not, stop looping.
                     if not any(t.status == "pending" for t in latest_phase.tasks):
                         break
+    except ExecutePhaseWallBudgetExceededError as exc:
+        # Task 2: the cumulative execute-phase wall-clock budget tripped
+        # somewhere in the whole-plan DAG (a task's retry loop, a dispatch
+        # loop's drained-with-pending-work raise, or a between-round /
+        # pre-phase-review check). Emit the LOUD, attributable ledger
+        # breadcrumb, then re-raise so the CLI driver exits with the
+        # "interrupted, resume" contract. The task in flight at breach time
+        # is left EXACTLY as-is (NOT quarantined / blocked) — the orphan-reap
+        # sweep at the top of the next ``run_execute_phase`` reverts it to
+        # ``pending`` so a normal ``autodev resume`` picks it back up. No new
+        # salvage machinery required. Best-effort breadcrumb — never let the
+        # ledger write mask the re-raise.
+        await _halt_for_execute_phase_wall_budget(orch, exc, processed)
+        raise
     except (AuthenticationFailedError, InfrastructureCircuitOpenError) as exc:
         # v0.29.0 Bug 7 / v0.30.0 Bug 5: typed halt during the whole-
         # plan loop. The worker has already stamped its own task as
@@ -3622,6 +3686,69 @@ async def _halt_for_auth_failed(
     print(_halt_console_message(exc))
 
 
+async def _halt_for_execute_phase_wall_budget(
+    orch: "Orchestrator",
+    exc: ExecutePhaseWallBudgetExceededError,
+    processed: list[Task],
+) -> None:
+    """Task 2: emit the LOUD, attributable breadcrumb for a cumulative
+    execute-phase wall-clock budget breach, then return so the caller
+    re-raises.
+
+    Mirrors the best-effort + structured-log shape of
+    :func:`_halt_for_auth_failed`, but DELIBERATELY does NOT quarantine the
+    task or pause the phase: the budget contract leaves the in-flight task
+    EXACTLY as-is (in whatever non-terminal status ``_execute_one`` had it)
+    so the orphan-reap sweep at the top of the next ``run_execute_phase``
+    reverts it to ``pending`` and a normal ``autodev resume`` picks it back
+    up. Emits the greppable ``execute_phase_wall_budget_exceeded`` ledger op
+    carrying ``{budget_s, elapsed_s, tasks_processed, task_ids_processed,
+    reason}``. The ledger write is best-effort — a failure here MUST NOT mask
+    the re-raise on the way back up to the CLI driver.
+
+    Code-review note: ``tasks_processed``/``task_ids_processed`` reflect only
+    phases that had already fully RETURNED from ``_execute_phase_dag`` into
+    the caller's accumulator at breach time — a breach raised *inside* a
+    still-in-progress phase's DAG dispatch loop is not yet folded in, so this
+    can under-count (read as 0) for a single-phase breach. ``budget_s``/
+    ``elapsed_s``/``reason`` are always accurate; per-task ground truth is
+    always recoverable from the ledger's own ``coded``/``task_complete`` ops
+    regardless of this count.
+    """
+    task_ids_processed = [t.id for t in processed]
+    try:
+        await orch.plan_manager.ledger_append(
+            op="execute_phase_wall_budget_exceeded",
+            payload={
+                "budget_s": exc.budget_s,
+                "elapsed_s": exc.elapsed_s,
+                "tasks_processed": len(processed),
+                "task_ids_processed": task_ids_processed,
+                "reason": str(exc),
+            },
+        )
+    except Exception as exc2:  # noqa: BLE001 — never mask the re-raise
+        logger.warning(
+            "execute_phase.execute_phase_wall_budget_breadcrumb_failed",
+            err=str(exc2),
+        )
+    logger.error(
+        "execute_phase.execute_phase_wall_budget_exceeded",
+        budget_s=exc.budget_s,
+        elapsed_s=exc.elapsed_s,
+        tasks_processed=len(processed),
+    )
+    # Operator-facing message — distinct from the structured log so
+    # ``autodev execute`` / ``resume`` users see one clear line on the
+    # console describing the halt and the recovery path.
+    print(
+        f"\nautodev execute: aborting on execute-phase wall-clock budget "
+        f"({exc.budget_s}s) exceeded after {exc.elapsed_s:.0f}s.\n"
+        f"  {len(processed)} task(s) processed; the in-flight task is left "
+        f"as-is and reverts to pending on the next `autodev resume`.\n"
+    )
+
+
 def _resolve_execute_parallelism(orch: "Orchestrator") -> int:
     """Resolve the per-task worker pool cap via runtime.resource_probe.
 
@@ -3701,12 +3828,19 @@ async def _execute_phase_dag(
     processed: list[Task] = []
 
     while True:
+        # Task 2: non-raising query, computed ONCE per loop iteration. Used to
+        # gate NEW-worker spawning below WITHOUT interrupting legitimately
+        # in-flight sibling tasks.
+        budget_exceeded = orch.guardrails.execute_phase_wall_budget_exceeded()
+
         # Termination: phase is fully terminal AND no workers running.
         if not in_flight and await _all_phase_tasks_terminal_async(orch, phase_id):
             return processed
 
-        # Try to spawn new workers up to the cap.
-        if len(in_flight) < parallelism:
+        # Try to spawn new workers up to the cap — but NOT once the cumulative
+        # execute-phase wall budget is blown (Task 2): let in-flight work
+        # finish, start nothing new.
+        if not budget_exceeded and len(in_flight) < parallelism:
             slots = parallelism - len(in_flight)
             excluded = await orch.plan_manager.in_flight_files()
             tasks_to_run = await orch.plan_manager.next_pending_tasks(
@@ -3766,6 +3900,16 @@ async def _execute_phase_dag(
 
                     raise PhaseStuckError(phase_id, stuck_task_ids)
                 return processed
+            # Task 2: in_flight is empty (all workers drained) AND real
+            # pending work remains (we gated off spawning above because the
+            # wall budget is blown). Rather than sleep-spin forever on work we
+            # will never dispatch, raise the breach now. Reached ONLY when
+            # ``budget_exceeded`` is True — the all-terminal and no-pending
+            # clean-return branches above run FIRST, so a phase that finished
+            # exactly at the budget boundary returns cleanly instead of
+            # raising spuriously.
+            if budget_exceeded:
+                orch.guardrails.check_execute_phase_wall_budget()
             await asyncio.sleep(0.05)
             continue
 
@@ -3785,12 +3929,27 @@ async def _execute_phase_dag(
             try:
                 completed_task = d.result()
                 processed.append(completed_task)
-            except (AuthenticationFailedError, InfrastructureCircuitOpenError):
+            except (
+                AuthenticationFailedError,
+                InfrastructureCircuitOpenError,
+                ExecutePhaseWallBudgetExceededError,
+            ):
                 # v0.29.0 Bug 7 / v0.30.0 Bug 5: drain remaining in-
                 # flight workers so we don't leave orphan asyncio tasks
                 # dangling, then re-raise so ``run_execute_phase`` can
                 # log the structured halt event and abort the phase
-                # loop. The worker itself has already stamped the
+                # loop.
+                #
+                # Task 2: ExecutePhaseWallBudgetExceededError is drained the
+                # SAME way. This drain block only cancels sibling asyncio
+                # tasks + clears the (observability-only) in-flight markers and
+                # re-raises — it NEVER mutates task STATUS, so it is safe for
+                # the budget trigger (whose contract requires leaving the task
+                # as-is). Verified: the auth/infra QUARANTINE stamp happens in
+                # ``_execute_one_worker`` (which for the budget trigger uses
+                # its own no-stamp re-raise clause), NOT here.
+                #
+                # The auth/infra worker itself has already stamped the
                 # offending task as ``quarantined`` with
                 # ``blocked_reason="auth_failed: ..."`` (or
                 # ``infra_circuit_open:`` for Bug 5) retained for
@@ -3972,6 +4131,11 @@ async def _execute_cross_phase_dag(
         return True
 
     while True:
+        # Task 2: non-raising query, computed ONCE per iteration (mirrors
+        # ``_execute_phase_dag``). Gates NEW-worker spawning below without
+        # interrupting legitimately in-flight sibling tasks.
+        budget_exceeded = orch.guardrails.execute_phase_wall_budget_exceeded()
+
         if not in_flight and await _all_terminal_across_plan():
             # Fire phase-reviews for every phase that's now terminal.
             plan = await orch.plan_manager.load()
@@ -3982,8 +4146,10 @@ async def _execute_cross_phase_dag(
 
         # Spawn workers up to parallelism cap. The dispatcher honors
         # the existing file-overlap and depends-on guards, but does NOT
-        # restrict by phase_id (the cross-phase contract).
-        if len(in_flight) < parallelism:
+        # restrict by phase_id (the cross-phase contract). Task 2: gated on
+        # ``not budget_exceeded`` so no NEW work starts once the wall budget
+        # is blown.
+        if not budget_exceeded and len(in_flight) < parallelism:
             slots = parallelism - len(in_flight)
             excluded = await orch.plan_manager.in_flight_files()
             tasks_to_run = await orch.plan_manager.next_pending_tasks(
@@ -4042,6 +4208,13 @@ async def _execute_cross_phase_dag(
             # on a different worker; brief sleep then re-poll.
             if await _all_terminal_across_plan():
                 continue
+            # Task 2: budget blown + real work remains (we gated off spawning
+            # above and nothing is in flight) → raise rather than sleep-spin
+            # forever. Reached only when ``budget_exceeded`` is True; the
+            # all-terminal branch above loops back to the clean return first,
+            # so a plan finishing exactly at the boundary is not affected.
+            if budget_exceeded:
+                orch.guardrails.check_execute_phase_wall_budget()
             await asyncio.sleep(0.05)
             continue
 
@@ -4080,12 +4253,26 @@ async def _execute_cross_phase_dag(
                     pass  # caught by the speculative_parents check below
                 if completed_task.status == "blocked":
                     failed_parents.add(finished_id)
-            except (AuthenticationFailedError, InfrastructureCircuitOpenError):
+            except (
+                AuthenticationFailedError,
+                InfrastructureCircuitOpenError,
+                ExecutePhaseWallBudgetExceededError,
+            ):
                 # v0.29.0 Bug 7 / v0.30.0 Bug 5: cross-phase variant of
                 # the typed halt. Cancel and drain remaining workers so
                 # we don't strand asyncio tasks across the cross-phase
                 # pool, then re-raise into ``run_execute_phase`` for
-                # the structured log + abort. The worker has already
+                # the structured log + abort.
+                #
+                # Task 2: ExecutePhaseWallBudgetExceededError is drained the
+                # SAME way — this block only cancels sibling asyncio tasks +
+                # clears observability-only in-flight markers and re-raises;
+                # it NEVER mutates task STATUS (the auth/infra quarantine stamp
+                # lives in ``_execute_one_worker``, which for the budget
+                # trigger uses its own no-stamp re-raise clause), so it is safe
+                # for the budget trigger's leave-as-is contract.
+                #
+                # The auth/infra worker has already
                 # stamped the offending task as ``quarantined`` with
                 # the typed prefix (``auth_failed:`` or
                 # ``infra_circuit_open:``) retained for forensics.
@@ -4243,6 +4430,20 @@ async def _execute_one_worker(
     """
     try:
         return await _execute_one(orch, task, worktree_mgr)
+    except ExecutePhaseWallBudgetExceededError:
+        # Task 2: the cumulative execute-phase wall-clock budget tripped at
+        # the top of this task's retry loop. Re-raise UNCHANGED — do NOT stamp
+        # the task. This is DELIBERATELY different from the two handlers
+        # below: the auth/infra handler stamps ``quarantined`` and the generic
+        # ``except Exception`` handler routes through ``block_task`` (→
+        # ``blocked`` + cascade-block descendants). Both are terminal-ish /
+        # status-mutating and WRONG for a budget breach, whose contract is to
+        # leave the in-flight task EXACTLY as-is (non-terminal) so the
+        # orphan-reap sweep on the next resume reverts it to ``pending``. The
+        # ``_execute_phase_dag`` drain (which cancels siblings without
+        # touching status) then re-raises up to ``run_execute_phase``'s
+        # top-level handler, which emits the attributable ledger breadcrumb.
+        raise
     except (AuthenticationFailedError, InfrastructureCircuitOpenError) as exc:
         # v0.29.0 Bug 7 / v0.30.0 Bug 5: stamp the task as
         # ``quarantined`` (NOT ``blocked``) with the typed prefix
@@ -5265,6 +5466,16 @@ async def _execute_one(
         # invocation per task).
         cumulative_backoff_s: float = 0.0
         while True:
+            # Task 2: FIRST statement of the retry loop, BEFORE the inner
+            # ``try`` — so a wall-budget breach raises cleanly out of the loop
+            # (it is NOT caught by the inner ``except GuardrailExceededError``
+            # / other loop-body handlers, which are wrong types) and is NOT
+            # misclassified as a per-task failure. The task was stamped
+            # ``in_progress`` before this loop and the loop-body handlers do
+            # not stamp it terminal on this raise, so the outer try/finally
+            # (which only ``end_task`` + cleans the worktree — no status
+            # mutation) leaves it non-terminal for the orphan-reap sweep.
+            orch.guardrails.check_execute_phase_wall_budget()
             try:
                 # v0.22.2 B3: emit a pre-flight marker BEFORE the developer
                 # dispatch so resume can detect "evidence written but

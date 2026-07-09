@@ -83,3 +83,37 @@ class PhaseStuckError(AutodevError):
             f"interrupted run; re-running `autodev resume` will reap "
             f"orphan in-flight tasks (v0.22.2 B1)."
         )
+
+
+class ExecutePhaseWallBudgetExceededError(AutodevError):
+    """``cfg.guardrails.execute_phase_wall_budget_s`` tripped.
+
+    The cumulative wall-clock ceiling for a WHOLE ``run_execute_phase()``
+    invocation was exceeded — i.e. across however many tasks, retries, and
+    tournaments run serially before the ``autodev execute`` / ``autodev
+    resume`` command returns. Raised by the execute-phase dispatch/retry
+    loops via :meth:`guardrails.enforcer.GuardrailEnforcer.check_execute_phase_wall_budget`,
+    checked cheaply BETWEEN units of work (never mid-call).
+
+    This is genuinely SEPARATE from the per-task and per-tournament budgets:
+    ``max_duration_s_per_task`` bounds one task's agent round-trips through
+    ``delegate()``; ``impl_phase_wall_budget_s`` bounds one impl tournament's
+    own pass loop. Neither bounds the SUM across a multi-task DAG, which is
+    what this ceiling catches (the SWE-bench pilot 1800s SIGKILL).
+
+    NOT a subclass of :class:`TournamentError` — it must fire even when no
+    tournament is involved (a plain developer retry loop hitting the budget).
+
+    The task in flight at breach time is left EXACTLY as-is (NOT stamped
+    ``blocked`` / ``quarantined``); the orphan-reap sweep
+    (:meth:`state.plan_manager.PlanManager.reap_orphans`) at the top of the
+    next ``run_execute_phase`` reverts it to ``pending`` so a normal
+    ``autodev resume`` picks it back up — no new salvage machinery required.
+    Carries ``budget_s`` and ``elapsed_s`` for the attributable ledger op
+    (``execute_phase_wall_budget_exceeded``) and the operator-facing message.
+    """
+
+    def __init__(self, *args: object, budget_s: float, elapsed_s: float) -> None:
+        super().__init__(*args)
+        self.budget_s = budget_s
+        self.elapsed_s = elapsed_s

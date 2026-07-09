@@ -61,6 +61,15 @@ def _build_orch_stub(
             )
 
     class FakeGuardrails:
+        def start_execute_phase(self, *a, **k):
+            return None
+
+        def execute_phase_wall_budget_exceeded(self, *a, **k):
+            return False
+
+        def check_execute_phase_wall_budget(self, *a, **k):
+            return None
+
         def pre_invocation(self, *_a, **_k):
             pass
 

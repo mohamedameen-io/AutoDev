@@ -75,6 +75,15 @@ async def test_sparse_paths_forwarded_when_enabled(
             return plan.phases[0].tasks[0]
 
     class _FakeGuard:
+        def start_execute_phase(self, *a, **k):
+            return None
+
+        def execute_phase_wall_budget_exceeded(self, *a, **k):
+            return False
+
+        def check_execute_phase_wall_budget(self, *a, **k):
+            return None
+
         def start_task(self, *a, **kw): ...
         def end_task(self, *a, **kw): ...
 
@@ -142,6 +151,15 @@ async def test_sparse_paths_none_when_disabled(
             return plan.phases[0].tasks[0]
 
     class _FakeGuard:
+        def start_execute_phase(self, *a, **k):
+            return None
+
+        def execute_phase_wall_budget_exceeded(self, *a, **k):
+            return False
+
+        def check_execute_phase_wall_budget(self, *a, **k):
+            return None
+
         def start_task(self, *a, **kw): ...
         def end_task(self, *a, **kw): ...
 
@@ -213,6 +231,15 @@ async def test_sparse_falls_back_to_task_files_when_no_edit_scope(
             return plan.phases[0].tasks[0]
 
     class _FakeGuard:
+        def start_execute_phase(self, *a, **k):
+            return None
+
+        def execute_phase_wall_budget_exceeded(self, *a, **k):
+            return False
+
+        def check_execute_phase_wall_budget(self, *a, **k):
+            return None
+
         def start_task(self, *a, **kw): ...
         def end_task(self, *a, **kw): ...
 
@@ -278,6 +305,15 @@ async def test_phase_scope_overrides_plan_scope(
             return plan.phases[0].tasks[0]
 
     class _FakeGuard:
+        def start_execute_phase(self, *a, **k):
+            return None
+
+        def execute_phase_wall_budget_exceeded(self, *a, **k):
+            return False
+
+        def check_execute_phase_wall_budget(self, *a, **k):
+            return None
+
         def start_task(self, *a, **kw): ...
         def end_task(self, *a, **kw): ...
 

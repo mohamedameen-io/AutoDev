@@ -712,6 +712,36 @@ LedgerOp = Literal[
     # ``{spec_hash, branch_index, budget_s, elapsed_s, passes_completed,
     #   tournament_id, reason}``.
     "plan_phase_wall_budget_exceeded",
+    # Task 1 (wall-budget fix, sibling of F-7): the impl-tournament
+    # cumulative WALL-CLOCK ceiling tripped. Audit-only, LOUD fail-fast
+    # breadcrumb — fired by
+    # ``orchestrator.impl_tournament_runner.run_impl_tournament`` when the
+    # tournament loop raises an ``impl_phase_wall_budget_exceeded``
+    # ``TournamentError`` (cumulative elapsed exceeded
+    # ``cfg.guardrails.impl_phase_wall_budget_s``, checked BETWEEN passes).
+    # This is the distinct, greppable attribution for what would otherwise
+    # be an opaque external SIGKILL: the runner emits this op, then
+    # re-raises so the caller's existing recovery path (retry / escalate /
+    # fall back to the pre-tournament bundle) takes over. Plan state is NOT
+    # mutated by this op; replay treats it as a no-op, and it is tolerated
+    # even when plan is None. Payload: ``{tournament_id, task_id, budget_s,
+    # reason}``.
+    "impl_phase_wall_budget_exceeded",
+    # Task 2 (wall-budget fix, DAG-wide sibling of the two above): the
+    # WHOLE-execute-phase cumulative WALL-CLOCK ceiling tripped. Audit-only,
+    # LOUD fail-fast breadcrumb — fired by
+    # ``orchestrator.execute_phase.run_execute_phase`` when a
+    # ``ExecutePhaseWallBudgetExceededError`` propagates out of the DAG /
+    # retry loops (cumulative elapsed exceeded
+    # ``cfg.guardrails.execute_phase_wall_budget_s``, checked BETWEEN
+    # tasks/retries/rounds). This is the distinct, greppable attribution for
+    # the previously-opaque external SIGKILL that killed the SWE-bench pilot
+    # at 1800s: the runner emits this op, then re-raises. Plan state is NOT
+    # mutated by this op — the task in flight at breach time is left as-is
+    # and the orphan-reap sweep reverts it to pending on the next resume;
+    # replay treats it as a no-op. Payload: ``{budget_s, elapsed_s,
+    # tasks_processed, task_ids_processed, reason}``.
+    "execute_phase_wall_budget_exceeded",
     # F-4 (field-finding): apply-time edit-scope WARN breadcrumb. Emitted by
     # ``orchestrator.execute_phase._apply_with_conflict_escalation`` when the
     # ``enforce_apply_time_edit_scope`` policy is ``"warn"`` and the
@@ -1398,6 +1428,20 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # phase and may precede ``init_plan``, mirroring the other plan-phase
         # dispatch-time audit ops above.
         "plan_phase_wall_budget_exceeded",
+        # Task 1 (wall-budget fix, sibling of F-7): impl-tournament
+        # cumulative wall-clock ceiling tripped. Audit-only no-op on replay —
+        # the runner re-raises a ``TournamentError`` after emitting this op;
+        # plan state is not mutated here. Tolerated even when plan is None,
+        # mirroring ``plan_phase_wall_budget_exceeded`` above.
+        "impl_phase_wall_budget_exceeded",
+        # Task 2 (wall-budget fix, DAG-wide sibling): whole-execute-phase
+        # cumulative wall-clock ceiling tripped. Audit-only no-op on replay —
+        # ``run_execute_phase`` re-raises ``ExecutePhaseWallBudgetExceededError``
+        # after emitting this op; plan state is NOT mutated here (the
+        # in-flight task is left as-is for the orphan-reap sweep to revert on
+        # the next resume). Tolerated even when plan is None, mirroring the
+        # wall-budget ops above.
+        "execute_phase_wall_budget_exceeded",
         # F-4 (field-finding): apply-time edit-scope WARN breadcrumb. Audit-
         # only — warn mode applies the diff regardless, so this op NEVER
         # mutates plan state; replay is a forensic no-op. Tolerated even when

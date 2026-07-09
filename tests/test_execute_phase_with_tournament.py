@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from adapters.types import AgentResult
 from agents import build_registry
 from config.defaults import default_config
 from orchestrator import Orchestrator
+from orchestrator import impl_tournament_runner as itr
 from state.schemas import (
     AcceptanceCriterion,
     Phase,
@@ -213,3 +215,132 @@ async def test_execute_with_impl_tournament_disabled_flag(
     # No tournament evidence.
     ev_path = tmp_path / ".autodev" / "evidence" / "1.1-tournament.json"
     assert not ev_path.exists()
+
+
+# ── Code-review finding (must-fix companion): wall-budget breach ────────
+
+
+def _git_init(path: Path) -> None:
+    """Initialize a minimal git repo at *path* with one commit.
+
+    Needed so the impl tournament's OWN worktree creation succeeds
+    normally for a couple of real passes before the fake-clock wall-budget
+    breach fires deterministically — as opposed to
+    ``test_execute_with_impl_tournament_error_still_completes`` above,
+    which relies on an INCIDENTAL (non-git-repo) worktree failure and
+    doesn't pin the wall-budget breach specifically.
+    """
+    subprocess.run(["git", "init"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=str(path), check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=str(path), check=True, capture_output=True,
+    )
+    (path / "README.md").write_text("init")
+    subprocess.run(["git", "add", "."], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=str(path), check=True, capture_output=True,
+    )
+
+
+class _FakeClock:
+    """Monotonic-shaped fake clock that advances a fixed step per read.
+
+    Mirrors ``tests.test_tournament_wall_budget._FakeClock`` /
+    ``tests.test_impl_tournament_wall_budget._FakeClock``.
+    """
+
+    def __init__(self, step: float = 10.0, start: float = 1000.0) -> None:
+        self._t = start
+        self._step = step
+
+    def __call__(self) -> float:
+        v = self._t
+        self._t += self._step
+        return v
+
+
+@pytest.mark.asyncio
+async def test_execute_with_impl_tournament_wall_budget_breach_still_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drives a REAL wall-budget breach inside the impl tournament through
+    the FULL ``execute_phase`` task pipeline (not ``run_impl_tournament`` in
+    isolation), and confirms:
+
+      1. ``execute_phase.py``'s existing ``except Exception`` around the
+         impl-tournament call still swallows the re-raised
+         ``TournamentError`` gracefully — the task completes rather than
+         the whole ``execute()`` call blowing up.
+      2. The task completes on the PRE-tournament basis: no
+         ``TournamentEvidence`` was written (the breach fires inside
+         ``run_impl_tournament``'s try/except/finally, BEFORE the function
+         ever reaches its evidence-write step) — so nothing from a
+         tournament refinement (which never succeeded) leaks in.
+      3. The new ``impl_phase_wall_budget_exceeded`` ledger op IS present.
+         This is the assertion that would have FAILED pre-fix: the real
+         shared engine raised carrying the WRONG (hardcoded)
+         ``plan_phase_wall_budget_exceeded`` marker, so the runner's guard
+         never matched and the op was never emitted — exactly the gap
+         code review found.
+
+    Uses the same "monkeypatch the ``TournamentConfig`` name in the
+    runner's module namespace to inject a fake clock" technique as
+    ``tests.test_impl_tournament_wall_budget`` — ``ImplTournament`` itself
+    is never touched, so this exercises the REAL engine end-to-end.
+    """
+    _git_init(tmp_path)
+    adapter = StubAdapter(
+        {
+            "developer": _coder_ok(),
+            "reviewer": _reviewer_ok(),
+            "test_engineer": _test_ok(),
+            "critic_t": ok("- nit"),
+            "architect_b": ok("- minor fix"),
+            "synthesizer": ok("- synthesize both"),
+            "judge": ok("Good work.\n\nRANKING: 1, 2, 3"),
+        }
+    )
+    orch = await _make_orch(
+        tmp_path, adapter, impl_enabled=True, judge_model="sonnet"
+    )
+    orch.cfg.guardrails.impl_phase_wall_budget_s = 25.0
+    # Prevent premature convergence / runaway-detector early-stops so the
+    # wall budget is unambiguously the ONLY early-stop cause (mirrors the
+    # core-level test in test_tournament_wall_budget.py).
+    orch.cfg.tournaments.impl.convergence_k = 10
+    orch.cfg.tournaments.impl.max_rounds = 50
+    orch.cfg.tournaments.impl.score_stability_window = None
+    orch.cfg.tournaments.impl.score_stability_max_delta = None
+    orch.cfg.tournaments.impl.winner_stability_window = None
+
+    clock = _FakeClock(step=10.0)
+
+    class _FakeClockTournamentConfig(itr.TournamentConfig):  # type: ignore[misc]
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            kwargs.setdefault("clock", clock)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(itr, "TournamentConfig", _FakeClockTournamentConfig)
+
+    tasks = await orch.execute()
+
+    assert len(tasks) == 1
+    assert tasks[0].status == "complete"
+
+    ev_path = tmp_path / ".autodev" / "evidence" / "1.1-tournament.json"
+    assert not ev_path.exists(), (
+        "no TournamentEvidence should be written — the breach fires before "
+        "run_impl_tournament reaches its evidence-write step"
+    )
+
+    entries = await orch.plan_manager.read_ledger()
+    ops = [e.op for e in entries]
+    assert "impl_phase_wall_budget_exceeded" in ops, (
+        f"expected the impl wall-budget ledger op from the swallowed "
+        f"breach; got ops={ops}"
+    )
