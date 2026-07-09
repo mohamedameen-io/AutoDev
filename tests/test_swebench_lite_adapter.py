@@ -33,7 +33,10 @@ import pytest
 from benchmarks.adapters.base import BenchmarkAdapter
 from benchmarks.adapters.swebench_lite import (
     CANDIDATE,
+    DEFAULT_SWEBENCH_TIMEOUT,
     SwebenchLiteAdapter,
+    _EXECUTE_PHASE_WALL_BUDGET_FLOOR_S,
+    _EXECUTE_PHASE_WALL_BUDGET_MARGIN_S,
     build_adapter,
 )
 from benchmarks.datasets import swebench_lite as ds
@@ -43,6 +46,16 @@ from benchmarks.runner.solve import (
     solve,
 )
 from benchmarks.scorers.base import ERROR
+
+# The default-timeout-derived guardrail value, computed the SAME way
+# production code derives it (not a hardcoded re-pin) -- code-review finding:
+# the value must track ``self.timeout`` (the effective, possibly
+# ``--swebench-timeout``-overridden timeout), not a bare module constant, or
+# an operator override can silently invert the outer/inner ordering.
+_DEFAULT_EXECUTE_PHASE_WALL_BUDGET_S = max(
+    DEFAULT_SWEBENCH_TIMEOUT - _EXECUTE_PHASE_WALL_BUDGET_MARGIN_S,
+    _EXECUTE_PHASE_WALL_BUDGET_FLOOR_S,
+)
 
 # ---------------------------------------------------------------------------
 # Fixture content: a tiny repo with a source module and a test module.
@@ -335,8 +348,9 @@ def test_venv_install_failure_flips_test_runner_off_and_records_blind(tmp_path: 
     """When the arm64 venv install FAILS, the effective ``config_patch`` turns
     ``qa_gates.test_runner`` OFF (solve blind, no self-repair) AND the instance
     report records ``degraded_blind=True`` -- while still cutting the burst with
-    ``max_parallel_subprocesses=1``. End-to-end, the patch flips real config
-    state (deep-merged, siblings preserved)."""
+    ``max_parallel_subprocesses=1`` and activating the execute-phase wall-budget
+    guardrail. End-to-end, the patch flips real config state (deep-merged,
+    siblings preserved)."""
     adapter = _adapter(env_installer=lambda instance, workdir: False)  # install FAILS
     instance = _make_instance()
     workdir = tmp_path / "inst"
@@ -346,6 +360,10 @@ def test_venv_install_failure_flips_test_runner_off_and_records_blind(tmp_path: 
     # (1) the effective config_patch on the profile is degraded blind.
     assert profile.config_patch["qa_gates"]["test_runner"] is False
     assert profile.config_patch["tournaments"]["max_parallel_subprocesses"] == 1
+    assert (
+        profile.config_patch["guardrails"]["execute_phase_wall_budget_s"]
+        == _DEFAULT_EXECUTE_PHASE_WALL_BUDGET_S
+    )
 
     # (2) end-to-end: an autodev init that writes a config.json gets the patch
     #     deep-merged (test_runner flipped, unrelated siblings preserved).
@@ -357,6 +375,7 @@ def test_venv_install_failure_flips_test_runner_off_and_records_blind(tmp_path: 
                 json.dumps({
                     "qa_gates": {"test_runner": True, "lint": True},
                     "tournaments": {"max_parallel_subprocesses": 8},
+                    "guardrails": {"max_duration_s_per_task": 300},
                 }),
                 encoding="utf-8",
             )
@@ -371,6 +390,8 @@ def test_venv_install_failure_flips_test_runner_off_and_records_blind(tmp_path: 
     assert cfg["qa_gates"]["test_runner"] is False  # flipped by the patch
     assert cfg["qa_gates"]["lint"] is True  # deep-merge preserved sibling
     assert cfg["tournaments"]["max_parallel_subprocesses"] == 1
+    assert cfg["guardrails"]["execute_phase_wall_budget_s"] == _DEFAULT_EXECUTE_PHASE_WALL_BUDGET_S
+    assert cfg["guardrails"]["max_duration_s_per_task"] == 300  # sibling preserved
 
     # (3) the blind degradation is recorded on the report.
     assert adapter.reports[-1].degraded_blind is True
@@ -379,7 +400,7 @@ def test_venv_install_failure_flips_test_runner_off_and_records_blind(tmp_path: 
 def test_venv_install_success_keeps_test_runner_on(tmp_path: Path):
     """Non-vacuous control for gate (d): when the install SUCCEEDS, the config_patch
     does NOT force ``test_runner`` off (self-repair stays engaged) and the report is
-    not blind -- but the burst cut still applies."""
+    not blind -- but the burst cut and the wall-budget guardrail still apply."""
     adapter = _adapter(env_installer=lambda instance, workdir: True)  # install OK
     instance = _make_instance()
     workdir = tmp_path / "inst"
@@ -390,11 +411,76 @@ def test_venv_install_success_keeps_test_runner_on(tmp_path: Path):
         "install-OK must not force test_runner off"
     )
     assert profile.config_patch["tournaments"]["max_parallel_subprocesses"] == 1
+    assert (
+        profile.config_patch["guardrails"]["execute_phase_wall_budget_s"]
+        == _DEFAULT_EXECUTE_PHASE_WALL_BUDGET_S
+    )
 
     outcome = solve(workdir, adapter.intent(instance), profile,
                     _writing_invoker({"mod.py": FIXED_SRC}))
     adapter.predict(instance, workdir, outcome)
     assert adapter.reports[-1].degraded_blind is False
+
+
+def test_config_patch_activates_execute_phase_wall_budget_not_impl_budget(
+    tmp_path: Path,
+):
+    """Dedicated pin for the benchmark wiring: ``prepare``'s ``config_patch`` sets
+    ``guardrails.execute_phase_wall_budget_s`` (comfortably under the outer
+    ``DEFAULT_SWEBENCH_TIMEOUT`` -- 3000s at the default 3600s timeout), nested
+    alongside the pre-existing ``tournaments.max_parallel_subprocesses = 1``
+    burst cut -- and must NOT also set ``impl_phase_wall_budget_s`` (that
+    guardrail is unproven for this multi-task-chain incident shape and is
+    deliberately left for later data)."""
+    adapter = _adapter()
+    instance = _make_instance()
+    workdir = tmp_path / "inst"
+
+    profile = adapter.prepare(instance, workdir)
+
+    assert profile.config_patch["guardrails"] == {
+        "execute_phase_wall_budget_s": _DEFAULT_EXECUTE_PHASE_WALL_BUDGET_S
+    }
+    assert _DEFAULT_EXECUTE_PHASE_WALL_BUDGET_S == 3000  # unchanged from before
+    assert profile.config_patch["tournaments"] == {"max_parallel_subprocesses": 1}
+    assert "impl_phase_wall_budget_s" not in profile.config_patch["guardrails"]
+
+
+def test_execute_phase_wall_budget_tracks_swebench_timeout_override(
+    tmp_path: Path,
+):
+    """Code-review regression: the guardrail budget must be DERIVED from the
+    effective (possibly ``--swebench-timeout``-overridden) timeout, not a fixed
+    module constant -- otherwise a small override can silently invert the
+    intended outer/inner ordering and reintroduce the opaque-SIGKILL behavior
+    this whole feature exists to prevent."""
+    # A large override: the derived budget scales up with it (margin below).
+    big = _adapter(timeout=10_000)
+    profile = big.prepare(_make_instance(), tmp_path / "big")
+    assert (
+        profile.config_patch["guardrails"]["execute_phase_wall_budget_s"]
+        == 10_000 - _EXECUTE_PHASE_WALL_BUDGET_MARGIN_S
+    )
+
+    # A small override (below the floor itself): the invariant-preserving
+    # outer clamp wins over the floor -- the budget must stay STRICTLY under
+    # the effective timeout even here, never negative or degenerate. This is
+    # the exact scenario a first attempt at this derivation got wrong (the
+    # floor alone would have produced 300 > 100, inverting the ordering).
+    small = _adapter(timeout=100)
+    profile = small.prepare(_make_instance(), tmp_path / "small")
+    budget = profile.config_patch["guardrails"]["execute_phase_wall_budget_s"]
+    assert budget == 99
+    assert budget < 100, "the guardrail must still fire before the outer timeout"
+
+
+def test_build_adapter_rejects_non_positive_swebench_timeout():
+    """Code-review finding: ``--swebench-timeout 0`` must NOT silently fall
+    back to the default (0 is falsy, so a naive ``or DEFAULT`` swallows it),
+    and a negative value must not thread into ``subprocess.run(timeout=...)``."""
+    for bad in (0, -5):
+        with pytest.raises(ValueError, match="positive"):
+            build_adapter(argparse.Namespace(swebench_timeout=bad))
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +496,31 @@ def test_adapter_satisfies_protocol():
     built = build_adapter(argparse.Namespace())
     assert isinstance(built, BenchmarkAdapter)
     assert built.name
+
+
+def test_default_swebench_timeout_floor():
+    """A sane floor, not a brittle exact-value pin: bumped 1800 -> 3600 after a
+    real Phase-1 pilot run showed 1800s was insufficient for at least one
+    legitimately-slow instance (django__django-10914, killed mid-progress at the
+    old cutoff). See the constant's docstring in ``swebench_lite.py`` for the
+    full rationale and the note to revisit after a full screening run."""
+    assert DEFAULT_SWEBENCH_TIMEOUT >= 3600
+
+
+def test_build_adapter_defaults_timeout_when_swebench_timeout_omitted():
+    """Non-vacuous control: a bare ``Namespace`` (the CLI flag omitted, which
+    parses to ``default=None`` in ``benchmarks.runner.pilot._build_parser``)
+    falls back to ``DEFAULT_SWEBENCH_TIMEOUT`` unchanged."""
+    built = build_adapter(argparse.Namespace())
+    assert built.timeout == DEFAULT_SWEBENCH_TIMEOUT
+
+
+def test_build_adapter_honors_swebench_timeout_override():
+    """``build_adapter`` reads an explicit ``swebench_timeout`` off ``args`` (as
+    populated by the ``--swebench-timeout`` CLI flag) and threads it into the
+    adapter's ``timeout``, overriding the default."""
+    built = build_adapter(argparse.Namespace(swebench_timeout=7200))
+    assert built.timeout == 7200
 
 
 # ---------------------------------------------------------------------------

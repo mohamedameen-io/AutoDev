@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -253,6 +254,36 @@ def pilot_instance_status(guard_result: GuardResult, score_status: str) -> str:
 # "≥~15 clean instances" go criterion.
 GO_NOGO_MIN_CLEAN = 15
 
+# Length (chars) of the fail_stdout_tail/fail_stderr_tail EXCERPT rendered in the
+# human summary's failure-detail section — a short pointer for at-a-glance triage,
+# not the full capture (up to solve.py's _FAIL_OUTPUT_TAIL=2000 chars). The FULL
+# tail is always in pilot-report.json.
+_SUMMARY_TAIL_EXCERPT_CHARS = 300
+
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def _render_tail_block(lines: list[str], *, label: str, tail: str) -> None:
+    """Append one excerpt block (``stdout``/``stderr``) to ``lines`` as a
+    fenced code block, sized against ``_SUMMARY_TAIL_EXCERPT_CHARS``.
+
+    Code-review finding: captured autodev output routinely contains its own
+    triple-backtick fences (autodev echoes diffs/plans/markdown), so a
+    hardcoded ``` fence can be closed early by the CONTENT, garbling the
+    rendered section (the raw file / JSON are unaffected — only the
+    rendering breaks). Widening the fence to one backtick longer than the
+    longest backtick run actually present in the excerpt makes this
+    unreachable, mirroring the standard Markdown nested-fence convention.
+    """
+    excerpt = tail[-_SUMMARY_TAIL_EXCERPT_CHARS:]
+    longest_run = max((len(m) for m in _BACKTICK_RUN_RE.findall(excerpt)), default=0)
+    fence = "`" * max(longest_run + 1, 3)
+    lines.append(f"{label} (last {len(excerpt)} chars; full tail in pilot-report.json):")
+    lines.append(fence)
+    lines.append(excerpt)
+    lines.append(fence)
+    lines.append("")
+
 
 @dataclass
 class PilotInstanceOutcome:
@@ -263,6 +294,14 @@ class PilotInstanceOutcome:
     solved with ``test_runner`` off (arm64 deps failed → no self-repair). The
     remaining fields are the throughput/quota telemetry the pilot exists to
     measure.
+
+    ``fail_stdout_tail`` / ``fail_stderr_tail`` are threaded straight from the
+    terminal :class:`~benchmarks.runner.quota_guard.GuardResult` (default ``""``
+    when nothing was captured — a clean PASS, or a prepare-error isolation) so a
+    timeout/error is diagnosable from the pilot report alone, without
+    hand-inspecting the instance's workdir. ``PilotReport.to_dict()`` serialises
+    the FULL tails (via ``asdict()``); ``human_summary()`` renders only a short
+    excerpt of each (see ``_SUMMARY_TAIL_EXCERPT_CHARS``).
     """
 
     instance_id: str
@@ -273,6 +312,8 @@ class PilotInstanceOutcome:
     blind: bool
     quota_exhausted: bool
     detail: str | None = None
+    fail_stdout_tail: str = ""
+    fail_stderr_tail: str = ""
 
     @property
     def clean(self) -> bool:
@@ -378,6 +419,31 @@ class PilotReport:
                 f"{o.quota_wait_time_s:.1f} | {o.attempts} | {o.blind}"
             )
         lines.append("")
+
+        # A separate section (not inlined into the pipe-delimited table above,
+        # which multi-line stdout/stderr would corrupt). Data-driven — NOT
+        # hardcoded to "only ERROR status instances" — so it can never silently
+        # drift out of sync with however status is actually computed elsewhere.
+        lines.append("## Failure detail (excerpt — full tails in pilot-report.json)")
+        lines.append("")
+        reportable = [
+            o
+            for o in self.instances
+            if o.detail or o.fail_stdout_tail or o.fail_stderr_tail
+        ]
+        if not reportable:
+            lines.append("(none)")
+            lines.append("")
+        for o in reportable:
+            lines.append(f"### {o.instance_id}")
+            lines.append("")
+            if o.detail:
+                lines.append(f"- detail: {o.detail}")
+                lines.append("")
+            if o.fail_stdout_tail:
+                _render_tail_block(lines, label="stdout", tail=o.fail_stdout_tail)
+            if o.fail_stderr_tail:
+                _render_tail_block(lines, label="stderr", tail=o.fail_stderr_tail)
         return "\n".join(lines)
 
 
@@ -480,6 +546,8 @@ def run_pilot(
                 blind=blind.get(g.instance_id, False),
                 quota_exhausted=g.quota_exhausted,
                 detail=g.detail,
+                fail_stdout_tail=g.fail_stdout_tail,
+                fail_stderr_tail=g.fail_stderr_tail,
             )
         )
 
@@ -618,6 +686,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_ATTEMPTS,
         help="Per-instance quota retry cap.",
+    )
+    parser.add_argument(
+        "--swebench-timeout",
+        type=int,
+        default=None,
+        help=(
+            "Per-autodev-command (init/plan/execute) wall-clock timeout in seconds "
+            "for the SWE-bench-Lite adapter. Default: the adapter's built-in "
+            "DEFAULT_SWEBENCH_TIMEOUT when omitted (benchmarks.adapters.swebench_lite)."
+        ),
     )
     return parser
 

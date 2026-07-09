@@ -22,6 +22,7 @@ The four required proofs from the task:
 from __future__ import annotations
 
 import inspect
+import re
 from pathlib import Path
 
 from benchmarks.gate.coarse_gate import baseline_path_for
@@ -63,7 +64,14 @@ def _outcome(*, wall_time_s: float, diff: str = "patch") -> SolveOutcome:
     )
 
 
-def _guard_complete(instance_id: str, wall_time_s: float) -> GuardResult:
+def _guard_complete(
+    instance_id: str,
+    wall_time_s: float,
+    *,
+    detail: str | None = None,
+    fail_stdout_tail: str = "",
+    fail_stderr_tail: str = "",
+) -> GuardResult:
     return GuardResult(
         instance_id=instance_id,
         status=COMPLETE,
@@ -71,6 +79,9 @@ def _guard_complete(instance_id: str, wall_time_s: float) -> GuardResult:
         attempts=1,
         quota_waits=0,
         quota_wait_time_s=0.0,
+        detail=detail,
+        fail_stdout_tail=fail_stdout_tail,
+        fail_stderr_tail=fail_stderr_tail,
     )
 
 
@@ -513,3 +524,279 @@ def test_run_pilot_degenerate_run_does_not_write_baseline(tmp_path: Path):
     assert report.gate_verdict == "red"
     assert report.baseline_established is False
     assert not baseline_path_for(baselines_root, "0.0.0-degen").exists()
+
+
+# ---------------------------------------------------------------------------
+# 6. CLI: --swebench-timeout is accepted and None-by-default (adapter fallback)
+# ---------------------------------------------------------------------------
+
+
+def test_build_parser_accepts_swebench_timeout_and_defaults_to_none():
+    """``--swebench-timeout`` is a new, purely-additive flag: omitted, it parses
+    to ``None`` -- the load-bearing default that keeps ``build_adapter``'s
+    ``getattr(args, "swebench_timeout", None) or DEFAULT_SWEBENCH_TIMEOUT``
+    fallback (``benchmarks.adapters.swebench_lite``) byte-for-byte unchanged.
+    Supplied, it threads the operator's override straight onto ``args``."""
+    parser = pilot._build_parser()
+    required = ["--workdir-root", "/tmp/wd", "--out-dir", "/tmp/out"]
+
+    default_args = parser.parse_args(required)
+    assert default_args.swebench_timeout is None
+
+    overridden = parser.parse_args([*required, "--swebench-timeout", "7200"])
+    assert overridden.swebench_timeout == 7200
+
+
+# ---------------------------------------------------------------------------
+# 7. fail_stdout_tail/fail_stderr_tail surfaced end-to-end (Piece 4): a
+#    timeout/error must be diagnosable from the pilot report alone, with no
+#    need to hand-inspect the instance's workdir.
+# ---------------------------------------------------------------------------
+
+
+def test_run_pilot_threads_fail_tails_from_guard_result_into_outcome_and_json(
+    tmp_path: Path,
+):
+    """fail_stdout_tail/fail_stderr_tail on a GuardResult must be threaded onto
+    the resulting PilotInstanceOutcome AND survive the JSON round-trip (through
+    PilotReport.to_dict()'s asdict()) — the whole point of the fix: a future
+    timeout/error is diagnosable from pilot-report.json alone."""
+    import json
+
+    guards = [
+        _guard_complete(
+            "t1",
+            1.0,
+            detail="autodev execute timed out after 1800s",
+            fail_stdout_tail="stdout tail content",
+            fail_stderr_tail="stderr tail content",
+        )
+    ]
+    preds = [{"instance_id": "t1", "model_name_or_path": "autodev", "model_patch": ""}]
+    adapter = _FakeAdapter(reports=[])
+    scorer = _FakeScorer({"t1": ERROR})
+
+    report = run_pilot(
+        adapter,
+        scorer,
+        instances=[{"instance_id": "t1", "problem_statement": "x", "repo": "a/b"}],
+        invoker=lambda *a, **k: None,
+        workdir_root=tmp_path / "wd",
+        run_id="rid-tails",
+        autodev_version="9.9.9-tails",
+        baselines_root=tmp_path / "baselines",
+        guarded_solve=_fake_guarded_solve_factory(preds, guards),
+    )
+
+    (only,) = report.instances
+    assert only.fail_stdout_tail == "stdout tail content"
+    assert only.fail_stderr_tail == "stderr tail content"
+
+    json_path, _ = write_pilot_report(report, tmp_path / "out")
+    doc = json.loads(json_path.read_text(encoding="utf-8"))
+    (inst_doc,) = doc["instances"]
+    assert inst_doc["fail_stdout_tail"] == "stdout tail content"
+    assert inst_doc["fail_stderr_tail"] == "stderr tail content"
+
+
+def test_human_summary_renders_failure_detail_with_excerpt_and_json_pointer():
+    """human_summary() must surface a NEW failure-detail section — it does NOT
+    surface ``detail`` at all today, only the JSON does — with: the failing
+    instance's id, a TRUNCATED excerpt of a long tail, and a pointer to
+    pilot-report.json for the full tail. Negative control: a clean/passing
+    instance with no detail/tails must NOT produce any failure-detail content
+    for itself."""
+    long_tail = "x" * 50 + "MIDDLE_MARKER" + "y" * 400  # 463 chars, > 300
+    failing = PilotInstanceOutcome(
+        instance_id="fail-1",
+        status=ERROR,
+        wall_time_s=5.0,
+        quota_wait_time_s=0.0,
+        attempts=1,
+        blind=False,
+        quota_exhausted=False,
+        detail="autodev execute timed out after 1800s",
+        fail_stdout_tail=long_tail,
+        fail_stderr_tail="short stderr",
+    )
+    clean = PilotInstanceOutcome(
+        instance_id="clean-1",
+        status=PASS,
+        wall_time_s=2.0,
+        quota_wait_time_s=0.0,
+        attempts=1,
+        blind=False,
+        quota_exhausted=False,
+        detail=None,
+        fail_stdout_tail="",
+        fail_stderr_tail="",
+    )
+    report = PilotReport(
+        run_id="rid",
+        autodev_version="1.0.0",
+        timestamp="2026-01-01T00:00:00+00:00",
+        instances=[failing, clean],
+        passed=1,
+        failed=0,
+        errored=1,
+        blind_count=0,
+        clean_count=0,
+        total_wall_time_s=7.0,
+        total_quota_wait_time_s=0.0,
+        gate_verdict="red",
+        gate_status="insufficient",
+        gate_reasons=[],
+        baseline_established=False,
+        baseline_path=None,
+        recommend_lock=False,
+    )
+
+    summary = report.human_summary()
+
+    assert "fail-1" in summary
+    assert "autodev execute timed out after 1800s" in summary
+    assert "pilot-report.json" in summary
+    # the excerpt is TRUNCATED (last 300 chars) — the marker near the start of
+    # the 463-char tail must have fallen off the excerpt entirely.
+    assert "MIDDLE_MARKER" not in summary
+    assert ("y" * 300) in summary  # the tail end of the excerpt survives intact
+    # the FULL tail is never dumped into the .md — only the JSON gets that
+    assert long_tail not in summary
+
+    # NEGATIVE CONTROL: split the doc at the failure-detail section header and
+    # confirm the clean instance's id does not appear anywhere after it (it
+    # legitimately appears earlier, in the per-instance table).
+    assert "## Failure detail" in summary
+    detail_section = summary.split("## Failure detail", 1)[1]
+    assert "clean-1" not in detail_section
+
+
+def test_pilot_report_excerpt_vs_full_tail_split_between_md_and_json(tmp_path: Path):
+    """The excerpt/full split must be genuinely locked: a tail longer than
+    _SUMMARY_TAIL_EXCERPT_CHARS is TRUNCATED in the .md but the FULL string is
+    still present, verbatim, in pilot-report.json."""
+    import json
+
+    from benchmarks.runner.pilot import _SUMMARY_TAIL_EXCERPT_CHARS
+
+    full_tail = "A" * 50 + "B" * (_SUMMARY_TAIL_EXCERPT_CHARS + 50)  # 400 chars
+    outcome = PilotInstanceOutcome(
+        instance_id="trunc-1",
+        status=ERROR,
+        wall_time_s=1.0,
+        quota_wait_time_s=0.0,
+        attempts=1,
+        blind=False,
+        quota_exhausted=False,
+        detail="boom",
+        fail_stdout_tail=full_tail,
+        fail_stderr_tail="",
+    )
+    report = PilotReport(
+        run_id="rid-trunc",
+        autodev_version="1.0.0",
+        timestamp="2026-01-01T00:00:00+00:00",
+        instances=[outcome],
+        passed=0,
+        failed=0,
+        errored=1,
+        blind_count=0,
+        clean_count=0,
+        total_wall_time_s=1.0,
+        total_quota_wait_time_s=0.0,
+        gate_verdict="red",
+        gate_status="insufficient",
+        gate_reasons=[],
+        baseline_established=False,
+        baseline_path=None,
+        recommend_lock=False,
+    )
+
+    json_path, summary_path = write_pilot_report(report, tmp_path / "out")
+    md_text = summary_path.read_text(encoding="utf-8")
+    doc = json.loads(json_path.read_text(encoding="utf-8"))
+
+    # full tail present, verbatim, in the JSON
+    assert doc["instances"][0]["fail_stdout_tail"] == full_tail
+    # .md gets only the last _SUMMARY_TAIL_EXCERPT_CHARS chars — the leading
+    # "A"*50 run must have fallen off the excerpt entirely.
+    assert full_tail not in md_text
+    assert ("A" * 50) not in md_text
+    assert ("B" * _SUMMARY_TAIL_EXCERPT_CHARS) in md_text
+
+
+def test_human_summary_failure_block_survives_embedded_backtick_fence():
+    """Code-review regression: captured autodev output routinely contains its
+    OWN triple-backtick fences (autodev echoes diffs/plans/markdown). A naive
+    hardcoded ``` wrapper would be closed early by that embedded fence,
+    garbling the rendered section — reproduced and fixed by widening the
+    wrapper fence beyond the longest backtick run actually present in the
+    excerpt. This locks the block is well-formed: exactly two fence lines,
+    identical to each other, strictly longer than any backtick run inside,
+    with the full excerpt content intact between them."""
+    tricky_tail = (
+        "before\n```python\ndef f():\n    return 1\n```\nafter, and a longer "
+        "run: ```` still inside ````\nend"
+    )
+    outcome = PilotInstanceOutcome(
+        instance_id="fence-1",
+        status=ERROR,
+        wall_time_s=1.0,
+        quota_wait_time_s=0.0,
+        attempts=1,
+        blind=False,
+        quota_exhausted=False,
+        detail="autodev execute exited 1",
+        fail_stdout_tail=tricky_tail,
+        fail_stderr_tail="",
+    )
+    report = PilotReport(
+        run_id="rid-fence",
+        autodev_version="1.0.0",
+        timestamp="2026-01-01T00:00:00+00:00",
+        instances=[outcome],
+        passed=0,
+        failed=0,
+        errored=1,
+        blind_count=0,
+        clean_count=0,
+        total_wall_time_s=1.0,
+        total_quota_wait_time_s=0.0,
+        gate_verdict="red",
+        gate_status="insufficient",
+        gate_reasons=[],
+        baseline_established=False,
+        baseline_path=None,
+        recommend_lock=False,
+    )
+
+    summary = report.human_summary()
+    section = summary.split("### fence-1", 1)[1]
+
+    # The tail is short enough to render in full (well under the excerpt cap),
+    # so every line of it must appear verbatim, unmangled, inside the block.
+    for line in tricky_tail.splitlines():
+        assert line in section
+
+    # The wrapper is the OUTERMOST pair of bare backtick-only lines — the
+    # first and last such line in the section, NOT "exactly 2 total" (the
+    # payload legitimately contains its own bare "```" line as part of its
+    # embedded fenced block, which a naive count would misclassify).
+    section_lines = section.splitlines()
+    fence_idx = [
+        i for i, line in enumerate(section_lines) if line and set(line) == {"`"}
+    ]
+    assert len(fence_idx) >= 2, f"expected an opening + closing fence, got {fence_idx!r}"
+    opening_idx, closing_idx = fence_idx[0], fence_idx[-1]
+    opening, closing = section_lines[opening_idx], section_lines[closing_idx]
+    assert opening == closing, "opening and closing wrapper fences must match"
+
+    # The actual guarantee: the wrapper fence is strictly longer than the
+    # longest backtick run anywhere in the body it wraps (here, the
+    # embedded "````" run of 4) — this is what makes the wrapper unclosable
+    # by content, regardless of how many backtick lines the payload itself
+    # happens to contain.
+    body = "\n".join(section_lines[opening_idx + 1 : closing_idx])
+    longest_inner_run = max((len(m) for m in re.findall(r"`+", body)), default=0)
+    assert longest_inner_run == 4, "fixture sanity check: expected a run of 4"
+    assert len(opening) > longest_inner_run

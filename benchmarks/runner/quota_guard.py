@@ -165,6 +165,16 @@ class GuardResult:
     the guard, not reconstructed by string-formatting) — the caller feeds exactly
     this path to ``adapter.predict`` so the scored patch can never desync from the
     solved tree. ``None`` when no attempt ran a solve (e.g. a raised quota abort).
+
+    ``fail_stdout_tail`` / ``fail_stderr_tail`` mirror the terminal
+    :class:`SolveOutcome`'s captured-failure tails (see ``solve.py``'s
+    ``_FAIL_OUTPUT_TAIL``) so a report built from this result is self-diagnosing
+    without re-reading the instance's workdir by hand. Both default to ``""``:
+    populated from the terminal outcome when one exists (the COMPLETE site always
+    has one; the quota-exhausted site has one only if some attempt actually
+    returned rather than raising); left at ``""`` when isolation catches an
+    ``InstancePrepareError`` before any autodev subprocess ever ran (there is
+    genuinely nothing captured to surface).
     """
 
     instance_id: str
@@ -176,6 +186,8 @@ class GuardResult:
     detail: str | None = None
     quota_exhausted: bool = False
     workdir: Path | None = None
+    fail_stdout_tail: str = ""
+    fail_stderr_tail: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +364,8 @@ def run_instance_with_quota_guard(
                     quota_wait_time_s=quota_wait_time_s,
                     detail=outcome.failed_reason,
                     workdir=_winning_workdir(solve_attempt),
+                    fail_stdout_tail=outcome.fail_stdout_tail,
+                    fail_stderr_tail=outcome.fail_stderr_tail,
                 )
 
         # --- here: this attempt was a quota abort (raised or classified) ---
@@ -385,6 +399,11 @@ def run_instance_with_quota_guard(
             f"({quota_waits} quota waits, {quota_wait_time_s:.0f}s parked)"
         ),
         quota_exhausted=True,
+        # last_outcome is None when EVERY attempt raised an in-process quota
+        # exception (never returned a SolveOutcome to capture tails from) —
+        # fall back to "" rather than a None attribute access.
+        fail_stdout_tail=last_outcome.fail_stdout_tail if last_outcome else "",
+        fail_stderr_tail=last_outcome.fail_stderr_tail if last_outcome else "",
     )
 
 
@@ -503,6 +522,10 @@ def run_guarded_solve(
                     quota_waits=0,
                     quota_wait_time_s=0.0,
                     detail=f"prepare failed: {exc}",
+                    # fail_stdout_tail/fail_stderr_tail deliberately left at their
+                    # "" defaults: prepare failed before any autodev subprocess
+                    # ever ran, so there is genuinely nothing captured to surface
+                    # here — not an oversight.
                 )
             )
             predictions.append(

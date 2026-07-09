@@ -276,6 +276,10 @@ def test_gate_a_usage_limit_then_success_resolves_via_retry(tmp_path: Path):
     # RESOLVED via retry — landed on the attempt-2 SUCCESS, not the abort.
     assert result.status == COMPLETE
     assert result.outcome is win
+    # The winning attempt's SolveOutcome captured no failure output (a clean
+    # success) — the terminal GuardResult's tails mirror that: empty.
+    assert result.fail_stdout_tail == ""
+    assert result.fail_stderr_tail == ""
     assert solver.calls == 2
     assert result.attempts == 2
     # It slept exactly once (between the abort and the retry), toward the window.
@@ -320,6 +324,7 @@ def test_gate_b_attempt_cap_exhausts_to_error_not_fail(tmp_path: Path):
         success=False,
         ledger_path=_empty_ledger(tmp_path),
         failed_reason="autodev execute exited 1",
+        stdout="rate limit warning printed to stdout",
         stderr="rate_limited: slow down",
     )
     cap = 3
@@ -343,6 +348,45 @@ def test_gate_b_attempt_cap_exhausts_to_error_not_fail(tmp_path: Path):
     assert sleep.durations == [10.0, 20.0]  # backoff toward the next window
     assert result.quota_waits == cap - 1
     assert result.quota_wait_time_s == 30.0
+    # last_outcome IS set here (every attempt returned a SolveOutcome, none
+    # raised) — the quota-exhausted site must surface ITS captured output too,
+    # not silently drop it just because the instance is quota-exhausted.
+    assert (
+        result.fail_stdout_tail
+        == quota.fail_stdout_tail
+        == "rate limit warning printed to stdout"
+    )
+    assert result.fail_stderr_tail == quota.fail_stderr_tail == "rate_limited: slow down"
+
+
+def test_gate_b_quota_exhausted_with_only_raised_exceptions_has_empty_tails(
+    tmp_path: Path,
+):
+    """Edge case for the quota-exhausted terminal site: every attempt raises an
+    in-process quota exception and NONE ever returns a SolveOutcome, so
+    last_outcome stays None all the way through to quota-exhaustion.
+    fail_stdout_tail/fail_stderr_tail must fall back to "" rather than crash on
+    a None attribute access — there is genuinely nothing captured to surface
+    (no SolveOutcome ever existed for this instance)."""
+    cap = 3
+    solver = ScriptedSolve(
+        [
+            InfrastructureCircuitOpenError("infrastructure circuit open — 1"),
+            InfrastructureCircuitOpenError("infrastructure circuit open — 2"),
+            InfrastructureCircuitOpenError("infrastructure circuit open — 3"),
+        ]
+    )
+    sleep = FakeSleep()
+
+    result = run_instance_with_quota_guard(
+        "inst-raised-only", solver, max_attempts=cap, backoff=_BACKOFF, sleep=sleep
+    )
+
+    assert result.status == ERROR
+    assert result.quota_exhausted is True
+    assert result.outcome is None  # no attempt ever returned a SolveOutcome
+    assert result.fail_stdout_tail == ""
+    assert result.fail_stderr_tail == ""
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +402,7 @@ def test_gate_c_capability_failure_is_not_retried(tmp_path: Path):
         success=False,
         ledger_path=_empty_ledger(tmp_path),
         failed_reason="autodev execute exited 1",
+        stdout="collecting tests...\n9 passed, 1 failed",
         stderr="AssertionError: 1 != 2",  # capability signal, NOT quota
     )
     solver = ScriptedSolve([dud])  # only ONE entry: a 2nd call would AssertionError
@@ -380,6 +425,12 @@ def test_gate_c_capability_failure_is_not_retried(tmp_path: Path):
     assert result.quota_waits == 0
     assert result.quota_exhausted is False
     assert events == []  # no ERROR-until-complete waits fired
+    # The COMPLETE terminal site must surface the outcome's captured failure
+    # output verbatim — this is what makes a future timeout/error diagnosable
+    # from the report alone, without hand-inspecting the instance's workdir.
+    assert result.fail_stdout_tail == dud.fail_stdout_tail
+    assert result.fail_stdout_tail == "collecting tests...\n9 passed, 1 failed"
+    assert result.fail_stderr_tail == dud.fail_stderr_tail == "AssertionError: 1 != 2"
 
 
 def test_non_quota_exception_propagates(tmp_path: Path):
@@ -650,6 +701,10 @@ def test_run_guarded_solve_isolates_bad_instance_prepare_and_continues(tmp_path:
     assert by_id["bad-2"].status == ERROR
     assert by_id["bad-2"].status != FAIL
     assert by_id["bad-2"].outcome is None
+    # prepare failed before any autodev subprocess ever ran — genuinely nothing
+    # was captured, so both tails must stay at their "" defaults (not None).
+    assert by_id["bad-2"].fail_stdout_tail == ""
+    assert by_id["bad-2"].fail_stderr_tail == ""
     # patch-less prediction present for the bad instance — never a silent drop.
     preds_by_id = {p["instance_id"]: p for p in predictions}
     assert preds_by_id["bad-2"]["model_patch"] == ""
@@ -708,3 +763,6 @@ def test_guard_result_is_dataclass_shape():
     )
     assert r.instance_id == "x"
     assert r.quota_exhausted is False
+    # plain str defaults ("" not None) — matches SolveOutcome's convention.
+    assert r.fail_stdout_tail == ""
+    assert r.fail_stderr_tail == ""
