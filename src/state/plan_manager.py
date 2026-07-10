@@ -410,7 +410,14 @@ class PlanManager:
                 # after the transition (the RECOVER_TASK guidance-injection
                 # channel from the contract). Merge (don't clobber) so other
                 # metadata keys survive.
-                for _mkey in ("resolver_note", "resolver_action"):
+                #
+                # WS6: ``model_override`` rides the same persisted channel. The
+                # resolver's ``escalate_model`` recovery stamps a validated model
+                # alias here; ``execute_phase.delegate`` reads it back on the next
+                # dispatch so the escalated model actually takes effect (and
+                # survives ``autodev resume``). A ``None`` value clears it (same
+                # explicit-clear semantics as the resolver note).
+                for _mkey in ("resolver_note", "resolver_action", "model_override"):
                     if _mkey not in meta:
                         continue
                     _mval = meta[_mkey]

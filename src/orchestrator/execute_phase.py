@@ -1845,7 +1845,7 @@ def _ledger_trajectory(
 
 
 async def _resolver_retry(
-    orch: "Orchestrator", task: Task, *, note: str
+    orch: "Orchestrator", task: Task, *, note: str, model_override: str | None = None
 ) -> Task | None:
     """Re-enable ``task`` for another attempt (the architect-continue pattern).
 
@@ -1869,22 +1869,31 @@ async def _resolver_retry(
     Clearing ``escalated`` here lets the recovery fall through to ``continue`` in
     the same ``_execute_one`` call, matching how the already-safe KEYSTONE /
     PIVOT / REFINE recovery rungs behave (they never call ``mark_escalated``).
+
+    WS6: ``model_override`` (a validated model alias, e.g. ``"opus"``) is stamped
+    onto ``Task.metadata`` so the NEXT ``delegate`` dispatch for this task runs on
+    the escalated model (the ``escalate_model`` recovery rung — see
+    :func:`_apply_escalate_model`). ``None`` (the default, every non-model rung)
+    leaves any prior override untouched — so a plain retry after a model
+    escalation keeps the task on the escalated model without re-widening.
     """
     try:
         target = "in_progress" if task.status != "in_progress" else task.status
-        await orch.plan_manager.update_task_status(
-            task.id,
-            target,
-            meta={
-                "retry_count": 0,
-                # Clear any stale ``mark_escalated()`` stamp so a genuine
-                # recovery here is not misread by the caller's
-                # ``if task.escalated: return task`` guard (see docstring).
-                "escalated": False,
-                "resolver_action": "retry",
-                "resolver_note": note[:500],
-            },
-        )
+        meta: dict[str, object] = {
+            "retry_count": 0,
+            # Clear any stale ``mark_escalated()`` stamp so a genuine
+            # recovery here is not misread by the caller's
+            # ``if task.escalated: return task`` guard (see docstring).
+            "escalated": False,
+            "resolver_action": "retry",
+            "resolver_note": note[:500],
+        }
+        # WS6: only touch ``model_override`` when the caller supplies one — a
+        # plain retry (``None``) must NOT clear an override stamped by an earlier
+        # ``escalate_model`` rung on the same task.
+        if model_override is not None:
+            meta["model_override"] = model_override
+        await orch.plan_manager.update_task_status(task.id, target, meta=meta)
         return await orch.plan_manager.get_task(task.id) or task
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -2276,6 +2285,103 @@ async def _handle_ask_human_deadend(
     return None
 
 
+# WS6: model aliases ranked weakest → strongest. BOTH adapters (claude_code and
+# cursor) speak these short aliases rather than concrete per-release ids (see
+# ``config.defaults.resolve_model`` — "Claude Code: Uses aliases opus/sonnet/haiku
+# that auto-resolve to latest") and the CLI passes ``inv.model`` straight through
+# to ``--model``, so a resolver ``escalate_model`` target maps 1:1 onto an alias
+# the adapter already understands — no concrete-id translation table to drift.
+# ``escalate_model`` may only move UP this ladder: the weakest alias (index 0) is
+# a de-escalation, never a valid escalation target (see
+# ``_resolve_escalate_model_target``). No reusable strength ordering exists to
+# borrow — ``plan_phase_recovery.should_escalate_model`` is an architect-specific
+# sonnet→opus boolean with no haiku rung and no target — so the order lives here.
+_MODEL_STRENGTH_ORDER: tuple[str, ...] = ("haiku", "sonnet", "opus")
+
+
+def _resolve_escalate_model_target(to: object) -> str | None:
+    """Validate + normalize a resolver ``escalate_model`` ``{"to": ...}`` target
+    to an ESCALATION-eligible model alias.
+
+    Returns the normalized alias (a rung of ``_MODEL_STRENGTH_ORDER`` above the
+    floor) when ``to`` names a genuine stronger-model target the dispatch layer
+    can resolve, else ``None``. A missing / non-string / unrecognized target — OR
+    the weakest alias (``haiku``, which would DOWN-shift the developer despite the
+    action being "escalate") — degrades to the current behavior (a plain retry, no
+    model change) rather than dispatching a bogus or de-escalating ``--model``.
+
+    Substring match (mirrors
+    :func:`orchestrator.plan_phase_recovery.should_escalate_model`) so a concrete
+    id an LLM might emit (``"claude-opus-4-…"``) still maps to its alias without a
+    per-release table. Matched strongest-first so a string naming more than one
+    tier resolves deterministically to the stronger one.
+    """
+    if not isinstance(to, str):
+        return None
+    lowered = to.strip().lower()
+    if not lowered:
+        return None
+    for alias in reversed(_MODEL_STRENGTH_ORDER):  # opus, sonnet, haiku
+        if alias in lowered:
+            # Reject the floor: ``escalate_model`` must move UP, never to the
+            # weakest tier (that would be a de-escalation, not an escalation).
+            if alias == _MODEL_STRENGTH_ORDER[0]:
+                return None
+            return alias
+    return None
+
+
+async def _apply_escalate_model(
+    orch: "Orchestrator",
+    task: Task,
+    ctx: object,
+    params: dict[str, object],
+    rationale: str,
+) -> Task | None:
+    """WS6: map a resolver ``escalate_model`` action onto a real per-task model
+    override on the NEXT dispatch — the ladder's one genuine "harder model" rung
+    before ``ask_human`` (schema comment: "sonnet -> opus (recovery Tier-5)").
+
+    The chosen ``params["to"]`` alias is validated (``_resolve_escalate_model_target``)
+    then stamped onto ``Task.metadata["model_override"]`` via
+    :func:`_resolver_retry`; ``delegate`` reads it back so the re-dispatched
+    developer runs on the escalated model.
+
+    Once-per-blocker cap (structurally mirrors ``escalate_budget``'s
+    once-per-blocker coordination — see ``blocker_resolver._budget_dedupe_key`` /
+    ``defer_to_tracker``): a SECOND consecutive ``escalate_model`` for the SAME
+    blocker must NOT re-fire. We key the dedupe off the ledger-backed,
+    blocker-scoped ``ctx.recovery_already_tried`` (the same signal the
+    deterministic ladder uses to advance rungs, populated by
+    ``_prior_resolution_actions`` from the per-``blocker_key``
+    ``resolution_chosen`` ops). When ``escalate_model`` is already in it — OR the
+    target is unusable — we fall back to a plain retry WITHOUT stamping a fresh
+    override.
+
+    Note the cap's value here is NOT budget-related (unlike ``escalate_budget``):
+    ``escalate_model`` routes only through ``_resolver_retry`` and touches no
+    turn/timeout budget. The cap instead stops a second same-blocker
+    ``escalate_model`` from OVERWRITING the first override — which, since the
+    resolver chooses the target, could otherwise land a weaker model on the second
+    pass. The first override persists on ``Task.metadata`` (a plain retry leaves it
+    untouched), so the task simply stays on the already-escalated model.
+    """
+    target = _resolve_escalate_model_target(params.get("to"))
+    already_escalated = "escalate_model" in list(
+        getattr(ctx, "recovery_already_tried", None) or []
+    )
+    if target is None or already_escalated:
+        # No usable target OR a re-widen for the same blocker → plain retry; do
+        # NOT pass a model_override (so any prior override persists un-bumped).
+        return await _resolver_retry(orch, task, note=f"escalate_model: {rationale}")
+    return await _resolver_retry(
+        orch,
+        task,
+        note=f"escalate_model→{target}: {rationale}",
+        model_override=target,
+    )
+
+
 async def _apply_resolution(
     orch: "Orchestrator",
     task: Task | None,
@@ -2370,11 +2476,15 @@ async def _apply_resolution(
             else f"consult_knowledge: {rationale}"
         )
         return await _resolver_retry(orch, task, note=note)
+    if a == "escalate_model":
+        # WS6: the ONLY rung that changes which model the next attempt dispatches
+        # on. Threads a validated ``params["to"]`` alias into a per-task model
+        # override, capped once per blocker (see :func:`_apply_escalate_model`).
+        return await _apply_escalate_model(orch, task, ctx, params, rationale)
     if a in (
         "retry_with_changes",
         "escalate_budget",
         "relax_constraint",
-        "escalate_model",
         "repair_environment",
         "soft_pass_with_evidence",
     ):
@@ -8339,11 +8449,25 @@ async def delegate(
     if role == "reviewer":
         _output_token_budget = 4_096
 
+    # WS6: per-task model override. The resolver's ``escalate_model`` recovery
+    # rung stamps a validated model alias onto ``Task.metadata["model_override"]``
+    # (see ``_apply_escalate_model`` / ``_resolver_retry``). Honour it here — the
+    # single dispatch chokepoint every role flows through — so the NEXT attempt
+    # for the task actually runs on the escalated model instead of the per-role
+    # spec default. ``None`` / absent (every task without an active escalation,
+    # and every ``task``-less dispatch such as reviewer/test_engineer) falls back
+    # to ``spec.model`` — byte-identical legacy behavior.
+    _model = spec.model
+    if task is not None:
+        _override = (task.metadata or {}).get("model_override")
+        if isinstance(_override, str) and _override.strip():
+            _model = _override.strip()
+
     inv = AgentInvocation(
         role=role,
         prompt="\n".join(parts),
         cwd=effective_cwd,
-        model=spec.model,
+        model=_model,
         allowed_tools=list(spec.tools) if spec.tools else None,
         max_turns=max_turns,
         effort=effort,
