@@ -64,6 +64,11 @@ def test_v031_evidence_deserialises_with_diagnosis_none() -> None:
     assert ev.collection_error is None
     assert ev.runner_stderr_tail is None
 
+    # WS1: the two new dispatch-layer fields also default to None so a
+    # pre-WS1 evidence file (which never carried them) deserialises cleanly.
+    assert ev.agent_subtype is None
+    assert ev.agent_error is None
+
 
 def test_v032_evidence_serialises_with_new_fields() -> None:
     """A freshly serialised v0.32.0 evidence carries all five new fields.
@@ -110,17 +115,43 @@ def test_v032_evidence_serialises_with_new_fields() -> None:
 
 
 def test_v032_evidence_diagnosis_literal_validates() -> None:
-    """The ``diagnosis`` Literal accepts each documented value."""
+    """The ``diagnosis`` Literal accepts each documented value (incl. WS1's
+    additive ``turn_budget_exhausted``)."""
     for diag in (
         "ok",
         "no_tests_found",
         "collection_failed",
         "runtime_crash",
         "capture_failed",
+        "turn_budget_exhausted",
         "no_signal",
     ):
         ev = TestEvidence(task_id="1.1", diagnosis=diag)
         assert ev.diagnosis == diag
+
+
+def test_ws1_agent_dispatch_fields_round_trip() -> None:
+    """WS1: ``agent_subtype`` / ``agent_error`` serialise and round-trip, and
+    the new ``turn_budget_exhausted`` diagnosis persists alongside them."""
+    ev = TestEvidence(
+        task_id="1.1",
+        passed=0,
+        failed=0,
+        total=0,
+        output_text="",
+        diagnosis="turn_budget_exhausted",
+        agent_subtype="error_max_turns",
+        agent_error="claude exited 1: Reached maximum number of turns (8)",
+    )
+    dumped = ev.model_dump()
+    assert "agent_subtype" in dumped
+    assert "agent_error" in dumped
+
+    rehydrated = TestEvidence.model_validate(dumped)
+    assert rehydrated.diagnosis == "turn_budget_exhausted"
+    assert rehydrated.agent_subtype == "error_max_turns"
+    assert rehydrated.agent_error is not None
+    assert "maximum number of turns" in rehydrated.agent_error
 
 
 def test_v032_evidence_diagnosis_rejects_unknown_value() -> None:

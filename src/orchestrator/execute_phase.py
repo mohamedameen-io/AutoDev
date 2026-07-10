@@ -6227,6 +6227,11 @@ async def _execute_one(
                 raw_response=test_result.text,
                 diagnosis=diagnosis,
                 runner_stderr_tail=stderr_tail or None,
+                # WS1: persist the dispatch-layer signal unconditionally so a
+                # turn-exhausted run (empty ``output_text``) is diagnosable
+                # after the fact. A clean pass records ``agent_subtype="success"``.
+                agent_subtype=test_result.subtype,
+                agent_error=test_result.error,
             )
             await write_evidence(orch.cwd, task.id, test_ev)
 
@@ -6308,6 +6313,16 @@ async def _execute_one(
                 "collection_failed",
                 "runtime_crash",
                 "capture_failed",
+                # WS1: turn-budget exhaustion is infra-class too (retry once,
+                # then hard-fail). Deliberately NOT added to the
+                # ``treat_unrunnable_tests_as_no_tests`` tuple above — that
+                # flag means "this environment structurally cannot run tests",
+                # a different claim from "the agent ran out of turns". And the
+                # ``capture_failed`` soft-pass gate below keys on
+                # ``diagnosis == "capture_failed"``, so this new string never
+                # matches it — a turn-exhausted run is never silently
+                # soft-passed (the intended WS1 behaviour, achieved by omission).
+                "turn_budget_exhausted",
             ):
                 # Infrastructure-class failures: retry once, then
                 # hard-fail with the diagnosis preserved in evidence.
@@ -6322,8 +6337,9 @@ async def _execute_one(
                 # stubs without a breaker silently no-op. The breaker
                 # itself ignores diagnoses not in
                 # ``cfg.test_diag_breaker_diagnoses`` (default:
-                # ``capture_failed`` only), so feeding all three here
-                # is safe and keeps the routing simple.
+                # ``capture_failed`` + ``turn_budget_exhausted``), so
+                # feeding all four infra-class diagnoses here is safe and
+                # keeps the routing simple.
                 #
                 # I4 (HK7): on threshold cross the breaker no longer
                 # hard-halts immediately — it returns the next
@@ -6465,6 +6481,10 @@ async def _execute_one(
                         raw_response=test_result.text,
                         diagnosis=diagnosis,
                         runner_stderr_tail=stderr_tail or None,
+                        # WS1: mirror the primary evidence site — keep the
+                        # dispatch-layer attribution on the re-stamped record.
+                        agent_subtype=test_result.subtype,
+                        agent_error=test_result.error,
                         soft_passed=True,
                         soft_pass_reason=soft_pass_reason,
                     )

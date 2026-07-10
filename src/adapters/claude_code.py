@@ -410,12 +410,37 @@ class ClaudeCodeAdapter(PlatformAdapter):
             # classifier).
             subtype_val: str | None = None
             api_error_status_val: int | None = None
+            # WS1 (1d): the CLI often writes a complete result JSON to stdout
+            # even on a non-zero exit. Stop discarding its diagnostic content:
+            # surface ``result`` as ``.text`` (exactly as the success path
+            # does below) and fold the CLI's own ``errors`` list into the
+            # error message. Defaults preserve the genuine-subprocess-death
+            # path (empty / non-dict stdout → ``text=""`` and ``msg``
+            # unchanged), so the existing empty-stderr sentinel and
+            # stdout-tail branches above are untouched.
+            text_val: str = ""
             try:
                 parsed_failure = json.loads(stdout)
                 if isinstance(parsed_failure, dict):
                     st = parsed_failure.get("subtype")
                     if st:
                         subtype_val = str(st)
+                    # Surface the CLI's ``result`` as ``.text``. For the
+                    # turn-exhaustion subtype this is genuinely empty, so
+                    # ``.text`` correctly stays "" — TestEvidence.agent_subtype
+                    # (WS1 1b) is what makes that specific case diagnosable.
+                    result_field = parsed_failure.get("result")
+                    if result_field:
+                        text_val = str(result_field)
+                    # Fold the CLI's ``errors`` list (present on
+                    # ``error_max_turns`` / ``error_during_execution`` etc.)
+                    # into the error message rather than dropping it.
+                    errors_field = parsed_failure.get("errors")
+                    if isinstance(errors_field, list) and errors_field:
+                        errors_joined = "; ".join(
+                            str(e) for e in errors_field
+                        )
+                        msg = f"{msg} | errors: {errors_joined}"
                     # v0.28.0 (Bug 1): surface ``api_error_status`` and
                     # synthesize a typed subtype from it when the CLI
                     # itself didn't classify the failure. A real error
@@ -451,7 +476,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
             )
             return AgentResult(
                 success=False,
-                text="",
+                text=text_val,
                 duration_s=duration,
                 error=msg,
                 raw_stdout=stdout,

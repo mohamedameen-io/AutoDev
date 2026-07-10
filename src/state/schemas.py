@@ -544,6 +544,18 @@ class TestEvidence(_BaseEvidence):
     tests_collected: int | None = None
     collection_error: str | None = None
     runner_stderr_tail: str | None = None
+    # WS1: dispatch-layer attribution, distinct from the ``runner_*`` fields
+    # above (which describe the test *runner*). These describe the
+    # ``test_engineer`` agent *dispatch* itself: ``agent_subtype`` mirrors the
+    # CLI's ``AgentResult.subtype`` (``"success"`` on a clean pass,
+    # ``"error_max_turns"`` on turn exhaustion, etc.) and ``agent_error``
+    # preserves the adapter's ``AgentResult.error`` string. Populated at every
+    # ``TestEvidence`` construction site so a turn-exhausted run is
+    # diagnosable after the fact (the CLI's own ``result`` is genuinely empty
+    # in that mode, so ``output_text`` alone cannot explain it). Optional with
+    # ``None`` defaults for backward compatibility with pre-WS1 evidence files.
+    agent_subtype: str | None = None
+    agent_error: str | None = None
     diagnosis: (
         Literal[
             "ok",
@@ -551,6 +563,11 @@ class TestEvidence(_BaseEvidence):
             "collection_failed",
             "runtime_crash",
             "capture_failed",
+            # WS1: turn-budget exhaustion — an infrastructure-class dispatch
+            # failure (agent ran out of turns), NOT a broken runner. Purely
+            # additive to this closed Literal, so pre-WS1 evidence JSON (which
+            # never carried this value) still deserialises cleanly.
+            "turn_budget_exhausted",
             "no_signal",
         ]
         | None

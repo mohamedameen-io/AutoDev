@@ -35,8 +35,22 @@ TestDiagnosis = Literal[
     "collection_failed",
     "runtime_crash",
     "capture_failed",
+    "turn_budget_exhausted",
     "no_signal",
 ]
+
+
+# WS1: CLI ``subtype`` values that mean "the agent ran out of turns", NOT "the
+# work is wrong / the runner is broken". ``error_max_turns`` is the per-attempt
+# cap the CLI emits; ``error_max_turns_escalation_exhausted`` is the synthetic
+# subtype the budget-escalation tracker returns once the per-(task, role)
+# escalation ladder is spent. Kept in lockstep with
+# ``orchestrator.execute_phase._TURN_EXHAUSTION_SUBTYPES`` (duplicated here
+# rather than imported so this module stays free of the adapter/orchestrator
+# dependency tree — see the module docstring).
+_TURN_BUDGET_EXHAUSTION_SUBTYPES: frozenset[str] = frozenset(
+    {"error_max_turns", "error_max_turns_escalation_exhausted"}
+)
 
 
 class _AgentResultLike(Protocol):
@@ -52,6 +66,12 @@ class _AgentResultLike(Protocol):
     text: str
     error: str | None
     raw_stderr: str
+    # WS1: the CLI-reported dispatch subtype (``AgentResult.subtype``).
+    # ``None`` when the adapter surfaced no subtype (e.g. a genuine subprocess
+    # death with no parseable stdout). Read to attribute a turn-exhausted
+    # ``test_engineer`` dispatch to ``turn_budget_exhausted`` instead of the
+    # generic ``capture_failed``.
+    subtype: str | None
 
 
 def classify_test_result(
@@ -65,6 +85,16 @@ def classify_test_result(
       1. ``total > 0`` → ``"ok"`` regardless of pass/fail. Once any
          tests were collected and reported, the runner clearly worked
          and downstream branches handle pass-vs-fail.
+      1b. ``success=False`` and ``subtype`` is a turn-exhaustion subtype
+         (``error_max_turns`` / ``error_max_turns_escalation_exhausted``)
+         → ``"turn_budget_exhausted"``. WS1: the CLI's own signal that the
+         ``test_engineer`` dispatch ran out of turns — an
+         infrastructure-class budget failure, NOT a broken runner. Ordered
+         after the ``total>0`` short-circuit (a run that reported counts
+         clearly worked, so the subtype must not override it) and BEFORE
+         all text heuristics (an empty turn-exhausted transcript would
+         otherwise be misattributed to ``capture_failed`` — the exact
+         defect WS1 fixes).
       2. ``success=True`` and ``"no test"`` or ``"skipped"`` in the
          lower-cased output text → ``"no_tests_found"``. Legitimate
          "nothing to test" path; the orchestrator should proceed.
@@ -93,6 +123,16 @@ def classify_test_result(
     # 1. Any collected tests → ok.
     if total > 0:
         return "ok"
+
+    # 1b. WS1: turn-budget exhaustion. Read defensively via ``getattr`` so
+    # lightweight stand-ins that predate the ``subtype`` field (e.g. legacy
+    # test stubs) don't raise ``AttributeError`` — mirrors the tolerant
+    # ``agent_result.text or ""`` style below. Placed before every text
+    # heuristic so an empty turn-exhausted transcript is attributed to the
+    # CLI's own ``error_max_turns`` signal instead of ``capture_failed``.
+    subtype = getattr(agent_result, "subtype", None)
+    if not agent_result.success and subtype in _TURN_BUDGET_EXHAUSTION_SUBTYPES:
+        return "turn_budget_exhausted"
 
     text = agent_result.text or ""
     text_lower = text.lower()

@@ -162,6 +162,15 @@ def test_reviewer_budget_bumped_to_8() -> None:
     assert default_config().agents["reviewer"].max_turns == 8
 
 
+def test_test_engineer_budget_bumped_to_8() -> None:
+    """WS1 1f: test_engineer max_turns 5 → 8, mirroring the reviewer precedent
+    (same symptom: a fixed 5-turn budget was insufficient and the CLI
+    terminated the dispatch via ``error_max_turns``). The robust complement —
+    a bounded prompt workload — ships in test_engineer.md."""
+    assert _AGENT_MAX_TURNS["test_engineer"] == 8
+    assert default_config().agents["test_engineer"].max_turns == 8
+
+
 def test_critic_t_budget_bumped_to_6() -> None:
     """A4: critic_t max_turns 1 → 6."""
     assert _AGENT_MAX_TURNS["critic_t"] == 6

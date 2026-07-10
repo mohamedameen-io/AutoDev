@@ -65,7 +65,12 @@ _AGENT_MAX_TURNS: dict[str, int] = {
     # handled in execute_phase.py / phase_review_runner.py elsewhere; this
     # budget bump is the belt-and-suspenders complement.
     "reviewer": 8,
-    "test_engineer": 5,
+    # WS1 (1f): bumped 5 → 8, mirroring the reviewer precedent above (v0.41.0
+    # A1) for the identical symptom — a fixed 5-turn budget was insufficient,
+    # so the CLI terminated the dispatch via ``error_max_turns`` (17 of 18
+    # captured transcripts). The robust complement is a bounded prompt
+    # workload (test_engineer.md); this budget bump is belt-and-suspenders.
+    "test_engineer": 8,
     "critic_sounding_board": 3,
     "critic_drift_verifier": 3,
     "docs": 3,

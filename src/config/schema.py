@@ -1582,12 +1582,16 @@ class AutodevConfig(BaseModel):
     60 seconds)."""
 
     test_diag_breaker_diagnoses: list[str] = Field(
-        default_factory=lambda: ["capture_failed"]
+        default_factory=lambda: ["capture_failed", "turn_budget_exhausted"]
     )
     """Which :class:`~orchestrator.test_result_classifier.TestDiagnosis`
     values count toward the test-diag breaker. ``capture_failed`` is
-    always recommended; ``runtime_crash`` and ``collection_failed`` are
-    opt-in because they can be legitimate per-task issues."""
+    always recommended; WS1 adds ``turn_budget_exhausted`` to the default so
+    the cross-task circuit breaker keeps coverage of the failure mode that
+    was previously (mis)classified as ``capture_failed`` — dropping it from
+    the default would quietly lose that systemic-halt signal. ``runtime_crash``
+    and ``collection_failed`` remain opt-in because they can be legitimate
+    per-task issues."""
 
     treat_unrunnable_tests_as_no_tests: bool = Field(default=False)
     """When True, infrastructure-class test diagnoses (``capture_failed``,

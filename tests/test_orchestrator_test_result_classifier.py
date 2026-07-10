@@ -32,6 +32,10 @@ class _FakeResult:
     text: str = ""
     error: str | None = None
     raw_stderr: str = ""
+    # WS1: the CLI-reported dispatch subtype (``AgentResult.subtype``). The
+    # classifier reads it to attribute a turn-exhausted ``test_engineer``
+    # dispatch to ``turn_budget_exhausted`` rather than ``capture_failed``.
+    subtype: str | None = None
 
 
 def test_classify_ok() -> None:
@@ -106,6 +110,69 @@ def test_classify_no_signal_catchall() -> None:
         raw_stderr="",
     )
     assert classify_test_result(result, (0, 0, 0)) == "no_signal"
+
+
+# ── WS1: turn-budget exhaustion attribution ──────────────────────────────
+
+
+def test_classify_turn_budget_exhausted_error_max_turns() -> None:
+    """A failed dispatch with subtype ``error_max_turns`` and no captured
+    counts → ``turn_budget_exhausted`` (NOT ``capture_failed``).
+
+    This is the core WS1 contract: the CLI's own ``error_max_turns`` signal
+    is the distinguisher the classifier previously ignored, so a
+    turn-exhausted ``test_engineer`` was misattributed to ``capture_failed``.
+    """
+    result = _FakeResult(
+        success=False, text="", raw_stderr="", subtype="error_max_turns"
+    )
+    assert classify_test_result(result, (0, 0, 0)) == "turn_budget_exhausted"
+
+
+def test_classify_turn_budget_exhausted_escalation_exhausted() -> None:
+    """The synthetic ``error_max_turns_escalation_exhausted`` subtype (emitted
+    once the per-(task, role) budget-escalation ladder is spent) also maps to
+    ``turn_budget_exhausted``."""
+    result = _FakeResult(
+        success=False,
+        text="",
+        raw_stderr="",
+        subtype="error_max_turns_escalation_exhausted",
+    )
+    assert classify_test_result(result, (0, 0, 0)) == "turn_budget_exhausted"
+
+
+def test_classify_total_wins_over_turn_budget_subtype() -> None:
+    """``total > 0`` short-circuits to ``"ok"`` even when the subtype is a
+    turn-exhaustion subtype — a run that reported counts clearly worked, so
+    the subtype must not override the collected result."""
+    result = _FakeResult(
+        success=False, text="RESULTS: passed=5 failed=0 total=5",
+        subtype="error_max_turns",
+    )
+    assert classify_test_result(result, (5, 0, 5)) == "ok"
+
+
+def test_classify_capture_failed_still_fires_without_turn_subtype() -> None:
+    """Regression pin: a genuinely unexplained empty failure (no
+    turn-exhaustion subtype) still classifies as ``capture_failed``. The WS1
+    rule must be additive — it must NOT swallow the existing capture-failed
+    path for failures the CLI did not attribute to turn exhaustion.
+    """
+    result = _FakeResult(
+        success=False, text="", raw_stderr="", subtype=None
+    )
+    assert classify_test_result(result, (0, 0, 0)) == "capture_failed"
+
+
+def test_classify_non_turn_subtype_does_not_map_to_turn_budget() -> None:
+    """A non-turn-exhaustion subtype (e.g. an infra ``rate_limited``) does NOT
+    map to ``turn_budget_exhausted``; empty text/stderr still falls to
+    ``capture_failed`` via the existing rung."""
+    result = _FakeResult(
+        success=False, text="", raw_stderr="", subtype="rate_limited"
+    )
+    assert classify_test_result(result, (0, 0, 0)) == "capture_failed"
 
 
 def test_redact_stderr_tail_drops_secret_lines() -> None:

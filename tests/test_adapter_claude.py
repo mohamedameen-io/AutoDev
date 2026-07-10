@@ -391,6 +391,56 @@ async def test_execute_rc1_with_error_max_turns_json_extracts_subtype(
     assert result.subtype == "error_max_turns"
     assert result.error is not None
     assert result.error.startswith("claude exited 1")
+    # WS1 (1d): the CLI's own ``errors`` list is folded into ``.error`` instead
+    # of being discarded. ``.text`` stays "" here specifically because the CLI's
+    # ``result`` field is genuinely empty in the turn-exhaustion mode.
+    assert "Reached maximum number of turns" in result.error
+    assert result.text == ""
+
+
+@pytest.mark.asyncio
+async def test_execute_rc_nonzero_populates_text_and_errors(
+    tmp_path: Path,
+) -> None:
+    """WS1 (1d): on a non-zero exit whose JSON envelope carries a NON-empty
+    ``result`` and an ``errors`` list, the adapter now surfaces ``result`` as
+    ``.text`` (instead of the old hardcoded "") and folds ``errors`` into
+    ``.error`` (instead of discarding the CLI's own diagnostic content).
+
+    Uses a different subtype (``error_during_execution``) with a populated
+    ``result`` to prove the fix is not specific to the empty turn-exhaustion
+    case.
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=1)
+    blob = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "duration_ms": 100,
+            "num_turns": 2,
+            "result": "partial test output\nRESULTS: passed=2 failed=1 total=3",
+            "stop_reason": "tool_use",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "total_cost_usd": 0.0,
+            "errors": ["execution aborted: boom happened"],
+        }
+    )
+    fake = _fake_proc(stdout=blob, stderr="", returncode=1)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.subtype == "error_during_execution"
+    # ``result`` is surfaced as ``.text`` (was hardcoded "" before WS1).
+    assert result.text == "partial test output\nRESULTS: passed=2 failed=1 total=3"
+    # ``errors`` folded into ``.error``; the "claude exited N" prefix is kept.
+    assert result.error is not None
+    assert result.error.startswith("claude exited 1")
+    assert "execution aborted: boom happened" in result.error
 
 
 @pytest.mark.asyncio
