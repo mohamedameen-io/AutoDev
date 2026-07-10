@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from adapters.git_utils import _git_rev_parse_head, extract_files_from_diff
 from adapters.types import AgentInvocation, AgentResult
 from errors import (
+    AskHumanDeadEndError,
     AutodevError,
     ExecutePhaseWallBudgetExceededError,
     GuardrailExceededError,
@@ -66,6 +67,7 @@ from state.schemas import (
     Plan,
     ReviewEvidence,
     Task,
+    TaskStatus,
     TestEvidence,
 )
 from orchestrator.test_result_classifier import (
@@ -2141,19 +2143,164 @@ def _synthesize_corrective_direction(
     )
 
 
+async def _best_effort_commit_on_ask_human(
+    orch: "Orchestrator",
+    task: Task,
+    ctx: object,
+    *,
+    worktree: "Path",
+    worktree_mgr: "WorktreeManager",
+) -> Task | None:
+    """WS5 apply head: land the worktree diff (best-effort, NEVER forced) and,
+    on success, walk the FSM to ``complete`` via :func:`_walk_task_to_complete`.
+
+    Returns the completed task, or ``None`` (fall through to the legacy block)
+    when there is nothing to commit or the apply does not cleanly succeed.
+    Reuses the SAME worktree primitives as Tier J / the conflict path
+    (``get_diff_vs_base`` + ``apply_patch_to_main``) — no new apply is invented.
+    Unlike ``_apply_with_conflict_escalation`` this does NOT retry / 3-way /
+    rewrite / abandon on failure: a failing apply simply falls through. The
+    apply succeeding or failing IS the safety check — it is never forced.
+    """
+    fclass = getattr(ctx, "failure_class", None)
+    # 1. Read the current worktree diff. An unreadable tree is a best-effort
+    #    fall-through, NOT a hard block (this opt-in path never manufactures a
+    #    block the default ``"block"`` mode would not already produce).
+    try:
+        diff = await worktree_mgr.get_diff_vs_base(worktree)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.best_effort_commit_diff_check_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return None
+    if not diff or not diff.strip():
+        # Nothing to commit → unchanged (fall through to the legacy block).
+        return None
+    # 2. Attempt a SINGLE plain apply to main. No 3-way / rewrite / abandon
+    #    dance — its success or failure is the safety check, never forced.
+    try:
+        await worktree_mgr.apply_patch_to_main(
+            worktree,
+            base_ref="HEAD",
+            commit_message=(
+                f"autodev(best-effort): task {task.id} ({task.title}) "
+                "[needs human review]"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.best_effort_commit_apply_failed",
+            task_id=task.id,
+            failure_class=fclass,
+            err=str(exc),
+        )
+        return None
+    # 3. Applied cleanly → complete with distinguishing metadata + ledger op so
+    #    a benchmark scorer treats this as its OWN terminal category (a
+    #    best-effort commit pending human review), NOT a normally-"solved" task.
+    return await _walk_task_to_complete(
+        orch,
+        task,
+        ledger_op="best_effort_committed_on_ask_human",
+        ledger_payload={
+            "needs_human_review": True,
+            "failure_class": fclass,
+            "diff_empty": False,
+        },
+        complete_meta={
+            "needs_human_review": True,
+            "completion_reason": "best_effort_commit_on_ask_human",
+        },
+        log_event="execute_phase.best_effort_committed_on_ask_human",
+        log_fields={"failure_class": fclass, "needs_human_review": True},
+    )
+
+
+async def _handle_ask_human_deadend(
+    orch: "Orchestrator",
+    task: Task,
+    ctx: object,
+    *,
+    worktree: "Path | None",
+    worktree_mgr: "WorktreeManager | None",
+) -> Task | None:
+    """WS5: decide what happens when the recovery ladder resolves to ``ask_human``.
+
+    Governed by ``cfg.resolver.on_ask_human`` (default ``"block"``):
+
+      * ``"block"``               — return ``None``; the caller does its legacy
+        block (UNCHANGED vs. pre-WS5 — the regression pin).
+      * ``"fail"``                — raise :class:`AskHumanDeadEndError` loudly (no
+        worktree needed) so an unattended run exits non-zero instead of silently
+        blocking at a dead-end no operator will ever see.
+      * ``"best_effort_commit"``  — attempt to commit whatever diff exists in the
+        task's worktree (:func:`_best_effort_commit_on_ask_human`); returns the
+        completed task on success, else ``None`` (fall through). Degrades to
+        ``"block"`` when no worktree is in scope at this call site.
+    """
+    mode = getattr(getattr(orch.cfg, "resolver", None), "on_ask_human", "block")
+    if mode == "fail":
+        fclass = getattr(ctx, "failure_class", None)
+        # Best-effort forensic breadcrumb so the loud exit is self-documenting
+        # in the ledger (parallel to ``best_effort_committed_on_ask_human``).
+        # Never let the breadcrumb mask the raise it precedes.
+        try:
+            await orch.plan_manager.ledger_append(
+                op="ask_human_fail_fast",
+                payload={"task_id": task.id, "failure_class": fclass},
+            )
+        except Exception as exc:  # noqa: BLE001 — breadcrumb best-effort
+            logger.warning(
+                "execute_phase.ledger_append_failed",
+                op="ask_human_fail_fast",
+                err=str(exc),
+            )
+        raise AskHumanDeadEndError(
+            f"recovery ladder resolved to ask_human for task {task.id} "
+            f"(failure_class={fclass}); on_ask_human='fail' — failing loudly "
+            "instead of silently blocking",
+            task_id=task.id,
+            failure_class=fclass,
+        )
+    if (
+        mode == "best_effort_commit"
+        and worktree is not None
+        and worktree_mgr is not None
+    ):
+        return await _best_effort_commit_on_ask_human(
+            orch, task, ctx, worktree=worktree, worktree_mgr=worktree_mgr
+        )
+    # "block" (default) OR best_effort_commit with no worktree available here.
+    return None
+
+
 async def _apply_resolution(
     orch: "Orchestrator",
     task: Task | None,
     ctx: object,
     action: object,
+    *,
+    worktree: "Path | None" = None,
+    worktree_mgr: "WorktreeManager | None" = None,
 ) -> Task | None:
     """Map a ``ResolutionAction`` onto an existing recovery primitive.
 
-    Returns a non-``None`` Task when the blocker was actively re-enabled (caller
-    SKIPS its legacy block), or ``None`` to fall through to the legacy block.
-    Conservative by design: the heavyweight / human-decision actions
-    (``ask_human``/``fall_through``/``web_search``/``reroute``) fall through; the
+    Returns a non-``None`` Task when the blocker was actively re-enabled OR
+    completed (caller SKIPS its legacy block), or ``None`` to fall through to the
+    legacy block. Conservative by design: the heavyweight / human-decision
+    actions (``fall_through``/``web_search``/``reroute``) fall through; the
     structural re-plan actions only act when a task + direction are available.
+
+    WS5: ``ask_human`` — the ladder's terminal dead-end — is no longer an
+    unconditional decline. It routes through :func:`_handle_ask_human_deadend`,
+    which honours ``cfg.resolver.on_ask_human`` (``"block"`` default keeps the
+    legacy decline; ``"best_effort_commit"`` may commit the worktree diff +
+    complete; ``"fail"`` raises loudly). ``worktree``/``worktree_mgr`` are the
+    live per-task worktree (threaded from ``_execute_one`` via
+    ``_try_retry_or_escalate``); ``None`` at call sites without a worktree, where
+    ``best_effort_commit`` safely degrades to ``block``.
     """
     a = getattr(action, "action", "fall_through")
     rationale = (getattr(action, "rationale", "") or "")[:300]
@@ -2161,7 +2308,11 @@ async def _apply_resolution(
     if task is None:
         # Plan-level structural site (no task to mutate) — observability only.
         return None
-    if a in ("ask_human", "fall_through", "web_search", "reroute"):
+    if a == "ask_human":
+        return await _handle_ask_human_deadend(
+            orch, task, ctx, worktree=worktree, worktree_mgr=worktree_mgr
+        )
+    if a in ("fall_through", "web_search", "reroute"):
         return None
     if a in _STRUCTURAL_CORRECTIVE_ACTIONS:
         # Step 5: prefer an LLM-supplied STRUCTURED direction; only synthesize a
@@ -2266,15 +2417,25 @@ async def _maybe_resolve_blocker(
     failing_role: str | None = None,
     phase_id: str | None = None,
     evidence_refs: list[str] | None = None,
+    worktree: "Path | None" = None,
+    worktree_mgr: "WorktreeManager | None" = None,
 ) -> Task | None:
     """ADR-0047 chokepoint. Route a terminal blocker through the resolver before
     the caller's legacy block/degrade.
 
     Returns a non-``None`` Task when the resolver actively recovered the blocker
     (caller MUST use it and SKIP the legacy block); ``None`` otherwise (caller
-    does its legacy block unchanged). NEVER raises. The
+    does its legacy block unchanged). NEVER raises — EXCEPT the WS5
+    ``on_ask_human="fail"`` :class:`AskHumanDeadEndError`, which is deliberately
+    propagated (not swallowed) so a fail-fast benchmark run exits loudly. The
     ``cfg.resolver.enabled`` + ``AUTODEV_RESOLVER_DISABLED`` gate lives here so a
     disabled resolver is a zero-cost no-op at every call site.
+
+    WS5: ``worktree``/``worktree_mgr`` are the live per-task worktree, threaded
+    from ``_execute_one`` via ``_try_retry_or_escalate`` so the
+    ``best_effort_commit`` ask_human path can apply the in-progress diff. They
+    default ``None`` at call sites without a worktree in scope (phase-level /
+    quarantine / block_hook), where ``best_effort_commit`` degrades to ``block``.
     """
     import os
 
@@ -2384,7 +2545,14 @@ async def _maybe_resolve_blocker(
         return None
 
     try:
-        recovered = await _apply_resolution(orch, task, ctx, action)
+        recovered = await _apply_resolution(
+            orch, task, ctx, action, worktree=worktree, worktree_mgr=worktree_mgr
+        )
+    except AskHumanDeadEndError:
+        # WS5 ``on_ask_human="fail"``: propagate the loud dead-end — this is the
+        # ONE apply outcome that must NOT be swallowed into a silent None (the
+        # whole point of the ``"fail"`` mode is an audible non-zero exit).
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "execute_phase.resolver_apply_failed",
@@ -3094,6 +3262,13 @@ async def run_execute_phase(
         # baseline_commit is unset).
         await _maybe_record_phase_entry(orch, task.phase_id)
         try:
+            # WS5: the single-task path runs in-place (``worktree_mgr`` omitted →
+            # ``_execute_one`` uses ``orch.cwd`` with no per-task worktree). No
+            # worktree is threaded to the resolver chokepoint here, so
+            # ``on_ask_human="best_effort_commit"`` DELIBERATELY degrades to
+            # ``block`` on ``autodev execute --task-id`` runs (there is no
+            # isolated diff to commit). ``"fail"`` still fires (no worktree
+            # needed). Best-effort completion is a whole-plan-run feature.
             processed.append(await _execute_one(orch, task))
             # Task 2 (code-review finding, 2nd round): phase-review runs
             # its OWN tournament — it must not START once the wall budget
@@ -3964,6 +4139,11 @@ async def _execute_phase_dag(
                 AuthenticationFailedError,
                 InfrastructureCircuitOpenError,
                 ExecutePhaseWallBudgetExceededError,
+                # WS5 ``on_ask_human="fail"``: drained + re-raised the SAME way
+                # as the wall-budget breach so the loud ask_human dead-end
+                # aborts the phase loop (→ ``run_execute_phase`` → CLI) instead
+                # of being cascade-blocked as a spurious worker crash.
+                AskHumanDeadEndError,
             ):
                 # v0.29.0 Bug 7 / v0.30.0 Bug 5: drain remaining in-
                 # flight workers so we don't leave orphan asyncio tasks
@@ -4288,6 +4468,11 @@ async def _execute_cross_phase_dag(
                 AuthenticationFailedError,
                 InfrastructureCircuitOpenError,
                 ExecutePhaseWallBudgetExceededError,
+                # WS5 ``on_ask_human="fail"``: drained + re-raised the SAME way
+                # as the wall-budget breach so the loud ask_human dead-end
+                # aborts the phase loop (→ ``run_execute_phase`` → CLI) instead
+                # of being cascade-blocked as a spurious worker crash.
+                AskHumanDeadEndError,
             ):
                 # v0.29.0 Bug 7 / v0.30.0 Bug 5: cross-phase variant of
                 # the typed halt. Cancel and drain remaining workers so
@@ -4461,6 +4646,14 @@ async def _execute_one_worker(
     """
     try:
         return await _execute_one(orch, task, worktree_mgr)
+    except AskHumanDeadEndError:
+        # WS5 ``on_ask_human="fail"``: re-raise UNCHANGED (mirrors the
+        # wall-budget clause below) so the loud dead-end propagates out of the
+        # worker rather than being converted into a silent ``block`` by the
+        # generic ``except Exception`` handler at the bottom. The DAG dispatcher
+        # drains siblings and re-raises it up to ``run_execute_phase`` → CLI
+        # non-zero exit. Do NOT stamp the task.
+        raise
     except ExecutePhaseWallBudgetExceededError:
         # Task 2: the cumulative execute-phase wall-clock budget tripped at
         # the top of this task's retry loop. Re-raise UNCHANGED — do NOT stamp
@@ -4548,6 +4741,13 @@ async def _execute_one_worker(
                         "preserving quarantine semantics regardless"
                     ),
                 )
+        except AskHumanDeadEndError:
+            # WS5 ``on_ask_human="fail"``: symmetry with the other re-raise
+            # guards — never let the generic handler below swallow the loud
+            # dead-end into a silent quarantine. Unreachable today
+            # (INFRA_CIRCUIT_OPEN → fall_through, never ask_human), but cheap
+            # insurance against a future resolver-mapping change.
+            raise
         except Exception as exc4:  # noqa: BLE001 — never mask the original
             logger.warning(
                 "execute_phase.quarantine_resolver_consult_failed",
@@ -5497,6 +5697,20 @@ async def _execute_one(
         # invocation per task).
         cumulative_backoff_s: float = 0.0
         while True:
+            # WS5: terminal short-circuit. A retry/escalate helper can now hand
+            # back an already-TERMINAL task — specifically a ``complete`` task
+            # when the resolver's ``ask_human`` dead-end took the
+            # ``best_effort_commit`` path (``_handle_ask_human_deadend`` →
+            # ``_walk_task_to_complete``). Such a task is returned up through
+            # ``_try_retry_or_escalate`` (its ``status != "blocked"``
+            # "recovered" branch), and the caller then ``continue``s the loop.
+            # Re-dispatching a completed (or otherwise terminal) task would be
+            # wrong, so terminate here. Provably unreachable pre-WS5 (every
+            # ``continue`` path re-enters with a non-terminal task; ``escalated``
+            # / ``blocked`` paths ``return`` instead of ``continue``), so this is
+            # a pure no-op for all legacy flows and the default ``block`` mode.
+            if task.status in _TERMINAL_TASK_STATUSES:
+                return task
             # Task 2: FIRST statement of the retry loop, BEFORE the inner
             # ``try`` — so a wall-budget breach raises cleanly out of the loop
             # (it is NOT caught by the inner ``except GuardrailExceededError``
@@ -5715,6 +5929,8 @@ async def _execute_one(
                     reason=_build_adapter_failure_reason(developer_result),
                     # Developer adapter failed at the code layer (no usable diff).
                     failure_class=_fcls.WORKER_EXCEPTION,
+                    worktree=worktree,
+                    worktree_mgr=worktree_mgr,
                 )
                 if task.escalated:
                     return task
@@ -5768,6 +5984,8 @@ async def _execute_one(
                     reason=_containment_reason,
                     # Diff confined to .autodev/ — a scope violation.
                     failure_class=_fcls.EDIT_SCOPE_VIOLATION,
+                    worktree=worktree,
+                    worktree_mgr=worktree_mgr,
                 )
                 if task.escalated:
                     return task
@@ -5803,6 +6021,8 @@ async def _execute_one(
                     reason=gate_failure,
                     # Auto-gate (syntax/lint/build/test_runner/secretscan) failed.
                     failure_class=_fcls.QA_GATE_FAILED,
+                    worktree=worktree,
+                    worktree_mgr=worktree_mgr,
                 )
                 if task.escalated:
                     return task
@@ -5911,6 +6131,8 @@ async def _execute_one(
                         reason="review_tournament max_rounds",
                         # Review tournament hit max_rounds without convergence.
                         failure_class=_fcls.REVIEW_ESCALATED,
+                        worktree=worktree,
+                        worktree_mgr=worktree_mgr,
                     )
                     if task.escalated:
                         return task
@@ -6138,6 +6360,8 @@ async def _execute_one(
                     reason="reviewer MALFORMED",
                     # Reviewer verdict unparseable (NOT a turn-budget exhaustion).
                     failure_class=_fcls.REVIEW_MALFORMED,
+                    worktree=worktree,
+                    worktree_mgr=worktree_mgr,
                 )
                 if task.escalated:
                     return task
@@ -6157,6 +6381,8 @@ async def _execute_one(
                     reason=f"reviewer {verdict}",
                     # Reviewer returned NEEDS_CHANGES / REJECTED.
                     failure_class=_fcls.REVIEW_REJECTED,
+                    worktree=worktree,
+                    worktree_mgr=worktree_mgr,
                 )
                 if task.escalated:
                     return task
@@ -6301,6 +6527,8 @@ async def _execute_one(
                     reason="tests failed",
                     # Tests collected and ran but at least one failed.
                     failure_class=_fcls.TESTS_FAILED,
+                    worktree=worktree,
+                    worktree_mgr=worktree_mgr,
                 )
                 if task.escalated:
                     return task
@@ -6968,6 +7196,8 @@ async def _try_retry_or_escalate(
     reason: str,
     *,
     failure_class: str,
+    worktree: "Path | None" = None,
+    worktree_mgr: "WorktreeManager | None" = None,
 ) -> Task:
     """Bump retry count or escalate when the limit is reached.
 
@@ -7097,6 +7327,10 @@ async def _try_retry_or_escalate(
         # from the REAL failure_class so the resolver's BlockerContext carries it.
         failing_role=_failing_role_for_class(failure_class),
         phase_id=task.phase_id,
+        # WS5: thread the live per-task worktree so a terminal ``ask_human`` under
+        # ``on_ask_human="best_effort_commit"`` can commit the in-progress diff.
+        worktree=worktree,
+        worktree_mgr=worktree_mgr,
     )
     if recovered is not None and getattr(recovered, "status", None) != "blocked":
         # Resolver ACTIVELY recovered (re-enabled the task). Return the
@@ -8721,6 +8955,114 @@ def _reviewer_exhausted_turns(
     return last_subtype in _TURN_EXHAUSTION_SUBTYPES
 
 
+# Canonical happy-path pipeline order (see ``state.schemas.TaskStatus`` /
+# ``orchestrator.task_state.TASK_TRANSITIONS``). The FSM forbids a direct
+# ``in_progress -> complete`` edge, so a task whose work is accepted out of band
+# must walk the intermediate rungs. Consumed by :func:`_walk_task_to_complete`.
+_TASK_PIPELINE_ORDER: tuple[TaskStatus, ...] = (
+    "in_progress",
+    "coded",
+    "auto_gated",
+    "reviewed",
+    "tested",
+    "tournamented",
+    "complete",
+)
+
+
+async def _walk_task_to_complete(
+    orch: "Orchestrator",
+    task: "Task",
+    *,
+    ledger_op: str,
+    ledger_payload: dict[str, Any],
+    complete_meta: dict[str, Any],
+    log_event: str,
+    log_fields: dict[str, Any] | None = None,
+) -> "Task":
+    """Walk an in-flight (pre-``complete``) task's FSM forward to ``complete``.
+
+    THE shared FSM-walk-to-``complete`` primitive. Given a task whose work has
+    ALREADY been landed (its worktree diff applied to main by the caller, or an
+    intentionally-empty diff), it:
+
+      1. logs a breadcrumb (``log_event`` + ``log_fields``);
+      2. appends a distinctly-named ledger op (``ledger_op`` + ``ledger_payload``,
+         best-effort — a ledger failure must never mask the completion);
+      3. walks the canonical pipeline edges FORWARD from the task's current
+         state to ``complete`` (each edge is legal per
+         ``task_state.TASK_TRANSITIONS``; only the terminal ``complete``
+         transition carries ``complete_meta``);
+      4. resets the stuck-state + phase-scoped corrective-cycle counters
+         (mirrors the happy-path completion tail).
+
+    Shared by Tier J's :func:`_maybe_accept_approved_on_exhaustion` (accept an
+    APPROVED-but-turn-exhausted artifact) and WS5's best-effort-commit
+    ask_human path, and reusable by a later conflict-recovery workstream. It is
+    deliberately APPLY-AGNOSTIC: the caller owns whether/how the diff reached
+    main (Tier J escalates conflicts via ``_apply_with_conflict_escalation``;
+    WS5 is best-effort-no-force), because that force-semantic genuinely differs
+    between call sites — only the walk + stamping is safely shared.
+
+    Idempotent: ``complete`` is terminal, so a resume re-runs the same edges
+    deterministically. Forward-only: a task already at a mid-pipeline rung skips
+    the rungs it has passed and never attempts an illegal back-edge.
+    """
+    logger.warning(log_event, task_id=task.id, **(log_fields or {}))
+
+    # Audit-only ledger breadcrumb. Best-effort — a ledger failure here MUST
+    # NOT mask the completion the operator needs.
+    if getattr(orch, "plan_manager", None) is not None:
+        try:
+            await orch.plan_manager.ledger_append(
+                op=ledger_op,
+                payload={"task_id": task.id, **ledger_payload},
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort breadcrumb
+            logger.warning(
+                "execute_phase.ledger_append_failed",
+                op=ledger_op,
+                err=str(exc),
+            )
+
+    completed = task
+    if completed.status == "complete":
+        return completed
+    try:
+        start_idx = _TASK_PIPELINE_ORDER.index(completed.status)
+    except ValueError as exc:
+        # Contract: callers pass a happy-path pipeline status (in practice always
+        # ``in_progress``). An off-pipeline status (``blocked`` / ``quarantined``
+        # / ``pending``) has NO legal forward edge to ``coded`` — fail loud with
+        # an attributable message rather than attempt an illegal walk that would
+        # raise deeper (in ``assert_transition``) with a less-attributable one.
+        raise ValueError(
+            f"_walk_task_to_complete requires a pipeline status, got "
+            f"{completed.status!r}"
+        ) from exc
+    # Intermediate rungs carry no meta; the terminal ``complete`` carries it.
+    for _status in _TASK_PIPELINE_ORDER[start_idx + 1 : -1]:
+        completed = await orch.plan_manager.update_task_status(task.id, _status)
+    completed = await orch.plan_manager.update_task_status(
+        task.id, "complete", meta=complete_meta
+    )
+
+    # Zero the stuck-state counters on success (mirrors the happy-path
+    # completion tail). Best-effort — never mask the completion.
+    try:
+        await orch.plan_manager.reset_stuck_state(task.id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "execute_phase.reset_stuck_state_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+    # Forward progress resets the phase-scoped corrective-cycle counters.
+    if task.phase_id:
+        await _reset_corrective_cycle_counters(orch, phase_id=task.phase_id)
+    return completed
+
+
 async def _maybe_accept_approved_on_exhaustion(
     orch: "Orchestrator",
     task: "Task",
@@ -8899,70 +9241,34 @@ async def _maybe_accept_approved_on_exhaustion(
                 # _apply_with_conflict_escalation.
                 return await orch.plan_manager.get_task(task.id) or task
 
-    # Emit the acceptance breadcrumb now that we know whether the worktree
-    # diff was empty (no prior changes) or non-empty (applied above).
+    # Mark complete via the shared FSM-walk primitive. At this point the diff
+    # was either empty (no-op) or already applied to main above. The task is
+    # ``in_progress`` (set at dispatch, reset on every retry), and the FSM
+    # forbids a direct ``in_progress -> complete`` edge, so the helper walks the
+    # canonical happy-path pipeline states the approved artifact would have
+    # traversed had it not been pre-empted by turn-exhaustion. ``diff_empty``
+    # distinguishes the no-op-diff research task from the applied-prior-diff
+    # case in the breadcrumb + ledger op.
     _actual_diff_empty = worktree_diff is None or not worktree_diff.strip()
-    logger.warning(
-        "execute_phase.accepted_approved_on_exhaustion",
-        task_id=task.id,
-        subtype=subtype,
-        verdict="APPROVED",
-        diff_empty=_actual_diff_empty,
+    return await _walk_task_to_complete(
+        orch,
+        task,
+        ledger_op="accepted_approved_on_exhaustion",
+        ledger_payload={
+            "verdict": "APPROVED",
+            "subtype": subtype or "unknown",
+            "diff_empty": _actual_diff_empty,
+        },
+        complete_meta={
+            "evidence_bundle": f".autodev/evidence/{task.id}-review.json"
+        },
+        log_event="execute_phase.accepted_approved_on_exhaustion",
+        log_fields={
+            "subtype": subtype,
+            "verdict": "APPROVED",
+            "diff_empty": _actual_diff_empty,
+        },
     )
-
-    # Audit-only ledger breadcrumb. Best-effort — a ledger failure here
-    # MUST NOT mask the completion the operator needs.
-    if getattr(orch, "plan_manager", None) is not None:
-        try:
-            await orch.plan_manager.ledger_append(
-                op="accepted_approved_on_exhaustion",
-                payload={
-                    "task_id": task.id,
-                    "verdict": "APPROVED",
-                    "subtype": subtype or "unknown",
-                    "diff_empty": _actual_diff_empty,
-                },
-            )
-        except Exception as exc:  # noqa: BLE001 — best-effort breadcrumb
-            logger.warning(
-                "execute_phase.ledger_append_failed",
-                op="accepted_approved_on_exhaustion",
-                err=str(exc),
-            )
-
-    # Mark complete. At this point the diff was either empty (no-op) or
-    # already applied to main above. The task is ``in_progress`` at
-    # this point (set at dispatch and reset on every retry), and the FSM
-    # forbids a direct ``in_progress -> complete`` edge, so walk the
-    # canonical happy-path pipeline states the approved artifact would
-    # have traversed had it not been pre-empted by turn-exhaustion. Each
-    # edge is legal per ``task_state.TASK_TRANSITIONS``; the final
-    # ``tournamented -> complete`` carries the evidence bundle.
-    completed = task
-    for _status in ("coded", "auto_gated", "reviewed", "tested", "tournamented"):
-        if completed.status == _status:
-            continue
-        completed = await orch.plan_manager.update_task_status(task.id, _status)
-    completed = await orch.plan_manager.update_task_status(
-        task.id,
-        "complete",
-        meta={"evidence_bundle": f".autodev/evidence/{task.id}-review.json"},
-    )
-    # Zero the stuck-state counters on success (mirrors the happy-path
-    # completion tail). Best-effort — never mask the completion.
-    try:
-        await orch.plan_manager.reset_stuck_state(task.id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "execute_phase.reset_stuck_state_failed",
-            task_id=task.id,
-            err=str(exc),
-        )
-    # F-2: forward progress resets the phase-scoped corrective-cycle counters
-    # (mirrors the happy-path completion tail above).
-    if task.phase_id:
-        await _reset_corrective_cycle_counters(orch, phase_id=task.phase_id)
-    return completed
 
 
 def _build_adapter_failure_reason(

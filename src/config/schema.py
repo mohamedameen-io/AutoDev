@@ -569,6 +569,23 @@ class ResolverConfig(BaseModel):
     # consulted on every routed blocker (more LLM calls; useful for evaluation).
     fast_path_only_on_known: bool = True
     model: str | None = None
+    # WS5 — ask_human dead-end policy. Every deterministic ladder terminates at
+    # ``ask_human`` when exhausted, but an unattended run has no human-decision
+    # channel, so the historical behaviour silently blocks the task. This field
+    # is a GENUINE behaviour change with real blast radius, so it ships opt-in
+    # (default ``"block"`` == today's behaviour, byte-for-byte):
+    #   * ``"block"``               — decline ask_human; the caller does its
+    #     legacy block/degrade (UNCHANGED — the regression pin).
+    #   * ``"best_effort_commit"``  — when the ladder would resolve to
+    #     ``ask_human``, attempt to apply whatever diff currently exists in the
+    #     task's worktree; if non-empty AND it applies, mark the task complete
+    #     (stamped ``needs_human_review`` + a distinct ledger op so a benchmark
+    #     scorer treats it as its OWN terminal category, not "solved"). Nothing
+    #     to commit / an apply that fails → falls through to the legacy block.
+    #   * ``"fail"``                — raise ``AskHumanDeadEndError`` loudly at the
+    #     point the ladder resolves to ``ask_human`` (a benchmark harness that
+    #     prefers a hard failure to a silent block).
+    on_ask_human: Literal["block", "best_effort_commit", "fail"] = "block"
 
 
 def _default_resolver_cfg() -> "ResolverConfig":
@@ -582,6 +599,7 @@ def _default_resolver_cfg() -> "ResolverConfig":
         max_corrective_cycles_per_phase=3,
         fast_path_only_on_known=True,
         model=None,
+        on_ask_human="block",
     )
 
 

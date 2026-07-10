@@ -422,6 +422,23 @@ class PlanManager:
                     else:
                         new_md[_mkey] = str(_mval)
                     task.metadata = new_md
+                # WS5: persist the best-effort-commit terminal markers onto the
+                # Task model so the completed task is SELF-DESCRIBING for a
+                # benchmark scorer (a non-``blocked`` terminal that is NOT
+                # "solved"). Purely additive — these keys are only ever set by
+                # the ``best_effort_commit`` ask_human path, so every existing
+                # flow (and the default ``block`` mode) is byte-identical.
+                # ``needs_human_review`` is stored verbatim (bool);
+                # ``completion_reason`` is coerced to str. Merge, don't clobber.
+                for _mkey, _coerce in (
+                    ("needs_human_review", bool),
+                    ("completion_reason", str),
+                ):
+                    if _mkey not in meta:
+                        continue
+                    new_md = dict(task.metadata or {})
+                    new_md[_mkey] = _coerce(meta[_mkey])
+                    task.metadata = new_md
                 # v0.32.0 (Phase 5, Gap G): structured recovery hint.
                 # Accept either a :class:`RecoveryHint` model instance OR
                 # the equivalent ``dict`` payload (covers callers that

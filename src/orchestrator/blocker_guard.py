@@ -33,7 +33,7 @@ from orchestrator.blocker_resolver import record_phase_degrade
 # so the recovery control flow below matches on TYPE *and* signature. If a
 # future plan_manager reword changes the message text, the isinstance gate makes
 # the retry+breadcrumb fail SAFE (skipped) rather than silently mis-firing.
-from errors import PlanConcurrentModificationError
+from errors import AskHumanDeadEndError, PlanConcurrentModificationError
 
 if TYPE_CHECKING:  # pragma: no cover
     from orchestrator import Orchestrator
@@ -105,6 +105,12 @@ async def block_task(
             phase_id=phase_id,
             evidence_refs=evidence_refs,
         )
+    except AskHumanDeadEndError:
+        # WS5 ``on_ask_human="fail"``: the ONE resolver outcome that must NOT be
+        # swallowed into a silent block. Propagate the loud dead-end so a
+        # fail-fast benchmark run exits non-zero rather than committing a
+        # ``blocked`` transition here.
+        raise
     except Exception:  # noqa: BLE001 - resolver must never break the block path
         recovered = None
     if recovered is not None and getattr(recovered, "status", None) != "blocked":

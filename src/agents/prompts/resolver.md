@@ -48,8 +48,19 @@ object described below, with NO prose and NO bare `ESCALATE:` line. The
 in-band equivalent of escalation for you is the **`ask_human`** action:
 choose it (and put the precise one-sentence question in
 `params.question`) exactly when the shared clause would have you emit
-`ESCALATE:`. The orchestrator routes `ask_human` to the same
-human-decision channel.
+`ESCALATE:`.
+
+`ask_human` is a genuine TERMINAL dead-end, not an interactive question
+an unattended run can answer. By default the orchestrator has no live
+human channel: the task is blocked and surfaced to the operator
+after the run (e.g. `autodev status --blocked`), and your
+`params.question` is recorded as the reason. (An operator MAY opt the
+run into committing the task's best-effort diff and completing it
+stamped `needs_human_review`, or into failing the whole run loudly,
+instead of blocking — but in every case `ask_human` ends the recovery
+ladder rather than pausing it for a reply.) So reserve `ask_human` for
+when NO mechanical action above can make progress; do not choose it
+expecting an answer to come back.
 
 ## Inputs (in the CONTEXT block of this message)
 

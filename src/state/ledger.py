@@ -576,6 +576,24 @@ LedgerOp = Literal[
     # breadcrumb. Payload shape:
     # ``{task_id: str, verdict: str, subtype: str, diff_empty: bool}``.
     "accepted_approved_on_exhaustion",
+    # WS5 (ask_human dead-end → best-effort-commit): under
+    # ``cfg.resolver.on_ask_human="best_effort_commit"``, when the recovery
+    # ladder would resolve to ``ask_human`` the orchestrator committed whatever
+    # non-empty diff existed in the task's worktree and completed the task,
+    # STAMPED ``needs_human_review`` so a benchmark scorer treats it as its OWN
+    # terminal category (a best-effort commit pending review — NOT normally
+    # "solved"). Audit-only — the ``status="complete"`` transition flows through
+    # the regular ``update_task_status`` op emitted alongside; replay is a no-op
+    # forensic breadcrumb. Payload:
+    # ``{task_id: str, needs_human_review: bool, failure_class: str | None,
+    # diff_empty: bool}``.
+    "best_effort_committed_on_ask_human",
+    # WS5 (fail mode): under ``cfg.resolver.on_ask_human="fail"`` the ladder
+    # resolved to ``ask_human`` and the run raised ``AskHumanDeadEndError`` to
+    # exit loudly instead of silently blocking. Audit-only breadcrumb emitted
+    # immediately before the raise; the run aborts (no plan mutation), so replay
+    # is a no-op. Payload: ``{task_id: str, failure_class: str | None}``.
+    "ask_human_fail_fast",
     # Gap 5 (containment): a developer diff was confined ENTIRELY to
     # AutoDev's own ``.autodev/`` directory (evidence / ledger / tournament
     # / index state) instead of the target repository's code — the agent
@@ -1387,6 +1405,13 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # regular ``update_task_status`` op emitted alongside; replay is a
         # no-op forensic breadcrumb.
         "accepted_approved_on_exhaustion",
+        # WS5 (ask_human dead-end): best-effort-commit completion + fail-fast
+        # breadcrumbs. Both audit-only — the ``status="complete"`` transition
+        # (best_effort) flows through the regular ``update_task_status`` op
+        # emitted alongside, and the fail-fast op precedes a run-aborting raise
+        # (no plan mutation). Replay is a no-op forensic breadcrumb.
+        "best_effort_committed_on_ask_human",
+        "ask_human_fail_fast",
         # Gap 5 (containment): developer diff confined to AutoDev's own
         # ``.autodev/`` directory was rejected as invalid task output.
         # Audit-only — the task-status transition (retry / escalate / block)

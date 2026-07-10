@@ -117,3 +117,31 @@ class ExecutePhaseWallBudgetExceededError(AutodevError):
         super().__init__(*args)
         self.budget_s = budget_s
         self.elapsed_s = elapsed_s
+
+
+class AskHumanDeadEndError(AutodevError):
+    """``cfg.resolver.on_ask_human == "fail"``: the recovery ladder resolved to
+    ``ask_human`` and the operator opted for a HARD failure over a silent block.
+
+    Every deterministic recovery ladder terminates at ``ask_human`` when it is
+    exhausted, but an unattended run has no human-decision channel — the default
+    (``on_ask_human="block"``) silently blocks the task. A benchmark harness that
+    would rather see a loud non-zero exit than remember to check
+    ``autodev status --blocked`` sets ``on_ask_human="fail"``; this exception is
+    then raised at the point the ladder resolves to ``ask_human`` and propagates
+    (mirroring :class:`ExecutePhaseWallBudgetExceededError`) out of
+    ``run_execute_phase`` so the CLI driver exits loudly.
+
+    Carries the offending ``task_id`` / ``failure_class`` for the attributable
+    ledger op and the operator-facing message.
+    """
+
+    def __init__(
+        self,
+        *args: object,
+        task_id: str | None = None,
+        failure_class: str | None = None,
+    ) -> None:
+        super().__init__(*args)
+        self.task_id = task_id
+        self.failure_class = failure_class

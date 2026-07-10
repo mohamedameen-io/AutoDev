@@ -51,9 +51,12 @@ _ALLOWED_VARIABLE_ROUTED_STATUS = {
     # → the ternary ALWAYS yields "in_progress"; never "blocked".
     ("orchestrator/execute_phase.py", "_resolver_retry"),
     ("orchestrator/execute_phase.py", "_dispatch_architect_consult"),
-    # iterates a FIXED tuple ("coded","auto_gated","reviewed","tested",
-    # "tournamented") then literal "complete" — "blocked" is never in it.
-    ("orchestrator/execute_phase.py", "_maybe_accept_approved_on_exhaustion"),
+    # iterates a FIXED slice of the pipeline tuple ("coded","auto_gated",
+    # "reviewed","tested","tournamented") then literal "complete" — "blocked" is
+    # never in it. The shared FSM-walk-to-complete primitive (Tier J's
+    # accept-approved-on-exhaustion + WS5's best-effort-commit both route their
+    # completion through it).
+    ("orchestrator/execute_phase.py", "_walk_task_to_complete"),
     # idempotent SELF-write of the current status to clear resolver_note at the
     # re-enable loop-top (status is in_progress there); preserves status, so it
     # can never CREATE a blocked transition.
