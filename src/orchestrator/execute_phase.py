@@ -1648,16 +1648,28 @@ async def _dispatch_architect_consult(
         )
 
     if arch_resolution.action == "architect-continue":
-        # Reset the developer's retry budget once and put the task back
-        # into ``in_progress`` so the outer loop picks it up. The
-        # ``update_task_status`` meta carries the retry reset; the
-        # caller's ``last_issues`` is appended on the next iteration.
+        # Reset the developer's retry budget once and put the task back into
+        # ``in_progress`` so the SAME ``_execute_one`` call re-dispatches it (via
+        # its loop ``continue``). The ``update_task_status`` meta carries the
+        # retry reset; the caller's ``last_issues`` is appended on the next
+        # iteration.
+        #
+        # Defense-in-depth (same footgun as ``_resolver_retry``): also clear
+        # ``escalated`` so a stale ``mark_escalated()`` stamp can never make the
+        # caller's ``if task.escalated: return task`` guard orphan a
+        # successfully-continued task. This branch is NOT currently reachable
+        # with ``escalated=True`` (``_try_retry_or_escalate`` guarantees
+        # ``escalated == False`` on entry here), so this is not an active bug —
+        # but it is the identical re-enable shape one call away from becoming
+        # live under a future change, so we keep it symmetric with
+        # ``_resolver_retry``.
         target_status = "in_progress" if task.status != "in_progress" else task.status
         await orch.plan_manager.update_task_status(
             task.id,
             target_status,
             meta={
                 "retry_count": 0,
+                "escalated": False,
                 "architect_consult_action": "continue",
             },
         )
@@ -1836,10 +1848,25 @@ async def _resolver_retry(
     """Re-enable ``task`` for another attempt (the architect-continue pattern).
 
     Resets the developer retry budget and transitions the task back to
-    ``in_progress`` so the outer loop re-dispatches it; stamps a typed
-    ``resolver_note`` into the task metadata for forensics + next-attempt
-    guidance. Returns the refreshed Task, or ``None`` if the transition failed
-    (caller falls through to its legacy block).
+    ``in_progress`` so the SAME ``_execute_one`` call re-dispatches it (via its
+    loop ``continue``); stamps a typed ``resolver_note`` into the task metadata
+    for forensics + next-attempt guidance. Returns the refreshed Task, or
+    ``None`` if the transition failed (caller falls through to its legacy block).
+
+    Also CLEARS ``escalated`` (``escalated=False`` in the meta below). Three
+    blocker-resolution rungs — ``SOFT_BLOCKER``, the legacy retry-exhaustion
+    rung, and ``_dispatch_architect_consult``'s ``architect-infra`` branch —
+    call :meth:`PlanManager.mark_escalated` (which sets ``task.escalated = True``
+    directly, bypassing the FSM) BEFORE consulting the resolver. If the resolver
+    then recovers the task via THIS function, the stale ``escalated=True`` would
+    otherwise survive: the 7 sites in ``_execute_one`` that check
+    ``if task.escalated: return task`` (after ``_try_retry_or_escalate``) would
+    treat a successfully-recovered task as needing to exit back to the dispatcher
+    — which the DAG dispatcher never re-picks up (it only selects
+    ``status == "pending"`` tasks), orphaning it into a ``PhaseStuckError``.
+    Clearing ``escalated`` here lets the recovery fall through to ``continue`` in
+    the same ``_execute_one`` call, matching how the already-safe KEYSTONE /
+    PIVOT / REFINE recovery rungs behave (they never call ``mark_escalated``).
     """
     try:
         target = "in_progress" if task.status != "in_progress" else task.status
@@ -1848,6 +1875,10 @@ async def _resolver_retry(
             target,
             meta={
                 "retry_count": 0,
+                # Clear any stale ``mark_escalated()`` stamp so a genuine
+                # recovery here is not misread by the caller's
+                # ``if task.escalated: return task`` guard (see docstring).
+                "escalated": False,
                 "resolver_action": "retry",
                 "resolver_note": note[:500],
             },
@@ -5543,6 +5574,15 @@ async def _execute_one(
                         orch=orch, task_id=task.id, exc=exc
                     ),
                 )
+                if task.status != "blocked":
+                    # block_task's resolver-first consult recovered the task
+                    # instead of blocking it — loop back within THIS
+                    # _execute_one call (matching every other retryable failure
+                    # in this loop) rather than returning a non-terminal,
+                    # dispatcher-invisible task that the DAG dispatcher (which
+                    # only re-selects status=="pending" tasks) never re-picks up.
+                    last_issues = [str(exc)]
+                    continue
                 return task
 
             coder_ev = CoderEvidence(
@@ -5621,6 +5661,16 @@ async def _execute_one(
                         raw_error=str(_budget_exc),
                         meta=_budget_meta,
                     )
+                    if task.status != "blocked":
+                        # block_task's resolver-first consult recovered the task
+                        # instead of blocking it — loop back within THIS
+                        # _execute_one call (matching every other retryable
+                        # failure in this loop) rather than returning a
+                        # non-terminal, dispatcher-invisible task that the DAG
+                        # dispatcher (which only re-selects status=="pending"
+                        # tasks) never re-picks up.
+                        last_issues = [str(_budget_exc)]
+                        continue
                     return task
                 # v0.39.0 (Cluster C2c): runtime under-decomposition
                 # telemetry. Best-effort, purely observational — never
@@ -5818,6 +5868,16 @@ async def _execute_one(
                             orch=orch, task_id=task.id, exc=exc
                         ),
                     )
+                    if task.status != "blocked":
+                        # block_task's resolver-first consult recovered the task
+                        # instead of blocking it — loop back within THIS
+                        # _execute_one call (matching every other retryable
+                        # failure in this loop) rather than returning a
+                        # non-terminal, dispatcher-invisible task that the DAG
+                        # dispatcher (which only re-selects status=="pending"
+                        # tasks) never re-picks up.
+                        last_issues = [str(exc)]
+                        continue
                     return task
 
                 verdict = review_tournament_outcome.winning_verdict
@@ -5885,6 +5945,16 @@ async def _execute_one(
                             orch=orch, task_id=task.id, exc=exc
                         ),
                     )
+                    if task.status != "blocked":
+                        # block_task's resolver-first consult recovered the task
+                        # instead of blocking it — loop back within THIS
+                        # _execute_one call (matching every other retryable
+                        # failure in this loop) rather than returning a
+                        # non-terminal, dispatcher-invisible task that the DAG
+                        # dispatcher (which only re-selects status=="pending"
+                        # tasks) never re-picks up.
+                        last_issues = [str(exc)]
+                        continue
                     return task
 
                 verdict, issues = _parse_review_verdict(review_result.text)
@@ -5964,6 +6034,16 @@ async def _execute_one(
                             orch=orch, task_id=task.id, exc=exc
                         ),
                     )
+                    if task.status != "blocked":
+                        # block_task's resolver-first consult recovered the task
+                        # instead of blocking it — loop back within THIS
+                        # _execute_one call (matching every other retryable
+                        # failure in this loop) rather than returning a
+                        # non-terminal, dispatcher-invisible task that the DAG
+                        # dispatcher (which only re-selects status=="pending"
+                        # tasks) never re-picks up.
+                        last_issues = [str(exc)]
+                        continue
                     return task
 
                 retry_verdict, retry_issues = _parse_review_verdict(
@@ -6112,6 +6192,15 @@ async def _execute_one(
                         orch=orch, task_id=task.id, exc=exc
                     ),
                 )
+                if task.status != "blocked":
+                    # block_task's resolver-first consult recovered the task
+                    # instead of blocking it — loop back within THIS
+                    # _execute_one call (matching every other retryable failure
+                    # in this loop) rather than returning a non-terminal,
+                    # dispatcher-invisible task that the DAG dispatcher (which
+                    # only re-selects status=="pending" tasks) never re-picks up.
+                    last_issues = [str(exc)]
+                    continue
                 return task
 
             passed, failed, total = _parse_test_counts(test_result.text)
@@ -6463,6 +6552,16 @@ async def _execute_one(
                             "recovery_hint": hint_hardfail,
                         },
                     )
+                    if task.status != "blocked":
+                        # block_task's resolver-first consult recovered the task
+                        # instead of blocking it — loop back within THIS
+                        # _execute_one call (matching every other retryable
+                        # failure in this loop) rather than returning a
+                        # non-terminal, dispatcher-invisible task that the DAG
+                        # dispatcher (which only re-selects status=="pending"
+                        # tasks) never re-picks up.
+                        last_issues = [f"test_diagnosis: {diagnosis}"]
+                        continue
                     return task
             else:
                 # ``no_signal`` — soft-block with an explicit reason
@@ -6501,6 +6600,15 @@ async def _execute_one(
                         "recovery_hint": hint_no_signal,
                     },
                 )
+                if task.status != "blocked":
+                    # block_task's resolver-first consult recovered the task
+                    # instead of blocking it — loop back within THIS
+                    # _execute_one call (matching every other retryable failure
+                    # in this loop) rather than returning a non-terminal,
+                    # dispatcher-invisible task that the DAG dispatcher (which
+                    # only re-selects status=="pending" tasks) never re-picks up.
+                    last_issues = ["test result inconclusive — no diagnostic signal"]
+                    continue
                 return task
 
             # Step 6: impl tournament.
@@ -6616,6 +6724,33 @@ async def _execute_one(
                             "blocked_reason": f"worktree_apply_failed: {exc}",
                         },
                     )
+                    if task.status != "blocked":
+                        # block_task's resolver-first consult recovered the task
+                        # instead of blocking it — loop back within THIS
+                        # _execute_one call (matching every other retryable
+                        # failure in this loop) rather than returning a
+                        # non-terminal, dispatcher-invisible task that the DAG
+                        # dispatcher (which only re-selects status=="pending"
+                        # tasks) never re-picks up.
+                        #
+                        # Code-review note: this branch is currently UNREACHABLE
+                        # in practice — at this point task.status is
+                        # "tournamented" (set a few lines above), whose only
+                        # legal FSM transitions are {complete, blocked}
+                        # (task_state.py). Both resolver recovery targets
+                        # (_resolver_retry -> in_progress, _resolver_corrective
+                        # -> skipped) are illegal from "tournamented", so
+                        # assert_transition rejects them, _resolver_retry's own
+                        # except swallows the ValueError and returns None, and
+                        # block_task always ends up committing "blocked" here
+                        # regardless of what the resolver would have chosen.
+                        # Kept for symmetry with the other 8 guarded sites in
+                        # this loop and as defense-in-depth if the FSM ever
+                        # grows a tournamented -> in_progress edge — do not
+                        # "clean this up" as dead code without re-checking the
+                        # FSM first.
+                        last_issues = [f"worktree_apply_failed: {exc}"]
+                        continue
                     return task
                 if not applied:
                     return await orch.plan_manager.get_task(task.id) or task
