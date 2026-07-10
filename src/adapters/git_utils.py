@@ -51,6 +51,18 @@ __all__ = [
 #    index"), and the worktree→main apply failed as a spurious
 #    ``conflict_3way_failed``. The agent should never ship regenerated
 #    bytecode, so it is dropped at the diff source — before any apply.
+#
+# WS2: ``.autodev/*`` was added for the SAME failure class as the
+# ``__pycache__/*.pyc`` case above, this time for AutoDev's OWN run-state
+# (ledger, tournament artifacts, index, session files, the language-profile
+# cache, ...). ``WorktreeManager._list_untracked`` is the primary guard (it
+# drops these paths before they ever reach a diff — see
+# :meth:`orchestrator.worktree.WorktreeManager._is_autodev_state_path`); this
+# glob is a defense-in-depth backstop here so any OTHER diff text that never
+# went through ``_list_untracked`` still gets AutoDev's state filtered out
+# before delivery/apply. Root-anchored (``.autodev`` always sits at whatever
+# repo root it belongs to — see ``state.paths.autodev_root``), and fnmatch's
+# ``*`` matches across ``/`` so this covers every path nested under it.
 GENERATED_FILE_GLOBS: tuple[str, ...] = (
     "*.lock",
     "package-lock.json",
@@ -63,6 +75,7 @@ GENERATED_FILE_GLOBS: tuple[str, ...] = (
     "composer.lock",
     "*.min.js",
     "*.min.css",
+    ".autodev/*",
 )
 
 
@@ -358,8 +371,17 @@ def _list_untracked(cwd: Path) -> list[str]:
 
     Returns ``[]`` for non-repos / subprocess failure. Used by
     :func:`_git_diff_with_untracked` to surface new files in adapter
-    evidence. Mirrors
-    :meth:`orchestrator.worktree.WorktreeManager._list_untracked`.
+    evidence.
+
+    WS2: this module-level helper does NOT itself drop AutoDev's own
+    ``.autodev/`` run-state — unlike
+    :meth:`orchestrator.worktree.WorktreeManager._list_untracked`, which
+    filters those paths directly. Here the equivalent protection lives one
+    layer up in :func:`_git_diff_with_untracked`, whose final
+    :func:`filter_generated_from_diff` pass drops any ``.autodev/*`` section
+    (that glob is in :data:`GENERATED_FILE_GLOBS`) from the built diff. So
+    both call paths end up ``.autodev``-free; they just apply the filter at
+    different stages (path-list vs. assembled-diff).
     """
     try:
         import subprocess
@@ -392,7 +414,17 @@ def _git_diff_with_untracked(cwd: Path) -> str | None:
     diff --no-index`` returns rc=1 when files differ (the success case
     here), so we accept rc in (0, 1). Returns ``None`` outside a git
     repo or when there is genuinely nothing to diff. Mirrors
-    :meth:`orchestrator.worktree.WorktreeManager.get_diff_vs_base`.
+    :meth:`orchestrator.worktree.WorktreeManager.get_diff_vs_base`,
+    including its final :func:`filter_generated_from_diff` pass.
+
+    WS2: the trailing :func:`filter_generated_from_diff` drops generated
+    cruft — most importantly AutoDev's own ``.autodev/*`` run-state, which
+    the module-level :func:`_list_untracked` does not itself exclude — from
+    the assembled diff before it becomes ``AgentResult.diff`` (coder /
+    review / test / tournament evidence text). This does NOT affect what
+    merges to main (the apply path recomputes via ``get_diff_vs_base``); it
+    keeps AutoDev's internals out of the evidence a reviewer / the next
+    agent reads.
     """
     import subprocess
 
@@ -409,7 +441,7 @@ def _git_diff_with_untracked(cwd: Path) -> str | None:
                 cwd=str(cwd),
                 capture_output=True,
                 text=True,
-            errors="replace",
+                errors="replace",
                 timeout=10,
                 check=False,
             )
@@ -417,7 +449,12 @@ def _git_diff_with_untracked(cwd: Path) -> str | None:
             continue
         if out.returncode in (0, 1):
             diff_text += out.stdout
-    return diff_text or None
+    # WS2: drop generated cruft (incl. ``.autodev/*``) — single source of
+    # truth in ``filter_generated_from_diff`` — so AutoDev's own state never
+    # leaks into the delivered evidence diff. ``or None`` preserves the
+    # legacy "empty ⇒ None" contract (filter returns "" for an all-cruft or
+    # empty diff).
+    return filter_generated_from_diff(diff_text) or None
 
 
 def _git_diff_range(cwd: Path, from_sha: str, to_sha: str) -> str | None:

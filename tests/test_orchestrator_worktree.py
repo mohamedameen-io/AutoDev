@@ -672,3 +672,65 @@ def test_state_manifest_atomic_write_survives_partial_failure(
 
     after = worktree_state.load_manifest(autodev_root)
     assert after == before, "atomic write must preserve the prior manifest"
+
+
+# ---------------------------------------------------------------------------
+# WS2: shared AutoDev-state predicate (_is_autodev_state_path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rel_path,expected",
+    [
+        # Canonical + nested cases → matched (un-anchored, whole-component).
+        (".autodev", True),
+        (".autodev/language_profile.json", True),
+        (".autodev/tournaments/impl-1/a/foo.py", True),
+        ("a/b/.autodev/c.json", True),
+        ("notautodev/.autodev/x", True),
+        ("./.autodev/plan-ledger.jsonl", True),
+        # Substring look-alikes → NOT matched (no false positives).
+        (".autodev-notes/x", False),
+        ("vendor/dotautodev/x", False),
+        ("src/autodev/x", False),
+        ("a/b/c.py", False),
+    ],
+)
+def test_is_autodev_state_path_predicate(
+    tmp_path: Path, rel_path: str, expected: bool
+) -> None:
+    """WS2: lock in the shared predicate's whole-path-component matching.
+
+    Pure predicate — no git subprocess, no on-disk repo needed. Confirms
+    the docstring's claims directly: ``.autodev/`` is matched wherever it
+    sits in the tree (nested anywhere), a bare ``.autodev`` is matched, and
+    substring look-alikes (``.autodev-notes``, ``dotautodev``,
+    ``src/autodev``) are NOT matched because the compare is over whole path
+    components, never substrings.
+    """
+    mgr = WorktreeManager(
+        main_repo=tmp_path / "repo", tournament_dir=tmp_path / "wt"
+    )
+    assert mgr._is_autodev_state_path(rel_path) is expected
+
+
+def test_is_autodev_state_path_nonstandard_root(tmp_path: Path) -> None:
+    """WS2: a non-standard ``autodev_root`` under the repo is also matched.
+
+    Proves the multi-component prefix path of ``_autodev_state_prefixes``
+    feeds the predicate (not just the canonical ``.autodev``), so the
+    diff-side exclusion and the ``git clean`` exclusion stay in lockstep
+    for non-default layouts too.
+    """
+    repo = tmp_path / "repo"
+    mgr = WorktreeManager(
+        main_repo=repo,
+        tournament_dir=tmp_path / "wt",
+        autodev_root=repo / "custom" / "state",
+    )
+    # The non-standard root (multi-component prefix) is matched...
+    assert mgr._is_autodev_state_path("custom/state/ledger.jsonl") is True
+    # ...and so is the canonical name (always included).
+    assert mgr._is_autodev_state_path(".autodev/x") is True
+    # A path sharing only the FIRST component is not matched.
+    assert mgr._is_autodev_state_path("custom/other/x") is False

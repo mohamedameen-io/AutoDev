@@ -167,6 +167,51 @@ async def test_regenerated_pyc_excluded_from_diff(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_untracked_autodev_state_excluded_from_diff(
+    tmp_path: Path,
+) -> None:
+    """WS2: an untracked ``.autodev/*`` file must never leak into the diff.
+
+    Mirrors ``test_untracked_new_pyc_excluded_but_source_kept`` above for a
+    SIBLING generated-artifact class: ``runtime.language_profile
+    .compute_language_profile`` caches its result to
+    ``<cwd>/.autodev/language_profile.json``; when some AutoDev subsystem
+    (e.g. a QA gate) computes it with ``cwd=worktree``, the cache file
+    lands INSIDE the per-task worktree as an untracked file. Because a
+    fresh target repo's ``.gitignore`` has never heard of AutoDev, this is
+    indistinguishable from real new task content to
+    ``git ls-files --others --exclude-standard`` -- ``_list_untracked``
+    must filter it out by path (not glob), same as it now protects
+    ``git clean`` via ``_git_clean_autodev_excludes``.
+
+    RED before the fix: ``_list_untracked`` returns every untracked path
+    unconditionally, so ``.autodev/language_profile.json`` is diffed
+    alongside the legitimate untracked ``new_src.py``.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo(repo)
+
+    wt_dir = tmp_path / "worktrees"
+    mgr = WorktreeManager(main_repo=repo, tournament_dir=wt_dir)
+    wt = await mgr.create_per_task("5.1")
+
+    (wt / "new_src.py").write_text("created = True\n")
+    autodev_dir = wt / ".autodev"
+    autodev_dir.mkdir()
+    (autodev_dir / "language_profile.json").write_text(
+        '{"profile": {"python": 1.0}}\n'
+    )
+
+    diff = await mgr.get_diff_vs_base(wt)
+    assert "new_src.py" in diff
+    assert "language_profile.json" not in diff
+    assert ".autodev" not in diff
+
+    await mgr.cleanup_all()
+
+
+@pytest.mark.asyncio
 async def test_text_only_diff_unaffected_by_flags(tmp_path: Path) -> None:
     """Regression: ordinary text-only diffs still apply (no binary block)."""
     repo = tmp_path / "repo"

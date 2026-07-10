@@ -95,3 +95,29 @@ def test_with_untracked_skips_gitignored(tmp_path: Path) -> None:
     assert "kept.md" in diff
     # The ignored.log line MUST NOT appear (it's gitignored).
     assert "ignored.log" not in diff
+
+
+def test_with_untracked_excludes_autodev_state(tmp_path: Path) -> None:
+    """WS2: AutoDev's own untracked ``.autodev/`` state must not leak here.
+
+    A fresh target repo's ``.gitignore`` has never heard of AutoDev, so its
+    own run-state (ledger, tournament artifacts, the language-profile
+    cache, ...) shows up to ``git ls-files --others`` exactly like a real
+    new file. The module-level ``_list_untracked`` does NOT itself filter
+    it (unlike ``WorktreeManager._list_untracked``); the protection is the
+    trailing ``filter_generated_from_diff`` pass in
+    ``_git_diff_with_untracked``, which drops the ``.autodev/*`` section.
+    The legitimate untracked source file must still survive.
+    """
+    _init_git(tmp_path)
+    (tmp_path / "real_change.py").write_text("x = 1\n")
+    autodev = tmp_path / ".autodev"
+    autodev.mkdir()
+    (autodev / "language_profile.json").write_text(
+        '{"profile": {"python": 1.0}}\n'
+    )
+    diff = _git_diff_with_untracked(tmp_path)
+    assert diff is not None
+    assert "real_change.py" in diff
+    assert "language_profile.json" not in diff
+    assert ".autodev" not in diff

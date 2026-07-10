@@ -22,6 +22,7 @@ import asyncio
 import re
 import shutil
 from contextlib import suppress
+from functools import cached_property
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
@@ -1047,14 +1048,36 @@ class WorktreeManager:
         return filter_generated_from_diff(diff_text)
 
     async def _list_untracked(self, worktree: Path) -> list[str]:
-        """Return paths of untracked files (excluding gitignored)."""
+        """Return paths of untracked files (excluding gitignored).
+
+        WS2: AutoDev's own run-state (``.autodev/`` -- ledger, tournament
+        artifacts, index, session files, the language-profile cache, ...)
+        is never real task content, yet a fresh target repo's
+        ``.gitignore`` has typically never heard of AutoDev, so it shows up
+        here as "untracked" exactly like a legitimate new file. Filtered
+        out via the shared :meth:`_is_autodev_state_path` predicate (also
+        used by :meth:`_git_clean_autodev_excludes`) so it can never flow
+        into the diff :meth:`get_diff_vs_base` builds from this list. Field
+        symptom this prevents: a QA gate computing
+        ``runtime.language_profile.compute_language_profile`` with
+        ``cwd=worktree`` leaves an untracked
+        ``.autodev/language_profile.json`` inside the worktree; diffing and
+        applying it collided with main's own independently-computed copy
+        of the same path on every ``--3way`` attempt (``conflict_3way_failed``
+        on an otherwise-trivial task -- see
+        ``tests/test_impl_tournament_spurious_conflict_a2.py``).
+        """
         rc, out, _ = await _run_git(
             worktree,
             ["ls-files", "--others", "--exclude-standard"],
         )
         if rc != 0:
             return []
-        return [line for line in out.splitlines() if line.strip()]
+        return [
+            line
+            for line in out.splitlines()
+            if line.strip() and not self._is_autodev_state_path(line.strip())
+        ]
 
     async def apply_patch_to_main(
         self,
@@ -1338,17 +1361,83 @@ class WorktreeManager:
                 autodev_protected=bool(autodev_excludes),
             )
 
+    @cached_property
+    def _autodev_state_prefixes(self) -> list[str]:
+        """Repo-relative prefixes identifying AutoDev's own run-state.
+
+        WS2: single canonical source of truth consumed by BOTH
+        :meth:`_is_autodev_state_path` (used by :meth:`_list_untracked` to
+        keep AutoDev's own state out of the computed worktree diff) and
+        :meth:`_git_clean_autodev_excludes` (protects the same paths from
+        ``git clean -fd``) — one definition instead of two that can drift.
+
+        Returns the canonical ``.autodev`` (the standard layout) plus, if
+        ``self._autodev_root`` lives under the main repo at a non-standard
+        location, that relative path too. The canonical name is always
+        included even when the autodev root is OUTSIDE the repo (then it's
+        the only protection reachable from inside the repo anyway).
+
+        Computed once (``cached_property``): a pure function of
+        ``self._main`` / ``self._autodev_root``, both set in ``__init__``
+        and never reassigned. ``_is_autodev_state_path`` consults this
+        per-untracked-candidate, so memoizing avoids re-running
+        ``Path.resolve()`` / ``relative_to()`` on every path.
+        """
+        from state.paths import AUTODEV_DIR
+
+        prefixes: list[str] = [AUTODEV_DIR]
+        try:
+            rel = self._autodev_root.resolve().relative_to(self._main.resolve())
+            rel_str = rel.as_posix()
+            # ``rel_str == "."`` means the autodev root IS the main repo root;
+            # a "." prefix would match every path — meaningless and unsafe.
+            if rel_str not in (".", "") and rel_str not in prefixes:
+                prefixes.append(rel_str)
+        except (ValueError, OSError):
+            # autodev_root is outside the repo (or unresolvable) — the
+            # canonical ``.autodev`` prefix is the only relevant guard.
+            pass
+        return prefixes
+
+    def _is_autodev_state_path(self, rel_path: str) -> bool:
+        """True if *rel_path* is part of AutoDev's own run-state.
+
+        ``rel_path`` is a posix-style path relative to a repo or worktree
+        root (e.g. as returned by ``git ls-files``). Matches when ANY path
+        component sequence of *rel_path* equals one of
+        :attr:`_autodev_state_prefixes` — un-anchored by design, mirroring
+        the pre-existing ``git clean -e`` exclude philosophy (protects a
+        ``.autodev/`` wherever it sits in the tree, not just at the root,
+        since protecting AutoDev's own state is always the safe direction).
+        A path that merely shares a prefix STRING with a protected name
+        (e.g. a sibling ``.autodev-notes/x``) is NOT matched — the compare
+        is over whole path components, never substrings.
+        """
+        normalized = rel_path.strip()
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        parts = PurePosixPath(normalized).parts
+        for prefix in self._autodev_state_prefixes:
+            prefix_parts = PurePosixPath(prefix).parts
+            span = len(prefix_parts)
+            if span == 0:
+                continue
+            for start in range(len(parts) - span + 1):
+                if parts[start : start + span] == prefix_parts:
+                    return True
+        return False
+
     def _git_clean_autodev_excludes(self) -> list[str]:
         """Return ``git clean -e`` pathspec(s) protecting AutoDev's state dir.
 
         A1 safety net: the per-repo ``.autodev/`` directory (ledger, snapshot,
         evidence, tournaments) is normally UNTRACKED in the target repo, so a
         repo-wide ``git clean -fd`` would delete it — destroying the live plan
-        mid-run. This computes the exclude pathspec relative to the main repo
-        root. Returns the canonical ``.autodev`` (the standard layout) plus, if
-        ``self._autodev_root`` lives under the main repo at a non-standard
-        location, that relative path too. Empty only when the autodev root is
-        OUTSIDE the repo (then ``git clean`` can't reach it anyway).
+        mid-run. Delegates to :attr:`_autodev_state_prefixes` — the SAME
+        canonical prefix list :meth:`_is_autodev_state_path` matches against
+        (WS2) — so this and the diff-side exclusion can never drift apart.
+        Returns a COPY so a caller mutating the result can't corrupt the
+        cached list.
 
         The canonical ``AUTODEV_DIR`` exclude is deliberately BROAD (un-anchored,
         so ``git clean -e`` protects a ``.autodev/`` wherever it sits in the
@@ -1356,21 +1445,7 @@ class WorktreeManager:
         so this is NOT narrowed to a root-anchored ``/.autodev`` — that would
         stop protecting non-standard ``_autodev_root`` layouts.
         """
-        from state.paths import AUTODEV_DIR
-
-        excludes: list[str] = [AUTODEV_DIR]
-        try:
-            rel = self._autodev_root.resolve().relative_to(self._main.resolve())
-            rel_str = rel.as_posix()
-            # ``rel_str == "."`` means the autodev root IS the main repo root;
-            # appending ``-e .`` would be a meaningless (and confusing) no-op.
-            if rel_str not in (".", "") and rel_str not in excludes:
-                excludes.append(rel_str)
-        except (ValueError, OSError):
-            # autodev_root is outside the repo (or unresolvable) — the
-            # canonical ``.autodev`` exclude is the only relevant guard.
-            pass
-        return excludes
+        return list(self._autodev_state_prefixes)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────

@@ -365,3 +365,146 @@ async def test_reconcilable_diff_not_spuriously_blocked_when_critic_abandons(
     # Both independent edits landed (true 3-way merge).
     merged = (repo / "foo.py").read_text()
     assert "L1-main" in merged and "L3-dev" in merged
+
+
+# ── Repro 4: AutoDev's own ``.autodev/`` state leaks into the diff and    ──
+#            spuriously blocks disjoint-file tasks (django-10914 shape)   ──
+
+
+@pytest.mark.asyncio
+async def test_autodev_own_state_leak_spuriously_blocks_disjoint_file_tasks(
+    tmp_path: Path,
+) -> None:
+    """WS2 RED repro of the field finding (SWE-bench ``django-10914`` shape).
+
+    Forensic evidence (2026-07-09 pilot, ``inst_0000_try_01``, task
+    ``1.c4``, captured stderr)::
+
+        error: .autodev/language_profile.json: already exists in working
+        directory
+        ...
+        Applied patch to 'django/conf/global_settings.py' cleanly.
+        Applied patch to 'docs/ref/settings.txt' cleanly.
+        Applied patch to 'docs/releases/3.0.txt' cleanly.
+        Applied patch to 'tests/file_storage/tests.py' cleanly.
+        Falling back to direct application...
+        Performing three-way merge...
+        error: .autodev/language_profile.json: does not exist in index
+        error: cannot read the current contents of
+        '.autodev/language_profile.json'
+        error: .autodev/language_profile.json: patch does not apply
+
+    The task's own real content applied CLEANLY -- the whole apply still
+    failed (plain, then ``--3way``) purely on the ``.autodev/`` hunk.
+
+    Root cause: ``runtime.language_profile.compute_language_profile``
+    caches to ``<cwd>/.autodev/language_profile.json``; when computed with
+    ``cwd=worktree`` (e.g. a QA gate scanning the per-task worktree) that
+    lands INSIDE the worktree as an untracked file.
+    ``WorktreeManager._list_untracked`` handed EVERY untracked path to
+    ``get_diff_vs_base`` with no exception, so this run-state was diffed
+    and applied alongside the task's real content -- colliding with main's
+    own independently-computed (differently-timestamped) copy of the same
+    path on every apply attempt, plain AND ``--3way``.
+
+    This fixture reproduces the SHAPE: two tasks touching DISJOINT files
+    (``a.py`` / ``b.py``), each with its own per-task worktree that
+    independently picks up its own ``.autodev/language_profile.json``
+    (simulating the real side effect), while main carries its own
+    independently-seeded copy. Both tasks' real edits are, on their own,
+    trivially appliable in isolation.
+
+    RED today: BOTH tasks spuriously block on the ``.autodev/`` collision,
+    proving this is systemic (recurs on every task), not a one-off fluke.
+    GREEN after the fix: both apply cleanly, neither ``.autodev/`` copy
+    (main's or either worktree's) is ever part of the delivered diff.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    _commit_file(repo, "a.py", "A1\nA2\n", "init a")
+    _commit_file(repo, "b.py", "B1\nB2\n", "init b")
+
+    # Main's own independently-computed language-profile cache (untracked --
+    # never committed, exactly like the field forensic). Different content
+    # from what each worktree below will carry, so a "new file" patch for
+    # the same path is guaranteed to collide (mirrors the "differently-
+    # timestamped copy" field language).
+    main_autodev = repo / ".autodev"
+    main_autodev.mkdir(parents=True, exist_ok=True)
+    (main_autodev / "language_profile.json").write_text(
+        '{"profile": {"python": 1.0}, "computed_by": "main"}\n'
+    )
+
+    task_a = Task(
+        id="1.1", phase_id="1", title="fix a", description="d", files=["a.py"]
+    )
+    task_b = Task(
+        id="1.2", phase_id="1", title="fix b", description="d", files=["b.py"]
+    )
+    plan = Plan(
+        plan_id="p-a2-autodev",
+        spec_hash="h",
+        phases=[Phase(id="1", title="Work", tasks=[task_a, task_b])],
+        created_at=_iso(),
+        updated_at=_iso(),
+    )
+    pm = PlanManager(repo, session_id="sess-a2-autodev")
+    await pm.init_plan(plan)
+    await pm.update_task_status("1.1", "in_progress")
+    await pm.update_task_status("1.2", "in_progress")
+
+    wt_mgr = WorktreeManager(
+        main_repo=repo, tournament_dir=repo / ".autodev" / "execute_worktrees"
+    )
+    orch = _make_orch(
+        repo, pm, critic_resolution="RESOLUTION: rebase-and-retry\n"
+    )
+
+    # ── Task 1.1: disjoint edit to a.py; its worktree independently gains
+    #    its own (differently-timestamped) language-profile cache. ──
+    wt_a = await wt_mgr.create_per_task("1.1")
+    (wt_a / "a.py").write_text("A1-fixed\nA2\n")
+    wt_a_autodev = wt_a / ".autodev"
+    wt_a_autodev.mkdir(parents=True, exist_ok=True)
+    (wt_a_autodev / "language_profile.json").write_text(
+        '{"profile": {"python": 1.0}, "computed_by": "task-1.1"}\n'
+    )
+
+    applied_a = await ep._apply_with_conflict_escalation(orch, task_a, wt_a, wt_mgr)
+
+    # ── Task 1.2: disjoint edit to b.py; a FRESH per-task worktree ALSO
+    #    independently gains its own language-profile cache -- proves the
+    #    collision recurs on every task's apply, not just the first. ──
+    wt_b = await wt_mgr.create_per_task("1.2")
+    (wt_b / "b.py").write_text("B1-fixed\nB2\n")
+    wt_b_autodev = wt_b / ".autodev"
+    wt_b_autodev.mkdir(parents=True, exist_ok=True)
+    (wt_b_autodev / "language_profile.json").write_text(
+        '{"profile": {"python": 1.0}, "computed_by": "task-1.2"}\n'
+    )
+
+    applied_b = await ep._apply_with_conflict_escalation(orch, task_b, wt_b, wt_mgr)
+
+    await wt_mgr.cleanup_all()
+
+    assert applied_a is True, (
+        "task 1.1's real edit must not be blocked by AutoDev's own "
+        ".autodev/ state"
+    )
+    assert applied_b is True, (
+        "task 1.2's real edit must not be blocked by AutoDev's own "
+        ".autodev/ state"
+    )
+    reason_a = await _blocked_reason(pm, "1.1")
+    reason_b = await _blocked_reason(pm, "1.2")
+    assert reason_a is None or "3way_failed" not in reason_a
+    assert reason_b is None or "3way_failed" not in reason_b
+    assert (repo / "a.py").read_text() == "A1-fixed\nA2\n"
+    assert (repo / "b.py").read_text() == "B1-fixed\nB2\n"
+    # Main's own independently-computed cache must never be touched by
+    # either task's apply -- the delivered diff must never carry a hunk
+    # for it.
+    assert (main_autodev / "language_profile.json").read_text() == (
+        '{"profile": {"python": 1.0}, "computed_by": "main"}\n'
+    )
