@@ -381,6 +381,111 @@ def test_checkout_failure_is_error_not_silent_proceed(
     assert adapter.reports[-1].base_commit == ""
 
 
+def test_default_clone_raises_on_failed_git_clone_without_creating_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Confirmed field incident: a real Phase-1 pilot run hit a transient ``git
+    clone`` failure. ``_default_clone`` ignored the non-zero returncode and
+    returned normally WITHOUT creating ``workdir``. The very next step in
+    ``prepare`` (``git checkout``, ``cwd=workdir``) then hit a MISSING cwd and
+    raised a raw, untyped ``FileNotFoundError`` -- which the quota guard's
+    per-instance ``except InstancePrepareError`` does not catch, so it escaped
+    and aborted the entire multi-hour run (discarding every already-completed
+    instance's report).
+
+    ``_default_clone`` must fail fast instead: a non-zero ``git clone`` raises
+    ``InstancePrepareError`` (specifically ``PrepareError`` -- the SAME typed
+    error the checkout-failure path above raises), never a raw
+    ``FileNotFoundError``/``OSError``, and it must never return silently having
+    left ``workdir`` unmaterialised.
+
+    Non-vacuous: before the fix this call returned ``None`` (no exception) and
+    left ``workdir`` absent -- the ``pytest.raises`` below would fail (DID NOT
+    RAISE)."""
+    from benchmarks.adapters import swebench_lite as adp
+    from benchmarks.adapters.base import InstancePrepareError
+    from benchmarks.runner.solve import _SubprocessResult
+
+    def failing_clone_run(cmd, *, cwd, timeout, env=None):
+        assert cmd[:2] == ["git", "clone"], f"unexpected command in this test: {cmd}"
+        return _SubprocessResult(
+            returncode=128,
+            stdout="",
+            stderr="fatal: unable to access 'https://...': Could not resolve host",
+            timed_out=False,
+            elapsed_seconds=0.0,
+        )
+
+    monkeypatch.setattr(adp, "_run", failing_clone_run)
+
+    workdir = tmp_path / "inst"
+    with pytest.raises(InstancePrepareError):
+        adp._default_clone("demo/repo", workdir)
+
+    assert not workdir.exists(), (
+        "a failed clone must not leave a workdir behind for the caller to "
+        "mistake for a successful clone"
+    )
+
+
+def test_prepare_treats_silent_clone_failure_as_error_not_missing_cwd_crash(
+    tmp_path: Path,
+):
+    """Defensive guard (belt-and-suspenders on top of ``_default_clone``'s own
+    fail-fast): even if the INJECTED cloner -- not ``_default_clone`` -- silently
+    misbehaves by returning normally without creating ``workdir`` (exactly the
+    field-incident shape), ``prepare`` must not proceed into ``git checkout``
+    with a missing cwd. It must instead record an ERROR InstanceReport and raise
+    ``PrepareError`` -- the exact contract the checkout-failure path already
+    honors -- so a custom/future cloner can never reintroduce the escape.
+
+    Non-vacuous: before the fix, ``prepare`` called straight into
+    ``git checkout`` with ``cwd=<missing workdir>`` right after the silent
+    clone, raising an untyped ``FileNotFoundError`` instead of ``PrepareError``
+    -- the ``pytest.raises(adp.PrepareError)`` below would fail with the wrong
+    exception type."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    def silently_broken_cloner(repo: str, workdir: Path) -> None:
+        # Mirrors the field incident: no exception, no workdir created.
+        return None
+
+    adapter = _adapter(cloner=silently_broken_cloner)
+    instance = _make_instance()
+    workdir = tmp_path / "inst"
+
+    with pytest.raises(adp.PrepareError):
+        adapter.prepare(instance, workdir)
+
+    assert adapter.reports, "a failed clone must still record an InstanceReport"
+    assert adapter.reports[-1].status == ERROR
+    assert adapter.reports[-1].base_commit == ""
+
+
+def test_prepare_wraps_cloner_raised_instance_prepare_error(tmp_path: Path):
+    """If the injected cloner raises ``InstancePrepareError`` directly (e.g. the
+    default cloner's own fail-fast, or a custom cloner with its own detection),
+    ``prepare`` must still record an ERROR InstanceReport -- mirroring every
+    other prepare-failure path -- before the typed error propagates onward."""
+    from benchmarks.adapters.base import InstancePrepareError
+
+    def raising_cloner(repo: str, workdir: Path) -> None:
+        raise InstancePrepareError("simulated: git clone exited 128")
+
+    adapter = _adapter(cloner=raising_cloner)
+    instance = _make_instance()
+    workdir = tmp_path / "inst"
+
+    with pytest.raises(InstancePrepareError):
+        adapter.prepare(instance, workdir)
+
+    assert adapter.reports, (
+        "a raised clone failure must still record an InstanceReport"
+    )
+    assert adapter.reports[-1].status == ERROR
+    assert adapter.reports[-1].base_commit == ""
+
+
 def test_diff_is_measured_from_base_commit(tmp_path: Path):
     """The source patch is measured from ``base_commit``: a fix to ``mod.py`` shows
     up as a change relative to BASE_SRC (removing ``return 1``, adding ``return

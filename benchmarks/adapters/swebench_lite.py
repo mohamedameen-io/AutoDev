@@ -258,15 +258,48 @@ def _test_paths(instance: Instance) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
+def _is_git_repo(path: Path) -> bool:
+    """Cheap, dependency-free check that ``path`` looks like a materialised git
+    working tree (a directory containing ``.git``).
+
+    No subprocess spawn -- good enough to detect "the cloner silently didn't put
+    anything here" without asking git itself. Used by both :func:`_default_clone`'s
+    own fail-fast check and ``prepare``'s defensive guard against a misbehaving
+    injected cloner.
+    """
+    return path.is_dir() and (path / ".git").exists()
+
+
 def _default_clone(repo: str, workdir: Path) -> None:
     """Clone ``<repo>`` (``owner/name``) from GitHub into ``workdir``.
 
     ``git clone`` creates ``workdir``; the adapter checks out ``base_commit``
-    afterwards. Best-effort: raises only if git itself fails to spawn.
+    afterwards.
+
+    FAIL-FAST, mirroring the checkout-failure contract in ``prepare`` below: a
+    confirmed field incident showed a transient ``git clone`` failure leaving
+    ``workdir`` un-created WITHOUT raising -- the caller's next step
+    (``git checkout``, ``cwd=workdir``) then hit a missing cwd and raised a raw,
+    untyped ``FileNotFoundError`` that escaped straight past the quota guard's
+    per-instance isolation (which only catches :class:`InstancePrepareError`),
+    aborting an entire multi-hour pilot run and discarding every already-
+    completed instance's report. A non-zero ``git clone`` exit, OR one that
+    exits 0 but somehow didn't leave a real git repo at ``workdir``, now raises
+    :class:`PrepareError` (the SAME typed error the checkout-failure path
+    raises) so the guard's per-instance ``except InstancePrepareError`` catches
+    it, degrades just this one instance to ERROR, and lets the sweep continue.
     """
     url = f"https://github.com/{repo}.git"
     workdir.parent.mkdir(parents=True, exist_ok=True)
-    _run(["git", "clone", url, str(workdir)], cwd=workdir.parent, timeout=_CLONE_TIMEOUT)
+    result = _run(
+        ["git", "clone", url, str(workdir)], cwd=workdir.parent, timeout=_CLONE_TIMEOUT
+    )
+    if result.returncode != 0 or not _is_git_repo(workdir):
+        detail = (
+            f"git clone {repo} failed (exit {result.returncode}): "
+            f"{(result.stderr or '').strip()[:200]}"
+        )
+        raise PrepareError(detail)
 
 
 def _write_install_failure_log(workdir: Path, *, stdout: str, stderr: str) -> None:
@@ -541,7 +574,48 @@ class SwebenchLiteAdapter:
         instance_id = str(instance.get("instance_id", ""))
 
         # 1. Materialise the repo (injected clone; real ``git clone`` in prod).
-        self._clone(str(instance["repo"]), workdir)
+        #    A clone can fail two ways: the cloner raises directly (e.g. the
+        #    default cloner's own fail-fast on a non-zero ``git clone`` -- see
+        #    ``_default_clone``), or it returns "successfully" but leaves
+        #    ``workdir`` missing / not a real git repo (a silently-broken
+        #    injected/custom cloner -- belt-and-suspenders in case a future
+        #    cloner reintroduces the gap). Either way this must be handled
+        #    exactly like the checkout failure below -- record an ERROR
+        #    InstanceReport and raise the typed prepare error -- rather than
+        #    falling into the NEXT step (``git checkout``, cwd=workdir) with a
+        #    missing cwd, which raises a raw, untyped ``FileNotFoundError`` the
+        #    quota guard's per-instance isolation does not catch (a confirmed
+        #    field incident: that escape aborted an entire multi-hour pilot run
+        #    and discarded every already-completed instance's report).
+        try:
+            self._clone(str(instance["repo"]), workdir)
+        except InstancePrepareError as exc:
+            detail = f"clone failed: {exc}"
+            self.reports.append(
+                InstanceReport(
+                    instance_id=instance_id,
+                    status=ERROR,
+                    degraded_blind=False,
+                    base_commit="",
+                    wall_time_s=0.0,
+                    detail=detail,
+                )
+            )
+            raise PrepareError(detail) from exc
+
+        if not _is_git_repo(workdir):
+            detail = f"clone did not materialise a git repo at {workdir}"
+            self.reports.append(
+                InstanceReport(
+                    instance_id=instance_id,
+                    status=ERROR,
+                    degraded_blind=False,
+                    base_commit="",
+                    wall_time_s=0.0,
+                    detail=detail,
+                )
+            )
+            raise PrepareError(detail)
 
         # 2. Check out ``base_commit`` ourselves — the adapter owns this so the
         #    baseline is deterministic and testable. A FAILED checkout (invalid /

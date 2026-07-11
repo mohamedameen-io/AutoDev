@@ -712,6 +712,94 @@ def test_run_guarded_solve_isolates_bad_instance_prepare_and_continues(tmp_path:
     assert preds_by_id["ok-3"]["model_patch"] == "fix"
 
 
+def test_run_guarded_solve_isolates_clone_failure_and_continues(tmp_path: Path):
+    """Confirmed field incident, reproduced through the REAL adapter (not a
+    generic ``InstancePrepareError`` double): a per-instance clone failure --
+    the injected cloner silently returns without materialising ``workdir``, the
+    exact shape a real ``git clone`` failure took during a Phase-1 pilot run --
+    must be isolated to THAT instance (recorded ERROR) while the sweep
+    CONTINUES to run and complete subsequent instances, never aborting the
+    whole run.
+
+    Mirrors ``test_run_guarded_solve_isolates_bad_instance_prepare_and_continues``
+    but exercises the real ``SwebenchLiteAdapter.prepare`` (real git checkout on
+    a real tmp repo, real ``_PrepState``/``InstanceReport`` bookkeeping) instead
+    of a hand-rolled fake adapter -- proving the fix closes the clone-path
+    asymmetry end-to-end at the guard boundary, not merely inside the adapter's
+    own isolated unit tests.
+
+    Non-vacuous: before the fix, "bad-2"'s silently-broken clone left ``workdir``
+    missing, so the adapter's own ``git checkout`` (cwd=<missing workdir>) raised
+    a raw, untyped ``FileNotFoundError`` that the guard's
+    ``except InstancePrepareError`` does not catch -- this call would raise
+    ``FileNotFoundError`` instead of returning results for all three instances."""
+    from benchmarks.adapters.swebench_lite import InstallResult, SwebenchLiteAdapter
+    from benchmarks.runner.solve import _git
+
+    def cloner(repo: str, workdir: Path) -> None:
+        if "bad" in repo:
+            # Simulated silent clone failure (the field-incident shape): no
+            # exception, no workdir created.
+            return
+        # A minimal real git repo so the adapter's OWN checkout succeeds.
+        workdir.mkdir(parents=True, exist_ok=True)
+        _git(["init", "-q", "-b", "main"], cwd=workdir)
+        _git(["config", "user.email", "t@t"], cwd=workdir)
+        _git(["config", "user.name", "t"], cwd=workdir)
+        (workdir / "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        _git(["add", "."], cwd=workdir)
+        _git(["commit", "-qm", "base"], cwd=workdir)
+        _git(["tag", "base-ref"], cwd=workdir)
+
+    adapter = SwebenchLiteAdapter(
+        cloner=cloner,
+        env_installer=lambda instance, workdir: InstallResult(installed=True),
+    )
+
+    win = _outcome(success=True, ledger_path=_empty_ledger(tmp_path), diff="fix")
+
+    def solve_fn(workdir, intent, profile, invoker):
+        return win
+
+    def _instance(instance_id: str, repo: str) -> dict:
+        return {
+            "instance_id": instance_id,
+            "repo": repo,
+            "base_commit": "base-ref",
+            "problem_statement": "p",
+            "test_patch": "",
+        }
+
+    instances = [
+        _instance("ok-1", "demo/ok-1"),
+        _instance("bad-2", "demo/bad-2"),
+        _instance("ok-3", "demo/ok-3"),
+    ]
+    predictions, results = run_guarded_solve(
+        adapter,
+        instances,
+        invoker=lambda *a, **k: None,
+        workdir_root=tmp_path / "wd",
+        solve_fn=solve_fn,
+        backoff=_BACKOFF,
+        sleep=FakeSleep(),
+    )
+
+    # the sweep COMPLETED over all three (not aborted by the clone failure)
+    assert len(results) == 3
+    assert len(predictions) == 3
+    by_id = {r.instance_id: r for r in results}
+    assert by_id["ok-1"].status == COMPLETE
+    assert by_id["ok-3"].status == COMPLETE
+    assert by_id["bad-2"].status == ERROR
+    assert by_id["bad-2"].status != FAIL
+    assert by_id["bad-2"].outcome is None
+
+    # the adapter's OWN bookkeeping recorded the clone failure as ERROR too.
+    bad_reports = [r for r in adapter.reports if r.instance_id == "bad-2"]
+    assert bad_reports and bad_reports[-1].status == ERROR
+
+
 def test_run_guarded_solve_unexpected_prepare_exception_still_propagates(
     tmp_path: Path,
 ):
