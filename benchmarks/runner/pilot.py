@@ -302,6 +302,12 @@ class PilotInstanceOutcome:
     hand-inspecting the instance's workdir. ``PilotReport.to_dict()`` serialises
     the FULL tails (via ``asdict()``); ``human_summary()`` renders only a short
     excerpt of each (see ``_SUMMARY_TAIL_EXCERPT_CHARS``).
+
+    ``install_stdout_tail`` / ``install_stderr_tail`` are threaded the same way
+    but sourced from the adapter's ``InstanceReport`` (see :func:`_install_tail_map`,
+    which mirrors :func:`_blind_map`'s read of ``degraded_blind``) — the
+    per-instance arm64-install-failure capture (WS-7), diagnosing WHY an instance
+    went blind rather than just recording that it did.
     """
 
     instance_id: str
@@ -314,6 +320,8 @@ class PilotInstanceOutcome:
     detail: str | None = None
     fail_stdout_tail: str = ""
     fail_stderr_tail: str = ""
+    install_stdout_tail: str = ""
+    install_stderr_tail: str = ""
 
     @property
     def clean(self) -> bool:
@@ -472,6 +480,27 @@ def _blind_map(adapter: BenchmarkAdapter) -> dict[str, bool]:
     return out
 
 
+def _install_tail_map(adapter: BenchmarkAdapter) -> dict[str, tuple[str, str]]:
+    """Read the adapter's per-instance ``InstanceReport``s for the install-failure
+    tails (WS-7) — mirrors :func:`_blind_map`'s defensive read of ``degraded_blind``
+    exactly, just for the ``install_stdout_tail``/``install_stderr_tail`` pair.
+
+    Defensive: an adapter without ``reports``, or an ``InstanceReport`` shape
+    without these fields (an older report / a future adapter), simply yields
+    ``("", "")`` for that instance.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    for rep in getattr(adapter, "reports", []) or []:
+        iid = getattr(rep, "instance_id", None)
+        if iid is None:
+            continue
+        out[str(iid)] = (
+            str(getattr(rep, "install_stdout_tail", "") or ""),
+            str(getattr(rep, "install_stderr_tail", "") or ""),
+        )
+    return out
+
+
 def run_pilot(
     adapter: BenchmarkAdapter,
     scorer: Scorer,
@@ -532,10 +561,14 @@ def run_pilot(
         )
         quota_waits[g.instance_id] = g.quota_wait_time_s
     blind = _blind_map(adapter)
+    install_tails = _install_tail_map(adapter)
 
     outcomes: list[PilotInstanceOutcome] = []
     for g in guard_results:
         score_status = score_by_id.get(g.instance_id, ERROR)
+        install_stdout_tail, install_stderr_tail = install_tails.get(
+            g.instance_id, ("", "")
+        )
         outcomes.append(
             PilotInstanceOutcome(
                 instance_id=g.instance_id,
@@ -548,6 +581,8 @@ def run_pilot(
                 detail=g.detail,
                 fail_stdout_tail=g.fail_stdout_tail,
                 fail_stderr_tail=g.fail_stderr_tail,
+                install_stdout_tail=install_stdout_tail,
+                install_stderr_tail=install_stderr_tail,
             )
         )
 

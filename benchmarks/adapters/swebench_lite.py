@@ -49,6 +49,7 @@ from benchmarks.runner.scorer import DEFAULT_EXCLUDED_DIRS, diff_since_commit
 from benchmarks.runner.solve import (
     SolveOutcome,
     SolveProfile,
+    _FAIL_OUTPUT_TAIL,
     _git,
     _rev_parse_head,
     _run,
@@ -111,10 +112,54 @@ _CHECKOUT_TIMEOUT = 120
 _VENV_TIMEOUT = 300
 _INSTALL_TIMEOUT = 1800
 
+# This adapter's OWN scaffolding dir -- a SIBLING of ``.autodev/``, never nested
+# under it. ``_default_install_env`` runs BEFORE ``autodev init`` ever does (see
+# ``SwebenchLiteAdapter.prepare``), and ``init`` refuses to run if ``.autodev/``
+# already exists -- so the install-failure log cannot live under ``.autodev``.
+# Added to the adapter's excluded dirs (``_ADAPTER_EXCLUDED_DIRS`` below) so it
+# is never mistaken for part of the candidate source-only fix.
+_BENCH_SCAFFOLD_DIRNAME = ".autodev-bench"
+_INSTALL_FAILURE_LOG_NAME = "install-failure.log"
+
+# The generic scaffolding exclusions (``.autodev``/``.claude``/``.cursor`` from
+# ``benchmarks.runner.scorer``) PLUS this adapter's own ``.autodev-bench`` --
+# deliberately a local addition rather than widening the shared
+# ``DEFAULT_EXCLUDED_DIRS`` (other benchmarks/callers never create
+# ``.autodev-bench`` scaffolding, so it has no business in the generic default).
+_ADAPTER_EXCLUDED_DIRS: tuple[str, ...] = (
+    *DEFAULT_EXCLUDED_DIRS,
+    _BENCH_SCAFFOLD_DIRNAME,
+)
+
+
+@dataclass(frozen=True)
+class InstallResult:
+    """Outcome of one per-instance arm64 venv + editable install attempt.
+
+    ``installed`` is True iff the venv was created and ``pip install -e .``
+    exited 0. On failure, ``stdout_tail``/``stderr_tail`` carry the LAST
+    ``_FAIL_OUTPUT_TAIL`` chars of the failing command's captured output --
+    mirroring :class:`~benchmarks.runner.solve.SolveOutcome`'s
+    ``fail_stdout_tail``/``fail_stderr_tail`` tail convention exactly (same
+    truncation size, same "last N chars" semantics). Both default to ``""`` on
+    success (nothing to report).
+
+    The FULL, untruncated output is separately persisted by
+    :func:`_default_install_env` to ``workdir / ".autodev-bench" /
+    "install-failure.log"`` on failure, so a blind-solve instance is
+    diagnosable from disk even though these tails are truncated.
+    """
+
+    installed: bool
+    stdout_tail: str = ""
+    stderr_tail: str = ""
+
+
 # Injection points: a cloner materialises ``repo`` into a workdir; an env
-# installer returns True iff the per-instance deps installed on arm64.
+# installer attempts the per-instance arm64 deps install and reports the
+# outcome (see :class:`InstallResult`).
 Cloner = Callable[[str, Path], None]
-EnvInstaller = Callable[[Instance, Path], bool]
+EnvInstaller = Callable[[Instance, Path], InstallResult]
 
 
 class PrepareError(InstancePrepareError):
@@ -140,8 +185,13 @@ class InstanceReport:
     ``status`` is ``CANDIDATE`` (a source patch was produced, awaiting scoring) or
     ``ERROR`` (empty source residual / infra — never a silent pass). ``degraded_
     blind`` records whether the arm64 install failed and the solve ran with
-    ``test_runner`` off. Consumed by the quota-aware wrapper (P1.4) and the coarse
-    gate (P1.5).
+    ``test_runner`` off. ``install_stdout_tail``/``install_stderr_tail`` are
+    threaded straight from the terminal :class:`InstallResult` (default ``""``
+    when nothing was captured — a clean install, or no install ever attempted)
+    so a blind instance's arm64 install failure is diagnosable from the report
+    alone, mirroring how ``fail_stdout_tail``/``fail_stderr_tail`` already make a
+    solve failure diagnosable on :class:`~benchmarks.runner.pilot.PilotInstanceOutcome`.
+    Consumed by the quota-aware wrapper (P1.4) and the coarse gate (P1.5).
     """
 
     instance_id: str
@@ -150,6 +200,8 @@ class InstanceReport:
     base_commit: str
     wall_time_s: float = 0.0
     detail: str | None = None
+    install_stdout_tail: str = ""
+    install_stderr_tail: str = ""
 
 
 @dataclass
@@ -160,6 +212,8 @@ class _PrepState:
     exclude_dirs: tuple[str, ...]
     test_paths: tuple[str, ...]
     degraded_blind: bool
+    install_stdout_tail: str
+    install_stderr_tail: str
 
 
 # ---------------------------------------------------------------------------
@@ -214,14 +268,44 @@ def _default_clone(repo: str, workdir: Path) -> None:
     _run(["git", "clone", url, str(workdir)], cwd=workdir.parent, timeout=_CLONE_TIMEOUT)
 
 
-def _default_install_env(instance: Instance, workdir: Path) -> bool:
+def _write_install_failure_log(workdir: Path, *, stdout: str, stderr: str) -> None:
+    """Best-effort: persist the FULL (untruncated) install output to a durable
+    on-disk log under the sibling ``.autodev-bench`` scaffolding dir.
+
+    Confirmed empirically via both Phase-1 pilot reports showing EMPTY tails for
+    the two blind instances: without this, an arm64 install failure is
+    completely un-diagnosable after the fact. Never raises — a logging failure
+    must not turn a best-effort install probe into a hard error; the returned
+    (truncated) tail is still available on the :class:`InstallResult` even if
+    this write fails.
+    """
+    try:
+        log_dir = workdir / _BENCH_SCAFFOLD_DIRNAME
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / _INSTALL_FAILURE_LOG_NAME).write_text(
+            f"--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _default_install_env(instance: Instance, workdir: Path) -> InstallResult:
     """Best-effort per-instance arm64 venv + editable install.
 
-    Returns True iff a venv is created and ``pip install -e .`` succeeds. Never
-    raises — any failure (venv creation, resolution, native-build break on arm64,
-    timeout) degrades to ``False`` so the caller solves blind. Per-version install
-    specs (``environment_setup_commit``/``version``) are a pilot refinement (P1.6);
-    the generic editable install is the honest Phase-1 default.
+    Returns an :class:`InstallResult` whose ``installed`` is True iff a venv is
+    created and ``pip install -e .`` succeeds. Never raises — any failure (venv
+    creation, resolution, native-build break on arm64, timeout) degrades to
+    ``installed=False`` so the caller solves blind.
+
+    On failure, the last ``_FAIL_OUTPUT_TAIL`` chars of the failing command's
+    stdout/stderr are returned as ``stdout_tail``/``stderr_tail`` (mirroring
+    ``benchmarks.runner.solve.SolveOutcome``'s tail convention) AND the FULL
+    output is persisted to ``workdir / ".autodev-bench" / "install-failure.log"``
+    (see :func:`_write_install_failure_log`) so a blind-solve instance is
+    diagnosable without re-running the install by hand. Per-version install
+    specs (``environment_setup_commit``/``version``) are a pilot refinement
+    (P1.6); the generic editable install is the honest Phase-1 default.
     """
     try:
         venv_dir = workdir / ".venv"
@@ -231,15 +315,31 @@ def _default_install_env(instance: Instance, workdir: Path) -> bool:
             timeout=_VENV_TIMEOUT,
         )
         if made.returncode != 0:
-            return False
+            _write_install_failure_log(workdir, stdout=made.stdout, stderr=made.stderr)
+            return InstallResult(
+                installed=False,
+                stdout_tail=made.stdout[-_FAIL_OUTPUT_TAIL:],
+                stderr_tail=made.stderr[-_FAIL_OUTPUT_TAIL:],
+            )
         bin_dir = "Scripts" if sys.platform == "win32" else "bin"
         pip = venv_dir / bin_dir / "pip"
         installed = _run(
             [str(pip), "install", "-e", "."], cwd=workdir, timeout=_INSTALL_TIMEOUT
         )
-        return installed.returncode == 0
-    except Exception:  # noqa: BLE001 - best-effort; any failure => solve blind
-        return False
+        if installed.returncode != 0:
+            _write_install_failure_log(
+                workdir, stdout=installed.stdout, stderr=installed.stderr
+            )
+            return InstallResult(
+                installed=False,
+                stdout_tail=installed.stdout[-_FAIL_OUTPUT_TAIL:],
+                stderr_tail=installed.stderr[-_FAIL_OUTPUT_TAIL:],
+            )
+        return InstallResult(installed=True)
+    except Exception as exc:  # noqa: BLE001 - best-effort; any failure => solve blind
+        stderr_tail = str(exc)[-_FAIL_OUTPUT_TAIL:]
+        _write_install_failure_log(workdir, stdout="", stderr=str(exc))
+        return InstallResult(installed=False, stderr_tail=stderr_tail)
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +406,12 @@ class SwebenchLiteAdapter:
         base_sha = _rev_parse_head(workdir)
 
         # 4. Best-effort per-instance arm64 venv. The install decision drives the
-        #    per-instance ``test_runner`` policy.
-        installed = bool(self._install_env(instance, workdir))
+        #    per-instance ``test_runner`` policy. On failure, install_result
+        #    carries a truncated stdout/stderr tail (the FULL output is already
+        #    persisted to ".autodev-bench/install-failure.log" by the installer
+        #    itself) so a blind solve is diagnosable from the report alone.
+        install_result = self._install_env(instance, workdir)
+        installed = install_result.installed
         degraded_blind = not installed
 
         # 5. config_patch: always cut the within-task burst AND activate the
@@ -350,15 +454,18 @@ class SwebenchLiteAdapter:
         if degraded_blind:
             config_patch["qa_gates"] = {"test_runner": False}
 
-        # 6. SOURCE-ONLY diff exclusions: scaffolding + the hidden test paths.
+        # 6. SOURCE-ONLY diff exclusions: scaffolding (incl. this adapter's own
+        #    ".autodev-bench") + the hidden test paths.
         test_paths = _test_paths(instance)
-        exclude_dirs = (*DEFAULT_EXCLUDED_DIRS, *test_paths)
+        exclude_dirs = (*_ADAPTER_EXCLUDED_DIRS, *test_paths)
 
         self._prep[instance_id] = _PrepState(
             base_commit=base_sha,
             exclude_dirs=exclude_dirs,
             test_paths=test_paths,
             degraded_blind=degraded_blind,
+            install_stdout_tail=install_result.stdout_tail,
+            install_stderr_tail=install_result.stderr_tail,
         )
         return SolveProfile(
             config_patch=config_patch,
@@ -382,12 +489,16 @@ class SwebenchLiteAdapter:
             # Defensive: predict without a matching prepare (never via run_solve)
             # — recompute the baseline/exclusions rather than raising KeyError.
             base_commit = _rev_parse_head(workdir)
-            exclude_dirs = (*DEFAULT_EXCLUDED_DIRS, *_test_paths(instance))
+            exclude_dirs = (*_ADAPTER_EXCLUDED_DIRS, *_test_paths(instance))
             degraded_blind = False
+            install_stdout_tail = ""
+            install_stderr_tail = ""
         else:
             base_commit = prep.base_commit
             exclude_dirs = prep.exclude_dirs
             degraded_blind = prep.degraded_blind
+            install_stdout_tail = prep.install_stdout_tail
+            install_stderr_tail = prep.install_stderr_tail
 
         # SOURCE-ONLY residual: base_commit -> worktree, minus scaffolding + tests.
         source_diff = diff_since_commit(
@@ -416,6 +527,8 @@ class SwebenchLiteAdapter:
                 base_commit=base_commit,
                 wall_time_s=round(outcome.wall_time_s, 3),
                 detail=detail,
+                install_stdout_tail=install_stdout_tail,
+                install_stderr_tail=install_stderr_tail,
             )
         )
         return {

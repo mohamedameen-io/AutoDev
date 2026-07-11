@@ -99,11 +99,21 @@ def _guard_quota_exhausted(instance_id: str, quota_wait_time_s: float) -> GuardR
 
 
 class _Report:
-    """Minimal InstanceReport double (only the fields the pilot reads for blind)."""
+    """Minimal InstanceReport double (only the fields the pilot reads for blind
+    + the install-failure tails)."""
 
-    def __init__(self, instance_id: str, degraded_blind: bool) -> None:
+    def __init__(
+        self,
+        instance_id: str,
+        degraded_blind: bool,
+        *,
+        install_stdout_tail: str = "",
+        install_stderr_tail: str = "",
+    ) -> None:
         self.instance_id = instance_id
         self.degraded_blind = degraded_blind
+        self.install_stdout_tail = install_stdout_tail
+        self.install_stderr_tail = install_stderr_tail
 
 
 class _FakeAdapter:
@@ -597,6 +607,83 @@ def test_run_pilot_threads_fail_tails_from_guard_result_into_outcome_and_json(
     (inst_doc,) = doc["instances"]
     assert inst_doc["fail_stdout_tail"] == "stdout tail content"
     assert inst_doc["fail_stderr_tail"] == "stderr tail content"
+
+
+def test_run_pilot_threads_install_tails_from_adapter_reports_into_outcome_and_json(
+    tmp_path: Path,
+):
+    """install_stdout_tail/install_stderr_tail on the adapter's InstanceReport
+    (the per-instance arm64-install-failure capture, WS-7) must be threaded onto
+    the resulting PilotInstanceOutcome -- mirroring exactly how degraded_blind
+    already flows through ``_blind_map`` -- AND survive the JSON round-trip, so
+    a blind instance's install failure is diagnosable from pilot-report.json
+    alone, without hand-inspecting the instance's workdir / .autodev-bench log."""
+    import json
+
+    guards = [_guard_complete("i1", 1.0)]
+    preds = [{"instance_id": "i1", "model_name_or_path": "autodev", "model_patch": ""}]
+    adapter = _FakeAdapter(
+        reports=[
+            _Report(
+                "i1",
+                degraded_blind=True,
+                install_stdout_tail="venv stdout tail",
+                install_stderr_tail="pip stderr tail",
+            )
+        ]
+    )
+    scorer = _FakeScorer({"i1": ERROR})
+
+    report = run_pilot(
+        adapter,
+        scorer,
+        instances=[{"instance_id": "i1", "problem_statement": "x", "repo": "a/b"}],
+        invoker=lambda *a, **k: None,
+        workdir_root=tmp_path / "wd",
+        run_id="rid-install-tails",
+        autodev_version="9.9.9-install-tails",
+        baselines_root=tmp_path / "baselines",
+        guarded_solve=_fake_guarded_solve_factory(preds, guards),
+    )
+
+    (only,) = report.instances
+    assert only.install_stdout_tail == "venv stdout tail"
+    assert only.install_stderr_tail == "pip stderr tail"
+
+    json_path, _ = write_pilot_report(report, tmp_path / "out")
+    doc = json.loads(json_path.read_text(encoding="utf-8"))
+    (inst_doc,) = doc["instances"]
+    assert inst_doc["install_stdout_tail"] == "venv stdout tail"
+    assert inst_doc["install_stderr_tail"] == "pip stderr tail"
+
+
+def test_run_pilot_install_tails_default_empty_when_adapter_report_lacks_them(
+    tmp_path: Path,
+):
+    """Non-vacuous control: an adapter InstanceReport double that does NOT set
+    the install tails at all (the ``_Report`` default, matching every OTHER
+    existing fixture in this suite) must default to empty strings on the
+    PilotInstanceOutcome -- never crash, never leak a stale/garbage value."""
+    guards = [_guard_complete("i2", 1.0)]
+    preds = [{"instance_id": "i2", "model_name_or_path": "autodev", "model_patch": ""}]
+    adapter = _FakeAdapter(reports=[_Report("i2", degraded_blind=False)])
+    scorer = _FakeScorer({"i2": PASS})
+
+    report = run_pilot(
+        adapter,
+        scorer,
+        instances=[{"instance_id": "i2", "problem_statement": "x", "repo": "a/b"}],
+        invoker=lambda *a, **k: None,
+        workdir_root=tmp_path / "wd",
+        run_id="rid-install-tails-empty",
+        autodev_version="9.9.9-install-tails-empty",
+        baselines_root=tmp_path / "baselines",
+        guarded_solve=_fake_guarded_solve_factory(preds, guards),
+    )
+
+    (only,) = report.instances
+    assert only.install_stdout_tail == ""
+    assert only.install_stderr_tail == ""
 
 
 def test_human_summary_renders_failure_detail_with_excerpt_and_json_pointer():

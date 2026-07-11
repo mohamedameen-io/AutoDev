@@ -34,9 +34,11 @@ from benchmarks.adapters.base import BenchmarkAdapter
 from benchmarks.adapters.swebench_lite import (
     CANDIDATE,
     DEFAULT_SWEBENCH_TIMEOUT,
+    InstallResult,
     SwebenchLiteAdapter,
     _EXECUTE_PHASE_WALL_BUDGET_FLOOR_S,
     _EXECUTE_PHASE_WALL_BUDGET_MARGIN_S,
+    _FAIL_OUTPUT_TAIL,
     build_adapter,
 )
 from benchmarks.datasets import swebench_lite as ds
@@ -138,10 +140,37 @@ def _writing_invoker(writes: dict[str, str]):
     return invoker
 
 
+def _committing_invoker(writes: dict[str, str]):
+    """Like ``_writing_invoker``, but also ``git add`` + ``git commit``s the
+    written files on ``execute`` -- mirrors what real AutoDev actually does (see
+    the module docstring: "AutoDev *commits* its fix").
+
+    Load-bearing distinction, verified empirically: an UNTRACKED file (as
+    ``_writing_invoker`` leaves it) is invisible to ``git diff <base_commit>``
+    regardless of any pathspec exclusion -- so a test that only wants to prove a
+    scaffolding dir is excluded from the source-only diff must first make the
+    file TRACKED, or it passes vacuously (ERROR for the wrong reason: nothing
+    tracked changed at all, not because the pathspec excluded it)."""
+
+    def invoker(args, *, env, cwd, timeout):
+        if args and args[0] == "execute":
+            for rel, content in writes.items():
+                dest = Path(cwd) / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content, encoding="utf-8")
+            _git(["add", "-A"], cwd=Path(cwd))
+            _git(["commit", "-qm", "autodev scaffolding"], cwd=Path(cwd))
+        return _ok_result()
+
+    return invoker
+
+
 def _adapter(**kwargs) -> SwebenchLiteAdapter:
     """Adapter wired with the fake cloner + a install-OK stub, unless overridden."""
     kwargs.setdefault("cloner", _fake_cloner)
-    kwargs.setdefault("env_installer", lambda instance, workdir: True)
+    kwargs.setdefault(
+        "env_installer", lambda instance, workdir: InstallResult(installed=True)
+    )
     return SwebenchLiteAdapter(**kwargs)
 
 
@@ -250,6 +279,38 @@ def test_autodev_scaffolding_excluded_from_source_patch(tmp_path: Path):
     assert pred["model_patch"] == ""
 
 
+def test_bench_scaffolding_excluded_from_source_patch(tmp_path: Path):
+    """A change confined to ``.autodev-bench/`` -- this adapter's OWN scaffolding
+    dir for the install-failure log, a SIBLING of ``.autodev/`` (see
+    ``_default_install_env``) -- is not a source fix either: the source-only
+    residual excludes it -> ERROR.
+
+    Uses ``_committing_invoker`` (NOT ``_writing_invoker``) so the scaffolding
+    file is actually TRACKED (git-added + committed, mirroring what real
+    AutoDev does) before the diff is taken: an untracked file is invisible to
+    ``git diff <base_commit>`` regardless of any pathspec exclusion (verified
+    empirically), so committing first is what makes this a genuinely
+    non-vacuous proof that the ``.autodev-bench`` pathspec exclusion itself is
+    load-bearing -- confirmed by reverting ``_ADAPTER_EXCLUDED_DIRS`` to omit
+    ``.autodev-bench`` and observing this exact test fail (CANDIDATE, not
+    ERROR) before restoring the fix."""
+    adapter = _adapter()
+    instance = _make_instance()
+    workdir = tmp_path / "inst"
+
+    profile = adapter.prepare(instance, workdir)
+    outcome = solve(
+        workdir,
+        adapter.intent(instance),
+        profile,
+        _committing_invoker({".autodev-bench/install-failure.log": "boom\n"}),
+    )
+    pred = adapter.predict(instance, workdir, outcome)
+
+    assert adapter.reports[-1].status == ERROR
+    assert pred["model_patch"] == ""
+
+
 # ---------------------------------------------------------------------------
 # Gate (c): base_commit is actually checked out.
 # ---------------------------------------------------------------------------
@@ -350,8 +411,20 @@ def test_venv_install_failure_flips_test_runner_off_and_records_blind(tmp_path: 
     report records ``degraded_blind=True`` -- while still cutting the burst with
     ``max_parallel_subprocesses=1`` and activating the execute-phase wall-budget
     guardrail. End-to-end, the patch flips real config state (deep-merged,
-    siblings preserved)."""
-    adapter = _adapter(env_installer=lambda instance, workdir: False)  # install FAILS
+    siblings preserved).
+
+    Also pins the install-failure tail plumbing: the ``InstallResult`` tails
+    returned by the injected ``env_installer`` must flow through ``_PrepState``
+    into the final ``InstanceReport`` -- exactly like ``degraded_blind`` already
+    does -- so a pilot run can surface WHY an instance went blind without
+    re-running the install by hand."""
+    adapter = _adapter(
+        env_installer=lambda instance, workdir: InstallResult(  # install FAILS
+            installed=False,
+            stdout_tail="scripted venv/pip stdout tail",
+            stderr_tail="scripted venv/pip stderr tail",
+        )
+    )
     instance = _make_instance()
     workdir = tmp_path / "inst"
 
@@ -395,13 +468,23 @@ def test_venv_install_failure_flips_test_runner_off_and_records_blind(tmp_path: 
 
     # (3) the blind degradation is recorded on the report.
     assert adapter.reports[-1].degraded_blind is True
+    # (4) the install-failure tails are threaded onto the report too.
+    assert adapter.reports[-1].install_stdout_tail == "scripted venv/pip stdout tail"
+    assert adapter.reports[-1].install_stderr_tail == "scripted venv/pip stderr tail"
 
 
 def test_venv_install_success_keeps_test_runner_on(tmp_path: Path):
     """Non-vacuous control for gate (d): when the install SUCCEEDS, the config_patch
     does NOT force ``test_runner`` off (self-repair stays engaged) and the report is
-    not blind -- but the burst cut and the wall-budget guardrail still apply."""
-    adapter = _adapter(env_installer=lambda instance, workdir: True)  # install OK
+    not blind -- but the burst cut and the wall-budget guardrail still apply.
+
+    Also the non-vacuous control for the install-failure tail plumbing: a
+    successful install must leave the report's tails EMPTY (proves the tails are
+    genuinely sourced from the ``InstallResult``, not always-populated
+    boilerplate)."""
+    adapter = _adapter(
+        env_installer=lambda instance, workdir: InstallResult(installed=True)
+    )  # install OK
     instance = _make_instance()
     workdir = tmp_path / "inst"
 
@@ -420,6 +503,133 @@ def test_venv_install_success_keeps_test_runner_on(tmp_path: Path):
                     _writing_invoker({"mod.py": FIXED_SRC}))
     adapter.predict(instance, workdir, outcome)
     assert adapter.reports[-1].degraded_blind is False
+    assert adapter.reports[-1].install_stdout_tail == ""
+    assert adapter.reports[-1].install_stderr_tail == ""
+
+
+# ---------------------------------------------------------------------------
+# _default_install_env: the REAL (non-injected) installer must itself capture
+# output on failure -- confirmed empirically via both Phase-1 pilot reports
+# showing EMPTY tails for the two blind instances (the bug this workstream
+# fixes). These tests script ``_run`` directly so no real venv/pip subprocess
+# ever runs (hermetic, fast) while still exercising the production function.
+# ---------------------------------------------------------------------------
+
+
+def test_default_install_env_captures_tail_and_writes_full_log_on_pip_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A scripted, REAL ``_default_install_env`` failure (not the injected
+    ``env_installer`` seam) must populate BOTH the returned ``InstallResult``
+    tails AND persist the FULL (untruncated) output to a durable on-disk log at
+    ``workdir/.autodev-bench/install-failure.log`` -- a SIBLING of ``.autodev/``,
+    never nested under it (``autodev init`` refuses to run if ``.autodev/``
+    already exists, and this installer runs BEFORE ``init`` ever does)."""
+    from benchmarks.adapters import swebench_lite as adp
+    from benchmarks.runner.solve import _SubprocessResult
+
+    workdir = tmp_path / "inst"
+    workdir.mkdir(parents=True)
+
+    long_stdout = "resolving dependencies...\n" * 200
+    long_stderr = "error: could not build wheels for native-ext\n" * 200
+    assert len(long_stdout) > _FAIL_OUTPUT_TAIL
+    assert len(long_stderr) > _FAIL_OUTPUT_TAIL
+
+    def fake_run(cmd, *, cwd, timeout, env=None):
+        if "venv" in cmd:  # `sys.executable -m venv <dir>` succeeds
+            return _SubprocessResult(
+                returncode=0, stdout="", stderr="", timed_out=False, elapsed_seconds=0.01
+            )
+        # `<venv>/bin/pip install -e .` FAILS -- the realistic arm64 failure mode.
+        return _SubprocessResult(
+            returncode=1,
+            stdout=long_stdout,
+            stderr=long_stderr,
+            timed_out=False,
+            elapsed_seconds=0.01,
+        )
+
+    monkeypatch.setattr(adp, "_run", fake_run)
+
+    result = adp._default_install_env({"instance_id": "demo__1"}, workdir)
+
+    assert isinstance(result, adp.InstallResult)
+    assert result.installed is False
+    # Tail convention mirrors SolveOutcome.fail_stdout_tail/fail_stderr_tail:
+    # the LAST _FAIL_OUTPUT_TAIL chars, not the full text.
+    assert result.stdout_tail == long_stdout[-_FAIL_OUTPUT_TAIL:]
+    assert result.stderr_tail == long_stderr[-_FAIL_OUTPUT_TAIL:]
+    assert len(result.stdout_tail) == _FAIL_OUTPUT_TAIL
+    assert len(result.stderr_tail) == _FAIL_OUTPUT_TAIL
+
+    # The FULL output is durably persisted to the sibling scaffolding dir.
+    log_path = workdir / ".autodev-bench" / "install-failure.log"
+    assert log_path.is_file(), "install-failure.log was not written on failure"
+    log_text = log_path.read_text(encoding="utf-8")
+    assert long_stdout in log_text, "full stdout must be in the on-disk log"
+    assert long_stderr in log_text, "full stderr must be in the on-disk log"
+    # Never created (or nested under) .autodev/ itself.
+    assert not (workdir / ".autodev").exists()
+
+
+def test_default_install_env_success_leaves_no_tail_and_no_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Broken-control proving the fix is load-bearing: on a SUCCESSFUL install,
+    ``_default_install_env`` must return EMPTY tails and must NOT write
+    ``install-failure.log`` at all. If the capture/log-write were unconditional
+    (always firing, not genuinely gated on failure), this control would catch it
+    -- the log file would exist / the tails would be non-empty even here."""
+    from benchmarks.adapters import swebench_lite as adp
+    from benchmarks.runner.solve import _SubprocessResult
+
+    workdir = tmp_path / "inst"
+    workdir.mkdir(parents=True)
+
+    def fake_run(cmd, *, cwd, timeout, env=None):
+        return _SubprocessResult(
+            returncode=0,
+            stdout="some benign venv/pip chatter\n",
+            stderr="",
+            timed_out=False,
+            elapsed_seconds=0.01,
+        )
+
+    monkeypatch.setattr(adp, "_run", fake_run)
+
+    result = adp._default_install_env({"instance_id": "demo__1"}, workdir)
+
+    assert result.installed is True
+    assert result.stdout_tail == ""
+    assert result.stderr_tail == ""
+    assert not (workdir / ".autodev-bench").exists(), (
+        "no scaffolding/log should be written when the install succeeds"
+    )
+
+
+def test_default_install_env_exception_path_returns_install_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The pre-existing catch-all (``except Exception``) must still degrade to a
+    non-raising, well-typed result under the new return type -- and still make a
+    best-effort attempt to leave a diagnostic trail (the exception text) rather
+    than silently returning nothing, as the old bare ``False`` did."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    workdir = tmp_path / "inst"
+    workdir.mkdir(parents=True)
+
+    def raising_run(cmd, *, cwd, timeout, env=None):
+        raise RuntimeError("venv module unavailable")
+
+    monkeypatch.setattr(adp, "_run", raising_run)
+
+    result = adp._default_install_env({"instance_id": "demo__1"}, workdir)
+
+    assert isinstance(result, adp.InstallResult)
+    assert result.installed is False
+    assert "venv module unavailable" in result.stderr_tail
 
 
 def test_config_patch_activates_execute_phase_wall_budget_not_impl_budget(
