@@ -102,7 +102,9 @@ async def test_syntax_check_ignores_untouched_files_pre_existing_syntax_error(
 
     from orchestrator import execute_phase as ep
 
-    orch = _make_orch_stub(tmp_path)
+    # Isolate syntax_check: build_check OFF so only the syntax gate is exercised
+    # (mirrors the syntax_check=False in the build_check counterpart below).
+    orch = _make_orch_stub(tmp_path, build_check=False)
     developer_result = AgentResult(
         text="ok", success=True, duration_s=0.1, diff=_diff_touching("touched.py")
     )

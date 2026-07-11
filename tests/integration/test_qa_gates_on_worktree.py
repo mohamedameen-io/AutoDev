@@ -216,10 +216,14 @@ async def test_qa_gates_broken_control_reverting_cwd_passes_on_broken_worktree(
 ) -> None:
     """BROKEN-CONTROL: simulate reverting the fix (gate sees orch.cwd again).
 
-    With the cwd-override NOT supplied, ``_run_qa_gates`` falls back to
-    ``orch.cwd`` (clean main). The broken worktree is then never scanned and
-    the gate PASSES — exactly the silent wrong-pass we are fixing. This
-    asserts the fix is load-bearing: without the override the bug returns.
+    With the cwd-override NOT supplied, ``_run_qa_gates`` binds ``cwd`` to
+    ``orch.cwd`` (clean main). A ``developer_result`` whose diff touches
+    ``mod.py`` is supplied so the (diff-scoped, WS8) syntax gate genuinely
+    COMPILES ``main_repo/mod.py`` — clean main's copy, NOT the broken worktree
+    copy — and PASSES. (Without a developer_result the gate resolves ``paths=[]``
+    and scans NOTHING, so it would pass for the wrong reason; the diff makes it
+    scan clean main for real.) The broken worktree is never scanned, exactly the
+    silent wrong-pass we are fixing: this asserts the override is load-bearing.
     """
     main_repo = tmp_path / "main"
     await _init_clean_main_repo(main_repo)
@@ -233,12 +237,23 @@ async def test_qa_gates_broken_control_reverting_cwd_passes_on_broken_worktree(
     try:
         (worktree / "mod.py").write_text("def broken(\n    return 1\n")
 
-        # No cwd_override → legacy behavior → scans clean main → PASS.
-        out = await ep._run_qa_gates(_orch_stub(main_repo), _FakeTask())
+        # No cwd_override → legacy behavior → cwd binds to orch.cwd (clean main).
+        # WS8: syntax_check is diff-scoped, so a developer_result whose diff
+        # touches ``mod.py`` is required to actually steer the scan onto a file
+        # (mirroring the adapted sibling test + how _run_qa_gates is invoked in
+        # production). With cwd=clean main, the gate compiles ``main_repo/mod.py``
+        # (syntactically valid) and PASSES — the broken worktree copy is never
+        # scanned, proving the cwd_override is what makes G3 catch it.
+        developer_result = AgentResult(
+            text="ok", success=True, duration_s=0.1, diff="+++ b/mod.py\n"
+        )
+        out = await ep._run_qa_gates(
+            _orch_stub(main_repo), _FakeTask(), developer_result=developer_result
+        )
         assert out is None, (
             "control sanity: without cwd_override the gate must still scan "
-            "orch.cwd (clean main) and pass — proving the override is the "
-            "thing that makes G3 catch the broken worktree"
+            "orch.cwd (clean main's mod.py) and pass — proving the override is "
+            "the thing that makes G3 catch the broken worktree"
         )
     finally:
         await mgr.remove_per_task("1.1")
