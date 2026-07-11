@@ -146,6 +146,17 @@ STRUCTURAL_FAILURE_CLASSES: frozenset[str] = frozenset(
     {DAG_INVALID, CROSS_PHASE_DAG_INVALID, EDIT_SCOPE_VIOLATION, INFRA_CIRCUIT_OPEN}
 )
 
+# WS3: the three merge-conflict escalation classes that terminate the conflict
+# cascade at ``block_task``. The validated-patch conflict-recovery hook
+# (``execute_phase._maybe_recover_validated_patch_on_conflict_exhaustion``) fires
+# on EXACTLY these three — a task discarded over a *mechanical* merge collision
+# despite an already-validated (genuine-APPROVED + converged tournament winner)
+# result — and no others. A broader gate would recover over unrelated failure
+# classes; a narrower one would leave a discard class on the table.
+CONFLICT_EXHAUSTION_FAILURE_CLASSES: frozenset[str] = frozenset(
+    {CONFLICT_3WAY_FAILED, CONFLICT_ABANDON, CONFLICT_REWRITE_CAP_EXCEEDED}
+)
+
 
 def classify(raw: str | None) -> str:
     """Normalise an arbitrary failure-class string to a known class.
@@ -191,6 +202,7 @@ __all__ = [
     "FailureClass",
     "ALL_FAILURE_CLASSES",
     "STRUCTURAL_FAILURE_CLASSES",
+    "CONFLICT_EXHAUSTION_FAILURE_CLASSES",
     "classify",
     "classify_max_turns_failure",
     "is_known",

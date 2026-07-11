@@ -28,6 +28,11 @@ from typing import TYPE_CHECKING
 # single, enforced degrade setter (F1b).
 from orchestrator.blocker_resolver import record_phase_degrade
 
+# WS3: a pure-constants module (imports only ``typing``) — no cycle risk, keeps
+# this guard import-light. Supplies the conflict-exhaustion failure-class set
+# the validated-patch recovery hook gates on.
+from orchestrator import failure_classes as _fcls
+
 # All five plan_manager "no plan initialized; call init_plan first" raises are
 # ``PlanConcurrentModificationError`` (plan_manager.py:343/527/600/1330/1474),
 # so the recovery control flow below matches on TYPE *and* signature. If a
@@ -115,6 +120,40 @@ async def block_task(
         recovered = None
     if recovered is not None and getattr(recovered, "status", None) != "blocked":
         return recovered
+
+    # WS3: conflict-exhaustion validated-patch recovery. The resolver did NOT
+    # recover this blocker. Before committing the terminal ``blocked``
+    # transition, on EXACTLY the three conflict-exhaustion classes, attempt to
+    # recover an already-VALIDATED patch (genuine reviewer APPROVED + converged
+    # tournament winner) that was about to be discarded over a purely MECHANICAL
+    # merge collision. The recovery COMPLETES the task (via the shared FSM-walk
+    # ``_walk_task_to_complete``) and short-circuits this block — it NEVER
+    # commits a ``blocked`` transition itself, so the F1a sole-committer
+    # invariant (``tests/test_block_path_invariant.py``) is preserved: this
+    # remains the only site that commits ``blocked``. Best-effort, mirroring the
+    # resolver contract above — a recovery failure must NEVER break the block
+    # path. The call-time import mirrors ``_resolve``'s fallback (cycle-safe: by
+    # the time a block happens, ``execute_phase`` is fully loaded).
+    if failure_class in _fcls.CONFLICT_EXHAUSTION_FAILURE_CLASSES:
+        recovered_patch: "Task | None" = None
+        try:
+            from orchestrator.execute_phase import (
+                _maybe_recover_validated_patch_on_conflict_exhaustion,
+            )
+
+            recovered_patch = (
+                await _maybe_recover_validated_patch_on_conflict_exhaustion(
+                    orch, task, failure_class=failure_class
+                )
+            )
+        except Exception:  # noqa: BLE001 - recovery is best-effort; never break the block path
+            recovered_patch = None
+        if (
+            recovered_patch is not None
+            and getattr(recovered_patch, "status", None) != "blocked"
+        ):
+            return recovered_patch
+
     try:
         return await orch.plan_manager.update_task_status(
             task.id, "blocked", meta=meta or {}

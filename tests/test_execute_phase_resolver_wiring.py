@@ -395,6 +395,20 @@ def test_wired_failure_classes_are_known() -> None:
             "(typo or planted bogus constant in the resolver wiring?)"
         )
         value = getattr(fc, name)
+        # A set-valued GROUPING constant (e.g. ``STRUCTURAL_FAILURE_CLASSES``,
+        # WS3's ``CONFLICT_EXHAUSTION_FAILURE_CLASSES``) is a legitimate wiring
+        # reference — the guard gates a block on membership in the set. It is not
+        # itself a single class string, so validate that EVERY member is a known
+        # class (this PRESERVES the anti-typo guarantee for the grouping too: a
+        # bogus class planted inside the set still fails) rather than requiring
+        # the grouping object itself to be a member of ALL_FAILURE_CLASSES.
+        if isinstance(value, (frozenset, set, tuple, list)):
+            for member in value:
+                assert member in fc.ALL_FAILURE_CLASSES, (
+                    f"{module_path}: failure_classes.{name} member {member!r} "
+                    "is not in ALL_FAILURE_CLASSES"
+                )
+            continue
         assert value in fc.ALL_FAILURE_CLASSES, (
             f"{module_path}: failure_classes.{name} == {value!r} "
             "is not in ALL_FAILURE_CLASSES"

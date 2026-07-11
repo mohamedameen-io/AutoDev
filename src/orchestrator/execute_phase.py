@@ -9395,6 +9395,198 @@ async def _maybe_accept_approved_on_exhaustion(
     )
 
 
+async def _maybe_recover_validated_patch_on_conflict_exhaustion(
+    orch: "Orchestrator",
+    task: "Task",
+    *,
+    failure_class: str,
+) -> "Task | None":
+    """WS3: recover an already-VALIDATED patch discarded over a mechanical merge
+    collision, instead of blocking the task.
+
+    Structurally identical to Tier J's
+    :func:`_maybe_accept_approved_on_exhaustion` — "don't discard a validated
+    result over an unrelated mechanical failure" — but for the merge-conflict
+    cascade rather than turn-exhaustion. Hooked into
+    :func:`orchestrator.blocker_guard.block_task` (the sole enforced ``blocked``
+    committer) immediately before its final blocked commit, so the recovery
+    COMPLETES the task and short-circuits the block — it never adds a second
+    ``blocked`` committer.
+
+    Returns the completed ``Task`` when the validated patch is recovered, or
+    ``None`` (no-op) when the strict gate does not hold — in which case
+    ``block_task`` falls through to its unchanged terminal block.
+
+    The gap: a task whose winning patch is already validated (a GENUINE,
+    non-soft-passed reviewer ``APPROVED`` + a converged, judge-ranked tournament
+    winner) fails to land on ``main`` purely because of a stale-base merge
+    collision. The conflict-escalation cascade exhausts its 3-way / rewrite /
+    abandon rungs and discards the whole validated result. The failure is
+    infrastructural, not a semantic verdict.
+
+    Gate STRICTLY (all must hold):
+
+    1. ``failure_class`` is one of the three conflict-exhaustion classes
+       (:data:`orchestrator.failure_classes.CONFLICT_EXHAUSTION_FAILURE_CLASSES`).
+       Any other class is NOT this discard mode and is left to the caller's
+       block. (``block_task`` also pre-gates on this set; re-checked here so the
+       helper is safe to call directly / in tests.)
+    2. A GENUINE reviewer ``APPROVED`` verdict is on record
+       (``{task_id}-review.json``). Any other verdict — or an INFRA soft-pass
+       ``APPROVED`` (``soft_passed=True``, R7) which never carried a real
+       reviewer verdict — is refused; completing on it would certify an
+       unreviewed diff.
+    3. A recoverable winning diff exists: the converged tournament winner
+       (``{task_id}-tournament.json`` ``final_diff``), else — when no converged
+       tournament winner is on record — the validated developer patch
+       (``{task_id}-developer.json`` ``diff``). Both are the SAME validated
+       artifact the ``APPROVED`` verdict in (2) reviewed; an empty/absent diff
+       is a no-op fall-through.
+    4. The recovered patch applies CLEANLY and UNFORCED to the CURRENT ``main``
+       HEAD. The apply is never forced (no 3-way / rewrite / abandon): a clean
+       apply succeeding or failing IS the safety check. A patch that genuinely
+       conflicts with live ``main`` (e.g. a sibling landed a colliding change)
+       correctly fails here and the task stays blockable — which is exactly how
+       independently-validated siblings are handled "for free": each task's own
+       ``block_task`` call re-checks against live ``main`` at its own decision
+       point, no global ranking needed.
+
+    On success the task is walked to ``complete`` via the shared
+    :func:`_walk_task_to_complete` primitive (Tier J's completion step — this
+    helper brings its OWN unforced apply, since the helper is apply-agnostic),
+    stamped with ``resolver_action="conflict_fallback_recovered"`` +
+    ``needs_human_review`` metadata and a distinctly-named ledger op so nothing
+    downstream mistakes it for a normal clean pass.
+
+    Resume-safety: apply → ledger → FSM-walk, mirroring Tier J / WS5. A crash
+    after the unforced apply's git commit but before the FSM-walk cannot
+    double-apply: on resume the SAME persisted patch no longer applies to the
+    new ``main`` HEAD (its change is already there), so the pre-flight ``git
+    apply --check`` fails and the re-run falls through to the block — the work
+    is preserved on ``main`` exactly once, never applied twice.
+    """
+    # (1) Failure-class gate — exactly the three conflict-exhaustion classes.
+    if failure_class not in _fcls.CONFLICT_EXHAUSTION_FAILURE_CLASSES:
+        return None
+
+    from state.evidence import read_evidence  # noqa: PLC0415 — break cycle
+
+    # (2) Genuine, non-soft-passed reviewer APPROVED on record.
+    try:
+        review_ev = await read_evidence(orch.cwd, task.id, "review")
+    except Exception as exc:  # noqa: BLE001 — defensive: never break the block path
+        logger.warning(
+            "execute_phase.conflict_recovery_review_read_failed",
+            task_id=task.id,
+            err=str(exc),
+        )
+        return None
+    if review_ev is None or getattr(review_ev, "verdict", None) != "APPROVED":
+        return None
+    if getattr(review_ev, "soft_passed", False):
+        logger.warning(
+            "execute_phase.conflict_recovery_refused_softpass",
+            task_id=task.id,
+            failure_class=failure_class,
+            note=(
+                "APPROVED ReviewEvidence is an INFRA soft-pass (soft_passed=True), "
+                "not a genuine reviewer verdict; REFUSING conflict-recovery on it "
+                "(R7) — falling through to the block."
+            ),
+        )
+        return None
+
+    # (3) Recoverable winning diff: converged tournament winner, else the
+    #     validated developer patch (same artifact the APPROVED review covered).
+    winning_diff: str | None = None
+    diff_source: str | None = None
+    try:
+        tour_ev = await read_evidence(orch.cwd, task.id, "tournament")
+    except Exception:  # noqa: BLE001 — defensive
+        tour_ev = None
+    if tour_ev is not None and getattr(tour_ev, "converged", False):
+        _fd = getattr(tour_ev, "final_diff", None)
+        if _fd and _fd.strip():
+            winning_diff = _fd
+            diff_source = "tournament"
+    if winning_diff is None:
+        try:
+            dev_ev = await read_evidence(orch.cwd, task.id, "developer")
+        except Exception:  # noqa: BLE001 — defensive
+            dev_ev = None
+        _dd = getattr(dev_ev, "diff", None) if dev_ev is not None else None
+        if _dd and _dd.strip():
+            winning_diff = _dd
+            diff_source = "developer_patch"
+    if winning_diff is None:
+        return None
+
+    # (4) Re-fetch the authoritative task state; it must be at a walkable
+    #     pipeline rung (in practice ``tournamented`` at the conflict block).
+    #     Off-pipeline states (blocked/pending/skipped) have no forward edge to
+    #     ``complete`` — leave them to the caller's block.
+    current = await orch.plan_manager.get_task(task.id)
+    if current is None:
+        return None
+    if current.status not in _TASK_PIPELINE_ORDER or current.status == "complete":
+        return None
+
+    # A git repo is required to apply the patch to ``main``.
+    if not _is_git_repo(orch.cwd):
+        return None
+
+    # (4, apply) ONE clean, UNFORCED apply against the CURRENT main HEAD — the
+    # apply succeeding or failing IS the safety check. Never forced (no 3-way /
+    # rewrite / abandon). A conflict / any failure → fall through to the block.
+    worktree_mgr = WorktreeManager(
+        main_repo=orch.cwd,
+        tournament_dir=autodev_root(orch.cwd) / "execute_worktrees",
+    )
+    try:
+        await worktree_mgr.apply_diff_text_to_main(
+            winning_diff,
+            commit_message=(
+                f"autodev(conflict-recovery): task {current.id} "
+                f"({current.title}) [needs human review]"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — apply is the safety check, never force
+        logger.warning(
+            "execute_phase.conflict_recovery_apply_failed",
+            task_id=task.id,
+            failure_class=failure_class,
+            diff_source=diff_source,
+            err=str(exc),
+        )
+        return None
+
+    # Applied cleanly → complete via the shared FSM-walk, stamped so nothing
+    # downstream mistakes this for a normal clean pass.
+    return await _walk_task_to_complete(
+        orch,
+        current,
+        ledger_op="recovered_validated_patch_on_conflict_exhaustion",
+        ledger_payload={
+            "failure_class": failure_class,
+            "needs_human_review": True,
+            "resolver_action": "conflict_fallback_recovered",
+            "diff_source": diff_source,
+        },
+        complete_meta={
+            "needs_human_review": True,
+            "resolver_action": "conflict_fallback_recovered",
+            "completion_reason": "conflict_fallback_recovered",
+            "evidence_bundle": f".autodev/evidence/{task.id}-review.json",
+        },
+        log_event="execute_phase.recovered_validated_patch_on_conflict_exhaustion",
+        log_fields={
+            "failure_class": failure_class,
+            "diff_source": diff_source,
+            "needs_human_review": True,
+        },
+    )
+
+
 def _build_adapter_failure_reason(
     developer_result: AgentResult | None,
 ) -> str:

@@ -594,6 +594,19 @@ LedgerOp = Literal[
     # immediately before the raise; the run aborts (no plan mutation), so replay
     # is a no-op. Payload: ``{task_id: str, failure_class: str | None}``.
     "ask_human_fail_fast",
+    # WS3 (conflict-exhaustion validated-patch recovery): a task discarded over
+    # a purely MECHANICAL merge collision — despite an already-validated result
+    # (genuine, non-soft-passed reviewer ``APPROVED`` + a converged tournament
+    # winner) — had that validated patch re-applied UNFORCED to live ``main`` at
+    # the ``block_task`` chokepoint and was completed instead of blocked. Stamped
+    # ``resolver_action="conflict_fallback_recovered"`` + ``needs_human_review``
+    # so nothing downstream mistakes it for a normal clean pass. Audit-only — the
+    # ``status="complete"`` transition flows through the regular
+    # ``update_task_status`` op emitted alongside (via ``_walk_task_to_complete``);
+    # replay is a no-op forensic breadcrumb. Payload: ``{task_id: str,
+    # failure_class: str, needs_human_review: bool, resolver_action: str,
+    # diff_source: str}``.
+    "recovered_validated_patch_on_conflict_exhaustion",
     # Gap 5 (containment): a developer diff was confined ENTIRELY to
     # AutoDev's own ``.autodev/`` directory (evidence / ledger / tournament
     # / index state) instead of the target repository's code — the agent
@@ -1412,6 +1425,12 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         # (no plan mutation). Replay is a no-op forensic breadcrumb.
         "best_effort_committed_on_ask_human",
         "ask_human_fail_fast",
+        # WS3 (conflict-exhaustion validated-patch recovery): validated patch
+        # re-applied to live ``main`` + task completed at ``block_task`` instead
+        # of blocked. Audit-only — the ``status="complete"`` transition flows
+        # through the regular ``update_task_status`` op emitted alongside; replay
+        # is a no-op forensic breadcrumb.
+        "recovered_validated_patch_on_conflict_exhaustion",
         # Gap 5 (containment): developer diff confined to AutoDev's own
         # ``.autodev/`` directory was rejected as invalid task output.
         # Audit-only — the task-status transition (retry / escalate / block)

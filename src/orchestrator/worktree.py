@@ -1115,6 +1115,41 @@ class WorktreeManager:
         the v0.25.0 working-tree-only behavior used by impl tournaments.
         """
         diff_text = await self.get_diff_vs_base(worktree, base_ref=base_ref)
+        await self.apply_diff_text_to_main(
+            diff_text,
+            three_way=three_way,
+            edit_scope=edit_scope,
+            commit_message=commit_message,
+        )
+
+    async def apply_diff_text_to_main(
+        self,
+        diff_text: str,
+        *,
+        three_way: bool = False,
+        edit_scope: list[str] | None = None,
+        commit_message: str | None = None,
+    ) -> None:
+        """Apply a RAW unified-diff string to the main repo's working tree.
+
+        The worktree-agnostic core of :meth:`apply_patch_to_main`: that method
+        computes the worktree's diff via ``get_diff_vs_base`` then delegates
+        here. Callers that already hold a diff *text* — with NO live worktree
+        in scope — call this directly. WS3's conflict-recovery
+        (:func:`orchestrator.execute_phase._maybe_recover_validated_patch_on_conflict_exhaustion`)
+        is one such caller: it re-applies a persisted, already-validated
+        tournament-winner patch read back from evidence, at the ``block_task``
+        chokepoint where the per-task worktree is long gone.
+
+        Semantics are IDENTICAL to :meth:`apply_patch_to_main`: an empty diff
+        is a no-op; ``three_way=False`` (the default) keeps the ``git apply
+        --check`` pre-flight AUTHORITATIVE, so an UNFORCED apply raises
+        :class:`WorktreeError` on a genuine conflict rather than forcing a
+        merge (the apply succeeding or failing IS the caller's safety check);
+        ``edit_scope`` pre-flights the diff's target paths before any ``git
+        apply``; ``commit_message`` enables persistent commit-per-change
+        integration (``--index`` staging + a follow-on ``git commit``).
+        """
         if not diff_text.strip():
             self._log.info("worktree.apply_patch.empty_diff")
             return
