@@ -287,7 +287,13 @@ def _write_install_failure_log(workdir: Path, *, stdout: str, stderr: str) -> No
             f"--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n",
             encoding="utf-8",
         )
-    except OSError:
+    except Exception:  # noqa: BLE001 - best-effort log; must never escalate out of prepare()
+        # Called from INSIDE ``_default_install_env``'s catch-all, where
+        # ``str(exc)`` can carry a surrogate-escaped path -> ``write_text`` can
+        # itself raise ``UnicodeEncodeError`` (NOT an ``OSError``). Swallowing
+        # only ``OSError`` would let that propagate out of ``prepare()`` and
+        # abort the whole unattended sweep; mirror the sibling best-effort
+        # broad-except precedent in ``_default_install_env`` instead.
         pass
 
 

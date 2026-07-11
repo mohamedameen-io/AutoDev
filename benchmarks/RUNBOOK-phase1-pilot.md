@@ -136,7 +136,11 @@ Open `results/<run>/pilot-summary.md`. The key numbers:
 - **`clean_count`** — instances that reached a real PASS/FAIL verdict *with
   self-repair on* (deps installed, not blind). This is the count that matters.
 - **`blind_count`** — instances that solved blind (arm64 deps failed →
-  `test_runner` off). High blind count = weak signal.
+  `test_runner` off). High blind count = weak signal. To see *why* an instance
+  went blind, read its `install_stdout_tail` / `install_stderr_tail` in
+  `pilot-report.json` (also rendered under "install stdout" / "install stderr"
+  in `pilot-summary.md`'s **Failure detail** section), or the full untruncated
+  capture in `.autodev-bench/install-failure.log` under that instance's workdir.
 - **wall-time / quota-wait totals** — extrapolate to **sustainable
   instances/day** on the subscription.
 

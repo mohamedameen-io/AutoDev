@@ -633,6 +633,67 @@ def test_default_install_env_exception_path_returns_install_result(
     assert "venv module unavailable" in result.stderr_tail
 
 
+def test_write_install_failure_log_swallows_mkdir_failure(tmp_path: Path) -> None:
+    """WS7 #2 (control): a pre-existing FILE where the ``.autodev-bench``
+    scaffolding DIR would go makes ``mkdir(parents=True, exist_ok=True)`` raise
+    (``FileExistsError``). ``_write_install_failure_log`` is strictly
+    best-effort and must swallow it — never raise. (This case is a
+    ``FileExistsError`` = ``OSError``, so it is caught by the pre-fix
+    ``except`` too; it is the non-vacuous control for the sibling below.)"""
+    from benchmarks.adapters import swebench_lite as adp
+
+    workdir = tmp_path / "inst"
+    workdir.mkdir(parents=True)
+    # Occupy the scaffolding path with a FILE so mkdir cannot create the dir.
+    (workdir / adp._BENCH_SCAFFOLD_DIRNAME).write_text("i am a file", encoding="utf-8")
+
+    # Must not raise (and must not clobber the pre-existing file).
+    adp._write_install_failure_log(workdir, stdout="out", stderr="err")
+    assert (workdir / adp._BENCH_SCAFFOLD_DIRNAME).is_file()
+
+
+def test_default_install_env_never_escalates_when_log_write_raises_non_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WS7 #1 (BUG, red-before-green): ``_write_install_failure_log`` is called
+    from INSIDE ``_default_install_env``'s catch-all ``except Exception`` branch,
+    where ``str(exc)`` can embed a surrogate-escaped path so the log-write's own
+    ``write_text`` raises ``UnicodeEncodeError`` — NOT an ``OSError``. The pre-fix
+    ``except OSError`` let that propagate straight out of ``_default_install_env``
+    (and thus out of ``prepare()``), aborting the whole unattended sweep.
+
+    With the fix (``except Exception``) the log-write failure is swallowed and a
+    well-typed ``InstallResult`` is returned. RED before the fix (the
+    ``UnicodeEncodeError`` escapes), GREEN after."""
+    from benchmarks.adapters import swebench_lite as adp
+    from benchmarks.runner.solve import _SubprocessResult
+
+    workdir = tmp_path / "inst"
+    workdir.mkdir(parents=True)
+
+    # The install FAILS so a log write is genuinely attempted.
+    def fake_run(cmd, *, cwd, timeout, env=None):
+        return _SubprocessResult(
+            returncode=1, stdout="out", stderr="err", timed_out=False, elapsed_seconds=0.01
+        )
+
+    monkeypatch.setattr(adp, "_run", fake_run)
+
+    # The log-write's write_text raises a NON-OSError (the surrogate-escape
+    # UnicodeEncodeError the docstring/bug is about).
+    def boom_write_text(self, *args, **kwargs):
+        raise UnicodeEncodeError("utf-8", "x", 0, 1, "surrogates not allowed")
+
+    monkeypatch.setattr(Path, "write_text", boom_write_text)
+
+    # Must NOT raise — degrades to a well-typed InstallResult(installed=False).
+    result = adp._default_install_env(
+        {"instance_id": "demo__1", "repo": "some/unknown"}, workdir
+    )
+    assert isinstance(result, adp.InstallResult)
+    assert result.installed is False
+
+
 def test_config_patch_activates_execute_phase_wall_budget_not_impl_budget(
     tmp_path: Path,
 ):

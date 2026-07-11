@@ -437,7 +437,11 @@ class PilotReport:
         reportable = [
             o
             for o in self.instances
-            if o.detail or o.fail_stdout_tail or o.fail_stderr_tail
+            if o.detail
+            or o.fail_stdout_tail
+            or o.fail_stderr_tail
+            or o.install_stdout_tail
+            or o.install_stderr_tail
         ]
         if not reportable:
             lines.append("(none)")
@@ -452,6 +456,18 @@ class PilotReport:
                 _render_tail_block(lines, label="stdout", tail=o.fail_stdout_tail)
             if o.fail_stderr_tail:
                 _render_tail_block(lines, label="stderr", tail=o.fail_stderr_tail)
+            # WS-7: the arm64 install-failure capture is a DISTINCT pipeline
+            # stage from the solve-fail tails above, so it carries its own
+            # "install stdout"/"install stderr" labels — this is often the ONLY
+            # diagnostic for a blind instance (deps failed before a solve).
+            if o.install_stdout_tail:
+                _render_tail_block(
+                    lines, label="install stdout", tail=o.install_stdout_tail
+                )
+            if o.install_stderr_tail:
+                _render_tail_block(
+                    lines, label="install stderr", tail=o.install_stderr_tail
+                )
         return "\n".join(lines)
 
 

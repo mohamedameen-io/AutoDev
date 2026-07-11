@@ -686,6 +686,65 @@ def test_run_pilot_install_tails_default_empty_when_adapter_report_lacks_them(
     assert only.install_stderr_tail == ""
 
 
+def test_human_summary_surfaces_install_tails_for_blind_instance():
+    """WS7 #3 (red-before-green): a blind instance whose ONLY diagnostic is the
+    arm64 install failure — ``install_stdout_tail``/``install_stderr_tail``
+    populated, but ``detail`` and BOTH solve-fail tails empty — must still be
+    surfaced in the human summary's failure-detail section, with the install
+    tails rendered under DISTINCT ``install stdout``/``install stderr`` labels
+    (a different pipeline stage than the solve-fail ``stdout``/``stderr``).
+
+    RED before the fix: the pre-fix ``reportable`` filter keys only on
+    ``detail``/``fail_*_tail``, so this instance is dropped from the section
+    entirely. GREEN after the filter + render widening."""
+    blind = PilotInstanceOutcome(
+        instance_id="blind-1",
+        status=ERROR,
+        wall_time_s=3.0,
+        quota_wait_time_s=0.0,
+        attempts=1,
+        blind=True,
+        quota_exhausted=False,
+        detail=None,
+        fail_stdout_tail="",
+        fail_stderr_tail="",
+        install_stdout_tail="uv venv created ok; then pip install -e . failed",
+        install_stderr_tail="error: could not build wheels for native-ext",
+    )
+    report = PilotReport(
+        run_id="rid-install",
+        autodev_version="1.0.0",
+        timestamp="2026-01-01T00:00:00+00:00",
+        instances=[blind],
+        passed=0,
+        failed=0,
+        errored=1,
+        blind_count=1,
+        clean_count=0,
+        total_wall_time_s=3.0,
+        total_quota_wait_time_s=0.0,
+        gate_verdict="red",
+        gate_status="insufficient",
+        gate_reasons=[],
+        baseline_established=False,
+        baseline_path=None,
+        recommend_lock=False,
+    )
+
+    summary = report.human_summary()
+
+    # The blind instance appears in the failure-detail section (not just the
+    # per-instance table) ...
+    assert "## Failure detail" in summary
+    detail_section = summary.split("## Failure detail", 1)[1]
+    assert "blind-1" in detail_section
+    # ... with DISTINCT install-stage labels (NOT the solve-fail stdout/stderr) ...
+    assert "install stdout" in detail_section
+    assert "install stderr" in detail_section
+    # ... and the actual captured install failure text rendered in the block.
+    assert "could not build wheels for native-ext" in detail_section
+
+
 def test_human_summary_renders_failure_detail_with_excerpt_and_json_pointer():
     """human_summary() must surface a NEW failure-detail section — it does NOT
     surface ``detail`` at all today, only the JSON does — with: the failing
