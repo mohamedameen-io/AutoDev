@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from adapters.types import AgentResult
 from orchestrator import execute_phase as ep
 from orchestrator.worktree import WorktreeManager
 
@@ -180,8 +181,22 @@ async def test_qa_gates_scan_worktree_not_clean_main(tmp_path: Path) -> None:
         )
 
         # --- the gate under test --------------------------------------------
+        # WS8: syntax_check is now diff-scoped like every sibling gate, so a
+        # developer_result whose diff touches ``mod.py`` is required to steer
+        # the scan — mirroring how ``_run_qa_gates`` is actually invoked in
+        # production (always with the developer's AgentResult). This still
+        # isolates the G3 concern: the diff path is resolved relative to
+        # ``cwd`` (the worktree, via cwd_override), so the test still
+        # discriminates "which tree did the gate scan" — it would resolve to
+        # the clean main's ``mod.py`` if cwd routing regressed.
+        developer_result = AgentResult(
+            text="ok", success=True, duration_s=0.1, diff="+++ b/mod.py\n"
+        )
         out = await ep._run_qa_gates(
-            _orch_stub(main_repo), _FakeTask(), cwd_override=worktree
+            _orch_stub(main_repo),
+            _FakeTask(),
+            developer_result=developer_result,
+            cwd_override=worktree,
         )
         assert out is not None, (
             "QA gate vacuously PASSED: it scanned the clean MAIN repo "

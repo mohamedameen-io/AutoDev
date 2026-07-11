@@ -9932,9 +9932,9 @@ async def _run_qa_gates(
     # v0.22.0: gates are ``(name, enabled, callable)`` triples so the
     # warn-surface helper can attribute findings to a gate.
     gates: list[tuple[str, bool, Callable[[], Awaitable[GateResult]]]] = [
-        ("syntax_check", cfg.syntax_check, lambda: run_syntax_check(cwd, language)),
+        ("syntax_check", cfg.syntax_check, lambda: run_syntax_check(cwd, language, paths=secretscan_paths)),
         ("lint", cfg.lint, lambda: run_lint(cwd, language, paths=secretscan_paths, timeout_s=cfg.lint_timeout_s)),
-        ("build_check", cfg.build_check, lambda: run_build_check(cwd, language, timeout_s=cfg.build_check_timeout_s)),
+        ("build_check", cfg.build_check, lambda: run_build_check(cwd, language, paths=secretscan_paths, timeout_s=cfg.build_check_timeout_s)),
         ("test_runner", cfg.test_runner, lambda: run_tests(cwd, paths=secretscan_paths, timeout_s=cfg.test_timeout_s)),
         (
             "secretscan",
