@@ -33,7 +33,7 @@ import re
 from typing import Literal
 
 from autologging import get_logger
-from state.schemas import Task
+from state.schemas import Task, is_valid_task_relative_path
 
 
 logger = get_logger(__name__)
@@ -47,8 +47,12 @@ _RE_TOP_LEVEL_BULLET = re.compile(r"^[ ]?(?:[-*]|\d+\.)\s+(.+)$")
 # WS4: matches the "Scope strictly to: <files>." clause emitted by
 # ``orchestrator.execute_phase._synthesize_corrective_direction``'s
 # ``re_architect`` template — the sole producer of this exact phrase in the
-# codebase. The capture is non-greedy and stops at the first "." that is
-# followed by whitespace or end-of-string, so:
+# codebase. CAVEAT: this pattern structurally REQUIRES the trailing period —
+# it is the clause terminator the capture keys on. A future synthesizer edit
+# that dropped it would fail to match here and the whole file list would be
+# lost (degrading to ``files=[]``, no worse than the pre-WS4 behaviour). The
+# capture is non-greedy and stops at the first "." that is followed by
+# whitespace or end-of-string, so:
 #   * a period INSIDE a path (e.g. the "." in "src/foo.py") is never mistaken
 #     for the clause terminator, because it is immediately followed by more
 #     path characters, not whitespace; but
@@ -199,13 +203,17 @@ def _parse_scope_files(body: str) -> list[str]:
     * the clause carries the ``_synthesize_corrective_direction`` no-files
       sentinel (``"the originally-claimed files"``, emitted when the
       originating task had no declared ``files``) — prose, not a path, or
-    * every comma-separated entry fails the same structural checks
+    * every comma-separated entry fails the SHARED structural predicate
+      :func:`state.schemas.is_valid_task_relative_path` that
       :class:`state.schemas.Task` enforces on ``files`` (non-empty,
       repo-relative, no ``..`` segments).
 
-    This degrades exactly as gracefully as the rest of this module: a
-    parsing hiccup can never raise out of ``Task`` construction — it just
-    leaves ``files`` empty, identical to pre-fix behaviour.
+    Routing through that shared predicate — rather than hand-mirroring the
+    checks — is what guarantees this degrades gracefully: an entry we keep is
+    exactly an entry ``Task(files=[entry])`` would accept, so ``Task``
+    construction below can never raise a ``ValidationError`` on the ``files``
+    we pass. A parsing hiccup just leaves ``files`` empty, identical to
+    pre-fix behaviour.
     """
     match = _RE_SCOPE_CLAUSE.search(body)
     if match is None:
@@ -219,9 +227,9 @@ def _parse_scope_files(body: str) -> list[str]:
         path = entry.strip()
         if not path or path in seen:
             continue
-        if path.startswith("/"):
-            continue
-        if any(part == ".." for part in path.split("/")):
+        # Shared with Task._validate_files_format: the parser SKIPS what the
+        # validator would RAISE on, so the two can never drift.
+        if not is_valid_task_relative_path(path):
             continue
         seen.add(path)
         files.append(path)

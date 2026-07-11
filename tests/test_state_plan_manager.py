@@ -645,6 +645,100 @@ async def test_append_corrective_tasks_reinfer_survives_ledger_replay(
     assert tasks_by_id["1.c2"].depends_on == ["1.c1"]
 
 
+# ---------------------------------------------------------------------------
+# WS4 D1: corrective dep-inference replay must be SELF-SUFFICIENT. The live
+# ``append_corrective_tasks`` path re-runs ``infer_dependencies`` on the FULL
+# phase, so an edge can land on a PRE-EXISTING task — but the ledger op payload
+# only carries the newly-appended tasks. Without re-running inference inside the
+# replay handlers, that pre-existing-task edge is reproduced ONLY via the
+# snapshot net, not by pure-op replay. These tests drive the two replay handlers
+# (``state.ledger._apply_op`` + ``state.plan_manager._apply_for_load``) directly.
+# ---------------------------------------------------------------------------
+
+
+def _plan_two_preexisting_overlapping_uninferred() -> Plan:
+    """Phase 1 with two PRE-EXISTING tasks sharing a file but carrying NO
+    ``depends_on`` (un-inferred) — the shape where a later corrective append
+    infers an edge onto a task that is NOT in the append's op payload."""
+    return Plan(
+        plan_id="p-reinfer",
+        spec_hash="cafe",
+        phases=[
+            Phase(
+                id="1",
+                title="P1",
+                tasks=[
+                    Task(id="1.1", phase_id="1", title="a", description="a",
+                         files=["src/shared.py"]),
+                    Task(id="1.2", phase_id="1", title="b", description="b",
+                         files=["src/shared.py"]),
+                ],
+            )
+        ],
+        created_at=_iso(),
+        updated_at=_iso(),
+    )
+
+
+def _corrective_append_entry() -> object:
+    """An ``append_corrective_tasks`` ledger entry whose payload carries ONLY a
+    corrective (``1.c1``) that DOES NOT overlap the pre-existing pair — so the
+    ONLY edge inference can produce is ``1.2 -> 1.1``, entirely absent from the
+    payload."""
+    from fixtures.ledger_ops import make_entry
+
+    corrective = Task(
+        id="1.c1",
+        phase_id="1",
+        title="corrective",
+        description="c",
+        complexity="medium",
+        assigned_agent="developer",
+        files=["src/unrelated.py"],
+        metadata={"origin": "phase_review_corrective"},
+    )
+    return make_entry(
+        "append_corrective_tasks",
+        {
+            "phase_id": "1",
+            "tasks": [corrective.model_dump(mode="json")],
+            "review_status": "corrective_required",
+        },
+    )
+
+
+def test_apply_op_append_corrective_reinfers_edge_on_preexisting_task() -> None:
+    """WS4 D1 (ledger ``_apply_op``, red-before-green): pure-op replay of the
+    corrective append must reproduce the edge inferred onto the PRE-EXISTING
+    task ``1.2 -> 1.1`` — even though the op payload carries only ``1.c1``.
+    Before the fix, ``_apply_op`` alone yields ``depends_on=[]`` for ``1.2``."""
+    from state.ledger import _apply_op
+
+    plan = _plan_two_preexisting_overlapping_uninferred()
+    assert plan.phases[0].tasks[1].depends_on == []  # sanity: starts un-inferred
+
+    out = _apply_op(plan, _corrective_append_entry())  # type: ignore[arg-type]
+    assert out is not None
+    by_id = {t.id: t for t in out.phases[0].tasks}
+    assert "1.c1" in by_id  # the corrective landed
+    # the edge on the PRE-EXISTING task (absent from the payload) is reproduced
+    assert by_id["1.2"].depends_on == ["1.1"]
+
+
+def test_apply_for_load_append_corrective_reinfers_edge_on_preexisting_task() -> None:
+    """WS4 D1 (plan_manager ``_apply_for_load``, red-before-green): the load-time
+    replay twin must reproduce the same pre-existing-task edge as ``_apply_op``."""
+    from state.plan_manager import _apply_for_load
+
+    plan = _plan_two_preexisting_overlapping_uninferred()
+    assert plan.phases[0].tasks[1].depends_on == []
+
+    out = _apply_for_load(plan, _corrective_append_entry())  # type: ignore[arg-type]
+    by_id = {t.id: t for t in out.phases[0].tasks}
+    assert "1.c1" in by_id
+    assert by_id["1.2"].depends_on == ["1.1"]
+
+
 @pytest.mark.asyncio
 async def test_update_phase_meta_persists_baseline_commit(tmp_path: Path) -> None:
     pm = PlanManager(tmp_path, session_id="s1")

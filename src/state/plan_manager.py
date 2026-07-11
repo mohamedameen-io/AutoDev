@@ -1475,8 +1475,8 @@ class PlanManager:
                 # declaration order, so re-running cannot introduce a cycle.
                 # Lazy import: ``orchestrator`` imports ``state.plan_manager``
                 # at package-init time (mirrors ``mark_blocked_descendants``'s
-                # lazy ``orchestrator.dag`` import just below), so a top-level
-                # import here would be a state→orchestrator import cycle.
+                # lazy ``orchestrator.dag`` import elsewhere in this file), so a
+                # top-level import here would be a state→orchestrator import cycle.
                 from orchestrator.dependency_inference import infer_dependencies
 
                 infer_dependencies(phase)
@@ -1802,6 +1802,16 @@ def _apply_for_load(plan: Plan, entry: LedgerEntry) -> Plan:
         new_status = payload.get("review_status")
         if isinstance(new_status, str):
             phase.review_status = new_status  # type: ignore[assignment]
+        # WS4 D1: mirror the live path + ``state.ledger._apply_op`` — re-run
+        # implicit dependency inference so an edge inferred onto a PRE-EXISTING
+        # task (which the op payload does NOT carry — it holds only the appended
+        # tasks) is reproduced by this load-time replay, not only via the
+        # snapshot net. ``infer_dependencies`` is idempotent (only touches empty
+        # ``depends_on``, edges point strictly backward). Lazy import mirrors the
+        # live path above (avoids the state→orchestrator cycle).
+        from orchestrator.dependency_inference import infer_dependencies
+
+        infer_dependencies(phase)
         return plan
 
     if op == "update_phase_meta":

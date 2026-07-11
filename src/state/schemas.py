@@ -55,6 +55,30 @@ def _validate_edit_scope_paths(scope: list[str]) -> list[str]:
     return out
 
 
+def is_valid_task_relative_path(raw: str) -> bool:
+    """Structural validity of a single :attr:`Task.files` / ``files_new`` entry.
+
+    A valid entry is a non-empty string, repo-relative (no leading ``/``), with
+    no ``..`` path segments. Glob metacharacters are intentionally NOT rejected
+    — glob resolution is the runtime's job (see :meth:`Task._validate_files_format`).
+
+    This is the SINGLE source of truth for the rule, shared by
+    :meth:`Task._validate_files_format` (which RAISES on an invalid entry) and
+    :func:`orchestrator.corrective_parser._parse_scope_files` (which SKIPS an
+    invalid entry). Keeping both on this one predicate means a future rule change
+    can never drift them apart — the exact hazard that would otherwise let a
+    validator rule the parser doesn't mirror raise an uncaught ``ValidationError``
+    out of the parser's "degrades gracefully" contract.
+    """
+    if not isinstance(raw, str) or not raw:
+        return False
+    if raw.startswith("/"):
+        return False
+    if any(part == ".." for part in raw.split("/")):
+        return False
+    return True
+
+
 TaskStatus = Literal[
     "pending",
     "in_progress",
@@ -215,24 +239,16 @@ class Task(BaseModel):
         The validator does not at this layer attempt to resolve globs
         against the project — that's the runtime expansion's job. Here
         we just enforce that every entry is a non-empty string and is
-        repo-relative (no leading ``/``, no ``..`` segments). Same shape
-        as :func:`_validate_edit_scope_paths` so the surface is uniform.
+        repo-relative (no leading ``/``, no ``..`` segments) via the shared
+        :func:`is_valid_task_relative_path` predicate — the SAME predicate
+        :func:`orchestrator.corrective_parser._parse_scope_files` skips on,
+        so the two can never drift.
         """
         for raw in v:
-            if not isinstance(raw, str) or not raw:
+            if not is_valid_task_relative_path(raw):
                 raise ValueError(
-                    f"Task.files entries must be non-empty strings, got {raw!r}"
-                )
-            if raw.startswith("/"):
-                raise ValueError(
-                    f"Task.files entries must be repo-relative, got absolute "
-                    f"path {raw!r}"
-                )
-            parts = raw.split("/")
-            if any(p == ".." for p in parts):
-                raise ValueError(
-                    f"Task.files entries must not contain '..' segments, "
-                    f"got {raw!r}"
+                    f"Task.files entries must be non-empty, repo-relative paths "
+                    f"without '..' segments, got {raw!r}"
                 )
         return v
     acceptance: list[AcceptanceCriterion] = Field(default_factory=list)
@@ -1073,6 +1089,7 @@ __all__ = [
     "GatheredFact",
     "Hypothesis",
     "IntakeEvidence",
+    "is_valid_task_relative_path",
     "Phase",
     "Plan",
     "RecoveryHint",

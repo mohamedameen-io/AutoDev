@@ -1639,6 +1639,20 @@ def _apply_op(plan: Plan | None, entry: LedgerEntry) -> Plan | None:
         new_status = payload.get("review_status")
         if isinstance(new_status, str):
             phase.review_status = new_status  # type: ignore[assignment]
+        # WS4 D1: mirror the live ``append_corrective_tasks`` path, which
+        # re-runs implicit dependency inference on the FULL phase after the
+        # append. The op payload only carries the newly-appended tasks, so an
+        # edge the live path inferred onto a PRE-EXISTING task is otherwise
+        # reproduced ONLY via the snapshot net — pure-op replay (this function)
+        # would yield ``depends_on=[]`` for it. ``infer_dependencies`` is
+        # idempotent (only touches empty ``depends_on``, edges point strictly
+        # backward in declaration order), so re-running it here is safe and
+        # deterministic. Lazy import: a top-level ``orchestrator`` import would
+        # cycle — ``orchestrator`` imports ``state.plan_manager`` →
+        # ``state.ledger`` at package-init time.
+        from orchestrator.dependency_inference import infer_dependencies
+
+        infer_dependencies(phase)
         return plan
 
     if op == "update_phase_meta":

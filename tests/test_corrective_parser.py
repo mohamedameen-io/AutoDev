@@ -306,3 +306,45 @@ def test_scope_strictly_to_multiple_bullets_each_parsed_independently() -> None:
     assert len(tasks) == 2
     assert tasks[0].files == ["src/a.py"]
     assert tasks[1].files == ["src/b.py", "src/c.py"]
+
+
+# WS4 D2: the parser's per-entry skip rule and Task's files validator share
+# ONE predicate (``state.schemas.is_valid_task_relative_path``), so a future
+# validator rule the parser doesn't mirror can never raise an uncaught
+# ValidationError out of ``parse_corrective_direction``'s graceful-degrade
+# contract. Pin the equivalence.
+@pytest.mark.parametrize(
+    "raw, valid",
+    [
+        ("src/foo.py", True),
+        ("a/b/c.py", True),
+        ("src/qa/*.py", True),  # globs are permitted (runtime resolves them)
+        ("/abs/path.py", False),  # absolute
+        ("../escape.py", False),  # leading ".." segment
+        ("a/../b.py", False),  # mid ".." segment
+    ],
+)
+def test_scope_path_validation_matches_task_files_validator(
+    raw: str, valid: bool
+) -> None:
+    """The predicate, the parser's accept/skip, and ``Task(files=[raw])``
+    constructing-without-raising must all agree for every input."""
+    from pydantic import ValidationError
+
+    from orchestrator.corrective_parser import _parse_scope_files
+    from state.schemas import Task, is_valid_task_relative_path
+
+    # 1. the shared predicate
+    assert is_valid_task_relative_path(raw) is valid
+
+    # 2. the parser accepts iff valid (the clause round-trips a single path)
+    parsed = _parse_scope_files(f"Scope strictly to: {raw}.")
+    assert (raw in parsed) is valid
+
+    # 3. Task's validator constructs iff valid (raises ValidationError otherwise)
+    try:
+        Task(id="1.1", phase_id="1", title="t", description="d", files=[raw])
+        task_constructs = True
+    except ValidationError:
+        task_constructs = False
+    assert task_constructs is valid
