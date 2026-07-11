@@ -240,3 +240,66 @@ def test_returns_same_phase_object() -> None:
         ]
     )
     assert infer_dependencies(phase) is phase
+
+
+# ---------------------------------------------------------------------------
+# WS4: re-running infer_dependencies after corrective-task injection.
+#
+# ``PlanManager.append_corrective_tasks`` appends new (parsed-shape) Tasks to
+# the END of ``phase.tasks`` and then re-runs ``infer_dependencies`` on the
+# WHOLE phase. This must be safe to do on a phase that already went through
+# inference once (at initial plan-parse) — i.e. re-running must only ever
+# wire the newly-appended tasks and never disturb tasks that already carry an
+# edge (explicit or previously-inferred).
+# ---------------------------------------------------------------------------
+
+
+def test_reinfer_after_append_wires_new_corrective_tasks_only() -> None:
+    """Simulates the ``append_corrective_tasks`` re-run: infer once on the
+    architect's original tasks, append two corrective tasks that share a
+    file with EACH OTHER (but not with the original tasks), then re-run
+    ``infer_dependencies``. Only the new pair gets wired; the untouched
+    tasks/edges from the first pass are completely undisturbed."""
+    phase = _phase(
+        [
+            _t("1.1", files_new=["src/a.py"]),
+            _t("1.2", files=["src/a.py"]),
+        ]
+    )
+    infer_dependencies(phase)
+    assert phase.tasks[1].depends_on == ["1.1"]
+
+    # Simulate append_corrective_tasks: two new corrective tasks land at the
+    # end of phase.tasks (declaration order), sharing a file with each other
+    # only — not with 1.1/1.2.
+    phase.tasks.append(_t("1.c1", files=["src/shared.py"]))
+    phase.tasks.append(_t("1.c2", files=["src/shared.py"]))
+
+    infer_dependencies(phase)  # the re-run under test
+
+    # New edge wired between the two correctives.
+    assert phase.tasks[3].depends_on == ["1.c1"]
+    # Pre-existing tasks/edges from the first pass are completely undisturbed.
+    assert phase.tasks[0].depends_on == []
+    assert phase.tasks[1].depends_on == ["1.1"]
+
+
+def test_reinfer_is_idempotent_across_repeated_calls() -> None:
+    """Calling infer_dependencies a THIRD time (no new tasks appended) is a
+    pure no-op — it neither duplicates nor alters any edge."""
+    phase = _phase(
+        [
+            _t("1.1", files_new=["src/a.py"]),
+            _t("1.2", files=["src/a.py"]),
+        ]
+    )
+    infer_dependencies(phase)
+    phase.tasks.append(_t("1.c1", files=["src/shared.py"]))
+    phase.tasks.append(_t("1.c2", files=["src/shared.py"]))
+    infer_dependencies(phase)
+    snapshot = [list(t.depends_on) for t in phase.tasks]
+
+    infer_dependencies(phase)
+    infer_dependencies(phase)
+
+    assert [list(t.depends_on) for t in phase.tasks] == snapshot

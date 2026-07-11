@@ -217,3 +217,92 @@ def test_parse_corrective_direction_no_cap_preserves_legacy_behaviour(
     parsed = [c for c in captured if c["event"] == "corrective_parser.parsed"]
     assert parsed[0]["dropped"] == 0
     assert parsed[0]["max_tasks"] is None
+
+
+# ---------------------------------------------------------------------------
+# WS4: "Scope strictly to: <files>." clause populates Task.files.
+#
+# ``execute_phase._synthesize_corrective_direction``'s ``re_architect``
+# template is the sole producer of this phrase in the codebase. Before this
+# fix ``parse_corrective_direction`` never populated ``Task.files``, so a
+# corrective task was structurally invisible to both overlap-avoidance
+# mechanisms that key on it (``dependency_inference.infer_dependencies`` and
+# the runtime scheduler's ``in_flight_files()`` exclusion) — precisely when
+# it is most likely to be operating in just-contested scope.
+# ---------------------------------------------------------------------------
+
+
+def test_scope_strictly_to_clause_populates_task_files() -> None:
+    """A single-bullet direction with a trailing rationale after the clause
+    (the common ``re_architect`` shape) has its file list parsed into
+    ``Task.files``, and the rationale sentence is NOT folded into it."""
+    text = (
+        '- Re-implement "Add the widget factory" as smaller, non-overlapping '
+        "changes so the patches stop colliding. Scope strictly to: "
+        "src/widget.py, src/factory.py. patches keep colliding\n"
+    )
+    tasks = parse_corrective_direction(text, phase_id="1", base_task_count=0)
+    assert len(tasks) == 1
+    assert tasks[0].files == ["src/widget.py", "src/factory.py"]
+
+
+def test_scope_strictly_to_clause_single_path_no_rationale() -> None:
+    """No trailing rationale: the clause's period is the end of the bullet."""
+    text = '- Fix it. Scope strictly to: src/foo.py.\n'
+    tasks = parse_corrective_direction(text, phase_id="1", base_task_count=0)
+    assert tasks[0].files == ["src/foo.py"]
+
+
+def test_scope_strictly_to_sentinel_leaves_files_empty() -> None:
+    """The ``_synthesize_corrective_direction`` no-files fallback phrase
+    ("the originally-claimed files") is prose, not a path — it must never
+    land in ``Task.files``."""
+    text = "- Fix it. Scope strictly to: the originally-claimed files.\n"
+    tasks = parse_corrective_direction(text, phase_id="1", base_task_count=0)
+    assert tasks[0].files == []
+
+
+def test_bullet_without_scope_clause_leaves_files_empty() -> None:
+    """Pre-existing behaviour is unchanged for bullets with no scope clause
+    (e.g. free-form architect_b / synthesizer bullets)."""
+    text = "- Just a plain corrective bullet\n"
+    tasks = parse_corrective_direction(text, phase_id="1", base_task_count=0)
+    assert tasks[0].files == []
+
+
+def test_scope_strictly_to_matches_real_synthesized_direction() -> None:
+    """Closes the loop against the ACTUAL producer
+    (``execute_phase._synthesize_corrective_direction``'s ``re_architect``
+    template) so a future change to that emission format is caught here
+    instead of silently breaking the parse."""
+    from orchestrator.execute_phase import _synthesize_corrective_direction
+    from state.schemas import Task as _Task
+
+    task = _Task(
+        id="1.1",
+        phase_id="1",
+        title="Add the widget factory",
+        description="d",
+        files=["src/widget.py", "src/factory.py"],
+    )
+    direction = _synthesize_corrective_direction(
+        task, "re_architect", rationale="patches keep colliding"
+    )
+    tasks = parse_corrective_direction(
+        direction, phase_id="1", base_task_count=1
+    )
+    assert len(tasks) == 1
+    assert tasks[0].files == ["src/widget.py", "src/factory.py"]
+
+
+def test_scope_strictly_to_multiple_bullets_each_parsed_independently() -> None:
+    """Two top-level bullets each carrying their own scope clause get their
+    own, independent ``files`` lists (no cross-bullet bleed)."""
+    text = (
+        "- First fix. Scope strictly to: src/a.py.\n"
+        "- Second fix. Scope strictly to: src/b.py, src/c.py.\n"
+    )
+    tasks = parse_corrective_direction(text, phase_id="1", base_task_count=0)
+    assert len(tasks) == 2
+    assert tasks[0].files == ["src/a.py"]
+    assert tasks[1].files == ["src/b.py", "src/c.py"]

@@ -13,6 +13,18 @@ format. Malformed direction text degrades gracefully: an empty list is
 returned and the caller continues forward (the phase is recorded as
 ``corrective_required`` but no actual sub-tasks land, which the
 orchestrator treats as a soft failure of the corrective pass).
+
+WS4: a bullet whose body carries a "Scope strictly to: <files>." clause
+(the deterministic shape ``orchestrator.execute_phase.
+_synthesize_corrective_direction``'s ``re_architect`` template emits) has
+those paths parsed into the resulting ``Task.files``. Without this, a
+corrective task's ``files`` stayed ``[]`` even when its own direction prose
+declared an exact scope — making it structurally invisible to the two
+overlap-avoidance mechanisms that key on ``Task.files``
+(``orchestrator.dependency_inference.infer_dependencies`` and the runtime
+scheduler's ``in_flight_files()`` exclusion), right when a corrective is
+most likely operating in just-contested scope. A bullet with no such clause
+still gets ``files=[]``, identical to pre-fix behaviour.
 """
 
 from __future__ import annotations
@@ -31,6 +43,25 @@ logger = get_logger(__name__)
 # sub-bullets stay nested inside the parent bullet's description).
 _RE_BULLET = re.compile(r"^(?:[-*]|\d+\.)\s+(.+)$")
 _RE_TOP_LEVEL_BULLET = re.compile(r"^[ ]?(?:[-*]|\d+\.)\s+(.+)$")
+
+# WS4: matches the "Scope strictly to: <files>." clause emitted by
+# ``orchestrator.execute_phase._synthesize_corrective_direction``'s
+# ``re_architect`` template — the sole producer of this exact phrase in the
+# codebase. The capture is non-greedy and stops at the first "." that is
+# followed by whitespace or end-of-string, so:
+#   * a period INSIDE a path (e.g. the "." in "src/foo.py") is never mistaken
+#     for the clause terminator, because it is immediately followed by more
+#     path characters, not whitespace; but
+#   * the true terminator — always immediately followed by either the end of
+#     the bullet or a space before the trailing rationale sentence — is
+#     matched precisely, so a rationale that itself contains periods is never
+#     folded into the captured file list.
+_RE_SCOPE_CLAUSE = re.compile(r"Scope strictly to:\s*(.+?)\.(?=\s|$)")
+
+# The literal fallback ``_synthesize_corrective_direction`` emits in place of
+# a file list when the originating task had no declared ``files`` — prose,
+# never a real path, so it must never be parsed into ``Task.files``.
+_SCOPE_CLAUSE_SENTINEL = "the originally-claimed files"
 
 
 def parse_corrective_direction(
@@ -105,6 +136,7 @@ def parse_corrective_direction(
                 complexity=complexity_lit,
                 assigned_agent="developer",
                 metadata=metadata,
+                files=_parse_scope_files(description),
             )
         )
         # v0.37.0 H2: stop as soon as we reach the per-call cap so we
@@ -154,6 +186,46 @@ def _split_top_level_bullets(text: str) -> list[str]:
     if current:
         bullets.append("\n".join(current).rstrip())
     return [b for b in bullets if b.strip()]
+
+
+def _parse_scope_files(body: str) -> list[str]:
+    """Extract repo-relative paths from a bullet's "Scope strictly to:
+    <files>." clause (see :data:`_RE_SCOPE_CLAUSE`).
+
+    Returns ``[]`` — leaving ``Task.files`` at its default — when:
+
+    * the bullet carries no such clause at all (free-form architect_b /
+      synthesizer bullets that never mention scope), or
+    * the clause carries the ``_synthesize_corrective_direction`` no-files
+      sentinel (``"the originally-claimed files"``, emitted when the
+      originating task had no declared ``files``) — prose, not a path, or
+    * every comma-separated entry fails the same structural checks
+      :class:`state.schemas.Task` enforces on ``files`` (non-empty,
+      repo-relative, no ``..`` segments).
+
+    This degrades exactly as gracefully as the rest of this module: a
+    parsing hiccup can never raise out of ``Task`` construction — it just
+    leaves ``files`` empty, identical to pre-fix behaviour.
+    """
+    match = _RE_SCOPE_CLAUSE.search(body)
+    if match is None:
+        return []
+    raw = match.group(1).strip()
+    if not raw or raw == _SCOPE_CLAUSE_SENTINEL:
+        return []
+    files: list[str] = []
+    seen: set[str] = set()
+    for entry in raw.split(","):
+        path = entry.strip()
+        if not path or path in seen:
+            continue
+        if path.startswith("/"):
+            continue
+        if any(part == ".." for part in path.split("/")):
+            continue
+        seen.add(path)
+        files.append(path)
+    return files
 
 
 __all__ = ["parse_corrective_direction"]

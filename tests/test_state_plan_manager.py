@@ -548,6 +548,103 @@ async def test_append_corrective_tasks_idempotent_replay(tmp_path: Path) -> None
     assert plan.phases[0].corrective_task_ids.count("1.c1") == 1
 
 
+# ---------------------------------------------------------------------------
+# WS4: append_corrective_tasks re-runs dependency_inference.infer_dependencies
+# on the phase's task list right after the append succeeds, so overlapping
+# corrective tasks (now that the parser populates Task.files) get an inferred
+# depends_on edge — closing the gap where correctives were structurally
+# invisible to overlap-avoidance.
+# ---------------------------------------------------------------------------
+
+
+def _mk_corrective_task_with_files(idx: int, files: list[str]) -> Task:
+    return Task(
+        id=f"1.c{idx}",
+        phase_id="1",
+        title=f"corrective {idx}",
+        description=f"corrective body {idx}",
+        complexity="medium",
+        assigned_agent="developer",
+        files=list(files),
+        metadata={"origin": "phase_review_corrective"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_append_corrective_tasks_infers_deps_same_call(
+    tmp_path: Path,
+) -> None:
+    """Two correctives appended in the SAME call, sharing a file, get an
+    inferred depends_on edge."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    first = _mk_corrective_task_with_files(1, ["src/shared.py"])
+    second = _mk_corrective_task_with_files(2, ["src/shared.py", "src/other.py"])
+    plan = await pm.append_corrective_tasks("1", [first, second])
+    tasks_by_id = {t.id: t for t in plan.phases[0].tasks}
+    assert tasks_by_id["1.c2"].depends_on == ["1.c1"]
+    assert tasks_by_id["1.c1"].depends_on == []
+
+
+@pytest.mark.asyncio
+async def test_append_corrective_tasks_infers_deps_across_separate_rounds(
+    tmp_path: Path,
+) -> None:
+    """The realistic shape: two SEPARATE corrective rounds (e.g. two
+    architect-refine cycles). The second round's task still gets wired to
+    the first round's, proving inference safely re-runs on an
+    already-partially-inferred task list."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    await pm.append_corrective_tasks(
+        "1", [_mk_corrective_task_with_files(1, ["src/shared.py"])]
+    )
+    plan = await pm.append_corrective_tasks(
+        "1", [_mk_corrective_task_with_files(2, ["src/shared.py"])]
+    )
+    tasks_by_id = {t.id: t for t in plan.phases[0].tasks}
+    assert tasks_by_id["1.c2"].depends_on == ["1.c1"]
+
+
+@pytest.mark.asyncio
+async def test_append_corrective_tasks_reinfer_does_not_disturb_existing_deps(
+    tmp_path: Path,
+) -> None:
+    """Re-running inference after an append must never touch a task that
+    already has an explicit (or previously-inferred) depends_on."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    plan = _mk_plan()
+    plan.phases[0].tasks[1].depends_on = ["1.1"]  # pre-existing explicit edge
+    await pm.init_plan(plan)
+    await pm.append_corrective_tasks(
+        "1", [_mk_corrective_task_with_files(1, ["src/shared.py"])]
+    )
+    loaded = await pm.load()
+    assert loaded is not None
+    tasks_by_id = {t.id: t for t in loaded.phases[0].tasks}
+    assert tasks_by_id["1.2"].depends_on == ["1.1"]
+
+
+@pytest.mark.asyncio
+async def test_append_corrective_tasks_reinfer_survives_ledger_replay(
+    tmp_path: Path,
+) -> None:
+    """The inferred depends_on edge is part of the SAME
+    ``append_corrective_tasks`` ledger op (no separate op needed) — a fresh
+    PlanManager replaying from the ledger reproduces the edge."""
+    pm = PlanManager(tmp_path, session_id="s1")
+    await pm.init_plan(_mk_plan())
+    first = _mk_corrective_task_with_files(1, ["src/shared.py"])
+    second = _mk_corrective_task_with_files(2, ["src/shared.py"])
+    await pm.append_corrective_tasks("1", [first, second])
+
+    pm2 = PlanManager(tmp_path, session_id="s2")
+    plan = await pm2.load()
+    assert plan is not None
+    tasks_by_id = {t.id: t for t in plan.phases[0].tasks}
+    assert tasks_by_id["1.c2"].depends_on == ["1.c1"]
+
+
 @pytest.mark.asyncio
 async def test_update_phase_meta_persists_baseline_commit(tmp_path: Path) -> None:
     pm = PlanManager(tmp_path, session_id="s1")

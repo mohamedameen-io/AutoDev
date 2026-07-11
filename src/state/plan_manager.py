@@ -1345,6 +1345,17 @@ class PlanManager:
         but a future caller bypassing that path would still hit these
         invariants.
 
+        WS4: once the (possibly capped) batch is appended,
+        :func:`orchestrator.dependency_inference.infer_dependencies` re-runs
+        on the phase's FULL task list (existing + newly appended) before the
+        ledger entry is written, so a newly-landed corrective task that
+        shares a concrete file with an earlier same-phase task (the
+        architect's original work or an earlier corrective round) picks up
+        an inferred ``depends_on`` edge — closing the gap where corrective
+        tasks, previously always ``files=[]``, were invisible to both
+        overlap-avoidance mechanisms keyed on ``Task.files``. A no-op when
+        nothing was actually appended (all-duplicate / fully-capped batch).
+
         Returns the updated plan.
         """
         async with plan_lock(self._cwd, timeout_s=self._lock_timeout_s):
@@ -1442,6 +1453,34 @@ class PlanManager:
                 if t.id not in phase.corrective_task_ids:
                     phase.corrective_task_ids.append(t.id)
                 appended.append(t)
+
+            if appended:
+                # WS4: re-run implicit dependency inference on the phase's
+                # FULL task list (existing + newly appended) right after the
+                # append succeeds. Corrective tasks now carry real ``files``
+                # (parsed from the "Scope strictly to:" clause by
+                # :func:`orchestrator.corrective_parser.parse_corrective_direction`),
+                # so a corrective that shares a file with an earlier
+                # same-phase task (the architect's original work OR an
+                # earlier corrective round) can be serialized after it
+                # instead of racing it in a parallel worktree.
+                #
+                # Safe to re-run on an already-(partially-)inferred phase:
+                # ``infer_dependencies`` only ever touches tasks whose
+                # ``depends_on`` is CURRENTLY empty, so a task that already
+                # carries an explicit or previously-inferred edge is never
+                # revisited, and edges are assigned (not appended), so
+                # calling this more than once can never duplicate an edge.
+                # Every inferred edge points strictly backward in
+                # declaration order, so re-running cannot introduce a cycle.
+                # Lazy import: ``orchestrator`` imports ``state.plan_manager``
+                # at package-init time (mirrors ``mark_blocked_descendants``'s
+                # lazy ``orchestrator.dag`` import just below), so a top-level
+                # import here would be a state→orchestrator import cycle.
+                from orchestrator.dependency_inference import infer_dependencies
+
+                infer_dependencies(phase)
+
             phase.review_status = review_status  # type: ignore[assignment]
 
             await append_entry(
