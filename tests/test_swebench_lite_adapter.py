@@ -1050,3 +1050,59 @@ def test_default_install_env_untabulated_still_uses_sys_executable(
 
     assert result.installed is True
     assert calls[0] == [sys.executable, "-m", "venv", str(workdir / ".venv")]
+
+
+def test_repo_version_thresholds_buckets_sorted_ascending() -> None:
+    """WS9 invariant guard: ``_resolve_python_version`` picks a bucket with a
+    ``break``-on-first-below loop that resolves to the HIGHEST bucket whose
+    ``min_version <= version`` — CORRECT ONLY IF each repo's bucket list is
+    sorted ascending by ``min_version``. An out-of-order future edit would
+    silently return the WRONG interpreter (worse than ``None``), so pin the
+    invariant here where such an edit fails loudly."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    for repo, buckets in adp._REPO_VERSION_THRESHOLDS.items():
+        mins = [min_version for min_version, _python in buckets]
+        assert mins == sorted(mins), (
+            f"{repo} version buckets are not ascending by min_version: {mins} — "
+            "the break-based bucket selection would return a wrong version"
+        )
+
+
+def test_py_version_table_source_pins_upstream_commit() -> None:
+    """WS9: ``_PY_VERSION_TABLE_SOURCE`` is the load-bearing citation for where
+    every pinned interpreter came from. Pin it to the EXACT upstream file +
+    commit it was extracted from, so the citation can't silently rot into dead
+    code — and a future table edit re-verified against a DIFFERENT commit is
+    forced to update it in lockstep."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    assert adp._PY_VERSION_TABLE_SOURCE == (
+        "SWE-bench/SWE-bench swebench/harness/constants/python.py "
+        "@ c7a956c8a7ab288674151b853cf6cf2a4836256e"
+    )
+
+
+def test_parse_version_numeric_tuple_compare_orders_3_10_above_3_9() -> None:
+    """WS9: ``_parse_version``'s docstring claims a numeric int-tuple parse so
+    ``3.10`` sorts ABOVE ``3.9`` (a naive lexical string compare inverts this,
+    which would corrupt threshold-bucket selection). Nothing tested the property
+    directly — pin it."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    assert adp._parse_version("3.10") > adp._parse_version("3.9")
+
+
+def test_uv_available_reflects_shutil_which(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WS9: ``_uv_available`` is the single gate on the whole version-aware path
+    (it is otherwise monkeypatched wholesale in the resolver tests). Close the
+    last unmocked link by pinning it to ``shutil.which`` for BOTH outcomes —
+    present and absent."""
+    import shutil
+
+    from benchmarks.adapters import swebench_lite as adp
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/uv")
+    assert adp._uv_available() is True
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert adp._uv_available() is False
