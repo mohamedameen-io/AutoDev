@@ -39,6 +39,7 @@ unit-testable with a tmp git repo and no network / no pip.
 
 from __future__ import annotations
 
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -290,6 +291,161 @@ def _write_install_failure_log(workdir: Path, *, stdout: str, stderr: str) -> No
         pass
 
 
+# ---------------------------------------------------------------------------
+# Version-aware per-instance Python resolution (the deferred "P1.6").
+#
+# ``_default_install_env`` historically built EVERY per-instance venv from
+# ``sys.executable`` (AutoDev's own interpreter -- 3.13 on this host) regardless
+# of the target repo's era. That silently breaks era-sensitive installs --
+# confirmed for ``psf/requests``, whose ``setup.py`` imports ``from collections
+# import Mapping`` (removed in Python 3.10), so a 3.13 venv fails
+# ``pip install -e .`` before a solve can even start. This resolver maps a
+# SWE-bench-Lite instance's ``(repo, version)`` to the era-correct CPython the
+# OFFICIAL harness pins, so ``uv`` can provision exactly that interpreter.
+#
+# SOURCE OF TRUTH (re-verified against upstream, NOT from memory): the
+# ``python`` field of ``MAP_REPO_VERSION_TO_SPECS_PY`` in the SWE-bench harness,
+# extracted by exec-ing the authoritative constants file and reading every
+# version's ``python`` for the 12 SWE-bench-Lite repos:
+#   SWE-bench/SWE-bench  swebench/harness/constants/python.py
+#   @ commit c7a956c8a7ab288674151b853cf6cf2a4836256e  (2025-09-11)
+# Scope is DELIBERATELY the 12 Lite repos only -- NOT full harness parity (the
+# upstream table is ~350 per-repo/version entries across all languages).
+#
+# Two shapes fall out of the REAL data (the plan's "5 constant repos" estimate
+# was off-by-one -- there are 6):
+#   * 6 CONSTANT-version repos -- ONE python across their entire version range,
+#     so a bare repo lookup is 100% correct (the ``version`` field is ignored);
+#   * 6 THRESHOLD repos -- a handful of ``(min_inclusive_version, python)``
+#     buckets keyed off the instance's own ``version``; resolve to the HIGHEST
+#     bucket whose min <= the parsed version. A version BELOW a repo's lowest
+#     bucket (or missing/unparseable) resolves to None -> the conservative
+#     ``sys.executable`` fallback, never a guess.
+# Every bucket boundary below reproduces the upstream ``python`` at every
+# tabulated version exactly (verified against the exec-extracted map).
+_PY_VERSION_TABLE_SOURCE = (
+    "SWE-bench/SWE-bench swebench/harness/constants/python.py "
+    "@ c7a956c8a7ab288674151b853cf6cf2a4836256e"
+)
+
+# repo -> the single CPython pinned across its whole SWE-bench version range.
+_REPO_CONSTANT_PYTHON: dict[str, str] = {
+    "mwaskom/seaborn": "3.9",
+    "psf/requests": "3.9",
+    "pydata/xarray": "3.10",
+    "pylint-dev/pylint": "3.9",
+    "pytest-dev/pytest": "3.9",
+    "sympy/sympy": "3.9",
+}
+
+# repo -> ASCENDING ``(min_inclusive_version_tuple, python)`` buckets. Floors are
+# each repo's earliest tabulated version, so a below-range version is treated as
+# untabulated (None -> fallback) rather than guessed.
+_REPO_VERSION_THRESHOLDS: dict[str, tuple[tuple[tuple[int, ...], str], ...]] = {
+    "astropy/astropy": (((0, 1), "3.6"), ((3, 0), "3.9"), ((5, 3), "3.10")),
+    "django/django": (
+        ((1, 4), "3.5"),
+        ((3, 0), "3.6"),
+        ((4, 0), "3.8"),
+        ((4, 1), "3.9"),
+        ((5, 0), "3.11"),
+    ),
+    "matplotlib/matplotlib": (
+        ((1, 0), "3.5"),
+        ((3, 0), "3.7"),
+        ((3, 1), "3.8"),
+        ((3, 5), "3.11"),
+    ),
+    "pallets/flask": (((2, 0), "3.9"), ((2, 1), "3.10"), ((2, 2), "3.11")),
+    "scikit-learn/scikit-learn": (((0, 20), "3.6"), ((1, 3), "3.9")),
+    "sphinx-doc/sphinx": (((1, 5), "3.9"), ((8, 0), "3.10")),
+}
+
+
+def _parse_version(version: str) -> tuple[int, ...] | None:
+    """Parse a SWE-bench ``version`` string into a comparable int tuple.
+
+    Tolerates the upstream ``v``-prefixed key (astropy's only 3.10 spec is keyed
+    ``v5.3``) and surrounding whitespace. Returns None for an empty/unparseable
+    value so the resolver can fall back conservatively. Note the numeric-tuple
+    compare gets ``"3.10" -> (3, 10)`` correctly ABOVE ``"3.9" -> (3, 9)``, which
+    a naive lexical string compare would invert.
+    """
+    core = version.strip().lstrip("vV")
+    if not core:
+        return None
+    try:
+        return tuple(int(part) for part in core.split("."))
+    except ValueError:
+        return None
+
+
+def _resolve_python_version(repo: str, version: str | None) -> str | None:
+    """Resolve the era-correct CPython ``"X.Y"`` for a ``(repo, version)``.
+
+    Constant-version repos: a bare repo lookup (``version`` ignored). Threshold
+    repos: the highest bucket whose min <= the parsed version. Returns None --
+    the signal to keep today's ``sys.executable`` behavior -- for an untabulated
+    repo, a version below the repo's lowest bucket, or a missing/unparseable
+    version. Never raises: a wrong table is worse than none, so anything not
+    positively tabulated falls back.
+    """
+    constant = _REPO_CONSTANT_PYTHON.get(repo)
+    if constant is not None:
+        return constant
+    buckets = _REPO_VERSION_THRESHOLDS.get(repo)
+    if buckets is None:
+        return None
+    parsed = _parse_version(version) if version else None
+    if parsed is None:
+        return None
+    resolved: str | None = None
+    for min_version, python in buckets:  # ascending
+        if parsed >= min_version:
+            resolved = python
+        else:
+            break
+    return resolved
+
+
+def _uv_available() -> bool:
+    """True iff the ``uv`` CLI is on PATH (a documented Phase-1 prerequisite).
+
+    A single module-level function so it is one monkeypatch point in tests and
+    one place to gate the version-aware path -- if ``uv`` is absent the
+    resolver's answer is discarded and the plain ``sys.executable`` venv is built
+    (never a hard failure).
+    """
+    return shutil.which("uv") is not None
+
+
+def _venv_creation_command(instance: Instance, venv_dir: Path) -> list[str]:
+    """Build the argv that creates the per-instance venv.
+
+    When the instance resolves to an era-correct CPython AND ``uv`` is available:
+    ``uv venv --python X.Y --seed <venv_dir>``. ``uv`` provisions that
+    interpreter on demand (downloading it if need be) and ``--seed`` installs
+    pip/setuptools/wheel INTO the venv so the caller's downstream
+    ``<venv>/bin/pip install -e .`` is entirely unchanged. Otherwise -- an
+    untabulated repo, an unresolvable version, or no ``uv`` -- the plain
+    ``sys.executable -m venv <venv_dir>`` fallback (today's exact behavior).
+
+    Deliberately ONE resolved version per instance -- no "try N versions in
+    sequence" cascade (which would multiply wall-clock on the instances least
+    likely to benefit). If ``uv`` cannot actually provision the resolved version
+    at runtime (e.g. CPython 3.5/3.6, outside uv's managed range), the
+    venv-creation ``_run`` returns non-zero and the caller already degrades to a
+    blind solve -- no worse than today, where those old eras also fail on 3.13.
+    """
+    repo = str(instance.get("repo", ""))
+    raw_version = instance.get("version")
+    version = str(raw_version) if raw_version is not None else None
+    python = _resolve_python_version(repo, version)
+    if python is not None and _uv_available():
+        return ["uv", "venv", "--python", python, "--seed", str(venv_dir)]
+    return [sys.executable, "-m", "venv", str(venv_dir)]
+
+
 def _default_install_env(instance: Instance, workdir: Path) -> InstallResult:
     """Best-effort per-instance arm64 venv + editable install.
 
@@ -303,14 +459,19 @@ def _default_install_env(instance: Instance, workdir: Path) -> InstallResult:
     ``benchmarks.runner.solve.SolveOutcome``'s tail convention) AND the FULL
     output is persisted to ``workdir / ".autodev-bench" / "install-failure.log"``
     (see :func:`_write_install_failure_log`) so a blind-solve instance is
-    diagnosable without re-running the install by hand. Per-version install
-    specs (``environment_setup_commit``/``version``) are a pilot refinement
-    (P1.6); the generic editable install is the honest Phase-1 default.
+    diagnosable without re-running the install by hand.
+
+    The venv interpreter is version-aware (the former "P1.6"): the era-correct
+    CPython for this ``(repo, version)`` is resolved from the upstream-derived
+    table and provisioned via ``uv`` (see :func:`_venv_creation_command`),
+    falling back to ``sys.executable`` for any untabulated/unresolvable instance
+    or when ``uv`` is unavailable. The editable ``pip install -e .`` below is
+    otherwise unchanged.
     """
     try:
         venv_dir = workdir / ".venv"
         made = _run(
-            [sys.executable, "-m", "venv", str(venv_dir)],
+            _venv_creation_command(instance, venv_dir),
             cwd=workdir,
             timeout=_VENV_TIMEOUT,
         )

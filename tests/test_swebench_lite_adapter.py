@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -783,3 +784,208 @@ def test_dataset_hf_path_errors_clearly_when_datasets_absent():
     with pytest.raises(RuntimeError) as exc:
         ds.load_instances_from_hf(instance_ids=["x__1"])
     assert "datasets" in str(exc.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# WS9: version-aware per-instance Python for the per-instance venv (P1.6).
+#
+# ``_default_install_env`` used to ALWAYS build the venv from ``sys.executable``
+# (AutoDev's own interpreter, 3.13 on this host) regardless of the target repo's
+# era -- self-acknowledged deferred "P1.6" work. That breaks era-sensitive
+# installs: ``psf/requests``'s ``setup.py`` imports ``from collections import
+# Mapping`` (removed in 3.10), so a 3.13 venv fails ``pip install -e .`` before
+# a solve even starts. The resolver maps a SWE-bench-Lite instance's
+# ``(repo, version)`` to the era-correct CPython the OFFICIAL harness pins --
+# verified against SWE-bench/SWE-bench ``swebench/harness/constants/python.py``
+# @ c7a956c (see ``swebench_lite._PY_VERSION_TABLE_SOURCE``). Constant-version
+# repos are a bare repo lookup; the rest use a few version-threshold buckets
+# keyed off the instance's own ``version`` field. Untabulated repo, a
+# below-range/unparseable version, or ``uv`` absent -> None -> today's exact
+# ``sys.executable`` venv (never a hard failure, never a wrong guess).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_python_constant_version_repo_is_version_independent():
+    """A constant-version repo (its whole SWE-bench version range pins ONE
+    CPython) resolves by a bare repo lookup -- the ``version`` field is
+    irrelevant. ``psf/requests`` is 3.9 across all its tabulated versions (the
+    confirmed-valuable instance: its ``setup.py`` does ``from collections import
+    Mapping``, gone in 3.10+, so a 3.13 venv breaks the editable install)."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    assert adp._resolve_python_version("psf/requests", "2.31") == "3.9"
+    # version-independent: a different (even nonsensical) version -> same answer.
+    assert adp._resolve_python_version("psf/requests", "0.7") == "3.9"
+    assert adp._resolve_python_version("psf/requests", None) == "3.9"
+    # a second constant repo pinning a DIFFERENT constant (xarray -> 3.10).
+    assert adp._resolve_python_version("pydata/xarray", "2022.03") == "3.10"
+
+
+def test_resolve_python_threshold_boundary_repo():
+    """A threshold repo resolves off the instance ``version`` (the highest
+    bucket whose min <= version). Django is the canonical multi-bucket case:
+    4.0 -> 3.8 but 4.1 -> 3.9 (a real one-minor boundary in the upstream
+    specs), 2.2 -> 3.5, 3.2 -> 3.6, and 5.x -> 3.11."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    assert adp._resolve_python_version("django/django", "2.2") == "3.5"
+    assert adp._resolve_python_version("django/django", "3.2") == "3.6"
+    # the load-bearing boundary: 4.0 and 4.1 straddle a python bump.
+    assert adp._resolve_python_version("django/django", "4.0") == "3.8"
+    assert adp._resolve_python_version("django/django", "4.1") == "3.9"
+    assert adp._resolve_python_version("django/django", "5.0") == "3.11"
+
+
+def test_resolve_python_tolerates_v_prefixed_version_astropy_boundary():
+    """The version parser tolerates the upstream ``v``-prefixed key: astropy's
+    only 3.10 spec is keyed ``v5.3`` while 5.0-5.2 are 3.9, so a bare and a
+    v-prefixed 5.3 both resolve to 3.10 while 5.2 stays 3.9."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    assert adp._resolve_python_version("astropy/astropy", "5.2") == "3.9"
+    assert adp._resolve_python_version("astropy/astropy", "v5.3") == "3.10"
+    assert adp._resolve_python_version("astropy/astropy", "5.3") == "3.10"
+
+
+def test_resolve_python_untabulated_and_below_range_fall_back_to_none():
+    """Conservative fallback: an untabulated repo, a threshold repo whose
+    version is BELOW its lowest bucket, and a missing/unparseable version all
+    resolve to None -> the caller keeps today's ``sys.executable`` behavior
+    (never a hard failure, never a wrong guess)."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    # untabulated repo (not in either table).
+    assert adp._resolve_python_version("some/unknown-repo", "1.0") is None
+    # threshold repo, version below the lowest bucket (flask's floor is 2.0).
+    assert adp._resolve_python_version("pallets/flask", "1.0") is None
+    # missing / empty / unparseable version on a threshold repo.
+    assert adp._resolve_python_version("django/django", None) is None
+    assert adp._resolve_python_version("django/django", "") is None
+    assert adp._resolve_python_version("django/django", "not-a-version") is None
+
+
+def test_venv_command_uses_uv_for_resolvable_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The venv-creation argv for a resolvable instance (repo tabulated, version
+    resolves, ``uv`` available) is ``uv venv --python X.Y --seed <dir>``: uv
+    provisions the era-correct interpreter on demand and ``--seed`` installs
+    pip/setuptools/wheel so the downstream ``pip install -e .`` is unchanged."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    monkeypatch.setattr(adp, "_uv_available", lambda: True)
+    venv_dir = tmp_path / ".venv"
+    instance = {
+        "instance_id": "psf__requests-1963",
+        "repo": "psf/requests",
+        "version": "2.19",
+    }
+    cmd = adp._venv_creation_command(instance, venv_dir)
+    assert cmd[:4] == ["uv", "venv", "--python", "3.9"]
+    assert "--seed" in cmd
+    assert cmd[-1] == str(venv_dir)
+    # NOT the plain sys.executable fallback.
+    assert sys.executable not in cmd
+
+
+def test_venv_command_falls_back_to_sys_executable_when_untabulated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An untabulated repo -> the plain ``sys.executable -m venv <dir>`` fallback
+    (today's exact behavior) even when ``uv`` is available."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    monkeypatch.setattr(adp, "_uv_available", lambda: True)  # uv present, but...
+    venv_dir = tmp_path / ".venv"
+    instance = {"instance_id": "x__1", "repo": "some/unknown", "version": "1.0"}
+    cmd = adp._venv_creation_command(instance, venv_dir)
+    assert cmd == [sys.executable, "-m", "venv", str(venv_dir)]
+
+
+def test_venv_command_falls_back_when_uv_unavailable_even_if_resolvable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Even for a resolvable instance, if ``uv`` is not on PATH the argv is the
+    plain ``sys.executable -m venv`` fallback -- version-awareness is a strict
+    add-on that never becomes a hard dependency on uv."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    monkeypatch.setattr(adp, "_uv_available", lambda: False)
+    venv_dir = tmp_path / ".venv"
+    instance = {
+        "instance_id": "psf__requests-1963",
+        "repo": "psf/requests",
+        "version": "2.19",
+    }
+    cmd = adp._venv_creation_command(instance, venv_dir)
+    assert cmd == [sys.executable, "-m", "venv", str(venv_dir)]
+
+
+def test_default_install_env_invokes_uv_venv_for_resolvable_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Wiring proof: ``_default_install_env`` threads the resolved interpreter
+    into the REAL venv-creation call -- the first ``_run`` argv for a resolvable
+    instance is ``uv venv --python 3.9 --seed ...``, and the install step still
+    shells the seeded venv's own ``pip`` (downstream unchanged)."""
+    from benchmarks.adapters import swebench_lite as adp
+    from benchmarks.runner.solve import _SubprocessResult
+
+    monkeypatch.setattr(adp, "_uv_available", lambda: True)
+    workdir = tmp_path / "inst"
+    workdir.mkdir(parents=True)
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *, cwd, timeout, env=None):
+        calls.append(list(cmd))
+        return _SubprocessResult(
+            returncode=0, stdout="", stderr="", timed_out=False, elapsed_seconds=0.01
+        )
+
+    monkeypatch.setattr(adp, "_run", fake_run)
+
+    instance = {
+        "instance_id": "psf__requests-1963",
+        "repo": "psf/requests",
+        "version": "2.19",
+    }
+    result = adp._default_install_env(instance, workdir)
+
+    assert result.installed is True
+    # the venv-creation call used uv with the resolved (era-correct) interpreter.
+    assert calls[0][:4] == ["uv", "venv", "--python", "3.9"]
+    assert "--seed" in calls[0]
+    # the install step still shells the seeded venv's pip (downstream unchanged).
+    assert calls[1][1:] == ["install", "-e", "."]
+    assert calls[1][0].endswith("pip")
+
+
+def test_default_install_env_untabulated_still_uses_sys_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Non-vacuous control: for an untabulated instance ``_default_install_env``
+    still builds the venv from ``sys.executable`` (the pre-WS9 behavior),
+    proving the uv path is genuinely gated on a successful resolution."""
+    from benchmarks.adapters import swebench_lite as adp
+    from benchmarks.runner.solve import _SubprocessResult
+
+    monkeypatch.setattr(adp, "_uv_available", lambda: True)
+    workdir = tmp_path / "inst"
+    workdir.mkdir(parents=True)
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *, cwd, timeout, env=None):
+        calls.append(list(cmd))
+        return _SubprocessResult(
+            returncode=0, stdout="", stderr="", timed_out=False, elapsed_seconds=0.01
+        )
+
+    monkeypatch.setattr(adp, "_run", fake_run)
+
+    instance = {"instance_id": "x__1", "repo": "some/unknown", "version": "9.9"}
+    result = adp._default_install_env(instance, workdir)
+
+    assert result.installed is True
+    assert calls[0] == [sys.executable, "-m", "venv", str(workdir / ".venv")]
