@@ -22,9 +22,12 @@ runner now mirrors that suppression:
   (b) end-to-end through a real :class:`AdapterLLMClient` against a
       :class:`StubAdapter`, every ``critic_t`` / ``synthesizer`` invocation
       resolves to an EMPTY ``allowed_tools`` (Read dropped), while
-      ``architect_b`` keeps the benign ``["Read"]`` sentinel — proving the
-      suppression is keyed off the text-only set, not merely off an empty
-      registry tool list.
+      ``architect_b`` flows through its non-empty WS-5 registry grant
+      (Read + Bash + recon) verbatim — proving the suppression is keyed off
+      the text-only set, and that the WS-5 oracle-falsification grant reaches
+      the subprocess invocation end-to-end (the empty->``["Read"]`` sentinel
+      no longer applies to architect_b now that its registry tools are
+      non-empty).
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ from config.defaults import default_config
 from orchestrator import Orchestrator
 from orchestrator import plan_tournament_runner as ptr
 from orchestrator.plan_tournament_runner import _build_role_overrides
-from tournament.llm import _TEXT_ONLY_NO_TOOL_ROLES
+from tournament.llm import AdapterLLMClient, _TEXT_ONLY_NO_TOOL_ROLES
 
 from stub_adapter import StubAdapter
 
@@ -172,6 +175,40 @@ async def test_build_role_overrides_drops_read_for_text_only_roles(
     assert allowed_tools["judge"] == ["Read", "Grep"]
 
 
+@pytest.mark.asyncio
+async def test_architect_b_resolves_read_and_bash_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """WS-5: through the REAL resolution path (registry grant ->
+    ``_build_role_overrides`` -> ``AdapterLLMClient._resolve_allowed_tools``),
+    ``architect_b`` resolves to a tool set that includes Bash and Read and is
+    NOT the bare ``["Read"]`` sentinel.
+
+    This is the RED-pre-fix behavioral assertion the WS-5 spec pins: with the
+    old ``AGENT_TOOL_MAP["architect_b"] = []`` the registry produced empty
+    tools, ``_build_role_overrides`` yielded ``[]``, and
+    ``_resolve_allowed_tools`` normalised that to ``["Read"]`` — so the critic
+    could never run a reproduction. The grant must flow the whole way through.
+    """
+    orch = _make_orch(tmp_path, StubAdapter({}))
+
+    # No spec injection — use the real registry grant resolved from tool_map.
+    _max_turns, allowed_tools, _timeout, _effort = _build_role_overrides(
+        orch, "medium"
+    )
+    client = AdapterLLMClient(orch.adapter, cwd=orch.cwd, role_allowed_tools=allowed_tools)
+
+    resolved = client._resolve_allowed_tools("architect_b")
+    assert resolved is not None
+    assert "Bash" in resolved and "Read" in resolved, (
+        f"architect_b resolved to {resolved!r}; WS-5 requires Read + Bash"
+    )
+    assert resolved != ["Read"], (
+        "architect_b must NOT collapse to the bare ['Read'] sentinel — the "
+        "non-empty registry grant must suppress it"
+    )
+
+
 # ---------------------------------------------------------------------------
 # (b) end-to-end: no Read on critic/synth invocations + verdict reached
 # ---------------------------------------------------------------------------
@@ -183,9 +220,9 @@ async def test_plan_tournament_critic_synth_invocations_carry_no_read(
 ) -> None:
     """Run the real plan tournament. Assert every critic_t / synthesizer
     subprocess invocation was built with an EMPTY ``allowed_tools`` (no Read),
-    while architect_b keeps the benign ``["Read"]`` sentinel — proving the
-    suppression is keyed off the text-only set, not merely an empty registry
-    tool list."""
+    while architect_b flows through its non-empty WS-5 registry grant
+    (Read + Bash) — proving the suppression is keyed off the text-only set, and
+    that the WS-5 grant reaches the invocation end-to-end."""
     adapter = StubAdapter(
         {
             "critic_t": _a_wins_handler,
@@ -215,12 +252,20 @@ async def test_plan_tournament_critic_synth_invocations_carry_no_read(
         )
         assert c.allowed_tools != ["Read"]
 
-    # architect_b is NOT suppressed: its empty registry tools normalise to the
-    # benign ["Read"] sentinel — confirming the suppression keys off the
-    # text-only set, not just an empty tool list.
+    # architect_b is NOT suppressed AND (WS-5) now carries a non-empty registry
+    # grant (Read + Bash + recon), so it flows through verbatim — the
+    # empty->["Read"] sentinel no longer applies. This proves the WS-5
+    # oracle-falsification grant reaches the actual subprocess invocation
+    # end-to-end (registry -> _build_role_overrides -> _resolve_allowed_tools).
     architect_calls = [c for c in adapter.calls if c.role == "architect_b"]
     assert architect_calls, "expected at least one architect_b call"
-    assert all(c.allowed_tools == ["Read"] for c in architect_calls), (
-        "architect_b must keep the benign ['Read'] sentinel — it is excluded "
-        "from the text-only suppression set"
-    )
+    for c in architect_calls:
+        assert c.allowed_tools is not None
+        assert "Bash" in c.allowed_tools and "Read" in c.allowed_tools, (
+            f"architect_b invocation carried {c.allowed_tools!r}; WS-5 must "
+            f"grant Read + Bash so the critic can falsify the acceptance oracle"
+        )
+        assert c.allowed_tools != ["Read"], (
+            "architect_b resolving to bare ['Read'] means the WS-5 Bash grant "
+            "did not flow end-to-end"
+        )

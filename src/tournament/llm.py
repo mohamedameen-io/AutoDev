@@ -70,9 +70,13 @@ _EXPENSIVE_TRANSIENT_SUBSTRINGS = (
 # them to an EMPTY tool set and the empty-list-normalisation that would
 # otherwise re-introduce ``["Read"]`` is suppressed for these roles.
 #
-# ``architect_b`` is deliberately EXCLUDED: although it is currently text-only
-# too, it may legitimately need ``Read`` for richer revisions, so its empty
-# tool list keeps the benign ``["Read"]`` sentinel.
+# ``architect_b`` is deliberately EXCLUDED: WS-5 grants it a NON-empty
+# Read + Bash tool set (see ``agents.tool_map``) so the plan critic can run a
+# reproduction and empirically falsify a suspect acceptance oracle. Because its
+# configured tool list is non-empty it never reaches the empty→``["Read"]``
+# sentinel below; adding it here would wrongly strip that grant. ``judge`` is
+# likewise excluded — it keeps the benign ``["Read"]`` sentinel from its empty
+# canonical tools.
 _TEXT_ONLY_NO_TOOL_ROLES = frozenset({"critic_t", "synthesizer"})
 
 
@@ -252,7 +256,7 @@ class AdapterLLMClient:
             adapter,
             cwd=repo_root,
             role_max_turns={"architect_b": 5},
-            role_allowed_tools={"architect_b": []},
+            role_allowed_tools={"architect_b": ["Read", "Bash"], "judge": []},
         )
         text = await client.call(system="...", user="...", role="critic_t")
 
@@ -337,8 +341,10 @@ class AdapterLLMClient:
         # Empty list = "no tools" intent. The Claude CLI's variadic
         # --allowed-tools flag is omitted on falsy values, so we substitute a
         # benign read-only sentinel that actually restricts the toolset.
-        # (Applies to roles like ``architect_b`` that are NOT in the
-        # text-only-no-tool set above.)
+        # (Applies to roles like ``judge`` that are NOT in the
+        # text-only-no-tool set above yet have empty canonical tools.
+        # ``architect_b`` no longer lands here — WS-5 gives it a non-empty
+        # Read + Bash grant, so ``configured`` is truthy and flows through.)
         if configured is not None and len(configured) == 0:
             return ["Read"]
         return configured

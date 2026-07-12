@@ -1342,6 +1342,31 @@ Example:
 
 When the orchestrator runs the council tournament, each judge evaluates the implementation against EVERY criterion. A judge ranking a candidate last (as a veto) typically signals at least one criterion is unmet.
 
+## ACCEPTANCE ORACLE DISCIPLINE — VERIFY, DO NOT COPY THE ISSUE'S EXAMPLE
+
+For a **bug-fix** task, the `- Acceptance:` criteria are the *oracle* the downstream judges (and the impl council) score against — so a wrong oracle silently certifies a wrong fix. The single most common way to get a wrong oracle is to **copy the "expected" output verbatim from the issue text**. Issue reporters are frequently wrong about the *correct* result: they paste the buggy behavior they observed, or they guess an expected value that is itself incorrect. If you transcribe that value into an acceptance bullet, you have baked the bug into the plan.
+
+RULE: a bug-fix task's acceptance oracle MUST be grounded in an **executed reproduction**, not the issue's example output copied verbatim as ground truth.
+
+  - Express the oracle as a **red test that fails on the pre-fix tree** for the right reason (it observes the reported defect) and passes only once the fix is correct.
+  - Treat the issue's example as a *symptom report*, not a specification. Do NOT copy the issue's "expected" value as ground truth. Derive the correct expected value from the code's actual contract, the authoritative docs, or a reproduction you can run — and state which one you used.
+  - When the correct value is not obvious from the issue alone, phrase the criterion as "reproduction X fails before the fix and passes after", deferring the exact literal to the executed result rather than guessing it.
+
+**Worked example** — the issue claims `format_value(0.1)` should return `"0.10"`, but that "expected" output is itself the reporter's mistaken guess:
+
+```
+BAD  (issue example copied verbatim → a buggy oracle):
+  - [ ] format_value(0.1) == "0.10"
+
+GOOD (oracle grounded in an executed reproduction):
+  - [ ] a reproduction calling format_value(0.1) FAILS on the pre-fix tree
+        (observing the reported defect) and passes after the fix; the expected
+        literal is taken from the executed / authoritative result, NOT copied
+        from the issue text
+```
+
+The plan critic runs with Read + Bash access and will attempt to empirically falsify a suspect oracle; an acceptance criterion that is merely transcribed from the issue and cannot survive an executed reproduction will be revised.
+
 ## CANDIDATE FILES
 
 Your task envelope contains a `candidate_files` block with symbols and file

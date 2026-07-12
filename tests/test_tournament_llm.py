@@ -172,8 +172,10 @@ async def test_invocation_no_role_dicts_keeps_defaults(tmp_path: Path) -> None:
 def test_text_only_no_tool_roles_set_membership() -> None:
     """The text-only-no-tool set is exactly ``{critic_t, synthesizer}``.
 
-    architect_b is deliberately EXCLUDED — it may legitimately need Read for
-    richer revisions, so it keeps the benign ``["Read"]`` sentinel.
+    architect_b is deliberately EXCLUDED — WS-5 grants it a non-empty
+    Read + Bash registry tool set so the plan critic can execute a reproduction
+    and empirically falsify a suspect acceptance oracle. It must therefore NOT
+    be forced to an empty tool list.
     """
     assert _TEXT_ONLY_NO_TOOL_ROLES == frozenset({"critic_t", "synthesizer"})
     assert "architect_b" not in _TEXT_ONLY_NO_TOOL_ROLES
@@ -244,18 +246,25 @@ async def test_text_only_invocation_has_no_read_tool(
     assert adapter.calls[0].allowed_tools != ["Read"]
 
 
-def test_architect_b_still_gets_read_sentinel_for_empty_list(
+def test_non_text_only_role_gets_read_sentinel_for_empty_list(
     tmp_path: Path,
 ) -> None:
-    """Regression guard: architect_b (NOT in the text-only set) keeps the
-    legacy empty→["Read"] normalization so genuinely Read-needing roles are
-    undisturbed by the A4 fix."""
+    """Regression guard: a non-text-only role configured with ``[]`` keeps the
+    legacy empty→["Read"] normalization.
+
+    ``judge`` is the vehicle: it is excluded from the text-only-no-tool set
+    (so the empty->[] suppression does NOT apply) yet has empty canonical
+    tools, so ``_build_role_overrides`` configures it with ``[]`` and the
+    sentinel fires. (Pre-WS-5 this guard used architect_b, but WS-5 grants
+    architect_b a non-empty Read + Bash set, so it no longer exercises the
+    empty-list sentinel path.)
+    """
     client = AdapterLLMClient(
         StubAdapter([_Result()]),
         cwd=tmp_path,
-        role_allowed_tools={"architect_b": []},
+        role_allowed_tools={"judge": []},
     )
-    assert client._resolve_allowed_tools("architect_b") == ["Read"]
+    assert client._resolve_allowed_tools("judge") == ["Read"]
 
 
 # ── Step 3: per-role effort plumbing ──────────────────────────────────────

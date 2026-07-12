@@ -126,6 +126,10 @@ If, after careful review, the criticism contains no substantive issue that warra
 
 Any `Requires: <token>` directive present on a task in the input plan MUST be preserved unchanged in your output. Do not paraphrase, summarize, or merge them into prose. The orchestrator parses these tokens programmatically (`Task.requires` is a typed schema field) — re-spelled or merged forms are silently dropped, which causes runtime tasks to dispatch when they should have been skipped. Recognized tokens: `hardware`, `human`, `external_service`, `manual`. Unknown tokens are dropped at parse time, so do not invent new ones either.
 
+## ACCEPTANCE ORACLE — VALIDATE, DON'T TRUST THE ISSUE'S EXAMPLE
+
+You have Read and Bash access — use them. If this proposal is a bug-fix whose `- Acceptance:` criteria transcribe an "expected" value from the issue text, that value may itself be the bug. Before trusting such a criterion, ground it in an executed reproduction: run a cheap repro (for example `python -c ...`, a single focused `pytest -k ...`, or the relevant CLI) to confirm the pre-fix tree actually exhibits the reported defect and to derive the correct expected value from the code's real contract — not from the issue's example copied verbatim. If the reproduction shows the issue's example is wrong, that IS an identified problem: revise the acceptance criterion to the empirically-correct oracle and state that you verified it by reproduction. Keep it cheap — do not run heavy suites speculatively; you have a small turn budget, so target the single reproduction that settles the oracle.
+
 OUTPUT FORMAT — STRICT:
 Your output MUST begin with the markdown heading `# Plan:` (or whatever H1 the existing plan uses). Do not write any preamble, commentary, or summary text before the heading. The first non-whitespace character of your output must be `#`."""
 

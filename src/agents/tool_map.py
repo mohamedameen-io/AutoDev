@@ -53,9 +53,18 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
     "docs": ["read", "edit", "write", "glob", "grep"],
     # Designer: read-only design spec generation with web access.
     "designer": ["read", "glob", "grep", "web_fetch"],
+    # Tournament revision author / plan critic. WS-5: granted read-only
+    # reconnaissance + execution so it can run a reproduction and check a
+    # bug-fix acceptance oracle EMPIRICALLY — a buggy issue-example must not
+    # become an un-refutable oracle just because the critic was Read-only /
+    # Bash-denied. Scoped like `reviewer` (read/glob/grep) PLUS `bash`: it may
+    # reproduce + inspect, but NOT mutate the tree (no edit/write) and NOT
+    # delegate/browse (no task/web_*). Blast radius: adds bash-capable turns to
+    # the plan phase — see prompts.py ARCHITECT_B_PROMPT for the turn-budget
+    # guard that keeps reproductions cheap.
+    "architect_b": ["read", "glob", "grep", "bash"],
     # Tournament roles: pure text-in/text-out. No tools.
     "critic_t": [],
-    "architect_b": [],
     "synthesizer": [],
     "judge": [],
 }

@@ -63,10 +63,24 @@ def test_tool_names_in_frontmatter_developer(rendered_dir: Path) -> None:
     assert meta["tools"] == ["Read", "Edit", "Write", "Bash", "Glob", "Grep"]
 
 
-def test_tournament_roles_have_empty_tools(rendered_dir: Path) -> None:
-    for role in ("critic_t", "architect_b", "synthesizer", "judge"):
+def test_text_only_tournament_roles_have_empty_tools(rendered_dir: Path) -> None:
+    # architect_b is EXCLUDED: WS-5 grants it Read + Bash (oracle
+    # falsification), so its rendered frontmatter carries a non-empty toolset.
+    for role in ("critic_t", "synthesizer", "judge"):
         meta, _ = _split_frontmatter((rendered_dir / f"{role}.md").read_text())
         assert meta["tools"] == []
+
+
+def test_architect_b_rendered_frontmatter_grants_read_and_bash(
+    rendered_dir: Path,
+) -> None:
+    """WS-5: architect_b's rendered agent definition must expose the Read +
+    Bash grant end-to-end (registry tools -> rendered frontmatter)."""
+    meta, _ = _split_frontmatter((rendered_dir / "architect_b.md").read_text())
+    assert "Read" in meta["tools"] and "Bash" in meta["tools"], (
+        f"architect_b frontmatter tools={meta['tools']!r}; WS-5 requires "
+        f"Read + Bash to reach the rendered agent definition"
+    )
 
 
 def test_frontmatter_includes_model(rendered_dir: Path) -> None:
