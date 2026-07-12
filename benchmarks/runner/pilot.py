@@ -308,6 +308,18 @@ class PilotInstanceOutcome:
     which mirrors :func:`_blind_map`'s read of ``degraded_blind``) — the
     per-instance arm64-install-failure capture (WS-7), diagnosing WHY an instance
     went blind rather than just recording that it did.
+
+    ``score_detail`` is the SCORE-side counterpart to ``detail`` (which is the
+    SOLVE-side/quota-guard detail): it is the scorer's own
+    :attr:`~benchmarks.scorers.base.InstanceScore.detail` for this instance (e.g.
+    "sb-cli eval did not complete (infra)" — WS-1), always recorded regardless of
+    whether :func:`pilot_instance_status` overrode the final ``status``, so a
+    scoring-side infra failure is diagnosable from the pilot report alone.
+
+    ``cost_usd`` is the instance's total spend, summed from every line of the
+    solved workdir's ``run-summary.jsonl`` (the sibling of the terminal
+    ``SolveOutcome.ledger_path`` — see :func:`_instance_cost_usd`); ``0.0`` when
+    no outcome/ledger exists or nothing was recorded (best-effort, never raises).
     """
 
     instance_id: str
@@ -322,6 +334,8 @@ class PilotInstanceOutcome:
     fail_stderr_tail: str = ""
     install_stdout_tail: str = ""
     install_stderr_tail: str = ""
+    score_detail: str | None = None
+    cost_usd: float = 0.0
 
     @property
     def clean(self) -> bool:
@@ -418,13 +432,17 @@ class PilotReport:
         lines.append("")
         lines.append("## Per-instance")
         lines.append("")
-        header = "instance_id | status | wall_s | quota_wait_s | attempts | blind"
+        header = (
+            "instance_id | status | wall_s | quota_wait_s | attempts | blind | "
+            "cost_usd"
+        )
         lines.append(header)
         lines.append("-" * len(header))
         for o in self.instances:
             lines.append(
                 f"{o.instance_id} | {o.status} | {o.wall_time_s:.1f} | "
-                f"{o.quota_wait_time_s:.1f} | {o.attempts} | {o.blind}"
+                f"{o.quota_wait_time_s:.1f} | {o.attempts} | {o.blind} | "
+                f"{o.cost_usd:.4f}"
             )
         lines.append("")
 
@@ -438,6 +456,7 @@ class PilotReport:
             o
             for o in self.instances
             if o.detail
+            or o.score_detail
             or o.fail_stdout_tail
             or o.fail_stderr_tail
             or o.install_stdout_tail
@@ -451,6 +470,9 @@ class PilotReport:
             lines.append("")
             if o.detail:
                 lines.append(f"- detail: {o.detail}")
+                lines.append("")
+            if o.score_detail:
+                lines.append(f"- score_detail: {o.score_detail}")
                 lines.append("")
             if o.fail_stdout_tail:
                 _render_tail_block(lines, label="stdout", tail=o.fail_stdout_tail)
@@ -517,6 +539,48 @@ def _install_tail_map(adapter: BenchmarkAdapter) -> dict[str, tuple[str, str]]:
     return out
 
 
+def _instance_cost_usd(ledger_path: Path | None) -> float:
+    """Sum ``cost_usd`` across every line of an instance's ``run-summary.jsonl``.
+
+    ``run-summary.jsonl`` is written by the autodev CLI itself (once per
+    ``plan``/``execute`` command; see ``src/state/run_summary.py``) as a SIBLING
+    of the per-instance ledger, both under the solved workdir's ``.autodev/``
+    directory — so its path is derived from ``ledger_path.parent``, never
+    imported from autodev's own state package (mirroring how this whole runner
+    treats autodev as a subprocess/artifact producer, never a library import;
+    see ``quota_guard._ledger_has_signal`` for the same pattern against the
+    ledger itself).
+
+    Best-effort and defensive: ``ledger_path=None`` (no outcome — e.g. a raised
+    quota abort or a prepare failure), a missing file, or a malformed/partial
+    line never raises — each simply contributes ``0.0``, so a telemetry gap can
+    never crash the pilot or manufacture spend that was not actually recorded.
+    """
+    if ledger_path is None:
+        return 0.0
+    summary_path = ledger_path.parent / "run-summary.jsonl"
+    if not summary_path.is_file():
+        return 0.0
+    total = 0.0
+    try:
+        text = summary_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0.0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            row = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        try:
+            total += float(row.get("cost_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
 def run_pilot(
     adapter: BenchmarkAdapter,
     scorer: Scorer,
@@ -567,7 +631,7 @@ def run_pilot(
     )
 
     score_report: ScoreReport = scorer.score(predictions, run_id=run_id)
-    score_by_id = {s.instance_id: s.status for s in score_report.instances}
+    score_index = {s.instance_id: s for s in score_report.instances}
 
     wall_times: dict[str, float] = {}
     quota_waits: dict[str, float] = {}
@@ -581,7 +645,8 @@ def run_pilot(
 
     outcomes: list[PilotInstanceOutcome] = []
     for g in guard_results:
-        score_status = score_by_id.get(g.instance_id, ERROR)
+        score = score_index.get(g.instance_id)
+        score_status = score.status if score is not None else ERROR
         install_stdout_tail, install_stderr_tail = install_tails.get(
             g.instance_id, ("", "")
         )
@@ -599,6 +664,10 @@ def run_pilot(
                 fail_stderr_tail=g.fail_stderr_tail,
                 install_stdout_tail=install_stdout_tail,
                 install_stderr_tail=install_stderr_tail,
+                score_detail=score.detail if score is not None else None,
+                cost_usd=_instance_cost_usd(
+                    g.outcome.ledger_path if g.outcome is not None else None
+                ),
             )
         )
 

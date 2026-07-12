@@ -21,9 +21,21 @@ Design invariants (per the Phase-1 plan and ``benchmarks/CONTEXT.md``):
   ERROR and excluded from the submitted ``predictions.jsonl`` (the cloud is never
   asked to grade an empty attempt). If nothing has a real patch, sb-cli is not
   invoked at all.
+- **A submitted-but-not-completed eval is ERROR, never FAIL.** sb-cli can accept
+  a submission (exit 0, a report is written) yet the cloud evaluation never
+  actually runs the hidden tests for some or all instances — the slice4 forensic
+  re-grade proved this: submitting canonical GOLD patches for all 10
+  SWE-bench-Lite instances scored 10/10 "FAIL" with ``completed_instances=0``,
+  making a PASS structurally impossible regardless of patch quality. An instance
+  only ever becomes FAIL when the report shows it genuinely completed; every
+  other outcome (flagged in ``failed_ids``, or simply absent from a completed
+  result) is ERROR with an infra detail, never a silent FAIL.
 
-Verdict mapping from a report: an instance in ``error_ids`` → ERROR; else in
-``resolved_ids`` → PASS; otherwise (submitted-but-unresolved) → FAIL.
+Verdict mapping from a report: an instance in ``resolved_ids`` → PASS; in
+``error_ids`` → ERROR; genuinely completed (``completed_instances`` > 0) AND in
+``unresolved_ids`` AND NOT in ``failed_ids`` → FAIL ("unresolved" — the ONLY FAIL
+path); anything else — in ``failed_ids``, or simply absent from every id set
+(the eval did not complete for that instance) — → ERROR.
 """
 
 from __future__ import annotations
@@ -32,6 +44,7 @@ import json
 import os
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -52,6 +65,24 @@ API_KEY_ENV = "SWEBENCH_API_KEY"
 DEFAULT_CLI = "sb-cli"
 DEFAULT_SUBSET = "swe-bench_lite"
 DEFAULT_SPLIT = "test"
+# OPERATOR NOTE (WS-1, best-effort — not diagnosed further here, no invocation
+# behaviour changed by this note): every historical run against this exact
+# (DEFAULT_SUBSET, DEFAULT_SPLIT) pair — 7/7 runs, including the Phase-1 pilot
+# and the slice4 forensic re-grade's gold control — fast-failed in ~103s with
+# completed_instances=0 for EVERY submitted instance, never reaching the
+# hidden-test phase. That is too fast and too uniform across unrelated repos
+# to be per-instance solve/patch quality; it reads as an invocation/config
+# problem upstream of grading. Unconfirmed candidates an operator should check
+# next (roughly cheapest-to-rule-out first): (1) the installed ``sb-cli``
+# package version vs. what the swebench.com service currently expects;
+# (2) whether "swe-bench_lite" / "test" are still the LIVE subset/split ids
+# for that service (vs. a renamed, retired, or re-versioned split);
+# (3) ``SWEBENCH_API_KEY`` entitlement/quota on this subset specifically (a
+# general auth failure would more plausibly reject the submission itself
+# rather than accept it and then fast-fail at ~103s); (4) a swebench.com-side
+# outage/incident spanning the runs to date. The ERROR-not-FAIL reclassification
+# below is what makes the benchmark signal safe regardless of which of these
+# turns out to be the cause.
 # sb-cli submit with --gen_report 1 blocks until the cloud evaluation finishes,
 # so this is a generous ceiling, not a typical wait.
 DEFAULT_SUBMIT_TIMEOUT = 1800
@@ -94,11 +125,34 @@ def _locate_report(output_dir: Path, run_id: str) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def _parse_report(report_path: Path) -> tuple[set[str], set[str]]:
-    """Return ``(resolved_ids, error_ids)`` parsed from a sb-cli report.
+@dataclass(frozen=True)
+class _ParsedReport:
+    """The sb-cli report fields the verdict mapping reads (see module docstring).
+
+    ``completed`` is the report-wide ``completed_instances`` count (a batch-level
+    signal): when it is 0 the WHOLE submitted batch never got past the cloud's
+    pre-test fast-fail (the slice4 forensic finding), so nothing in it can be a
+    genuine FAIL. ``failed`` is the report's own ``failed_ids`` — instances
+    sb-cli itself flags as not having completed; this is a PER-INSTANCE signal
+    that stays ERROR even inside an otherwise-completed batch, independent of
+    the batch-wide ``completed`` count.
+    """
+
+    resolved: set[str]
+    errored: set[str]
+    unresolved: set[str]
+    failed: set[str]
+    completed: int
+
+
+def _parse_report(report_path: Path) -> _ParsedReport:
+    """Parse a sb-cli report into the fields the verdict mapping needs.
 
     Raises ``ValueError`` on malformed JSON / missing ``resolved_ids`` so the
     caller degrades the affected instances to ERROR (never a silent all-FAIL).
+    All other fields default defensively (missing/malformed → empty set / 0)
+    so an older or partial report shape never crashes the scorer — it just
+    reads as "nothing completed", which is the safe (ERROR-biased) default.
     """
     try:
         data = json.loads(report_path.read_text(encoding="utf-8"))
@@ -108,7 +162,20 @@ def _parse_report(report_path: Path) -> tuple[set[str], set[str]]:
         raise ValueError(f"sb-cli report missing resolved_ids: {report_path}")
     resolved = {str(i) for i in (data.get("resolved_ids") or [])}
     errored = {str(i) for i in (data.get("error_ids") or [])}
-    return resolved, errored
+    unresolved = {str(i) for i in (data.get("unresolved_ids") or [])}
+    failed = {str(i) for i in (data.get("failed_ids") or [])}
+    completed_raw = data.get("completed_instances", data.get("completed", 0))
+    try:
+        completed = int(completed_raw or 0)
+    except (TypeError, ValueError):
+        completed = 0
+    return _ParsedReport(
+        resolved=resolved,
+        errored=errored,
+        unresolved=unresolved,
+        failed=failed,
+        completed=completed,
+    )
 
 
 class SbcliScorer:
@@ -257,26 +324,44 @@ class SbcliScorer:
         if report_path is None:
             return _all_error("sb-cli reported success but wrote no report")
         try:
-            resolved, errored = _parse_report(report_path)
+            parsed = _parse_report(report_path)
         except ValueError as exc:
             return _all_error(str(exc))
 
+        # Verdict mapping (see module docstring): resolved -> PASS; error_ids ->
+        # ERROR; genuinely completed (completed > 0) AND explicitly unresolved AND
+        # not itself flagged failed_ids -> FAIL (the ONLY FAIL path); anything
+        # else -- failed_ids, or simply absent from a completed result -- is an
+        # infra non-completion, so it is ERROR, never folded into FAIL.
         scores: list[InstanceScore] = []
         for instance_id in ids:
-            if instance_id in errored:
+            if instance_id in parsed.resolved:
+                scores.append(InstanceScore(instance_id, PASS, "resolved"))
+            elif instance_id in parsed.errored:
                 scores.append(
                     InstanceScore(
                         instance_id, ERROR, "sb-cli reported an evaluation error"
                     )
                 )
-            elif instance_id in resolved:
-                scores.append(InstanceScore(instance_id, PASS, "resolved"))
-            else:
+            elif (
+                parsed.completed > 0
+                and instance_id in parsed.unresolved
+                and instance_id not in parsed.failed
+            ):
                 scores.append(InstanceScore(instance_id, FAIL, "unresolved"))
+            else:
+                scores.append(
+                    InstanceScore(
+                        instance_id,
+                        ERROR,
+                        "sb-cli eval did not complete (infra)",
+                    )
+                )
 
         summary = {
             "run_id": run_id,
             "submitted": len(ids),
+            "completed": parsed.completed,
             "resolved": sum(1 for s in scores if s.status == PASS),
             "unresolved": sum(1 for s in scores if s.status == FAIL),
             "errored": sum(1 for s in scores if s.status == ERROR),
@@ -298,12 +383,24 @@ def build_scorer(args: Any) -> SbcliScorer:
     """Construct the real (network-backed) scorer from CLI ``args``.
 
     Reads optional attributes defensively so a bare ``argparse.Namespace`` (the
-    external CLI's parser) works with all defaults.
+    external CLI's parser) works with all defaults. When ``args`` carries an
+    ``out_dir`` (the pilot's ``--out-dir``), the scorer's ``workdir`` is wired to
+    ``out_dir/"sbcli"`` so ``predictions.jsonl`` and the raw ``<run_id>.json``
+    sb-cli report are PERSISTED there for forensic inspection, instead of a temp
+    dir that ``score()`` deletes when it owns it (see ``score()``'s ``own_tmp``
+    branch). Without an ``out_dir`` (e.g. a bare ``argparse.Namespace()`` in a
+    test), ``workdir`` stays ``None`` and behaviour is unchanged.
     """
     cli = getattr(args, "sbcli", None) or DEFAULT_CLI
     subset = getattr(args, "sbcli_subset", None) or DEFAULT_SUBSET
     split = getattr(args, "sbcli_split", None) or DEFAULT_SPLIT
     timeout = getattr(args, "sbcli_timeout", None) or DEFAULT_SUBMIT_TIMEOUT
+    out_dir = getattr(args, "out_dir", None)
+    workdir = Path(out_dir) / "sbcli" if out_dir else None
     return SbcliScorer(
-        cli=str(cli), subset=str(subset), split=str(split), timeout=int(timeout)
+        cli=str(cli),
+        subset=str(subset),
+        split=str(split),
+        timeout=int(timeout),
+        workdir=workdir,
     )

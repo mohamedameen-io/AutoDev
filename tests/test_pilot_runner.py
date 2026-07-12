@@ -47,14 +47,19 @@ from benchmarks.runner.pilot import (
 # ---------------------------------------------------------------------------
 
 
-def _outcome(*, wall_time_s: float, diff: str = "patch") -> SolveOutcome:
+def _outcome(
+    *,
+    wall_time_s: float,
+    diff: str = "patch",
+    ledger_path: Path = Path("ledger.jsonl"),
+) -> SolveOutcome:
     return SolveOutcome(
         diff=diff,
         base_sha="basesha",
         success=True,
         empty_diff=not (diff and diff.strip()),
         diff_source="commit" if diff else "none",
-        ledger_path=Path("ledger.jsonl"),
+        ledger_path=ledger_path,
         failed_reason=None,
         calls=[],
         invocations=3,
@@ -71,11 +76,12 @@ def _guard_complete(
     detail: str | None = None,
     fail_stdout_tail: str = "",
     fail_stderr_tail: str = "",
+    ledger_path: Path = Path("ledger.jsonl"),
 ) -> GuardResult:
     return GuardResult(
         instance_id=instance_id,
         status=COMPLETE,
-        outcome=_outcome(wall_time_s=wall_time_s),
+        outcome=_outcome(wall_time_s=wall_time_s, ledger_path=ledger_path),
         attempts=1,
         quota_waits=0,
         quota_wait_time_s=0.0,
@@ -125,12 +131,21 @@ class _FakeAdapter:
 
 
 class _FakeScorer:
-    """Returns a pre-scripted ScoreReport, echoing the run_id it was handed."""
+    """Returns a pre-scripted ScoreReport, echoing the run_id it was handed.
+
+    ``details`` optionally supplies a per-instance ``InstanceScore.detail`` (the
+    SCORE-side diagnostic, e.g. WS-1's "sb-cli eval did not complete (infra)")
+    -- absent by default (``None``) so every existing caller that only passes
+    ``verdicts`` is unaffected.
+    """
 
     name = "fake-scorer"
 
-    def __init__(self, verdicts: dict[str, str]) -> None:
+    def __init__(
+        self, verdicts: dict[str, str], details: dict[str, str] | None = None
+    ) -> None:
         self._verdicts = verdicts
+        self._details = details or {}
         self.seen_run_id: str | None = None
         self.seen_predictions: list | None = None
 
@@ -139,7 +154,8 @@ class _FakeScorer:
         self.seen_predictions = list(predictions)
         return ScoreReport(
             instances=[
-                InstanceScore(iid, status) for iid, status in self._verdicts.items()
+                InstanceScore(iid, status, self._details.get(iid))
+                for iid, status in self._verdicts.items()
             ],
             summary={"run_id": run_id},
         )
@@ -407,6 +423,186 @@ def test_run_pilot_healthy_run_writes_baseline_and_report(tmp_path: Path):
     assert doc["run_id"] == "pilot-1"
     assert len(doc["instances"]) == n
     assert "inst-0" in summary_path.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 4b. WS-1: the scorer's per-instance InstanceScore.detail threads onto
+#     PilotInstanceOutcome.score_detail, and per-instance cost_usd is read
+#     from each workdir's run-summary.jsonl (sibling of outcome.ledger_path).
+# ---------------------------------------------------------------------------
+
+
+def test_run_pilot_threads_score_detail_from_scorer_into_outcome_and_json(
+    tmp_path: Path,
+):
+    """InstanceScore.detail (the SCORE-side diagnostic — e.g. WS-1's "sb-cli
+    eval did not complete (infra)") must be threaded onto
+    PilotInstanceOutcome.score_detail -- a field DISTINCT from the SOLVE-side
+    ``detail`` (the quota-guard's own detail) -- and survive the JSON
+    round-trip + appear in the human summary, so a scoring-side infra failure
+    is diagnosable from the pilot report alone."""
+    import json
+
+    guards = [_guard_complete("s1", 1.0)]
+    preds = [{"instance_id": "s1", "model_name_or_path": "autodev", "model_patch": "p"}]
+    adapter = _FakeAdapter(reports=[])
+    scorer = _FakeScorer(
+        {"s1": ERROR}, details={"s1": "sb-cli eval did not complete (infra)"}
+    )
+
+    report = run_pilot(
+        adapter,
+        scorer,
+        instances=[{"instance_id": "s1", "problem_statement": "x", "repo": "a/b"}],
+        invoker=lambda *a, **k: None,
+        workdir_root=tmp_path / "wd",
+        run_id="rid-score-detail",
+        autodev_version="9.9.9-score-detail",
+        baselines_root=tmp_path / "baselines",
+        guarded_solve=_fake_guarded_solve_factory(preds, guards),
+    )
+    (only,) = report.instances
+    assert only.score_detail == "sb-cli eval did not complete (infra)"
+    # the solve-side `detail` (None here -- a clean COMPLETE guard result) is a
+    # genuinely distinct field, never conflated with score_detail.
+    assert only.detail is None
+
+    json_path, _ = write_pilot_report(report, tmp_path / "out")
+    doc = json.loads(json_path.read_text(encoding="utf-8"))
+    (inst_doc,) = doc["instances"]
+    assert inst_doc["score_detail"] == "sb-cli eval did not complete (infra)"
+
+    summary = report.human_summary()
+    assert "score_detail: sb-cli eval did not complete (infra)" in summary
+
+
+def test_run_pilot_reads_cost_usd_from_run_summary_sibling_of_ledger_path(
+    tmp_path: Path,
+):
+    """cost_usd is summed from every line of the instance's run-summary.jsonl --
+    the SIBLING of the terminal SolveOutcome.ledger_path (both live under the
+    solved workdir's .autodev/ directory; see src/state/run_summary.py) -- and
+    must survive the JSON round-trip and appear in the per-instance table."""
+    import json
+
+    autodev_dir = tmp_path / "instance-workdir" / ".autodev"
+    autodev_dir.mkdir(parents=True)
+    ledger_path = autodev_dir / "plan-ledger.jsonl"
+    ledger_path.write_text("", encoding="utf-8")
+    run_summary_rows = [
+        {"phase": "plan", "cost_usd": 0.5, "elapsed_s": 1.0, "tasks": 1,
+         "ts": "2026-01-01T00:00:00+00:00"},
+        {"phase": "execute", "cost_usd": 1.25, "elapsed_s": 2.0, "tasks": 1,
+         "ts": "2026-01-01T00:00:01+00:00"},
+    ]
+    (autodev_dir / "run-summary.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in run_summary_rows) + "\n", encoding="utf-8"
+    )
+
+    guards = [_guard_complete("c1", 1.0, ledger_path=ledger_path)]
+    preds = [{"instance_id": "c1", "model_name_or_path": "autodev", "model_patch": "p"}]
+    adapter = _FakeAdapter(reports=[])
+    scorer = _FakeScorer({"c1": PASS})
+
+    report = run_pilot(
+        adapter,
+        scorer,
+        instances=[{"instance_id": "c1", "problem_statement": "x", "repo": "a/b"}],
+        invoker=lambda *a, **k: None,
+        workdir_root=tmp_path / "wd",
+        run_id="rid-cost",
+        autodev_version="9.9.9-cost",
+        baselines_root=tmp_path / "baselines",
+        guarded_solve=_fake_guarded_solve_factory(preds, guards),
+    )
+    (only,) = report.instances
+    assert only.cost_usd == 1.75  # 0.5 + 1.25, both exact in binary float
+
+    json_path, _ = write_pilot_report(report, tmp_path / "out")
+    doc = json.loads(json_path.read_text(encoding="utf-8"))
+    (inst_doc,) = doc["instances"]
+    assert inst_doc["cost_usd"] == 1.75
+
+    summary = report.human_summary()
+    assert "1.7500" in summary  # rendered in the per-instance table
+
+
+def test_run_pilot_cost_usd_defaults_to_zero_when_no_run_summary_present(
+    tmp_path: Path,
+):
+    """Non-vacuous control: an instance whose workdir has NO run-summary.jsonl
+    (e.g. a fresh/never-written workdir) must default cost_usd to 0.0 -- never
+    crash, never fabricate spend that was not actually recorded."""
+    guards = [_guard_complete("z1", 1.0)]
+    preds = [{"instance_id": "z1", "model_name_or_path": "autodev", "model_patch": "p"}]
+    adapter = _FakeAdapter(reports=[])
+    scorer = _FakeScorer({"z1": PASS})
+
+    report = run_pilot(
+        adapter,
+        scorer,
+        instances=[{"instance_id": "z1", "problem_statement": "x", "repo": "a/b"}],
+        invoker=lambda *a, **k: None,
+        workdir_root=tmp_path / "wd",
+        run_id="rid-cost-zero",
+        autodev_version="9.9.9-cost-zero",
+        baselines_root=tmp_path / "baselines",
+        guarded_solve=_fake_guarded_solve_factory(preds, guards),
+    )
+    (only,) = report.instances
+    assert only.cost_usd == 0.0
+
+
+def test_run_pilot_cost_usd_is_zero_when_outcome_is_none(tmp_path: Path):
+    """A guard result with outcome=None (e.g. quota-exhausted -- every attempt
+    raised without ever returning a SolveOutcome) has no ledger_path to read a
+    run-summary.jsonl from; cost_usd must default to 0.0, never crash."""
+    guards = [_guard_quota_exhausted("q1", 600.0)]
+    preds = [{"instance_id": "q1", "model_name_or_path": "autodev", "model_patch": ""}]
+    adapter = _FakeAdapter(reports=[])
+    scorer = _FakeScorer({"q1": FAIL})
+
+    report = run_pilot(
+        adapter,
+        scorer,
+        instances=[{"instance_id": "q1", "problem_statement": "x", "repo": "a/b"}],
+        invoker=lambda *a, **k: None,
+        workdir_root=tmp_path / "wd",
+        run_id="rid-cost-none",
+        autodev_version="9.9.9-cost-none",
+        baselines_root=tmp_path / "baselines",
+        guarded_solve=_fake_guarded_solve_factory(preds, guards),
+    )
+    (only,) = report.instances
+    assert only.cost_usd == 0.0
+
+
+def test_instance_cost_usd_helper_sums_and_defaults_safely(tmp_path: Path):
+    """Direct unit coverage of _instance_cost_usd: a None ledger_path and a
+    missing run-summary.jsonl both default to 0.0; a well-formed file sums
+    cost_usd across every line; a malformed line is skipped, never fatal."""
+    from benchmarks.runner.pilot import _instance_cost_usd
+
+    assert _instance_cost_usd(None) == 0.0
+
+    missing_dir = tmp_path / "no-such-workdir" / ".autodev"
+    missing_dir.mkdir(parents=True)
+    assert _instance_cost_usd(missing_dir / "plan-ledger.jsonl") == 0.0
+
+    autodev_dir = tmp_path / "real-workdir" / ".autodev"
+    autodev_dir.mkdir(parents=True)
+    (autodev_dir / "run-summary.jsonl").write_text(
+        "\n".join(
+            [
+                '{"phase": "plan", "cost_usd": 0.25}',
+                "not json at all",  # malformed line -- must not raise
+                '{"phase": "execute", "cost_usd": 0.75}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _instance_cost_usd(autodev_dir / "plan-ledger.jsonl") == 1.0
 
 
 # ---------------------------------------------------------------------------

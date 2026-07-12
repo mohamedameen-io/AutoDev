@@ -59,18 +59,60 @@ def _predictions() -> list[dict[str, Any]]:
 
 
 def _report(resolved: Sequence[str], unresolved: Sequence[str],
-            errored: Sequence[str] = ()) -> dict[str, Any]:
-    """A SWE-bench sb-cli report shaped like the real thing (superset is fine)."""
+            errored: Sequence[str] = (), failed: Sequence[str] = ()) -> dict[str, Any]:
+    """A SWE-bench sb-cli report shaped like the real thing (superset is fine).
+
+    ``failed`` models the REAL sb-cli ``failed_ids`` field (see the slice4
+    forensic re-grade fixtures under ``~/bench-forensics/slice4/sbcli-rescore/``
+    and ``sbcli-goldctl/``, outside this repo): instances the cloud eval itself
+    never completed for -- deliberately excluded from ``completed_instances``,
+    exactly like the real report.
+    """
     return {
-        "total_instances": len(resolved) + len(unresolved) + len(errored),
-        "submitted_instances": len(resolved) + len(unresolved) + len(errored),
+        "total_instances": len(resolved) + len(unresolved) + len(errored) + len(failed),
+        "submitted_instances": len(resolved) + len(unresolved) + len(errored) + len(failed),
         "completed_instances": len(resolved) + len(unresolved),
         "resolved_instances": len(resolved),
         "unresolved_instances": len(unresolved),
         "error_instances": len(errored),
+        "failed_instances": len(failed),
         "resolved_ids": list(resolved),
         "unresolved_ids": list(unresolved),
         "error_ids": list(errored),
+        "failed_ids": list(failed),
+    }
+
+
+def _real_slice4_report_shape(submitted_ids: Sequence[str]) -> dict[str, Any]:
+    """The ACTUAL sb-cli report shape captured by the slice4 forensic re-grade
+    (``~/bench-forensics/slice4/sbcli-rescore/swe-bench_lite__test__slice4-rescore.json``
+    and ``.../sbcli-goldctl/swe-bench_lite__test__slice4-goldctl.json``, both
+    outside this repo): submitting canonical GOLD patches for all 10
+    SWE-bench-Lite instances scored 10/10 "FAIL" with ``completed_instances=0``
+    -- EVERY submitted instance lands in ``failed_ids`` and the cloud eval never
+    ran the hidden tests at all. This reproduces every field name/shape the real
+    report carries (``schema_version``, ``completed_ids``, ``pending_ids``, ...);
+    the 291-row ``incomplete_ids`` (unsubmitted dataset rows, irrelevant noise
+    for this unit) is omitted -- the scorer never reads it.
+    """
+    ids = list(submitted_ids)
+    return {
+        "total_instances": 300,
+        "submitted_instances": len(ids),
+        "completed_instances": 0,
+        "pending_instances": 0,
+        "failed_instances": len(ids),
+        "resolved_instances": 0,
+        "unresolved_instances": 0,
+        "error_instances": 0,
+        "completed_ids": [],
+        "submitted_ids": list(ids),
+        "error_ids": [],
+        "schema_version": 2,
+        "resolved_ids": [],
+        "unresolved_ids": [],
+        "pending_ids": [],
+        "failed_ids": list(ids),
     }
 
 
@@ -244,6 +286,107 @@ def test_report_error_ids_are_error_not_fail(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# WS-1 forensic fix: a submitted-but-not-completed sb-cli eval is ERROR,
+# never FAIL. Proven by the gold control (X5 re-grade): submitting canonical
+# gold patches for all 10 SWE-bench-Lite instances scored 10/10 "FAIL" with
+# completed=0 -- the cloud eval fast-fails before running the hidden tests, and
+# pre-fix code mislabelled that infra non-completion as a capability FAIL,
+# making a benchmark PASS structurally impossible regardless of patch quality.
+# ---------------------------------------------------------------------------
+
+
+def test_slice4_forensic_shape_all_incomplete_is_error_never_fail(tmp_path: Path):
+    """RED-before-fix regression, pinned to the ACTUAL sb-cli report shape from
+    the slice4 forensic re-grade: every submitted instance lands in
+    ``failed_ids`` with ``completed_instances=0`` -- pre-fix code mapped these to
+    FAIL,"unresolved" (the "else" catch-all); they MUST become ERROR, honoring
+    the file's own doctrine (module docstring: "ERROR is never folded into
+    FAIL")."""
+    ids = ["demo__repo-1", "demo__repo-2"]
+    preds = [
+        {"instance_id": i, "model_name_or_path": "autodev", "model_patch": _PATCH_A}
+        for i in ids
+    ]
+    scorer = SbcliScorer(
+        runner=_make_runner(report=_real_slice4_report_shape(ids)),
+        workdir=tmp_path,
+    )
+    report = scorer.score(preds, run_id="run-infra")
+
+    by_id = {s.instance_id: s.status for s in report.instances}
+    assert by_id == {i: ERROR for i in ids}, (
+        "a submitted-but-not-completed sb-cli eval must be ERROR, never FAIL"
+    )
+    assert all(s.status != FAIL for s in report.instances)
+    for s in report.instances:
+        assert s.detail and "did not complete" in s.detail.lower()
+    # the forensic-instrumentation ask: completed/submitted surfaced on summary.
+    assert report.summary["completed"] == 0
+    assert report.summary["submitted"] == len(ids)
+
+
+def test_normal_report_mixed_split_with_per_instance_infra_flag_inside_completed_batch(
+    tmp_path: Path,
+):
+    """Regression/non-vacuous control: a NORMAL, genuinely-completed report
+    (completed > 0) still yields PASS for resolved and FAIL for genuinely-
+    completed-unresolved -- AND an id sb-cli itself flags in ``failed_ids``
+    stays ERROR even though the BATCH overall completed, proving the
+    per-instance ``failed_ids`` check is load-bearing on its own, not just the
+    batch-wide ``completed == 0`` short-circuit."""
+    scorer = SbcliScorer(
+        runner=_make_runner(
+            report=_report(
+                resolved=["r-pass"],
+                unresolved=["r-fail"],
+                errored=["r-error"],
+                failed=["r-infra"],
+            ),
+        ),
+        workdir=tmp_path,
+    )
+    preds = [
+        {"instance_id": i, "model_name_or_path": "autodev", "model_patch": _PATCH_A}
+        for i in ("r-pass", "r-fail", "r-error", "r-infra")
+    ]
+    report = scorer.score(preds, run_id="run-mixed")
+
+    by_id = {s.instance_id: s.status for s in report.instances}
+    assert by_id == {
+        "r-pass": PASS,
+        "r-fail": FAIL,
+        "r-error": ERROR,
+        "r-infra": ERROR,
+    }
+    infra_detail = next(
+        s.detail for s in report.instances if s.instance_id == "r-infra"
+    )
+    assert infra_detail and "did not complete" in infra_detail.lower()
+    error_detail = next(
+        s.detail for s in report.instances if s.instance_id == "r-error"
+    )
+    assert error_detail == "sb-cli reported an evaluation error"
+
+
+def test_instance_absent_from_every_report_bucket_is_error_not_fail(tmp_path: Path):
+    """An id submitted but absent from resolved/unresolved/error/failed entirely
+    (e.g. still genuinely "pending") must be ERROR -- the pre-fix "else -> FAIL"
+    catch-all would have wrongly scored it FAIL."""
+    scorer = SbcliScorer(
+        runner=_make_runner(report=_report(resolved=["ok"], unresolved=[])),
+        workdir=tmp_path,
+    )
+    preds = [
+        {"instance_id": i, "model_name_or_path": "autodev", "model_patch": _PATCH_A}
+        for i in ("ok", "still-pending")
+    ]
+    report = scorer.score(preds, run_id="run-pending")
+    by_id = {s.instance_id: s.status for s in report.instances}
+    assert by_id["ok"] == PASS
+    assert by_id["still-pending"] == ERROR
+
+
+# ---------------------------------------------------------------------------
 # Gate (c): submit failure -> ERROR, never FAIL.
 # ---------------------------------------------------------------------------
 
@@ -363,6 +506,53 @@ def test_scorer_satisfies_protocol_and_builds():
     built = build_scorer(argparse.Namespace())
     assert isinstance(built, Scorer)
     assert built.name
+
+
+def test_build_scorer_wires_workdir_from_out_dir():
+    """WS-1 forensic-instrumentation fix: build_scorer must read ``out_dir`` from
+    ``args`` and pass ``workdir=out_dir/"sbcli"`` so ``predictions.jsonl`` + the
+    raw ``<run_id>.json`` report PERSIST for forensic inspection instead of a
+    temp dir that gets deleted (the retention path already exists in
+    ``score()``'s ``own_tmp`` branch when ``workdir`` is set)."""
+    args = argparse.Namespace(out_dir=Path("/tmp/some-pilot-run"))
+    built = build_scorer(args)
+    assert built._workdir == Path("/tmp/some-pilot-run") / "sbcli"
+
+
+def test_build_scorer_persists_predictions_and_report_under_out_dir_sbcli(
+    tmp_path: Path,
+):
+    """End-to-end (black-box) confirmation of the retention path: scoring
+    through a ``build_scorer``-built scorer actually leaves ``predictions.jsonl``
+    and the raw report on disk under ``out_dir/"sbcli"`` -- the whole point of
+    the forensic-instrumentation fix."""
+    out_dir = tmp_path / "pilot-out"
+    built = build_scorer(argparse.Namespace(out_dir=out_dir))
+    built._runner = _make_runner(
+        report=_report(resolved=["demo__repo-1"], unresolved=[])
+    )
+    report = built.score(
+        [
+            {
+                "instance_id": "demo__repo-1",
+                "model_name_or_path": "autodev",
+                "model_patch": _PATCH_A,
+            }
+        ],
+        run_id="run-persist",
+    )
+    assert report.instances[0].status == PASS
+    assert (out_dir / "sbcli" / "predictions.jsonl").is_file()
+    assert (out_dir / "sbcli" / "run-persist.json").is_file()
+
+
+def test_build_scorer_workdir_none_when_out_dir_absent():
+    """Back-compat: a bare ``argparse.Namespace()`` (no ``out_dir`` attribute,
+    e.g. an older/unrelated caller of ``build_scorer``) must not crash and
+    defaults ``workdir`` to ``None`` (own temp dir, cleaned up) -- unchanged
+    pre-fix behaviour."""
+    built = build_scorer(argparse.Namespace())
+    assert built._workdir is None
 
 
 def test_score_returns_scorereport(tmp_path: Path):
