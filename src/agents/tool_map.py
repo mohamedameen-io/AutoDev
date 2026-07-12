@@ -67,8 +67,13 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
     # phase-review tournaments AND consult mode — not just the plan phase. The
     # cheapness + non-mutation guard therefore lives in the SHARED
     # ARCHITECT_B_SYSTEM (tournament/prompts.py) so cost discipline follows the
-    # capability everywhere. (Consult mode uses its own prompt file — bringing
-    # the guard there is a separate follow-up outside this lane.)
+    # capability everywhere — INCLUDING consult mode: consult dispatches via
+    # ``delegate(orch, "architect_b", …)`` whose ``base_prompt = spec.prompt``,
+    # and ``build_registry`` sets architect_b's ``spec.prompt`` to
+    # ARCHITECT_B_SYSTEM, so consult inherits the guard (its
+    # ``architect_b_consult.md`` is LAYERED via ``extra_context``, not a
+    # replacement). A future task would only DUPLICATE the guard into that
+    # ``.md`` for explicitness — it would not close a hole.
     "architect_b": ["read", "glob", "grep", "bash"],
     # Tournament roles: pure text-in/text-out. No tools.
     "critic_t": [],

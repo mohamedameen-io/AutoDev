@@ -1037,13 +1037,16 @@ class TaskOverridesConfig(BaseModel):
             # raised 5 → 8 in ``config.defaults`` for its new Read + Bash
             # reproduction workload. This role key gives it proportional
             # huge-repo headroom (8 × 2.0 = 16), parity with the exec-workload
-            # roles (developer / test_engineer). NOTE: like the ``developer``
-            # role key above, this is consumed by the ``resolve_huge_repo_value``
-            # resolver + its telemetry op; the tournament dispatch path
-            # (``*_tournament_runner._build_role_overrides``) does NOT yet scale
-            # tournament-role ``max_turns`` by this key — wiring that in is a
-            # separate follow-up outside the WS-5 lane. The raised base floor (8)
-            # applies at all sites regardless.
+            # roles (developer / test_engineer). It is LIVE + beneficial in the
+            # consult ``delegate`` non-task-role path: the v0.39.0 C1 branch in
+            # ``execute_phase.py`` scales ``spec_max_turns`` by a DIRECT
+            # ``huge_repo_multipliers[role]`` dict lookup (NOT
+            # ``resolve_huge_repo_value``), so a huge-repo consult raises
+            # architect_b 8 → 16. It is dormant ONLY in the TOURNAMENT dispatch
+            # path (``*_tournament_runner._build_role_overrides`` does not yet
+            # scale tournament-role ``max_turns`` by this key — a follow-up
+            # outside the WS-5 lane). The raised base floor (8) applies at all
+            # sites regardless.
             "architect_b": 2.0,
             # v0.37.0 H5: knob-keyed. The :mod:`orchestrator.huge_repo_overrides`
             # resolver looks these up by knob name and applies the
