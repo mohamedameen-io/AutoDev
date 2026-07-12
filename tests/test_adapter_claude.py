@@ -480,6 +480,178 @@ async def test_execute_rc1_with_empty_stdout_subtype_is_none(
     assert result.error == "claude exited 1 with empty stderr"
 
 
+# ── WS-2b: cost_usd propagation across all result-parsing branches ─────
+#
+# Forensic audit finding: `invocation_cost.cost_usd` ledger ops recorded
+# 0.0 for roles that disproportionately resolve through the rc!=0 or
+# empty-result branches (explorer, framing, diagnostician,
+# critic_drift_verifier). Root cause: only the success branch read
+# ``total_cost_usd`` from the parsed CLI envelope; the other two branches
+# had access to a parsed JSON dict (or one recoverable from stdout) but
+# never looked at the field, so ``AgentResult.cost_usd`` silently fell
+# back to the Pydantic default of 0.0 even when the CLI reported real
+# spend for the turns it burned before failing/returning empty.
+
+
+@pytest.mark.asyncio
+async def test_execute_success_propagates_nonzero_cost_usd(tmp_path: Path) -> None:
+    """Sanity/regression: the happy path already extracts a non-zero
+    ``total_cost_usd`` (existing behavior — locked in ahead of refactoring
+    the extraction into a shared helper used by the other branches too).
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=1)
+    blob = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "duration_ms": 100,
+            "num_turns": 1,
+            "result": "OK",
+            "stop_reason": "end_turn",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "total_cost_usd": 0.1234,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+    )
+    fake = _fake_proc(stdout=blob, returncode=0)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is True
+    assert result.cost_usd == pytest.approx(0.1234)
+
+
+@pytest.mark.asyncio
+async def test_execute_rc_nonzero_with_json_stdout_propagates_cost_usd(
+    tmp_path: Path,
+) -> None:
+    """rc=1 but the CLI wrote a complete result JSON to stdout — the same
+    deterministic-failure shape exercised for ``subtype`` by
+    ``test_execute_rc1_with_error_max_turns_json_extracts_subtype`` above —
+    that carries a non-zero ``total_cost_usd``. The adapter must propagate
+    that cost onto ``AgentResult.cost_usd`` instead of silently reporting
+    0.0 — this is the exact branch several audited roles were losing cost
+    through.
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="explorer", prompt="p", cwd=tmp_path, max_turns=1)
+    blob = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error_max_turns",
+            "is_error": True,
+            "duration_ms": 100,
+            "num_turns": 2,
+            "result": "",
+            "stop_reason": "tool_use",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "total_cost_usd": 0.0421,
+            "errors": ["Reached maximum number of turns (1)"],
+        }
+    )
+    fake = _fake_proc(stdout=blob, stderr="", returncode=1)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.cost_usd == pytest.approx(0.0421)
+
+
+@pytest.mark.asyncio
+async def test_execute_rc_nonzero_missing_total_cost_usd_stays_zero(
+    tmp_path: Path,
+) -> None:
+    """rc!=0 with JSON stdout that omits ``total_cost_usd`` entirely: the
+    adapter must NOT fabricate a value — ``cost_usd`` stays 0.0.
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=1)
+    blob = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error_max_turns",
+            "is_error": True,
+            "result": "",
+            "errors": ["Reached maximum number of turns (1)"],
+        }
+    )
+    fake = _fake_proc(stdout=blob, stderr="", returncode=1)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.cost_usd == 0.0
+
+
+@pytest.mark.asyncio
+async def test_execute_empty_result_propagates_cost_usd(tmp_path: Path) -> None:
+    """rc=0, parseable JSON, empty ``result`` (the Phase 1.1 empty-result
+    dump branch) — the CLI still reports ``total_cost_usd`` for the turns
+    it burned before coming back empty. The adapter must propagate that
+    cost rather than reporting 0.0.
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="framing", prompt="p", cwd=tmp_path, max_turns=3)
+    blob = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "duration_ms": 100,
+            "num_turns": 1,
+            "result": "",
+            "stop_reason": "end_turn",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "total_cost_usd": 0.0777,
+            "usage": {"input_tokens": 1, "output_tokens": 0},
+        }
+    )
+    fake = _fake_proc(stdout=blob, returncode=0)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.error == "empty result from CLI"
+    assert result.cost_usd == pytest.approx(0.0777)
+
+
+@pytest.mark.asyncio
+async def test_execute_empty_result_missing_total_cost_usd_stays_zero(
+    tmp_path: Path,
+) -> None:
+    """Empty-result branch with no ``total_cost_usd`` in the envelope: the
+    adapter must NOT fabricate a value — ``cost_usd`` stays 0.0.
+    """
+    adapter = ClaudeCodeAdapter()
+    inv = AgentInvocation(role="r", prompt="p", cwd=tmp_path, max_turns=3)
+    blob = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "",
+        }
+    )
+    fake = _fake_proc(stdout=blob, returncode=0)
+    with patch(
+        "adapters.claude_code.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=fake),
+    ):
+        result = await adapter.execute(inv)
+    assert result.success is False
+    assert result.cost_usd == 0.0
+
+
 @pytest.mark.asyncio
 async def test_execute_binary_not_found(tmp_path: Path) -> None:
     adapter = ClaudeCodeAdapter(binary="nonexistent-claude-binary-xyz")

@@ -82,6 +82,36 @@ def _api_status_to_subtype(status: int | str) -> str | None:
     return None
 
 
+def _extract_cost_usd(parsed: dict[str, Any], *, role: str) -> float:
+    """Extract ``total_cost_usd`` from a parsed CLI result envelope.
+
+    Applied uniformly across every branch of :meth:`ClaudeCodeAdapter.execute`
+    that has access to a parsed JSON envelope — the success path, the
+    empty-result happy path, and the rc!=0 path that recovers a complete
+    result JSON from stdout on deterministic failures (``error_max_turns``
+    et al, mirroring the ``subtype`` extraction already done there).
+
+    Before this helper existed, only the success path read the field, so
+    any invocation resolved through one of the other two branches silently
+    reported ``cost_usd=0.0`` regardless of the CLI's actual reported spend
+    for the turns it burned — the audited cost-attribution bug behind
+    ``invocation_cost`` ledger ops recording 0.0 for roles that
+    disproportionately hit those branches (explorer, framing,
+    diagnostician, critic_drift_verifier).
+
+    Never fabricates a value: a missing OR non-numeric ``total_cost_usd``
+    returns ``0.0`` and logs ``claude_code.missing_total_cost_usd`` so the
+    gap stays observable rather than silently swallowed.
+    """
+    if "total_cost_usd" in parsed:
+        try:
+            return float(parsed["total_cost_usd"])
+        except (TypeError, ValueError):
+            pass
+    logger.warning("claude_code.missing_total_cost_usd", role=role)
+    return 0.0
+
+
 # huge-repo (Cluster B1): spawn-agent isolation flags. The target
 # repo's ``.claude`` SessionStart hooks + MCP servers inflate every
 # ``claude -p`` cold start (seconds added to each spawn + probe). Our
@@ -419,6 +449,14 @@ class ClaudeCodeAdapter(PlatformAdapter):
             # unchanged), so the existing empty-stderr sentinel and
             # stdout-tail branches above are untouched.
             text_val: str = ""
+            # WS-2b (cost-attribution bug): the CLI often writes a complete
+            # result JSON to stdout on rc!=0 deterministic-failure shapes
+            # (same shape the subtype extraction below already recovers
+            # from), and that JSON carries ``total_cost_usd`` for the turns
+            # actually burned. Default 0.0 preserves the pre-fix value for
+            # the genuine-subprocess-death case (unparseable / non-dict
+            # stdout), where there is nothing to extract.
+            cost_usd_val: float = 0.0
             try:
                 parsed_failure = json.loads(stdout)
                 if isinstance(parsed_failure, dict):
@@ -464,6 +502,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
                         synthesized = _api_status_to_subtype(raw_status)
                         if synthesized is not None:
                             subtype_val = synthesized
+                    cost_usd_val = _extract_cost_usd(parsed_failure, role=inv.role)
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -478,6 +517,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
                 success=False,
                 text=text_val,
                 duration_s=duration,
+                cost_usd=cost_usd_val,
                 error=msg,
                 raw_stdout=stdout,
                 raw_stderr=stderr,
@@ -557,10 +597,17 @@ class ClaudeCodeAdapter(PlatformAdapter):
                     synthesized = _api_status_to_subtype(raw_status)
                     if synthesized is not None:
                         empty_subtype_val = synthesized
+            # WS-2b (cost-attribution bug): ``parsed`` is a full result
+            # envelope here (rc=0, valid JSON, just an empty ``result``
+            # text) — it carries ``total_cost_usd`` for the turns burned
+            # before the CLI came back empty. Propagate it instead of
+            # silently reporting 0.0.
+            empty_cost_usd_val = _extract_cost_usd(parsed, role=inv.role)
             return AgentResult(
                 success=False,
                 text="",
                 duration_s=duration,
+                cost_usd=empty_cost_usd_val,
                 error="empty result from CLI",
                 raw_stdout=stdout,
                 raw_stderr=stderr,
@@ -599,14 +646,7 @@ class ClaudeCodeAdapter(PlatformAdapter):
             if synthesized is not None:
                 subtype_val = synthesized
 
-        cost_usd: float = 0.0
-        if "total_cost_usd" in parsed:
-            cost_usd = float(parsed["total_cost_usd"])
-        else:
-            logger.warning(
-                "claude_code.missing_total_cost_usd",
-                role=inv.role,
-            )
+        cost_usd: float = _extract_cost_usd(parsed, role=inv.role)
 
         files_after = _git_porcelain_set(inv.cwd)
         files_changed = _diff_files(files_before, files_after)
