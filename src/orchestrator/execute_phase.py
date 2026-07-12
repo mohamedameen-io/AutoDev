@@ -9512,22 +9512,29 @@ async def _maybe_recover_validated_patch_on_conflict_exhaustion(
 
     Gate STRICTLY (all must hold). The genuine reviewer APPROVED (2) is the
     validation and the unforced clean-apply (4) is the hard safety net, so the
-    failure class no longer restricts recovery (3a) — with ONE principled
-    exception (1):
+    failure class no longer restricts recovery (3a) — EXCEPT where the fix's own
+    tests demonstrably rejected it (1):
 
-    1. Recovery is attempted on ANY terminal block EXCEPT ``TESTS_FAILED`` (a
-       single DENY, NOT an allow-list). ``TESTS_FAILED`` means the fix's OWN
-       tests actually RAN and at least one FAILED (a genuine correctness signal,
-       ``diagnosis == "ok"`` — distinct from ``TEST_DIAGNOSIS_HARDFAIL`` /
-       ``turn_budget_exhausted``, where the tests could NOT run). Tests are the
-       arbiter: a static reviewer APPROVED must NOT override demonstrated failing
-       tests, not even behind ``needs_verification``. Every OTHER class recovers
-       — merge-conflict exhaustion, ``test_diagnosis_hardfail`` /
-       turn-budget→``guardrail_exceeded`` / infra where the tests could not run
-       or the failure is unrelated to the fix's correctness — because none of
-       those demonstrate the fix is wrong. ``failure_class`` is otherwise
-       recorded for observability only; a ``REVIEW_REJECTED`` / malformed block
-       also correctly won't recover — no genuine APPROVED verdict (2).
+    1. Recovery is attempted on ANY terminal block EXCEPT where the fix's OWN
+       tests demonstrably rejected it — two DENY conditions tied to the SIGNAL,
+       not just the label (a static reviewer APPROVED must not override a
+       demonstrated test rejection, not even behind ``needs_verification``):
+       (1a) ``failure_class == TESTS_FAILED`` — the tests actually RAN and at
+       least one FAILED (``diagnosis == "ok"``; distinct from
+       ``TEST_DIAGNOSIS_HARDFAIL`` / ``turn_budget_exhausted``, where they could
+       NOT run); and (1b) the persisted ``TestEvidence`` reports a MISSING CHANGE
+       (WS-4's ``BUGS FOUND:`` "expected change absent/unapplied" signal,
+       :func:`reports_missing_change`). (1b) is REQUIRED because the
+       ``TESTS_FAILED`` label is RELABELED on some escalation rungs (critic
+       ``SOFT_BLOCKER``, developer turn-exhaustion ``GUARDRAIL_EXCEEDED``) before
+       ``block_task``, so keying on the label alone would let a missing-change
+       task recover after a relabel — keying on the durable evidence closes that
+       leak. Every OTHER class recovers — merge-conflict exhaustion,
+       ``test_diagnosis_hardfail`` / turn-budget→``guardrail_exceeded`` / infra
+       where the tests could not run or the failure is unrelated to the fix's
+       correctness — because none demonstrate the fix is wrong. ``failure_class``
+       is otherwise recorded for observability only; a ``REVIEW_REJECTED`` /
+       malformed block also correctly won't recover — no genuine APPROVED (2).
     2. A GENUINE reviewer ``APPROVED`` verdict is on record
        (``{task_id}-review.json``). Any other verdict — or an INFRA soft-pass
        ``APPROVED`` (``soft_passed=True``, R7) which never carried a real
@@ -9571,24 +9578,51 @@ async def _maybe_recover_validated_patch_on_conflict_exhaustion(
     """
     from state.evidence import read_evidence  # noqa: PLC0415 — break cycle
 
-    # (1) Recovery is attempted on ANY terminal block (3a) — this is a single
-    #     principled DENY, NOT an allow-list of recoverable classes: EVERY class
-    #     recovers EXCEPT ``TESTS_FAILED``. A ``TESTS_FAILED`` block means the
-    #     fix's OWN tests actually RAN and at least one FAILED (a genuine
-    #     correctness signal, ``diagnosis == "ok"`` — distinct from
-    #     ``TEST_DIAGNOSIS_HARDFAIL`` / ``turn_budget_exhausted`` where the tests
-    #     could NOT run). Tests are the arbiter: a static reviewer ``APPROVED``
-    #     must NOT override demonstrated failing tests and ship the work as
+    # (1) Recovery is attempted on ANY terminal block (3a) — NOT an allow-list of
+    #     recoverable classes — EXCEPT where the fix's OWN tests demonstrably
+    #     REJECTED it. Tests are the arbiter: a static reviewer ``APPROVED`` must
+    #     NOT override a demonstrated test rejection and ship the work as
     #     "recovered" in an unattended run — not even behind a
-    #     ``needs_verification`` flag. Recovery is for blocks that do NOT
-    #     demonstrate the fix is wrong (merge-conflict exhaustion, tests-couldn't-
-    #     run, turn-exhaustion, infra); a real ran-and-failed result is exactly
-    #     the case it must leave blocked. Every OTHER class still recovers under
-    #     the validation gate (2)+(3) + the unforced clean-apply (4); a
-    #     ``REVIEW_REJECTED`` / malformed block also won't recover — it has no
-    #     genuine APPROVED verdict (2). ``failure_class`` is otherwise recorded
-    #     for observability only.
+    #     ``needs_verification`` flag. TWO deny conditions, tied to the underlying
+    #     SIGNAL (belt-and-suspenders, so neither a label nor an evidence gap can
+    #     leak a rejection through):
+    #
+    #     (1a) ``failure_class == TESTS_FAILED`` — the tests actually RAN and at
+    #          least one FAILED (``diagnosis == "ok"``; distinct from
+    #          ``TEST_DIAGNOSIS_HARDFAIL`` / ``turn_budget_exhausted``, where they
+    #          could NOT run).
+    #     (1b) the task's persisted ``TestEvidence`` reports a MISSING CHANGE —
+    #          WS-4's ``BUGS FOUND:`` "expected change is absent/unapplied" signal
+    #          (:func:`reports_missing_change`, the same detector WS-4 routes on).
+    #          This is REQUIRED, not redundant with (1a): the ``TESTS_FAILED``
+    #          label is NOT preserved on every escalation rung to ``block_task`` —
+    #          a later critic ``SOFT_BLOCKER`` or a developer turn-exhaustion
+    #          ``GUARDRAIL_EXCEEDED`` RELABELS the class — so keying only on (1a)
+    #          would let a missing-change task be recovered after a relabel,
+    #          landing an incomplete diff on ``main`` and discarding exactly the
+    #          WS-4 signal. (1b) keys on the durable evidence, so it holds
+    #          regardless of the label the block finally carries.
+    #
+    #     Every OTHER terminal block still recovers (merge-conflict exhaustion,
+    #     ``test_diagnosis_hardfail``, turn-budget, worker/infra — the tests could
+    #     not run or the failure is unrelated to the fix's correctness), under the
+    #     validation gate (2)+(3) + the unforced clean-apply (4). A
+    #     ``REVIEW_REJECTED`` / malformed block also won't recover — no genuine
+    #     APPROVED verdict (2). ``failure_class`` is otherwise recorded for
+    #     observability only.
     if failure_class == _fcls.TESTS_FAILED:
+        return None
+    try:
+        _test_ev = await read_evidence(orch.cwd, task.id, "test")
+    except Exception:  # noqa: BLE001 — defensive: never break the block path
+        _test_ev = None
+    if _test_ev is not None and any(
+        reports_missing_change(_t)
+        for _t in (
+            getattr(_test_ev, "output_text", "") or "",
+            getattr(_test_ev, "raw_response", None) or "",
+        )
+    ):
         return None
 
     # (2) Genuine, non-soft-passed reviewer APPROVED on record.

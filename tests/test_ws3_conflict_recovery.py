@@ -72,6 +72,7 @@ from state.schemas import (
     Plan,
     ReviewEvidence,
     Task,
+    TestEvidence,
     TournamentEvidence,
 )
 
@@ -230,6 +231,12 @@ async def _seed_patch(orch: Orchestrator, tid: str, *, diff: str) -> None:
     await write_patch(orch.cwd, tid, diff)
 
 
+async def _seed_test(orch: Orchestrator, tid: str, *, output_text: str) -> None:
+    """Persist a ``TestEvidence`` carrying the test_engineer's report text (the
+    ``BUGS FOUND:`` channel WS-4's ``reports_missing_change`` reads)."""
+    await write_evidence(orch.cwd, tid, TestEvidence(task_id=tid, output_text=output_text))
+
+
 async def _get(orch: Orchestrator, tid: str) -> Task:
     t = await orch.plan_manager.get_task(tid)
     assert t is not None
@@ -354,6 +361,70 @@ async def test_tests_failed_block_is_not_recovered(tmp_path: Path) -> None:
     )
     assert result.status == "blocked"
     assert _RECOVER_OP not in _ops(repo)
+
+
+async def test_relabeled_missing_change_block_is_not_recovered(
+    tmp_path: Path,
+) -> None:
+    """Composition safety (WS-4 ↔ WS-3): the ``TESTS_FAILED`` label is NOT
+    preserved on every escalation rung to ``block_task`` — a later critic
+    ``SOFT_BLOCKER`` or a developer turn-exhaustion ``GUARDRAIL_EXCEEDED``
+    RELABELS the class. Keying the deny only on the class label would let a task
+    WS-4 meant to block for a MISSING CHANGE be WS-3-recovered after such a
+    relabel — landing an incomplete/missing-change diff on ``main``. So the deny
+    is ALSO tied to the SIGNAL: the persisted ``TestEvidence`` ``BUGS FOUND:``
+    missing-change report makes recovery DECLINE regardless of the (relabeled)
+    class."""
+    repo = tmp_path / "repo"
+    orch, task, _ = await _blocked_task_with_recoverable_evidence(repo)
+    # WS-4 missing-change signal on the task's durable TestEvidence, but the
+    # block arrives under a RELABELED class (NOT TESTS_FAILED).
+    await _seed_test(
+        orch,
+        "1.1",
+        output_text=(
+            "RESULTS:\n1 passed\n\n"
+            "BUGS FOUND:\nThe expected fix — the source change is missing from "
+            "this diff."
+        ),
+    )
+    # Hook-level: the signal-deny holds under either relabel class.
+    for cls in (fc.GUARDRAIL_EXCEEDED, fc.SOFT_BLOCKER):
+        recovered = await ep._maybe_recover_validated_patch_on_conflict_exhaustion(
+            orch, task, failure_class=cls
+        )
+        assert recovered is None, cls
+    assert (await _get(orch, "1.1")).status == "tournamented"
+    # End-to-end through the real chokepoint under the relabeled class: it
+    # commits the terminal block (the missing-change signal is honored).
+    result = await block_task(
+        orch,
+        await _get(orch, "1.1"),
+        failure_class=fc.SOFT_BLOCKER,
+        raw_error="soft_blocker (relabeled from a missing-change TESTS_FAILED)",
+        meta={"blocked_reason": "soft_blocker"},
+    )
+    assert result.status == "blocked"
+    assert _RECOVER_OP not in _ops(repo)
+
+
+async def test_recovers_when_test_evidence_reports_no_missing_change(
+    tmp_path: Path,
+) -> None:
+    """Guardrail on the signal-deny: a benign ``TestEvidence`` (no ``BUGS FOUND:``
+    missing-change signal) on a normal recoverable block (``guardrail_exceeded``)
+    must STILL recover — the deny keys on a demonstrated missing change, not on
+    the mere presence of test evidence."""
+    repo = tmp_path / "repo"
+    orch, task, _ = await _blocked_task_with_recoverable_evidence(repo)
+    await _seed_test(
+        orch, "1.1", output_text="RESULTS:\n1 passed\n\nBUGS FOUND:\nnone"
+    )
+    recovered = await ep._maybe_recover_validated_patch_on_conflict_exhaustion(
+        orch, task, failure_class=fc.GUARDRAIL_EXCEEDED
+    )
+    assert recovered is not None
+    assert recovered.status == "complete"
 
 
 # ===========================================================================
