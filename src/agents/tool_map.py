@@ -58,10 +58,17 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
     # bug-fix acceptance oracle EMPIRICALLY — a buggy issue-example must not
     # become an un-refutable oracle just because the critic was Read-only /
     # Bash-denied. Scoped like `reviewer` (read/glob/grep) PLUS `bash`: it may
-    # reproduce + inspect, but NOT mutate the tree (no edit/write) and NOT
-    # delegate/browse (no task/web_*). Blast radius: adds bash-capable turns to
-    # the plan phase — see prompts.py ARCHITECT_B_PROMPT for the turn-budget
-    # guard that keeps reproductions cheap.
+    # reproduce + inspect, carries NO Edit/Write tools, and NO task/web_* (no
+    # delegate/browse). NOTE: withholding Edit/Write does NOT sandbox the tree —
+    # Bash is a superset that can still write/delete, so non-mutation is
+    # PROMPT-DISCOURAGED (ARCHITECT_B_SYSTEM), not enforced. Blast radius: this
+    # grant is registry-GLOBAL. architect_b is the SHARED reviser, so
+    # bash-capable turns reach ALL of its sites — the plan, impl, and
+    # phase-review tournaments AND consult mode — not just the plan phase. The
+    # cheapness + non-mutation guard therefore lives in the SHARED
+    # ARCHITECT_B_SYSTEM (tournament/prompts.py) so cost discipline follows the
+    # capability everywhere. (Consult mode uses its own prompt file — bringing
+    # the guard there is a separate follow-up outside this lane.)
     "architect_b": ["read", "glob", "grep", "bash"],
     # Tournament roles: pure text-in/text-out. No tools.
     "critic_t": [],

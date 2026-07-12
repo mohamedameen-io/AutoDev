@@ -1033,6 +1033,18 @@ class TaskOverridesConfig(BaseModel):
             # floor bump and under-scaled the role. Effective huge-repo budget:
             # 12 × 2.0 = 24.
             "test_engineer": 2.0,
+            # WS-5 (slice4 forensic, 2026-07-12): the architect_b floor was
+            # raised 5 → 8 in ``config.defaults`` for its new Read + Bash
+            # reproduction workload. This role key gives it proportional
+            # huge-repo headroom (8 × 2.0 = 16), parity with the exec-workload
+            # roles (developer / test_engineer). NOTE: like the ``developer``
+            # role key above, this is consumed by the ``resolve_huge_repo_value``
+            # resolver + its telemetry op; the tournament dispatch path
+            # (``*_tournament_runner._build_role_overrides``) does NOT yet scale
+            # tournament-role ``max_turns`` by this key — wiring that in is a
+            # separate follow-up outside the WS-5 lane. The raised base floor (8)
+            # applies at all sites regardless.
+            "architect_b": 2.0,
             # v0.37.0 H5: knob-keyed. The :mod:`orchestrator.huge_repo_overrides`
             # resolver looks these up by knob name and applies the
             # multiplier to the operator's configured base value.

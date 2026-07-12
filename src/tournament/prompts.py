@@ -61,10 +61,27 @@ CRITIC_SYSTEM = (
     "Be specific and concrete. Do not suggest fixes."
 )
 
+# WS-5 (I-2): architect_b carries a registry-GLOBAL Read + Bash grant (see
+# agents.tool_map). Because it is the SHARED reviser, this system prompt is the
+# system message at EVERY architect_b tournament site (tournament.core passes
+# ``ARCHITECT_B_SYSTEM`` for the plan, impl, AND phase-review tournaments), so
+# the cost + safety discipline for that capability MUST live here — not in a
+# per-site user template — or an undirected reproduction can fire on every impl
+# and phase-review pass (worst on huge repos).
+ARCHITECT_B_TOOL_DISCIPLINE = """
+
+## TOOL DISCIPLINE — Read + Bash are for validation, used cheaply and safely
+
+You have Read and Bash access so you can validate claims against the real codebase — for example, run a reproduction to confirm that a bug-fix acceptance oracle is actually correct instead of trusting a value copied from the issue text.
+
+  - CHEAP — you have a small turn budget: target the single command that settles the question (for example `python -c ...`, ONE focused `pytest -k ...`, or a `git grep`). Do NOT run full or heavy test suites, full builds, or broad scans speculatively.
+  - READ / EXEC ONLY — NEVER MUTATE: Bash is for observation, not change. Do not modify tracked files, do not use `git` to write (no stage / commit / checkout / reset), and do not install packages. Your only durable output is the revised proposal text; delete any scratch file a check creates before you finish."""
+
 ARCHITECT_B_SYSTEM = (
     "You are a senior consultant revising a proposal based on specific criticisms. "
     "Address each valid criticism directly. Do not make changes that aren't "
     "motivated by an identified problem."
+    + ARCHITECT_B_TOOL_DISCIPLINE
     + NECESSITY_LADDER_GUIDANCE
 )
 
@@ -128,7 +145,7 @@ Any `Requires: <token>` directive present on a task in the input plan MUST be pr
 
 ## ACCEPTANCE ORACLE — VALIDATE, DON'T TRUST THE ISSUE'S EXAMPLE
 
-You have Read and Bash access — use them. If this proposal is a bug-fix whose `- Acceptance:` criteria transcribe an "expected" value from the issue text, that value may itself be the bug. Before trusting such a criterion, ground it in an executed reproduction: run a cheap repro (for example `python -c ...`, a single focused `pytest -k ...`, or the relevant CLI) to confirm the pre-fix tree actually exhibits the reported defect and to derive the correct expected value from the code's real contract — not from the issue's example copied verbatim. If the reproduction shows the issue's example is wrong, that IS an identified problem: revise the acceptance criterion to the empirically-correct oracle and state that you verified it by reproduction. Keep it cheap — do not run heavy suites speculatively; you have a small turn budget, so target the single reproduction that settles the oracle.
+If this proposal is a bug-fix whose `- Acceptance:` criteria transcribe an "expected" value from the issue text, that value may itself be the bug. Before trusting such a criterion, ground it in an executed reproduction (using your Read + Bash tools per the TOOL DISCIPLINE above — cheap, read/exec only): confirm the pre-fix tree actually exhibits the reported defect, and derive the correct expected value from the code's real contract — not from the issue's example copied verbatim. If the reproduction shows the issue's example is wrong, that IS an identified problem: revise the acceptance criterion to the empirically-correct oracle and state that you verified it by reproduction.
 
 OUTPUT FORMAT — STRICT:
 Your output MUST begin with the markdown heading `# Plan:` (or whatever H1 the existing plan uses). Do not write any preamble, commentary, or summary text before the heading. The first non-whitespace character of your output must be `#`."""

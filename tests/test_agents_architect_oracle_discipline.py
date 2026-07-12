@@ -71,7 +71,11 @@ def test_architect_prompt_forbids_copying_issue_example_as_ground_truth() -> Non
 def test_architect_b_prompt_directs_empirical_oracle_validation() -> None:
     """The plan-critic prompt (architect_b) must direct it to USE its WS-5 tool
     grant to validate a suspect bug-fix oracle against a reproduction rather
-    than trusting the issue's example."""
+    than trusting the issue's example.
+
+    The cheapness / turn-budget / non-mutation guard does NOT live here — it is
+    in the SHARED ``ARCHITECT_B_SYSTEM`` so it follows the capability to every
+    architect_b site (see ``test_architect_b_system_carries_shared_tool_discipline``)."""
     from tournament import prompts as tp
 
     body = tp.ARCHITECT_B_PROMPT
@@ -79,10 +83,37 @@ def test_architect_b_prompt_directs_empirical_oracle_validation() -> None:
         "ARCHITECT_B_PROMPT must direct architect_b to run a reproduction to "
         "validate a bug-fix acceptance oracle."
     )
-    assert "Bash" in body, (
-        "ARCHITECT_B_PROMPT must reference the Bash capability WS-5 grants it."
-    )
     assert "verbatim" in body, (
         "ARCHITECT_B_PROMPT must warn against trusting the issue's example "
         "copied verbatim."
+    )
+
+
+def test_architect_b_system_carries_shared_tool_discipline() -> None:
+    """I-2: the cost + safety guard for the Read+Bash grant must live in the
+    SHARED ``ARCHITECT_B_SYSTEM`` (tournament/core passes it as the system
+    prompt for architect_b at the plan, impl, AND phase-review sites), so the
+    discipline follows the capability everywhere — not only in the plan-only
+    ``ARCHITECT_B_PROMPT`` user template.
+
+    It must (a) name the Bash capability, (b) bound cost (small turn budget /
+    no heavy or speculative suites), and (c) forbid mutation (Bash can write,
+    so this is a directive, not a sandbox)."""
+    from tournament import prompts as tp
+
+    system = tp.ARCHITECT_B_SYSTEM
+    assert "Bash" in system, "ARCHITECT_B_SYSTEM must name the Bash capability."
+    # (b) cost discipline
+    assert "small turn budget" in system, (
+        "ARCHITECT_B_SYSTEM must bound cost with the small-turn-budget guard."
+    )
+    assert "do not run" in system.lower() and "speculativ" in system.lower(), (
+        "ARCHITECT_B_SYSTEM must forbid running heavy/full suites speculatively."
+    )
+    # (c) non-mutation directive
+    assert "NEVER MUTATE" in system, (
+        "ARCHITECT_B_SYSTEM must forbid tree mutation (READ/EXEC only)."
+    )
+    assert "tracked files" in system, (
+        "ARCHITECT_B_SYSTEM must explicitly forbid modifying tracked files."
     )

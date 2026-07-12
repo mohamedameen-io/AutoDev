@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from agents import build_registry
 from agents.tool_map import (
     AGENT_TOOL_MAP,
     CLAUDE_CODE_TOOLS,
     resolve_claude_tools,
 )
+from config.defaults import default_config
 from config.schema import REQUIRED_AGENT_ROLES
 
 
@@ -77,14 +79,38 @@ def test_architect_b_can_falsify_oracle() -> None:
     assert "Bash" in tools, (
         "architect_b needs Bash to execute a reproduction and falsify the oracle"
     )
-    # Scoped: a critic reproduces + inspects, it does not implement.
+    # Scoped: a critic reproduces + inspects, it does not implement. (This is
+    # not a sandbox — Bash can still write; tree mutation is prompt-discouraged
+    # in ARCHITECT_B_SYSTEM. Withholding Edit/Write just removes the ergonomic
+    # mutation path.)
     assert "Edit" not in tools and "Write" not in tools, (
-        "architect_b is a critic — it must not carry Edit/Write (no tree mutation)"
+        "architect_b is a critic — it must not carry Edit/Write tools"
     )
     # The grant is non-empty, so the empty->['Read'] sentinel path in
     # AdapterLLMClient no longer applies to architect_b.
     assert tools != ["Read"], (
         "architect_b resolving to bare ['Read'] means the Bash grant did not flow"
+    )
+
+
+def test_architect_b_grant_reaches_all_tournament_sites() -> None:
+    """M-3: the architect_b Read+Bash grant is registry-GLOBAL by design.
+
+    architect_b is the SHARED reviser: the plan, impl, and phase-review
+    tournaments and consult mode all resolve its tools from the ONE registry
+    spec built here (each site's ``_build_role_overrides`` reads
+    ``orch.registry["architect_b"].tools``; consult mode delegates to the same
+    role). Pinning the shared spec documents that the global reach is
+    intentional so a future accidental scope change is caught here rather than
+    silently disabling oracle-falsification at three of the four sites.
+    """
+    spec_tools = build_registry(default_config())["architect_b"].tools
+    assert "Read" in spec_tools and "Bash" in spec_tools, (
+        f"architect_b registry spec tools={spec_tools!r}; the WS-5 Read+Bash "
+        f"grant must reach every site via this shared spec"
+    )
+    assert "Edit" not in spec_tools and "Write" not in spec_tools, (
+        "architect_b must remain a critic across all sites — no Edit/Write"
     )
 
 

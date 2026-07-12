@@ -108,7 +108,16 @@ _AGENT_MAX_TURNS: dict[str, int] = {
     # plan-tournament branches failed). The robust fix is feeding content
     # inline + dropping Read (handled elsewhere); this bump is the complement.
     "critic_t": 6,
-    "architect_b": 5,
+    # WS-5 (slice4 forensic, 2026-07-12): bumped 5 → 8. architect_b now carries
+    # a Read + Bash grant (agents.tool_map) and must run a reproduction AND emit
+    # the revised proposal within one dispatch. ``error_max_turns`` is a
+    # deterministic subtype (no retry), so at 5 turns the pass aborts and the
+    # salvage path recovers the UN-refined incumbent — i.e. WS-5 silently fails
+    # on exactly the bug-fix-suspect-oracle task it targets (worst on huge
+    # repos). 8 = parity with the read-heavy reviewer floor, strictly below the
+    # write+run test_engineer (12). Huge repos scale it via the ``architect_b``
+    # key in ``task_overrides.huge_repo_multipliers``.
+    "architect_b": 8,
     "synthesizer": 6,
     "judge": 1,
     "framing": 1,
