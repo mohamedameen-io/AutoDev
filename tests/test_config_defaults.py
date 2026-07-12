@@ -72,7 +72,8 @@ def test_resolve_model_claude_developer() -> None:
 def test_default_config_sets_max_turns_per_role() -> None:
     cfg = default_config()
     assert cfg.agents["architect"].max_turns == 5
-    assert cfg.agents["developer"].max_turns == 10
+    # WS-2a: developer floor raised 10 → 15 (escalation ladder's 1.5× rung).
+    assert cfg.agents["developer"].max_turns == 15
     assert cfg.agents["judge"].max_turns == 1
     assert cfg.agents["explorer"].max_turns == 3
 

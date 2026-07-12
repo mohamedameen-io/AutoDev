@@ -57,7 +57,20 @@ _AGENT_MAX_TURNS: dict[str, int] = {
     "architect": 5,
     "explorer": 3,
     "domain_expert": 3,
-    "developer": 10,
+    # WS-2a (slice4 forensic, 2026-07-12): bumped 10 → 15. Turn-budget
+    # exhaustion was the dominant defect (10/10 instances; 68
+    # ``error_max_turns`` all cut off mid-tool-call), and ``defaults.py:60``
+    # (developer=10) was cited as a root cause (flask-4045: the fix was never
+    # written). 15 = ceil(10 × 1.5) — the budget-escalation ladder's
+    # attempt-1 rung (:mod:`orchestrator.budget_escalation` escalates a
+    # role that exhausts ``error_max_turns`` 1.5× then 2.0×). Because
+    # attempt-0 exhaustion is now the *dominant* case (not occasional), we
+    # promote that first escalation rung to the floor, leaving the ladder's
+    # remaining rungs (→22, →30) as retry headroom. This is the spec /
+    # fallback base: a task tagged with a complexity uses the (larger)
+    # per-complexity curve in ``tournament/task_overrides.py``; an *untagged*
+    # task falls back to this value.
+    "developer": 15,
     # v0.41.0 (A1): bumped 5 → 8. On large diffs the reviewer ran out of
     # turns and its empty/truncated output was misparsed as MALFORMED →
     # routed as a developer discard+retry loop. The robust fix is
@@ -70,7 +83,21 @@ _AGENT_MAX_TURNS: dict[str, int] = {
     # so the CLI terminated the dispatch via ``error_max_turns`` (17 of 18
     # captured transcripts). The robust complement is a bounded prompt
     # workload (test_engineer.md); this budget bump is belt-and-suspenders.
-    "test_engineer": 8,
+    #
+    # WS-2a (slice4 forensic, 2026-07-12): bumped 8 → 12. The prior 5→8 bump
+    # was the right direction but "not enough" — 8 is structurally
+    # insufficient for the test_engineer's MANDATED workload (write AND run
+    # tests + iterate on failures), a heavier tool-call sequence than the
+    # read-only reviewer's (which sits at 8). The forensic shows this role
+    # crippled 9/10 (only 4/23 test runs ran clean). 12 = ceil(8 × 1.5) —
+    # the budget-escalation ladder's attempt-1 rung
+    # (:mod:`orchestrator.budget_escalation`), promoted to the floor because
+    # attempt-0 turn-exhaustion is now the *dominant* defect; the ladder's
+    # remaining rungs (→18, →24) stay as retry headroom. Stays strictly above
+    # the reviewer's 8 (write+run > read+verdict) and below the developer's
+    # medium-task budget (20). Huge repos scale it 2.0× via the
+    # ``test_engineer`` key in ``task_overrides.huge_repo_multipliers``.
+    "test_engineer": 12,
     "critic_sounding_board": 3,
     "critic_drift_verifier": 3,
     "docs": 3,

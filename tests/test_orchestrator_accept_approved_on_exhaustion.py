@@ -368,3 +368,72 @@ async def test_helper_accepts_and_resets_stuck_state(tmp_path: Path) -> None:
     assert result.status == "complete"
     stuck = await orch.plan_manager.get_stuck_state("0.1")
     assert stuck.discard_count == 0
+
+
+# ---------------------------------------------------------------------------
+# WS-2a: an exhaustion-accepted task is NOT a clean test-verified pass. The
+# reviewer statically APPROVED but the tests never ran (the developer
+# turn-exhausted), so the completion carries a distinct ``needs_verification``
+# marker + a distinctly-named ledger op so downstream / reporting never
+# mistakes it for a test-verified completion. (The Tier-J salvage is
+# UNCHANGED — the task is still accepted / completed.)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_accept_stamps_needs_verification_metadata(
+    tmp_path: Path,
+) -> None:
+    """The completed task's ``metadata`` carries the distinct, PERSISTED
+    ``completion_reason=accepted_approved_on_exhaustion`` marker so downstream
+    / reporting never mistakes an exhaustion-accept (reviewer statically
+    APPROVED, tests never ran) for a clean test-verified pass. (The explicit
+    ``needs_verification`` boolean rides the ledger op — asserted separately.)
+    """
+    await _seed_review(tmp_path, "0.1", "APPROVED")
+    await _seed_coder(tmp_path, "0.1", "")
+    adapter = StubAdapter({})
+    orch = await _make_orch(tmp_path, adapter)
+    await orch.plan_manager.update_task_status("0.1", "in_progress")
+    task = await orch.plan_manager.get_task("0.1")
+    assert task is not None
+
+    result = await ep._maybe_accept_approved_on_exhaustion(
+        orch, task, _escalation_exhausted_fail()
+    )
+    assert result is not None
+    assert result.status == "complete"
+    # The distinguishing, persisted marker: never a clean verified pass. It is
+    # distinct from the conflict-recovery marker (conflict_fallback_recovered)
+    # and absent on a normal verified completion.
+    assert result.metadata.get("completion_reason") == (
+        "accepted_approved_on_exhaustion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_accept_ledger_op_carries_needs_verification(
+    tmp_path: Path,
+) -> None:
+    """The distinctly-named ``accepted_approved_on_exhaustion`` ledger op
+    carries ``needs_verification=True`` in its payload so a forensic replay /
+    reporting layer can distinguish an exhaustion-accept from a verified pass
+    without inspecting task metadata."""
+    await _seed_review(tmp_path, "0.1", "APPROVED")
+    await _seed_coder(tmp_path, "0.1", "")
+    adapter = StubAdapter({"developer": _escalation_exhausted_fail()})
+    orch = await _make_orch(tmp_path, adapter)
+
+    tasks = await orch.execute()
+    assert tasks[0].status == "complete"
+
+    from state.ledger import read_entries
+
+    accept_ops = [
+        e for e in read_entries(tmp_path)
+        if e.op == "accepted_approved_on_exhaustion"
+    ]
+    assert len(accept_ops) == 1
+    assert accept_ops[0].payload.get("needs_verification") is True
+    # The salvage semantics are unchanged: still an APPROVED accept.
+    assert accept_ops[0].payload.get("verdict") == "APPROVED"

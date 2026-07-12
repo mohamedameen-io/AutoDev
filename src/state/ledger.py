@@ -573,8 +573,14 @@ LedgerOp = Literal[
     # approved (empty-diff) artifact and completes the task. Audit-only — the
     # actual ``status="complete"`` transition flows through the regular
     # ``update_task_status`` op emitted alongside; replay is a no-op forensic
-    # breadcrumb. Payload shape:
-    # ``{task_id: str, verdict: str, subtype: str, diff_empty: bool}``.
+    # breadcrumb. WS-2a: the payload carries ``needs_verification=True`` and
+    # the ``complete`` transition's meta carries
+    # ``completion_reason="accepted_approved_on_exhaustion"`` (the persisted,
+    # whitelisted task-metadata marker) because the reviewer statically
+    # APPROVED but the tests never ran — so downstream / reporting can
+    # distinguish this from a test-verified completion. Payload shape:
+    # ``{task_id: str, verdict: str, subtype: str, diff_empty: bool,
+    # needs_verification: bool}``.
     "accepted_approved_on_exhaustion",
     # WS5 (ask_human dead-end → best-effort-commit): under
     # ``cfg.resolver.on_ask_human="best_effort_commit"``, when the recovery

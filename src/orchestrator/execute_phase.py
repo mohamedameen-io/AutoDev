@@ -9374,6 +9374,25 @@ async def _maybe_accept_approved_on_exhaustion(
     # distinguishes the no-op-diff research task from the applied-prior-diff
     # case in the breadcrumb + ledger op.
     _actual_diff_empty = worktree_diff is None or not worktree_diff.strip()
+    # WS-2a (slice4 forensic, 2026-07-12): this task is being SALVAGED on
+    # turn-exhaustion — the reviewer statically APPROVED, but the tests never
+    # ran (the developer ran out of turns). That is NOT a clean test-verified
+    # completion, and treating it as one masks how wrong/incomplete fixes ship
+    # "APPROVED". We KEEP the Tier-J salvage (the task is still accepted /
+    # completed) but stamp it so downstream / reporting can tell a
+    # test-verified completion apart from an exhaustion-accepted one:
+    #   * task metadata carries ``completion_reason=accepted_approved_on_exhaustion``
+    #     — the WS5/WS3-precedent, whitelisted, PERSISTED self-describing marker
+    #     (distinct from conflict-recovery's ``conflict_fallback_recovered`` and
+    #     absent on a normal verified pass);
+    #   * the distinctly-named ``accepted_approved_on_exhaustion`` ledger op AND
+    #     the structured log carry the explicit ``needs_verification=True``
+    #     boolean.
+    # (A literal ``needs_verification`` boolean on ``task.metadata`` would
+    # require extending the ``PlanManager.update_task_status`` meta whitelist —
+    # outside WS-2a's config/exhaustion-region lane — so the persisted
+    # task-metadata distinction rides ``completion_reason``. Recommended
+    # follow-up: promote it to a whitelisted boolean.)
     return await _walk_task_to_complete(
         orch,
         task,
@@ -9382,15 +9401,18 @@ async def _maybe_accept_approved_on_exhaustion(
             "verdict": "APPROVED",
             "subtype": subtype or "unknown",
             "diff_empty": _actual_diff_empty,
+            "needs_verification": True,
         },
         complete_meta={
-            "evidence_bundle": f".autodev/evidence/{task.id}-review.json"
+            "completion_reason": "accepted_approved_on_exhaustion",
+            "evidence_bundle": f".autodev/evidence/{task.id}-review.json",
         },
         log_event="execute_phase.accepted_approved_on_exhaustion",
         log_fields={
             "subtype": subtype,
             "verdict": "APPROVED",
             "diff_empty": _actual_diff_empty,
+            "needs_verification": True,
         },
     )
 

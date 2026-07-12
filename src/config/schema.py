@@ -1009,13 +1009,30 @@ class TaskOverridesConfig(BaseModel):
             # pinned the legacy role name. Scheduled for removal in
             # v0.39.0 alongside the recent_evidence_include_kinds shim.
             "coder": 2.0,
+            # WS-2a (slice4 forensic, 2026-07-12): the developer floor was
+            # raised 10 → 15 in ``config.defaults``. This 2.0× role key is
+            # consumed for the huge-repo ``huge_repo_multiplier_applied``
+            # telemetry op on the *task* dispatch path; the developer's actual
+            # per-task huge-repo budget scaling flows through the
+            # COMPLEXITY-keyed curve in ``tournament/task_overrides.py``
+            # (``_HUGE_BUCKET_MULTIPLIERS``), not this role key.
             "developer": 2.0,
             # v0.39.0 C1: bumped 1.5 → 2.5 so non-task reviewer turns scale
             # enough on huge repos (base 5 × 2.5 ≈ 13 ≥ the empirically-
             # needed 12). Small-repo reviewer stays at the base 5.
             "reviewer": 2.5,
             "domain_expert": 1.5,
-            "test_engineer": 1.5,
+            # WS-2a (slice4 forensic, 2026-07-12): bumped 1.5 → 2.0. The
+            # test_engineer floor was raised 8 → 12 in ``config.defaults``;
+            # this role key genuinely scales that per-role budget on the
+            # NON-task dispatch path (``execute_phase`` scales
+            # ``spec_max_turns`` by the role multiplier when the repo is
+            # huge). The heaviest write+run role must scale AT LEAST as much
+            # as the lighter read+verdict roles (domain_expert 1.5), and to
+            # parity with the developer key (2.0) — the prior 1.5 predated the
+            # floor bump and under-scaled the role. Effective huge-repo budget:
+            # 12 × 2.0 = 24.
+            "test_engineer": 2.0,
             # v0.37.0 H5: knob-keyed. The :mod:`orchestrator.huge_repo_overrides`
             # resolver looks these up by knob name and applies the
             # multiplier to the operator's configured base value.

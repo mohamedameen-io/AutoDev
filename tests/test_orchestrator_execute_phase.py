@@ -578,9 +578,9 @@ async def test_developer_max_turns_falls_back_to_spec_when_complexity_none(
     tmp_path: Path,
 ) -> None:
     """Regression — v0.7.0 behavior preserved when ``Task.complexity is None``.
-    The developer's invocation uses ``spec.max_turns`` (10 in defaults) and
-    the orchestrator-level fallback timeout (``_DEFAULT_DEVELOPER_TIMEOUT_S
-    = 900``).
+    The developer's invocation uses ``spec.max_turns`` (the per-role floor in
+    defaults) and the orchestrator-level fallback timeout
+    (``_DEFAULT_DEVELOPER_TIMEOUT_S = 900``).
     """
     adapter = StubAdapter(
         {
@@ -592,8 +592,9 @@ async def test_developer_max_turns_falls_back_to_spec_when_complexity_none(
     orch = await _orch_with_complexity_plan(tmp_path, adapter, None)
     await orch.execute()
     inv = _developer_invocation(adapter)
-    # spec.max_turns for the developer is 10 in default_config().
-    assert inv.max_turns == 10
+    # WS-2a: spec.max_turns for the developer is 15 in default_config()
+    # (the fallback base for an untagged task — floor raised 10 → 15).
+    assert inv.max_turns == 15
     # Orchestrator fallback when no per-task override: 900s.
     assert inv.timeout_s == 900
 
