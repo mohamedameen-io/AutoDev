@@ -312,12 +312,25 @@ async def test_worktree_apply_infra_fault_produces_worktree_apply_failed(
     repo.mkdir()
     _git_init(repo)
 
-    from orchestrator.worktree import WorktreeError
+    from orchestrator.worktree import WorktreeError, WorktreeManager
 
     async def _boom(*_a: Any, **_k: Any) -> bool:
         raise WorktreeError("git index.lock held; apply impossible (infra fault)")
 
     monkeypatch.setattr(ep, "_apply_with_conflict_escalation", _boom)
+    # WS3 widening: the validated-patch recovery hook now fires on ANY terminal
+    # block (not just conflict-exhaustion) and attempts its OWN unforced apply of
+    # the recovered patch to main. A genuine "apply impossible" INFRA fault
+    # (index.lock held) affects EVERY git-apply op, so the recovery's fresh apply
+    # must fail too — otherwise this test's partial simulation would let the
+    # validated diff recover and mask the WORKTREE_APPLY_FAILED classification
+    # this test exists to verify. Patch the recovery's apply path to raise the
+    # same fault so the task correctly stays blocked (the recovery's clean-apply
+    # safety net holding, exactly as it would against a real index.lock).
+    async def _apply_boom(*_a: Any, **_k: Any) -> None:
+        raise WorktreeError("git index.lock held; apply impossible (infra fault)")
+
+    monkeypatch.setattr(WorktreeManager, "apply_diff_text_to_main", _apply_boom)
 
     adapter = StubAdapter(
         {

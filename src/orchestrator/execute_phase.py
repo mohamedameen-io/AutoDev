@@ -59,7 +59,7 @@ from qa import (
 from qa.code_size import run_code_size
 from qa.debug_tag_gate import run_debug_tag_gate
 from qa.reproduce_gate import run_reproduce_gate
-from state.paths import AUTODEV_DIR, autodev_root
+from state.paths import AUTODEV_DIR, autodev_root, patch_path
 from state.schemas import (
     CoderEvidence,
     CriticEvidence,
@@ -9479,17 +9479,21 @@ async def _maybe_recover_validated_patch_on_conflict_exhaustion(
     *,
     failure_class: str,
 ) -> "Task | None":
-    """WS3: recover an already-VALIDATED patch discarded over a mechanical merge
-    collision, instead of blocking the task.
+    """WS3: recover an already-VALIDATED patch on ANY terminal block, instead
+    of discarding it.
 
     Structurally identical to Tier J's
     :func:`_maybe_accept_approved_on_exhaustion` — "don't discard a validated
-    result over an unrelated mechanical failure" — but for the merge-conflict
-    cascade rather than turn-exhaustion. Hooked into
+    result over an unrelated mechanical failure" — but for the terminal-block
+    path rather than turn-exhaustion. Hooked into
     :func:`orchestrator.blocker_guard.block_task` (the sole enforced ``blocked``
     committer) immediately before its final blocked commit, so the recovery
     COMPLETES the task and short-circuits the block — it never adds a second
     ``blocked`` committer.
+
+    (The name is RETAINED for continuity with its out-of-tree doc references and
+    persisted ledger-op / marker strings; the helper is NO LONGER conflict-only
+    — see gate (1) below.)
 
     Returns the completed ``Task`` when the validated patch is recovered, or
     ``None`` (no-op) when the strict gate does not hold — in which case
@@ -9497,29 +9501,50 @@ async def _maybe_recover_validated_patch_on_conflict_exhaustion(
 
     The gap: a task whose winning patch is already validated (a GENUINE,
     non-soft-passed reviewer ``APPROVED`` + a converged, judge-ranked tournament
-    winner) fails to land on ``main`` purely because of a stale-base merge
-    collision. The conflict-escalation cascade exhausts its 3-way / rewrite /
-    abandon rungs and discards the whole validated result. The failure is
-    infrastructural, not a semantic verdict.
+    winner) reaches a terminal ``blocked`` state and its whole validated result
+    is silently discarded. Originally this recovery fired ONLY for the three
+    merge-conflict-exhaustion classes; the forensic finding (django-10914 /
+    flask-4992) is that the SAME reviewer-APPROVED, sometimes gold-identical
+    patch is dropped when the block is for a NON-conflict reason
+    (``test_diagnosis_hardfail``, a turn-budget / ``guardrail_exceeded`` overrun,
+    a ``worker_exception``). The discard is infrastructural, not a semantic
+    verdict.
 
-    Gate STRICTLY (all must hold):
+    Gate STRICTLY (all must hold). The genuine reviewer APPROVED (2) is the
+    validation and the unforced clean-apply (4) is the hard safety net, so the
+    failure class no longer restricts recovery (3a) — with ONE principled
+    exception (1):
 
-    1. ``failure_class`` is one of the three conflict-exhaustion classes
-       (:data:`orchestrator.failure_classes.CONFLICT_EXHAUSTION_FAILURE_CLASSES`).
-       Any other class is NOT this discard mode and is left to the caller's
-       block. (``block_task`` also pre-gates on this set; re-checked here so the
-       helper is safe to call directly / in tests.)
+    1. Recovery is attempted on ANY terminal block EXCEPT ``TESTS_FAILED`` (a
+       single DENY, NOT an allow-list). ``TESTS_FAILED`` means the fix's OWN
+       tests actually RAN and at least one FAILED (a genuine correctness signal,
+       ``diagnosis == "ok"`` — distinct from ``TEST_DIAGNOSIS_HARDFAIL`` /
+       ``turn_budget_exhausted``, where the tests could NOT run). Tests are the
+       arbiter: a static reviewer APPROVED must NOT override demonstrated failing
+       tests, not even behind ``needs_verification``. Every OTHER class recovers
+       — merge-conflict exhaustion, ``test_diagnosis_hardfail`` /
+       turn-budget→``guardrail_exceeded`` / infra where the tests could not run
+       or the failure is unrelated to the fix's correctness — because none of
+       those demonstrate the fix is wrong. ``failure_class`` is otherwise
+       recorded for observability only; a ``REVIEW_REJECTED`` / malformed block
+       also correctly won't recover — no genuine APPROVED verdict (2).
     2. A GENUINE reviewer ``APPROVED`` verdict is on record
        (``{task_id}-review.json``). Any other verdict — or an INFRA soft-pass
        ``APPROVED`` (``soft_passed=True``, R7) which never carried a real
        reviewer verdict — is refused; completing on it would certify an
        unreviewed diff.
-    3. A recoverable winning diff exists: the converged tournament winner
-       (``{task_id}-tournament.json`` ``final_diff``), else — when no converged
-       tournament winner is on record — the validated developer patch
-       (``{task_id}-developer.json`` ``diff``). Both are the SAME validated
-       artifact the ``APPROVED`` verdict in (2) reviewed; an empty/absent diff
-       is a no-op fall-through.
+    3. A non-empty VALIDATED diff is resolvable from the source ladder (first
+       non-empty wins): a CONVERGED tournament winner
+       (``{task_id}-tournament.json`` ``final_diff``, PREFERRED when present) →
+       the validated developer patch (``{task_id}-developer.json`` ``diff``) →
+       the durable ``evidence/{task_id}.patch`` (3b). A converged tournament is
+       PREFERRED but NOT required — the real discarded cases (django-10914 task
+       1.1, flask-4992 task 1.c3) are SINGLE-CANDIDATE with NO tournament
+       evidence at all; requiring a converged winner would re-exclude EXACTLY the
+       cases this recovery exists for. ``error_max_turns`` truncation empties the
+       JSON diffs, so the winning patch often survives ONLY as the durable
+       evidence patch — without that fallback even a fired recovery finds
+       nothing. An empty/absent diff across all three sources is a no-op.
     4. The recovered patch applies CLEANLY and UNFORCED to the CURRENT ``main``
        HEAD. The apply is never forced (no 3-way / rewrite / abandon): a clean
        apply succeeding or failing IS the safety check. A patch that genuinely
@@ -9533,8 +9558,9 @@ async def _maybe_recover_validated_patch_on_conflict_exhaustion(
     :func:`_walk_task_to_complete` primitive (Tier J's completion step — this
     helper brings its OWN unforced apply, since the helper is apply-agnostic),
     stamped with ``resolver_action="conflict_fallback_recovered"`` +
-    ``needs_human_review`` metadata and a distinctly-named ledger op so nothing
-    downstream mistakes it for a normal clean pass.
+    ``needs_human_review`` metadata and a distinctly-named ledger op carrying
+    ``needs_verification=True`` (the WS-2a convention) so nothing downstream
+    mistakes it for a normal test-verified clean pass.
 
     Resume-safety: apply → ledger → FSM-walk, mirroring Tier J / WS5. A crash
     after the unforced apply's git commit but before the FSM-walk cannot
@@ -9543,11 +9569,27 @@ async def _maybe_recover_validated_patch_on_conflict_exhaustion(
     apply --check`` fails and the re-run falls through to the block — the work
     is preserved on ``main`` exactly once, never applied twice.
     """
-    # (1) Failure-class gate — exactly the three conflict-exhaustion classes.
-    if failure_class not in _fcls.CONFLICT_EXHAUSTION_FAILURE_CLASSES:
-        return None
-
     from state.evidence import read_evidence  # noqa: PLC0415 — break cycle
+
+    # (1) Recovery is attempted on ANY terminal block (3a) — this is a single
+    #     principled DENY, NOT an allow-list of recoverable classes: EVERY class
+    #     recovers EXCEPT ``TESTS_FAILED``. A ``TESTS_FAILED`` block means the
+    #     fix's OWN tests actually RAN and at least one FAILED (a genuine
+    #     correctness signal, ``diagnosis == "ok"`` — distinct from
+    #     ``TEST_DIAGNOSIS_HARDFAIL`` / ``turn_budget_exhausted`` where the tests
+    #     could NOT run). Tests are the arbiter: a static reviewer ``APPROVED``
+    #     must NOT override demonstrated failing tests and ship the work as
+    #     "recovered" in an unattended run — not even behind a
+    #     ``needs_verification`` flag. Recovery is for blocks that do NOT
+    #     demonstrate the fix is wrong (merge-conflict exhaustion, tests-couldn't-
+    #     run, turn-exhaustion, infra); a real ran-and-failed result is exactly
+    #     the case it must leave blocked. Every OTHER class still recovers under
+    #     the validation gate (2)+(3) + the unforced clean-apply (4); a
+    #     ``REVIEW_REJECTED`` / malformed block also won't recover — it has no
+    #     genuine APPROVED verdict (2). ``failure_class`` is otherwise recorded
+    #     for observability only.
+    if failure_class == _fcls.TESTS_FAILED:
+        return None
 
     # (2) Genuine, non-soft-passed reviewer APPROVED on record.
     try:
@@ -9574,8 +9616,23 @@ async def _maybe_recover_validated_patch_on_conflict_exhaustion(
         )
         return None
 
-    # (3) Recoverable winning diff: converged tournament winner, else the
-    #     validated developer patch (same artifact the APPROVED review covered).
+    # (3) A recoverable, non-empty VALIDATED diff must exist — resolved from the
+    #     ladder below (first non-empty wins). It is the SAME artifact the genuine
+    #     APPROVED review (2) covered; the unforced clean-apply (4) is the hard
+    #     safety net. Ladder: a CONVERGED tournament winner
+    #     (``{task_id}-tournament.json`` ``final_diff``, PREFERRED when present) →
+    #     the validated developer patch (``{task_id}-developer.json`` ``diff``) →
+    #     the durable ``evidence/{task_id}.patch`` (3b).
+    #
+    #     A converged tournament winner is PREFERRED but NOT required: the real
+    #     discarded cases (django-10914 task 1.1, flask-4992 task 1.c3) are
+    #     SINGLE-CANDIDATE with NO tournament evidence on record at all — their
+    #     winning patch survives only as the developer diff or the durable
+    #     evidence patch. Requiring a converged winner as a GATE here would
+    #     re-exclude EXACTLY the cases this recovery exists for. ``error_max_turns``
+    #     truncation empties the JSON diffs, so the patch often survives ONLY as
+    #     the evidence patch — without that fallback even a fired recovery finds
+    #     nothing. An empty/absent diff across all three sources is a no-op.
     winning_diff: str | None = None
     diff_source: str | None = None
     try:
@@ -9596,6 +9653,17 @@ async def _maybe_recover_validated_patch_on_conflict_exhaustion(
         if _dd and _dd.strip():
             winning_diff = _dd
             diff_source = "developer_patch"
+    if winning_diff is None:
+        # (3b) Fallback: the durable ``evidence/{task}.patch`` copy — the ONLY
+        # place the winning patch survives when both JSON diffs were truncated.
+        try:
+            _pf = patch_path(orch.cwd, task.id)
+            _pt = _pf.read_text(encoding="utf-8") if _pf.exists() else None
+        except OSError:  # defensive: an unreadable patch file is a no-op source
+            _pt = None
+        if _pt and _pt.strip():
+            winning_diff = _pt
+            diff_source = "evidence_patch"
     if winning_diff is None:
         return None
 
@@ -9647,6 +9715,7 @@ async def _maybe_recover_validated_patch_on_conflict_exhaustion(
         ledger_payload={
             "failure_class": failure_class,
             "needs_human_review": True,
+            "needs_verification": True,
             "resolver_action": "conflict_fallback_recovered",
             "diff_source": diff_source,
         },
@@ -9661,6 +9730,7 @@ async def _maybe_recover_validated_patch_on_conflict_exhaustion(
             "failure_class": failure_class,
             "diff_source": diff_source,
             "needs_human_review": True,
+            "needs_verification": True,
         },
     )
 

@@ -1,26 +1,48 @@
-"""WS3 — recover validated work on conflict-exhaustion instead of discarding it.
+"""WS3 — recover an already-VALIDATED patch on ANY terminal block.
 
 Root cause (the discarded-work class): when a task's already-VALIDATED patch
 (a genuine, non-soft-passed reviewer ``APPROVED`` + a converged, judge-ranked
-tournament winner) fails to land on ``main`` purely because of a *mechanical*
-merge collision, the conflict-escalation cascade exhausts its 3-way / rewrite /
-abandon rungs and ``block_task`` discards the whole validated result. The
-failure is infrastructural (a stale-base collision), not a semantic verdict —
-exactly the "don't discard a validated result over an unrelated mechanical
-failure" gap Tier J's ``_maybe_accept_approved_on_exhaustion`` already solves
-for turn-exhaustion.
+tournament winner) fails to land on ``main``, ``block_task`` discards the whole
+validated result. The original WS3 recovered ONLY when the terminal block was
+one of the three merge-conflict-exhaustion classes; the forensic finding
+(slice3, django-10914 / flask-4992) is that the SAME reviewer-APPROVED,
+sometimes gold-identical patch is silently discarded when a task reaches a
+terminal ``blocked`` state for a NON-conflict reason — ``test_diagnosis_hardfail``,
+a turn-budget/``guardrail_exceeded`` overrun, a ``worker_exception``. The
+discard is infrastructural, not a semantic verdict — exactly the "don't discard
+a validated result over an unrelated mechanical failure" gap Tier J's
+``_maybe_accept_approved_on_exhaustion`` already solves for turn-exhaustion.
 
-Fix (modelled on Tier J): a new helper
-``_maybe_recover_validated_patch_on_conflict_exhaustion`` hooked into
-``block_task`` (the sole enforced ``blocked`` committer) immediately before its
-final blocked commit, gated on the three conflict failure classes. On a
-genuinely-validated task it attempts ONE clean, UNFORCED apply of the recovered
-patch against the *current* ``main`` HEAD (the apply succeeding or failing IS
-the safety check — nothing is forced). On success it walks the same FSM chain
-Tier J uses to reach ``complete`` (via the shared ``_walk_task_to_complete``),
-stamped with distinguishing metadata (``resolver_action:
-"conflict_fallback_recovered"`` + ``needs_human_review``) and a distinctly-named
-ledger op so nothing downstream mistakes it for a normal clean pass.
+Fix (two parts):
+  * (3a) WIDEN the trigger — recovery is attempted on ANY terminal block,
+    gated NOT by failure class but by the presence of a GENUINE
+    (non-soft-passed) reviewer-``APPROVED`` verdict AND a non-empty validated
+    diff resolvable from the source ladder (below). The genuine APPROVED review
+    + the unforced clean-apply-vs-live-``main`` check ARE the safety; the failure
+    class no longer restricts it. (A ``REVIEW_REJECTED`` / malformed block has no
+    genuine APPROVED verdict, so it correctly won't recover.) A converged
+    tournament winner is the PREFERRED diff source when present, but is NOT
+    required — the real discarded cases (django-10914 / flask-4992) are
+    single-candidate with NO tournament evidence at all, so requiring a converged
+    winner would re-exclude exactly the cases this recovery exists for.
+  * (3b) ADD an ``evidence/{task}.patch`` fallback diff source, used when
+    ``tournament.final_diff`` / ``developer.json.diff`` are empty/absent — the
+    compounding failure: ``error_max_turns`` truncates the developer return and
+    empties the JSON diffs, so the APPROVED fix survives ONLY as the durable
+    ``evidence/{task}.patch``.
+
+The recovery helper ``_maybe_recover_validated_patch_on_conflict_exhaustion``
+(name retained for continuity with its out-of-tree references; it is no longer
+conflict-only) is hooked into ``block_task`` (the sole enforced ``blocked``
+committer) immediately before its final blocked commit. On a genuinely-validated
+task it attempts ONE clean, UNFORCED apply of the recovered patch against the
+*current* ``main`` HEAD (the apply succeeding or failing IS the safety check —
+nothing is forced). On success it walks the same FSM chain Tier J uses to reach
+``complete`` (via the shared ``_walk_task_to_complete``), stamped with
+distinguishing metadata (``resolver_action: "conflict_fallback_recovered"`` +
+``needs_human_review``) and a distinctly-named ledger op carrying
+``needs_verification=True`` so nothing downstream mistakes it for a normal
+test-verified clean pass.
 
 Multiple siblings with independently-validated patches are handled "for free":
 each task's own ``block_task`` call re-checks against LIVE ``main`` at its own
@@ -42,7 +64,7 @@ from orchestrator import execute_phase as ep
 from orchestrator import failure_classes as fc
 from orchestrator.blocker_guard import block_task
 from state import ledger as ledger_mod
-from state.evidence import write_evidence
+from state.evidence import write_evidence, write_patch
 from state.schemas import (
     AcceptanceCriterion,
     CoderEvidence,
@@ -201,6 +223,13 @@ async def _seed_developer(orch: Orchestrator, tid: str, *, diff: str | None) -> 
     await write_evidence(orch.cwd, tid, CoderEvidence(task_id=tid, diff=diff))
 
 
+async def _seed_patch(orch: Orchestrator, tid: str, *, diff: str) -> None:
+    """Persist the winning patch to ``evidence/{tid}.patch`` (the durable copy
+    that survives when ``error_max_turns`` truncates the developer/tournament
+    JSON diffs — the WS3 (3b) fallback diff source)."""
+    await write_patch(orch.cwd, tid, diff)
+
+
 async def _get(orch: Orchestrator, tid: str) -> Task:
     t = await orch.plan_manager.get_task(tid)
     assert t is not None
@@ -240,7 +269,9 @@ async def _blocked_task_with_recoverable_evidence(
 
 
 # ===========================================================================
-# 1. Failure-class gate: only the three conflict-exhaustion classes
+# 1. Failure-class scope: recovery fires on ANY terminal block EXCEPT
+#    TESTS_FAILED (the one deny — a demonstrated ran-and-failed correctness
+#    signal). The conflict-exhaustion classes are no longer the gate.
 # ===========================================================================
 
 CONFLICT_CLASSES = (
@@ -251,8 +282,11 @@ CONFLICT_CLASSES = (
 
 
 def test_conflict_exhaustion_failure_classes_are_exactly_the_three() -> None:
-    """The gate set must be EXACTLY the three conflict-exhaustion classes — no
-    more (a broader gate would recover over unrelated failures), no fewer."""
+    """Anti-drift guard on the taxonomy grouping. As of WS3's widening this set
+    is NO LONGER the recovery gate (recovery is gated on the validation signals,
+    not the failure class); it is retained purely as the named grouping of the
+    three merge-conflict-exhaustion classes that terminate the conflict cascade.
+    Its membership must not silently drift."""
     assert fc.CONFLICT_EXHAUSTION_FAILURE_CLASSES == frozenset(CONFLICT_CLASSES)
 
 
@@ -267,17 +301,59 @@ async def test_recovers_for_each_conflict_class(tmp_path: Path) -> None:
         assert recovered.status == "complete", cls
 
 
-async def test_non_conflict_class_never_recovers(tmp_path: Path) -> None:
-    """A non-conflict failure class (even with perfectly recoverable evidence)
-    must be a no-op — the gate is scoped to the conflict cascade only."""
-    repo = tmp_path / "repo"
-    orch, task, _ = await _blocked_task_with_recoverable_evidence(repo)
-    for cls in (fc.WORKER_EXCEPTION, fc.TESTS_FAILED, fc.WORKTREE_APPLY_FAILED):
+async def test_widened_trigger_recovers_on_non_conflict_classes(
+    tmp_path: Path,
+) -> None:
+    """WS3 (3a) widening: a NON-conflict terminal block (with a genuinely
+    recoverable, validated patch) now recovers — the trigger is gated on the
+    validation signals, not the failure class. These are the exact forensic
+    classes (``test_diagnosis_hardfail`` / turn-budget→``guardrail_exceeded`` /
+    ``worker_exception``) that silently dropped reviewer-APPROVED, sometimes
+    gold-identical fixes. (``TESTS_FAILED`` is deliberately NOT here — a
+    demonstrated test failure is a correctness signal recovery must not
+    override; see ``test_tests_failed_block_is_not_recovered``.)"""
+    for i, cls in enumerate(
+        (
+            fc.TEST_DIAGNOSIS_HARDFAIL,
+            fc.GUARDRAIL_EXCEEDED,
+            fc.WORKER_EXCEPTION,
+        )
+    ):
+        repo = tmp_path / f"repo{i}"
+        orch, task, _ = await _blocked_task_with_recoverable_evidence(repo)
         recovered = await ep._maybe_recover_validated_patch_on_conflict_exhaustion(
             orch, task, failure_class=cls
         )
-        assert recovered is None, cls
+        assert recovered is not None, cls
+        assert recovered.status == "complete", cls
+
+
+async def test_tests_failed_block_is_not_recovered(tmp_path: Path) -> None:
+    """The ONE principled deny. A genuine reviewer-APPROVED, cleanly-appliable
+    patch that blocked on ``TESTS_FAILED`` — the fix's OWN tests actually RAN and
+    at least one FAILED (a demonstrated correctness signal, diagnosis=="ok") —
+    must NOT recover. Tests are the arbiter: a static ``APPROVED`` cannot override
+    a real test failure and ship failing work as "recovered" in an unattended
+    run, not even behind a ``needs_verification`` flag. Every OTHER terminal block
+    recovers; this one stays ``blocked``."""
+    repo = tmp_path / "repo"
+    orch, task, _ = await _blocked_task_with_recoverable_evidence(repo)
+    # Hook-level: the exclusion denies recovery outright (no-op).
+    recovered = await ep._maybe_recover_validated_patch_on_conflict_exhaustion(
+        orch, task, failure_class=fc.TESTS_FAILED
+    )
+    assert recovered is None
     assert (await _get(orch, "1.1")).status == "tournamented"
+    # End-to-end through the real chokepoint: it commits the terminal block.
+    result = await block_task(
+        orch,
+        await _get(orch, "1.1"),
+        failure_class=fc.TESTS_FAILED,
+        raw_error="tests_failed: 1 failed",
+        meta={"blocked_reason": "tests_failed: 1 failed"},
+    )
+    assert result.status == "blocked"
+    assert _RECOVER_OP not in _ops(repo)
 
 
 # ===========================================================================
@@ -324,15 +400,22 @@ async def test_no_review_evidence_does_not_recover(tmp_path: Path) -> None:
 
 
 # ===========================================================================
-# 3. Winning-diff source: converged tournament winner, else developer patch
+# 3. Winning-diff source ladder (3b): APPROVED verdict + a non-empty validated
+#    diff resolvable from tournament.final_diff (a CONVERGED winner, PREFERRED
+#    when present) → developer.diff → evidence/{task}.patch. A converged
+#    tournament is PREFERRED but NOT required — the real discarded cases
+#    (django-10914 / flask-4992) are single-candidate with NO tournament at all.
 # ===========================================================================
 
 
 async def test_recovers_from_developer_patch_when_no_tournament(
     tmp_path: Path,
 ) -> None:
-    """Tournament off / absent → the validated developer diff (CoderEvidence) is
-    the winning artifact, gated by the same genuine APPROVED review."""
+    """The single-candidate shape (django-10914 / flask-4992): tournament OFF /
+    absent, so the validated developer diff (CoderEvidence) IS the winning
+    artifact, gated by the same genuine APPROVED review. Requiring a converged
+    tournament here would re-exclude exactly this case — so a converged
+    tournament must be PREFERRED, never REQUIRED."""
     repo = tmp_path / "repo"
     orch, task, _ = await _blocked_task_with_recoverable_evidence(
         repo, use_tournament=False
@@ -344,11 +427,64 @@ async def test_recovers_from_developer_patch_when_no_tournament(
     assert recovered.status == "complete"
 
 
-async def test_non_converged_tournament_does_not_recover_from_it(
+async def test_recovers_from_developer_patch_when_tournament_final_diff_empty(
     tmp_path: Path,
 ) -> None:
-    """A non-converged tournament is NOT a judge-ranked winner — with no other
-    appliable source the task stays unrecovered (falls through to block)."""
+    """Ladder tier 2: a converged tournament winner is on record (PREFERRED) but
+    its ``final_diff`` was emptied by ``error_max_turns`` truncation. The ladder
+    falls through to the validated developer patch (CoderEvidence), which
+    carries the same winning diff → recovery lands it."""
+    repo = tmp_path / "repo"
+    _git_init(repo, {"widget.py": "x = 1\n"})
+    orch = await _mk_orch(repo, [_mk_task("1.1", ["widget.py"])])
+    diff = _make_appliable_diff(repo, "widget.py", "x = 1\nx = 2\n")
+    await _seed_review(orch, "1.1")
+    await _seed_tournament(orch, "1.1", final_diff="", converged=True)  # truncated
+    await _seed_developer(orch, "1.1", diff=diff)
+    await _advance_to_tournamented(orch, "1.1")
+    baseline = _commit_count(repo)
+    recovered = await ep._maybe_recover_validated_patch_on_conflict_exhaustion(
+        orch, await _get(orch, "1.1"), failure_class=fc.CONFLICT_3WAY_FAILED
+    )
+    assert recovered is not None
+    assert recovered.status == "complete"
+    assert _commit_count(repo) == baseline + 1
+    assert "x = 2" in _head_file(repo, "widget.py")
+
+
+async def test_recovers_from_evidence_patch_when_no_tournament(
+    tmp_path: Path,
+) -> None:
+    """WS3 (3b) — the single-candidate compounding case (django-10914 shape).
+    NO tournament evidence at all and the developer diff was emptied by
+    ``error_max_turns`` truncation; the APPROVED fix survives ONLY as
+    ``evidence/{task}.patch`` — the fallback source must find and land it."""
+    repo = tmp_path / "repo"
+    _git_init(repo, {"widget.py": "x = 1\n"})
+    orch = await _mk_orch(repo, [_mk_task("1.1", ["widget.py"])])
+    diff = _make_appliable_diff(repo, "widget.py", "x = 1\nx = 2\n")
+    await _seed_review(orch, "1.1")  # genuine APPROVED, NO tournament seeded
+    await _seed_developer(orch, "1.1", diff=None)  # truncated
+    await _seed_patch(orch, "1.1", diff=diff)  # durable survivor
+    await _advance_to_tournamented(orch, "1.1")
+    baseline = _commit_count(repo)
+    recovered = await ep._maybe_recover_validated_patch_on_conflict_exhaustion(
+        orch, await _get(orch, "1.1"), failure_class=fc.CONFLICT_3WAY_FAILED
+    )
+    assert recovered is not None
+    assert recovered.status == "complete"
+    # The ONLY source with the diff was evidence/{task}.patch → recovery used it.
+    assert _commit_count(repo) == baseline + 1
+    assert "x = 2" in _head_file(repo, "widget.py")
+
+
+async def test_non_converged_tournament_is_not_used_as_a_source(
+    tmp_path: Path,
+) -> None:
+    """A non-converged tournament is NOT a judge-ranked winner, so it is not used
+    as a diff SOURCE — with no other appliable source the task stays unrecovered.
+    (Convergence still governs the TOURNAMENT source; it just no longer gates
+    recovery overall.)"""
     repo = tmp_path / "repo"
     _git_init(repo, {"widget.py": "x = 1\n"})
     orch = await _mk_orch(repo, [_mk_task("1.1", ["widget.py"])])
@@ -363,12 +499,15 @@ async def test_non_converged_tournament_does_not_recover_from_it(
 
 
 async def test_no_appliable_diff_does_not_recover(tmp_path: Path) -> None:
-    """Genuine APPROVED but nothing to apply (empty/absent diff) → no-op."""
+    """Genuine APPROVED but nothing to apply — no diff resolvable from ANY ladder
+    source (empty/absent tournament, developer, and patch) → no-op."""
     repo = tmp_path / "repo"
     _git_init(repo, {"widget.py": "x = 1\n"})
     orch = await _mk_orch(repo, [_mk_task("1.1", ["widget.py"])])
     await _seed_review(orch, "1.1")
     await _seed_tournament(orch, "1.1", final_diff="   \n")  # whitespace-only
+    await _seed_developer(orch, "1.1", diff=None)  # empty
+    # No evidence/{task}.patch written → the ladder resolves nothing.
     await _advance_to_tournamented(orch, "1.1")
     recovered = await ep._maybe_recover_validated_patch_on_conflict_exhaustion(
         orch, await _get(orch, "1.1"), failure_class=fc.CONFLICT_3WAY_FAILED
@@ -507,17 +646,43 @@ async def test_block_task_recovers_instead_of_blocking(tmp_path: Path) -> None:
     assert _RECOVER_OP in _ops(repo)
 
 
-async def test_block_task_non_conflict_still_blocks(tmp_path: Path) -> None:
-    """A non-conflict failure class with the SAME recoverable evidence still
-    blocks — proves the block_task hook is gated to the conflict classes."""
+async def test_block_task_recovers_on_non_conflict_class_when_validated(
+    tmp_path: Path,
+) -> None:
+    """WS3 (3a) via the real chokepoint: ``block_task`` on a NON-conflict class
+    (``test_diagnosis_hardfail``) with the SAME recoverable evidence now
+    short-circuits to ``complete`` instead of blocking — proving the
+    ``blocker_guard`` hook is no longer gated to the conflict classes."""
     repo = tmp_path / "repo"
     orch, task, _ = await _blocked_task_with_recoverable_evidence(repo)
     result = await block_task(
         orch,
         task,
-        failure_class=fc.WORKER_EXCEPTION,
-        raw_error="boom",
-        meta={"blocked_reason": "boom"},
+        failure_class=fc.TEST_DIAGNOSIS_HARDFAIL,
+        raw_error="test_diagnosis: hardfail",
+        meta={"blocked_reason": "test_diagnosis: hardfail"},
+    )
+    assert result.status == "complete"
+    assert result.status != "blocked"
+    assert _RECOVER_OP in _ops(repo)
+
+
+async def test_block_task_still_blocks_when_no_genuine_approved(
+    tmp_path: Path,
+) -> None:
+    """The VALIDATION gate — not the failure class — is the safety. A block on
+    ANY class WITHOUT a genuine reviewer APPROVED (here NEEDS_CHANGES) is never
+    recovered: ``block_task`` commits the terminal ``blocked`` transition."""
+    repo = tmp_path / "repo"
+    orch, task, _ = await _blocked_task_with_recoverable_evidence(
+        repo, verdict="NEEDS_CHANGES"
+    )
+    result = await block_task(
+        orch,
+        task,
+        failure_class=fc.TEST_DIAGNOSIS_HARDFAIL,
+        raw_error="test_diagnosis: hardfail",
+        meta={"blocked_reason": "test_diagnosis: hardfail"},
     )
     assert result.status == "blocked"
     assert _RECOVER_OP not in _ops(repo)
@@ -567,3 +732,89 @@ async def test_resume_after_apply_no_double_apply(
     # fall through. Main STILL has exactly one recovery commit.
     assert result is None
     assert _commit_count(repo) == baseline + 1
+
+
+# ===========================================================================
+# 9. WS3 widening — end-to-end through block_task on a NON-conflict block, with
+#    the winning diff surviving ONLY in evidence/{task}.patch (the exact
+#    forensic class: django-10914 / flask-4992 lost the gold fix this way).
+# ===========================================================================
+
+
+async def test_widened_recovery_from_evidence_patch_on_test_diagnosis_hardfail(
+    tmp_path: Path,
+) -> None:
+    """The headline WS3 scenario, faithful to the REAL forensic shape
+    (django-10914 task 1.1 / flask-4992 task 1.c3): a SINGLE-CANDIDATE,
+    reviewer-APPROVED task with NO tournament evidence at all, reaching a
+    terminal ``blocked`` for a NON-conflict reason (``test_diagnosis_hardfail``),
+    whose winning diff was truncated out of the developer JSON so it survives
+    ONLY as ``evidence/{task}.patch``. Driven through the real ``block_task``
+    chokepoint, it must RECOVER to ``complete`` (needs-verification markers + the
+    distinct recovery ledger op) and the validated patch must reach ``main`` —
+    instead of being silently discarded. (No tournament is fabricated: a
+    converged winner must NOT be a precondition for recovery.)"""
+    repo = tmp_path / "repo"
+    _git_init(repo, {"widget.py": "x = 1\n"})
+    orch = await _mk_orch(repo, [_mk_task("1.1", ["widget.py"])])
+    diff = _make_appliable_diff(repo, "widget.py", "x = 1\nx = 2\n")
+    await _seed_review(orch, "1.1")  # genuine APPROVED, NO tournament seeded
+    await _seed_patch(orch, "1.1", diff=diff)  # ONLY surviving copy
+    await _advance_to_tournamented(orch, "1.1")
+    baseline = _commit_count(repo)
+
+    result = await block_task(
+        orch,
+        await _get(orch, "1.1"),
+        failure_class=fc.TEST_DIAGNOSIS_HARDFAIL,
+        raw_error="test_diagnosis: hardfail",
+        meta={"blocked_reason": "test_diagnosis: hardfail"},
+    )
+
+    assert result.status == "complete"
+    assert result.status != "blocked"
+    # Needs-verification markers so nothing mistakes this for a clean pass.
+    assert result.metadata.get("resolver_action") == "conflict_fallback_recovered"
+    assert result.metadata.get("needs_human_review") is True
+    # Distinct recovery ledger op, carrying needs_verification=True.
+    assert _RECOVER_OP in _ops(repo)
+    rec = next(e for e in ledger_mod.read_entries(repo) if e.op == _RECOVER_OP)
+    assert rec.payload.get("needs_verification") is True
+    assert rec.payload.get("failure_class") == fc.TEST_DIAGNOSIS_HARDFAIL
+    # The validated patch actually landed on main (real git apply + commit).
+    assert _commit_count(repo) == baseline + 1
+    assert "x = 2" in _head_file(repo, "widget.py")
+
+
+async def test_widened_safety_net_unapplyable_patch_stays_blocked(
+    tmp_path: Path,
+) -> None:
+    """The safety net, widened. Same single-candidate non-conflict block (diff
+    only in ``evidence/{task}.patch``, no tournament), but the winning patch
+    genuinely CONFLICTS with live ``main`` (a sibling landed a colliding
+    change). The clean, UNFORCED apply fails — so the task must stay ``blocked``
+    (nothing is ever forced in). Proves the widened trigger did not weaken the
+    apply-time safety."""
+    repo = tmp_path / "repo"
+    _git_init(repo, {"widget.py": "x = 1\n"})
+    orch = await _mk_orch(repo, [_mk_task("1.1", ["widget.py"])])
+    diff = _make_appliable_diff(repo, "widget.py", "x = 1\nx = 2\n")
+    await _seed_review(orch, "1.1")  # genuine APPROVED, NO tournament seeded
+    await _seed_patch(orch, "1.1", diff=diff)  # only surviving copy
+    await _advance_to_tournamented(orch, "1.1")
+    # Advance main so the recovered diff's hunk context no longer matches.
+    (repo / "widget.py").write_text("x = 999\n")
+    _git(repo, "commit", "-aqm", "main advanced")
+    baseline = _commit_count(repo)
+
+    result = await block_task(
+        orch,
+        await _get(orch, "1.1"),
+        failure_class=fc.GUARDRAIL_EXCEEDED,
+        raw_error="guardrail: turn budget exhausted",
+        meta={"blocked_reason": "guardrail: turn budget exhausted"},
+    )
+
+    assert result.status == "blocked"
+    assert _RECOVER_OP not in _ops(repo)
+    assert _commit_count(repo) == baseline  # nothing landed on main

@@ -210,12 +210,23 @@ def test_turn_exhaustion_subtype_sets_do_not_drift() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_exhausted_test_engineer_blocks_never_soft_passed(
+async def test_turn_exhausted_test_engineer_never_soft_passed(
     tmp_path: Path,
 ) -> None:
-    """A ``test_engineer`` that exhausts its turn budget twice ends the task
-    ``blocked`` with diagnosis ``turn_budget_exhausted`` — NOT soft-passed —
-    and the dispatch subtype is persisted on ``TestEvidence`` for forensics.
+    """A ``test_engineer`` that exhausts its turn budget twice is correctly
+    DIAGNOSED ``turn_budget_exhausted`` (never silently soft-passed) with the
+    dispatch subtype persisted on ``TestEvidence`` for forensics, and routes to
+    ``block_task`` with ``TEST_DIAGNOSIS_HARDFAIL``.
+
+    Terminal outcome (WS3 widening — SPEC-MANDATED): the winning diff was
+    reviewer-APPROVED and applies cleanly to ``main``, so WS3's validated-patch
+    recovery — which fires on ANY terminal block incl. ``test_diagnosis_hardfail``
+    /turn-budget, the exact spec headline class — COMPLETES the task instead of
+    discarding it, stamped with an explicit ``needs_human_review`` /
+    needs-verification marker. That is NOT a silent soft-pass (WS-1's real
+    guarantee): the diagnosis, retry contract, and forensics below are all
+    intact, and the completion is loudly flagged for human verification rather
+    than certified as a clean test-verified pass.
     """
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -239,18 +250,18 @@ async def test_turn_exhausted_test_engineer_blocks_never_soft_passed(
     assert len(tasks) == 1
     final = tasks[0]
 
-    # Terminal block attributed to the NEW diagnosis, not capture_failed.
-    assert final.status == "blocked", (
-        f"expected blocked, got {final.status} "
+    # Terminal outcome: WS3's validated-patch recovery COMPLETES the task
+    # (spec-mandated for a reviewer-APPROVED, cleanly-appliable diff blocked on
+    # TEST_DIAGNOSIS_HARDFAIL), stamped with an explicit needs-verification
+    # marker — NOT silently soft-passed, and NOT certified as a clean pass.
+    assert final.status == "complete", (
+        f"expected complete (WS3 recovery), got {final.status} "
         f"(blocked_reason={final.blocked_reason})"
     )
-    reason = final.blocked_reason or ""
-    assert "turn_budget_exhausted" in reason, (
-        f"turn-exhausted test_engineer did not attribute to "
-        f"turn_budget_exhausted; blocked_reason={reason!r}"
-    )
-    assert "capture_failed" not in reason, (
-        f"turn-exhausted run misattributed to capture_failed: {reason!r}"
+    assert final.metadata.get("needs_human_review") is True, (
+        "a recovered-but-unverified completion must be loudly flagged "
+        "needs_human_review (never a silent pass); "
+        f"metadata={final.metadata!r}"
     )
 
     # Retried once, then hard-failed on the second occurrence. With
@@ -262,7 +273,8 @@ async def test_turn_exhausted_test_engineer_blocks_never_soft_passed(
     )
 
     # Durable evidence carries the diagnosis + the dispatch-layer subtype, and
-    # is NEVER marked soft-passed.
+    # is NEVER marked soft-passed (the test gate correctly hard-failed; the
+    # completion is WS3 recovery, a DISTINCT explicitly-flagged mechanism).
     ev = await read_evidence(repo, "1.1", "test")
     assert isinstance(ev, TestEvidence)
     assert ev.diagnosis == "turn_budget_exhausted"
