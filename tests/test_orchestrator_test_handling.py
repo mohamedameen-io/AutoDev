@@ -398,3 +398,114 @@ async def test_no_tests_found_persists_diagnosis_in_evidence(
     assert evfile.exists()
     data = json.loads(evfile.read_text())
     assert data.get("diagnosis") == "no_tests_found"
+
+
+# ---------------------------------------------------------------------------
+# WS-4: a ``no_tests_found`` that ALSO reports the expected source change is
+# ABSENT (the test_engineer ``BUGS FOUND:`` contract) must NOT be soft-passed
+# to a clean complete. Reproduces the django-10914 task-2.1 shape: the test
+# agent correctly reported "the source change is missing from this diff", yet
+# the soft-pass discarded that signal and certified the task as passing.
+# ---------------------------------------------------------------------------
+
+
+def _test_engineer_reports_missing_change() -> AgentResult:
+    """A test_engineer result in the django-10914 shape.
+
+    ``success=True`` with zero counts and a "no tests" cue → the classifier
+    diagnoses ``no_tests_found``. The ``BUGS FOUND:`` section carries the
+    missing-change signal the forensic quoted verbatim.
+    """
+    return ok(
+        "RESULTS: passed=0 failed=0 total=0\n"
+        "No tests found that exercise this change.\n"
+        "COVERAGE: N/A\n"
+        "BUGS FOUND: global_settings.py:307 still defines "
+        "FILE_UPLOAD_PERMISSIONS = None; the source change is missing "
+        "from this diff.\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_tests_found_with_missing_change_is_not_soft_passed(
+    tmp_path: Path,
+) -> None:
+    """django-10914 shape: ``no_tests_found`` + "missing change" must NOT pass.
+
+    The developer diff claims a source change, but the test_engineer reports
+    (via ``BUGS FOUND:``) that the expected change is absent. This must be
+    surfaced as a real non-pass (routed to the retry/escalate → resolver/block
+    ladder), NOT soft-passed into a clean ``complete``.
+    """
+    import json
+
+    missing_change = _test_engineer_reports_missing_change()
+
+    # Ample stubs so the retry ladder exhausts on the persistent missing-change
+    # signal rather than running out of stubbed responses.
+    adapter = StubAdapter(
+        {
+            "developer": [_coder_ok_with_diff(f"v{i}") for i in range(8)],
+            "reviewer": _reviewer_approved(),
+            "test_engineer": [missing_change for _ in range(8)],
+        }
+    )
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    tasks = await orch.execute()
+
+    assert len(tasks) == 1
+    final = tasks[0]
+    # Core WS-4 contract: the missing-change signal is NOT soft-passed to a
+    # clean complete.
+    assert final.status != "complete", (
+        f"expected a non-pass, got {final.status} — the missing-change "
+        f"signal was soft-passed and discarded (the WS-4 defect)"
+    )
+    # It surfaced as a real, distinguishable non-pass (blocked or escalated),
+    # and it RETRIED the gate rather than silently accepting the first result.
+    assert final.status == "blocked" or final.escalated
+    assert adapter.count("test_engineer") >= 2
+
+    # The evidence preserves the genuine diagnosis + the BUGS FOUND content and
+    # was NOT stamped as a soft-pass.
+    evfile = tmp_path / ".autodev" / "evidence" / "1.1-test.json"
+    assert evfile.exists()
+    data = json.loads(evfile.read_text())
+    assert data.get("diagnosis") == "no_tests_found"
+    assert data.get("soft_passed") in (None, False)
+
+
+@pytest.mark.asyncio
+async def test_no_tests_found_bugs_found_none_still_soft_passes(
+    tmp_path: Path,
+) -> None:
+    """Regression: a genuine no-test-surface task still soft-passes.
+
+    The LEGITIMATE ``no_tests_found`` case — the task produced its intended
+    change and the test_engineer explicitly reports ``BUGS FOUND: none`` — must
+    behave exactly as before: soft-pass through to ``complete`` with no retry.
+    """
+    legitimate = ok(
+        "RESULTS: passed=0 failed=0 total=0\n"
+        "No tests found in scope for this change.\n"
+        "BUGS FOUND: none\n"
+    )
+
+    adapter = StubAdapter(
+        {
+            "developer": _coder_ok_with_diff(),
+            "reviewer": _reviewer_approved(),
+            "test_engineer": legitimate,
+        }
+    )
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    tasks = await orch.execute()
+
+    final = tasks[0]
+    assert final.status == "complete", (
+        f"expected complete, got {final.status} "
+        f"(blocked_reason={final.blocked_reason})"
+    )
+    assert final.blocked_reason is None
+    # A legitimate no-test-surface run does not retry.
+    assert adapter.count("test_engineer") == 1

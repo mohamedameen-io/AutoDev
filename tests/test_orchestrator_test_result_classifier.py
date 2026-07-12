@@ -15,7 +15,9 @@ import pytest
 
 from orchestrator.test_result_classifier import (
     classify_test_result,
+    parse_bugs_found,
     redact_stderr_tail,
+    reports_missing_change,
 )
 
 
@@ -246,3 +248,67 @@ def test_redact_stderr_tail_respects_tail_size() -> None:
 def test_classify_table(diag: str, result: _FakeResult, counts: tuple[int, int, int]) -> None:
     """Table-driven smoke test — one row per diagnosis."""
     assert classify_test_result(result, counts) == diag
+
+
+# ---------------------------------------------------------------------------
+# WS4: ``BUGS FOUND:`` contract parser + missing-change detector.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_bugs_found_absent_section_returns_none() -> None:
+    """No ``BUGS FOUND:`` line → ``None``."""
+    assert parse_bugs_found("RESULTS: passed=1 failed=0 total=1\nall good") is None
+
+
+def test_parse_bugs_found_none_body_returns_none() -> None:
+    """An explicit ``BUGS FOUND: none`` (and punctuated variants) → ``None``."""
+    assert parse_bugs_found("BUGS FOUND: none") is None
+    assert parse_bugs_found("BUGS FOUND: none.") is None
+    assert parse_bugs_found("BUGS FOUND: None — clean") is None
+
+
+def test_parse_bugs_found_extracts_body() -> None:
+    """A real bug body is returned stripped."""
+    body = parse_bugs_found(
+        "RESULTS: passed=0 failed=0 total=0\n"
+        "BUGS FOUND: off-by-one in range() bound\n"
+    )
+    assert body == "off-by-one in range() bound"
+
+
+def test_parse_bugs_found_stops_at_next_section_header() -> None:
+    """The body does not bleed into a trailing recognised section."""
+    body = parse_bugs_found(
+        "BUGS FOUND: the source change is missing from this diff\n"
+        "COVERAGE: 42%\n"
+    )
+    assert body == "the source change is missing from this diff"
+    assert "COVERAGE" not in (body or "")
+
+
+def test_reports_missing_change_django_shape() -> None:
+    """The django-10914 quote is detected as a missing-change signal."""
+    text = (
+        "RESULTS: passed=0 failed=0 total=0\n"
+        "No tests found that exercise this change.\n"
+        "BUGS FOUND: global_settings.py:307 still defines "
+        "FILE_UPLOAD_PERMISSIONS = None; the source change is missing "
+        "from this diff.\n"
+    )
+    assert reports_missing_change(text) is True
+
+
+def test_reports_missing_change_false_for_bugs_none() -> None:
+    """``BUGS FOUND: none`` is not a missing-change signal (legitimate case)."""
+    assert reports_missing_change("BUGS FOUND: none") is False
+
+
+def test_reports_missing_change_false_for_absent_section() -> None:
+    """No ``BUGS FOUND:`` section → not a missing-change signal."""
+    assert reports_missing_change("RESULTS: passed=0 failed=0 total=0") is False
+
+
+def test_reports_missing_change_false_for_unrelated_bug() -> None:
+    """A real bug that is NOT about a missing change must not over-trigger."""
+    text = "BUGS FOUND: divide-by-zero when denominator is 0"
+    assert reports_missing_change(text) is False

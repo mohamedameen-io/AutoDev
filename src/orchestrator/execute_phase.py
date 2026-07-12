@@ -73,6 +73,7 @@ from state.schemas import (
 from orchestrator.test_result_classifier import (
     classify_test_result,
     redact_stderr_tail,
+    reports_missing_change,
 )
 from tournament.effort import resolve_role_effort
 from tournament.errors import (
@@ -6578,6 +6579,61 @@ async def _execute_one(
             # flag live via getattr. No-op on small repos / escape hatch /
             # when already enabled.
             maybe_enable_auto_soft_pass(orch, diagnosis)
+
+            # WS-4: do NOT soft-pass a "missing change" signal into a clean
+            # pass. A genuine ``no_tests_found`` (the agent ran, success=True,
+            # zero tests) on a task whose developer diff CLAIMS a source change
+            # is legitimate ONLY when the change actually landed. When the
+            # test_engineer instead reports — via its ``BUGS FOUND:`` contract
+            # (agents/prompts/test_engineer.md) — that the expected change is
+            # ABSENT (the django-10914 task-2.1 shape: "the source change is
+            # missing from this diff"), the old soft-pass discarded that signal
+            # and certified the task as passing. Route it through the SAME
+            # retry→escalate ladder as a real test failure so it surfaces as a
+            # distinguishable non-pass (resolver / block path) instead of
+            # silently completing. Scoped to the genuine ``no_tests_found``
+            # diagnosis (the agent actually ran and reported); the infra
+            # ``treat_unrunnable_tests_as_no_tests`` soft-pass below — where the
+            # runner could not run at all — is deliberately untouched.
+            if (
+                diagnosis == "no_tests_found"
+                and (coder_ev.diff or "").strip()
+                and reports_missing_change(test_result.text)
+            ):
+                logger.warning(
+                    "execute_phase.tests_missing_change",
+                    task_id=task.id,
+                    diagnosis=diagnosis,
+                    note=(
+                        "test_engineer BUGS FOUND reported the expected source "
+                        "change is missing; refusing to soft-pass "
+                        "no_tests_found — routing to retry/escalate"
+                    ),
+                )
+                task = await _try_retry_or_escalate(
+                    orch,
+                    task,
+                    retry_limit,
+                    reason=(
+                        "test_engineer reported the expected source change "
+                        "is missing"
+                    ),
+                    # Semantically a real non-pass: the change under test is
+                    # absent. Reuse TESTS_FAILED (the closest existing retry-
+                    # mappable class) — a new class would live in
+                    # failure_classes.py, out of WS-4's lane.
+                    failure_class=_fcls.TESTS_FAILED,
+                    worktree=worktree,
+                    worktree_mgr=worktree_mgr,
+                )
+                if task.escalated:
+                    return task
+                last_issues = [
+                    "test_engineer reported the expected source change is "
+                    "missing (BUGS FOUND)",
+                    test_result.text[:500],
+                ]
+                continue
 
             if diagnosis == "no_tests_found" or (
                 diagnosis in ("capture_failed", "collection_failed", "runtime_crash")

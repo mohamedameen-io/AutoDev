@@ -24,6 +24,7 @@ unit tests.
 
 from __future__ import annotations
 
+import re
 from typing import Literal, Protocol
 
 
@@ -192,4 +193,115 @@ def redact_stderr_tail(stderr: str, tail_chars: int = 1000) -> str:
     return cleaned[-tail_chars:]
 
 
-__all__ = ["TestDiagnosis", "classify_test_result", "redact_stderr_tail"]
+# WS4: the ``test_engineer`` prompt contract (``agents/prompts/test_engineer.md``)
+# mandates that the agent close its report with a ``BUGS FOUND:`` line listing
+# "any source-code bugs discovered while testing, else ``none``". Until now that
+# line had ZERO consumers in ``src/`` — so when the agent correctly reported the
+# expected source change was ABSENT (the django-10914 task-2.1 shape), the signal
+# was parsed by nobody and the ``no_tests_found`` soft-pass discarded it. The two
+# functions below are that contract's first real consumer.
+
+# The recognised report section headers (from the prompt's OUTPUT FORMAT). Used
+# to bound the ``BUGS FOUND:`` body so a trailing section can't leak into it.
+_REPORT_SECTION_HEADERS: tuple[str, ...] = (
+    "RESULTS",
+    "FAILURES",
+    "COVERAGE",
+    "BUGS FOUND",
+    "SKIPPED",
+)
+
+# Conservative "the expected change did not land" phrasings, matched
+# case-insensitively as substrings of the ``BUGS FOUND:`` body. Deliberately
+# narrow: each marker asserts an ABSENT/UNAPPLIED change, so an unrelated source
+# bug the agent happens to report (a real ``BUGS FOUND:`` that is NOT about a
+# missing change) does not trip the missing-change gate. The django-10914 quote
+# — "the source change is missing from this diff" — is the anchor case.
+_MISSING_CHANGE_MARKERS: tuple[str, ...] = (
+    "source change is missing",
+    "source change was not",
+    "change is missing",
+    "change was not applied",
+    "change is not applied",
+    "change is absent",
+    "change is not present",
+    "missing from this diff",
+    "missing from the diff",
+    "not present in this diff",
+    "not present in the diff",
+    "expected change is missing",
+    "expected change is absent",
+    "expected change was not",
+    "expected fix is missing",
+    "fix is missing",
+    "fix was not applied",
+    "fix is not present",
+    "no source change",
+    "source was not modified",
+    "source is unchanged",
+)
+
+
+def parse_bugs_found(text: str) -> str | None:
+    """Extract the ``BUGS FOUND:`` section body from ``test_engineer`` output.
+
+    Honors the prompt's OUTPUT FORMAT contract. The body runs from the
+    ``BUGS FOUND:`` marker to the next recognised section header
+    (:data:`_REPORT_SECTION_HEADERS`) or end-of-text. Returns:
+
+      * ``None`` when no ``BUGS FOUND:`` line is present.
+      * ``None`` when the body is empty or its first word is ``none``
+        (case-insensitive) — the "no bugs" path, indistinguishable from an
+        absent section by design so callers branch once.
+      * the stripped body text otherwise.
+
+    Pure and synchronous — no I/O — so it composes with both the live
+    orchestrator and unit tests (mirrors the module contract).
+    """
+    if not text:
+        return None
+    marker = re.search(r"BUGS\s+FOUND\s*:", text, re.IGNORECASE)
+    if marker is None:
+        return None
+    body = text[marker.end() :]
+    # Truncate at the next recognised section header, if any, so a trailing
+    # section (e.g. a second block) never bleeds into the bugs body.
+    header_alt = "|".join(h.replace(" ", r"\s+") for h in _REPORT_SECTION_HEADERS)
+    nxt = re.search(rf"(?im)^\s*(?:{header_alt})\s*:", body)
+    if nxt is not None:
+        body = body[: nxt.start()]
+    body = body.strip()
+    if not body:
+        return None
+    # A body of "none" (optionally punctuated / annotated, e.g. "none.",
+    # "None — clean") means no bugs were found.
+    if re.match(r"none\b", body, re.IGNORECASE):
+        return None
+    return body
+
+
+def reports_missing_change(text: str) -> bool:
+    """True when ``text`` reports the EXPECTED source change is ABSENT.
+
+    Reads the ``BUGS FOUND:`` section (via :func:`parse_bugs_found` — the
+    test_engineer's contract channel for source-code findings) and matches a
+    conservative set of "missing/absent expected change" phrasings
+    (:data:`_MISSING_CHANGE_MARKERS`). Returns ``False`` when there is no
+    ``BUGS FOUND:`` section, the section says ``none``, or the reported bug is
+    not about a missing change — so the LEGITIMATE no-test-surface case (a task
+    that produced its intended change) is never flagged.
+    """
+    body = parse_bugs_found(text)
+    if body is None:
+        return False
+    body_lower = body.lower()
+    return any(marker in body_lower for marker in _MISSING_CHANGE_MARKERS)
+
+
+__all__ = [
+    "TestDiagnosis",
+    "classify_test_result",
+    "parse_bugs_found",
+    "redact_stderr_tail",
+    "reports_missing_change",
+]
