@@ -419,6 +419,19 @@ def _parse_version(version: str) -> tuple[int, ...] | None:
         return None
 
 
+# WS-6a (slice4 forensic roadmap): the host ``uv`` HARD-FLOORS at this
+# version -- ``uv venv --python 3.6`` (or 3.5) fails outright with
+# "error: Invalid version request: Python <3.7 is not supported", no matter
+# which era-correct interpreter the tables above say a repo/version wants.
+# Several ``_REPO_VERSION_THRESHOLDS`` buckets resolve below this (django's
+# >= 3.0 bucket -> "3.6", django's (1, 4) bucket -> "3.5", astropy's (0, 1)
+# bucket -> "3.6", matplotlib's (1, 0) bucket -> "3.5", scikit-learn's
+# (0, 20) bucket -> "3.6"), so venv creation for those instances fails and
+# the adapter silently degrades to a BLIND solve (tests never run) --
+# confirmed for BOTH django instances in the Phase-1 pilot.
+_HOST_UV_MIN_PYTHON = "3.7"
+
+
 def _resolve_python_version(repo: str, version: str | None) -> str | None:
     """Resolve the era-correct CPython ``"X.Y"`` for a ``(repo, version)``.
 
@@ -428,22 +441,44 @@ def _resolve_python_version(repo: str, version: str | None) -> str | None:
     repo, a version below the repo's lowest bucket, or a missing/unparseable
     version. Never raises: a wrong table is worse than none, so anything not
     positively tabulated falls back.
+
+    HOST FLOOR (WS-6a): a resolved (non-None) version is clamped UP to
+    ``_HOST_UV_MIN_PYTHON`` ("3.7") when it parses below it.
+    ``_REPO_VERSION_THRESHOLDS``/``_REPO_CONSTANT_PYTHON`` are deliberately
+    left UNTOUCHED by this clamp -- they are the verified upstream mirror
+    (see the module docstring above) and stay that way. This is a
+    HOST-CAPABILITY limitation layered on top, not a table correction: the
+    host ``uv`` cannot provision Python < 3.7 at all (see
+    ``_HOST_UV_MIN_PYTHON``'s comment), so returning a sub-3.7 answer as-is
+    would fail venv creation and force a blind solve every time. 3.7 is
+    itself a supported interpreter for these instances' eras -- the upstream
+    table pins one exact version per bucket, but the buckets are ranges (e.g.
+    Django 3.0 supports CPython 3.6-3.8) -- so substituting 3.7 lets the
+    instance actually install and run its tests instead, which is strictly
+    better than going blind. A version that never resolved (None -- an
+    untabulated repo, below the repo's lowest bucket, or unparseable) is
+    unaffected and still falls back to ``sys.executable``.
     """
     constant = _REPO_CONSTANT_PYTHON.get(repo)
     if constant is not None:
-        return constant
-    buckets = _REPO_VERSION_THRESHOLDS.get(repo)
-    if buckets is None:
-        return None
-    parsed = _parse_version(version) if version else None
-    if parsed is None:
-        return None
-    resolved: str | None = None
-    for min_version, python in buckets:  # ascending
-        if parsed >= min_version:
-            resolved = python
-        else:
-            break
+        resolved: str | None = constant
+    else:
+        buckets = _REPO_VERSION_THRESHOLDS.get(repo)
+        if buckets is None:
+            return None
+        parsed = _parse_version(version) if version else None
+        if parsed is None:
+            return None
+        resolved = None
+        for min_version, python in buckets:  # ascending
+            if parsed >= min_version:
+                resolved = python
+            else:
+                break
+    if resolved is not None:
+        resolved_tuple = _parse_version(resolved)
+        if resolved_tuple is not None and resolved_tuple < (3, 7):
+            return _HOST_UV_MIN_PYTHON
     return resolved
 
 

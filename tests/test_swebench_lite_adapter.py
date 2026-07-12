@@ -991,12 +991,19 @@ def test_resolve_python_threshold_boundary_repo():
     """A threshold repo resolves off the instance ``version`` (the highest
     bucket whose min <= version). Django is the canonical multi-bucket case:
     4.0 -> 3.8 but 4.1 -> 3.9 (a real one-minor boundary in the upstream
-    specs), 2.2 -> 3.5, 3.2 -> 3.6, and 5.x -> 3.11."""
+    specs), and 5.x -> 3.11. 2.2 and 3.2 raw-resolve to django's two lowest
+    buckets (3.5 and 3.6 respectively), both of which are below the host
+    ``uv`` floor and so come back floored to 3.7 (WS-6a; see
+    ``test_resolve_python_floors_sub_3_7_versions_to_3_7`` for the dedicated
+    floor coverage) -- the raw upstream-mirrored bucket values themselves are
+    unchanged, only the resolver's returned answer is."""
     from benchmarks.adapters import swebench_lite as adp
 
-    assert adp._resolve_python_version("django/django", "2.2") == "3.5"
-    assert adp._resolve_python_version("django/django", "3.2") == "3.6"
-    # the load-bearing boundary: 4.0 and 4.1 straddle a python bump.
+    # raw buckets are 3.5 / 3.6 -- both floored to the host uv minimum, 3.7.
+    assert adp._resolve_python_version("django/django", "2.2") == "3.7"
+    assert adp._resolve_python_version("django/django", "3.2") == "3.7"
+    # the load-bearing boundary: 4.0 and 4.1 straddle a python bump (both
+    # already >= 3.7, so the floor is a no-op here).
     assert adp._resolve_python_version("django/django", "4.0") == "3.8"
     assert adp._resolve_python_version("django/django", "4.1") == "3.9"
     assert adp._resolve_python_version("django/django", "5.0") == "3.11"
@@ -1011,6 +1018,48 @@ def test_resolve_python_tolerates_v_prefixed_version_astropy_boundary():
     assert adp._resolve_python_version("astropy/astropy", "5.2") == "3.9"
     assert adp._resolve_python_version("astropy/astropy", "v5.3") == "3.10"
     assert adp._resolve_python_version("astropy/astropy", "5.3") == "3.10"
+
+
+def test_resolve_python_floors_sub_3_7_versions_to_3_7() -> None:
+    """WS-6a: the host ``uv`` cannot provision CPython < 3.7 at all (``uv venv
+    --python 3.6`` hard-errors with "Invalid version request: Python <3.7 is
+    not supported"), so ANY raw upstream-mirrored bucket that resolves below
+    3.7 is floored UP to 3.7 before ``_resolve_python_version`` returns --
+    confirmed for BOTH SWE-bench django instances going BLIND (venv creation
+    failing outright) in the Phase-1 pilot. ``_REPO_VERSION_THRESHOLDS``
+    itself is intentionally left untouched (it stays the verified upstream
+    mirror) -- this exercises the resolver's floor, not a table edit. Covers
+    every sub-3.7 bucket across every affected repo: django's two lowest
+    buckets, astropy's lowest bucket, matplotlib's lowest bucket, and
+    scikit-learn's lowest bucket."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    # django: (1, 4) -> raw "3.5", (3, 0) -> raw "3.6" -- both floored to 3.7.
+    assert adp._resolve_python_version("django/django", "2.2") == "3.7"
+    assert adp._resolve_python_version("django/django", "3.2") == "3.7"
+    # astropy: (0, 1) -> raw "3.6" -- floored to 3.7.
+    assert adp._resolve_python_version("astropy/astropy", "0.1") == "3.7"
+    # matplotlib: (1, 0) -> raw "3.5" -- floored to 3.7.
+    assert adp._resolve_python_version("matplotlib/matplotlib", "2.0") == "3.7"
+    # scikit-learn: (0, 20) -> raw "3.6" -- floored to 3.7.
+    assert adp._resolve_python_version("scikit-learn/scikit-learn", "0.22") == "3.7"
+
+
+def test_resolve_python_at_or_above_3_7_is_unaffected_by_the_floor() -> None:
+    """WS-6a self-review: the floor must be a no-op for anything already
+    resolving to >= 3.7 -- both threshold-repo buckets at/above the line
+    (matplotlib and scikit-learn's higher buckets, not just django's) and
+    constant-version repos (which are all already >= 3.9 today)."""
+    from benchmarks.adapters import swebench_lite as adp
+
+    # threshold repos: buckets already at/above 3.7 are returned as-is.
+    assert adp._resolve_python_version("matplotlib/matplotlib", "3.0") == "3.7"
+    assert adp._resolve_python_version("matplotlib/matplotlib", "3.5") == "3.11"
+    assert adp._resolve_python_version("scikit-learn/scikit-learn", "1.3") == "3.9"
+    assert adp._resolve_python_version("django/django", "4.1") == "3.9"
+    # constant-version repos are untouched (all pin >= 3.9 already).
+    assert adp._resolve_python_version("psf/requests", "2.31") == "3.9"
+    assert adp._resolve_python_version("pydata/xarray", "2022.03") == "3.10"
 
 
 def test_resolve_python_untabulated_and_below_range_fall_back_to_none():
