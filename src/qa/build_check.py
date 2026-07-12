@@ -14,13 +14,17 @@ resolver treats it as blocking rather than a vacuous green.
 from __future__ import annotations
 
 import asyncio
-import sys
 from pathlib import Path
 
 from plugins.registry import GateResult
 from qa._scan_filter import collect_scan_files
 from qa.detect import detect_language
-from qa.env import resolve_tool
+
+# WS-6b: ``_resolve_target_python`` was promoted into the shared ``qa.env`` so
+# every QA gate (lint / syntax_check / test_runner) can select the target repo's
+# interpreter, not AutoDev's host. Re-exported here under its original private
+# name to preserve this module's call sites and existing tests/patch targets.
+from qa.env import resolve_target_python as _resolve_target_python
 
 
 # WS2-11: the orchestrator normally overrides this via
@@ -108,41 +112,6 @@ async def _run_subprocess(
     if proc.returncode == 0:
         return GateResult(passed=True, details=f"{tool_name} build check passed")
     return GateResult(passed=False, details=f"{tool_name} build check failed:\n{combined}")
-
-
-def _resolve_target_python(cwd: Path) -> list[str]:
-    """Return the argv prefix of the *target* repo's Python interpreter.
-
-    WS2-21: compiling the target repo with AutoDev's OWN ``sys.executable`` is a
-    version-mismatch trap — AutoDev runs on (say) 3.13 while the target pins
-    3.9, so 3.9-valid syntax (or 3.13-removed stdlib) makes ``py_compile``
-    FALSE-FAIL the build gate on otherwise-clean code. Resolve the *target's*
-    interpreter instead.
-
-    Cascade (first match wins):
-
-    * ``<cwd>/.venv/bin/python3`` / ``<cwd>/.venv/bin/python`` — the repo's own
-      virtualenv interpreter (direct, no PATH guesswork).
-    * :func:`qa.env.resolve_tool` for ``python3`` then ``python`` — this also
-      surfaces uv/poetry-managed interpreters (``uv run python3 -m …``) and any
-      ``.venv/bin/python*`` it finds. ``resolve_tool`` returns the *bare*
-      ``[tool]`` as its last-resort fallback; that is NOT a target-specific
-      resolution (it would shell out to whatever ``python``/``python3`` is on
-      PATH, defeating the point), so we ignore the bare form and keep cascading.
-    * ``sys.executable`` — only when nothing target-specific resolves (a repo
-      with no venv / no lockfile manager): AutoDev's interpreter is the best
-      available, matching the legacy behaviour for that case.
-    """
-    for direct in (".venv/bin/python3", ".venv/bin/python"):
-        candidate = cwd / direct
-        if candidate.exists():
-            return [str(candidate)]
-    for tool in ("python3", "python"):
-        argv = resolve_tool(cwd, tool)
-        # Skip the bare ``[tool]`` last-resort — only accept a managed/venv form.
-        if argv != [tool]:
-            return argv
-    return [sys.executable]
 
 
 async def _run_python_build(

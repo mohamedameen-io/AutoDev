@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import sys
 from pathlib import Path
 
 from plugins.registry import GateResult
 from qa._scan_filter import collect_scan_files
 from qa.detect import detect_language
+from qa.env import resolve_target_python
 
 
 _DEFAULT_TIMEOUT_S = 60
@@ -90,11 +90,16 @@ async def _python_syntax_check(
     G7: submodule trees, ``.git``/``.git/modules``, vendored/cache dirs, and
     generated stubs (``*_pb2.py`` …) are excluded.
     S2: when *paths* is non-``None`` only those files are compiled.
+    WS-6b: compiled with the *target* repo's interpreter (see
+    :func:`qa.env.resolve_target_python`), not AutoDev's host ``sys.executable``
+    — a version mismatch (host py3.13 vs a repo pinned to an older Python) would
+    otherwise FALSE-FAIL ``py_compile`` on otherwise-clean code.
     """
     py_files = [str(p) for p in collect_scan_files(cwd, (".py",), paths=paths)]
     if not py_files:
         return GateResult(passed=True, details="no .py files found")
 
+    interpreter = resolve_target_python(cwd)
     batches = _batch_files(py_files, _PY_COMPILE_BATCH_SIZE, _PY_COMPILE_BATCH_BYTES)
     all_errors: list[str] = []
 
@@ -102,7 +107,7 @@ async def _python_syntax_check(
         try:
             proc = await asyncio.wait_for(
                 asyncio.create_subprocess_exec(
-                    sys.executable,
+                    *interpreter,
                     "-m",
                     "py_compile",
                     *batch,

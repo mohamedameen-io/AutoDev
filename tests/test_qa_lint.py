@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,6 +18,15 @@ def _make_proc(returncode: int, stdout: bytes = b"", stderr: bytes = b"") -> Mag
     proc.returncode = returncode
     proc.communicate = AsyncMock(return_value=(stdout, stderr))
     return proc
+
+
+def _make_target_venv_python(cwd: Path, name: str = "python3") -> Path:
+    """Create an executable target ``.venv/bin/<name>`` interpreter and return it."""
+    interp = cwd / ".venv" / "bin" / name
+    interp.parent.mkdir(parents=True, exist_ok=True)
+    interp.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(interp, 0o755)
+    return interp
 
 
 @pytest.mark.asyncio
@@ -163,3 +174,95 @@ async def test_lint_python_paths_skips_absent_new_file(tmp_path: Path) -> None:
     assert result.passed
     assert "present on disk" in result.details
     mock_exec.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# WS-6b: flake8 must run under the TARGET repo interpreter, not AutoDev's host
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lint_flake8_uses_target_venv_interpreter(tmp_path: Path) -> None:
+    """ENGAGEMENT: with a ``.flake8`` config and a target ``.venv`` python present
+    (but no ``.venv/bin/flake8``), the gate runs flake8 UNDER the target
+    interpreter (``python -m flake8``) — not the bare host flake8 that crashes
+    under AutoDev's py3.13 (the django-10914 / pylint-5859 field failure)."""
+    interp = _make_target_venv_python(tmp_path, "python3")
+    (tmp_path / ".flake8").write_text("[flake8]\n", encoding="utf-8")
+
+    proc = _make_proc(0)
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
+        result = await run_lint(tmp_path, language="python")
+
+    assert result.passed
+    args = list(mock_exec.call_args.args)
+    assert args[0] == str(interp), (
+        "flake8 must run under the target repo's venv interpreter, "
+        f"not AutoDev's host; invoked={args[0]!r}"
+    )
+    assert args[0] != sys.executable
+    assert "-m" in args and "flake8" in args
+
+
+@pytest.mark.asyncio
+async def test_lint_flake8_no_venv_falls_back_to_bare_host(tmp_path: Path) -> None:
+    """FALLBACK: no target venv → the bare host flake8 (unchanged legacy behaviour)."""
+    (tmp_path / ".flake8").write_text("[flake8]\n", encoding="utf-8")
+
+    proc = _make_proc(0)
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
+        result = await run_lint(tmp_path, language="python")
+
+    assert result.passed
+    assert mock_exec.call_args.args[0] == "flake8"
+
+
+@pytest.mark.asyncio
+async def test_lint_ruff_stays_host_binary_even_with_venv_python(tmp_path: Path) -> None:
+    """CONTROL: ruff is a self-contained (version-agnostic) binary, so it is NOT
+    routed through the target interpreter. Even with a target ``.venv`` python
+    present, ruff resolves to the bare host binary (no ``python -m ruff``), which
+    avoids a false-fail when ruff is only installed on the host."""
+    _make_target_venv_python(tmp_path, "python3")
+    (tmp_path / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+
+    proc = _make_proc(0)
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
+        result = await run_lint(tmp_path, language="python")
+
+    assert result.passed
+    args = list(mock_exec.call_args.args)
+    assert args[0] == "ruff"
+    assert "-m" not in args
+
+
+@pytest.mark.asyncio
+async def test_lint_future_pure_python_linter_routes_through_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DENY-LIST DEFAULT: a linter NOT in ``_SELF_CONTAINED_LINTERS`` (here a
+    hypothetical future ``pylint`` value from ``detect_python_linter``) is treated
+    as a version-sensitive pure-Python tool and routed through the TARGET
+    interpreter (``python -m pylint``), NOT the bare host. Pins the deny-list
+    intent so adding a future pure-Python linter is correct-by-construction and
+    cannot silently reintroduce the host-interpreter crash."""
+    interp = _make_target_venv_python(tmp_path, "python3")
+    monkeypatch.setattr("qa.lint.detect_python_linter", lambda _cwd: "pylint")
+
+    proc = _make_proc(0)
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
+        result = await run_lint(tmp_path, language="python")
+
+    assert result.passed
+    args = list(mock_exec.call_args.args)
+    assert args[0] == str(interp)
+    assert args[0] != sys.executable
+    assert "-m" in args and "pylint" in args

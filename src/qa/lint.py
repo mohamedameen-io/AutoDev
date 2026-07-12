@@ -37,10 +37,21 @@ from pathlib import Path
 
 from plugins.registry import GateResult
 from qa.detect import detect_language
-from qa.env import detect_python_linter, resolve_tool
+from qa.env import detect_python_linter, resolve_python_tool, resolve_tool
 
 
 _DEFAULT_TIMEOUT_S = 60
+
+# WS-6b: linters that are self-contained, version-agnostic *binaries* — they have
+# no interpreter-mismatch problem, so they must NOT be routed through
+# ``python -m`` (which would false-fail when the binary is installed only on the
+# host, not in the target venv). Everything NOT in this deny-list is treated as a
+# version-sensitive *pure-Python* linter and routed through the TARGET repo's
+# interpreter by default (see ``_run_python_lint``). Deny-list rather than
+# allow-list on purpose: a future ``detect_python_linter`` value (pylint / mypy /
+# pyflakes — all pure-Python) is then correct-by-construction and cannot silently
+# reintroduce the host-interpreter crash.
+_SELF_CONTAINED_LINTERS = frozenset({"ruff"})
 
 
 async def run_lint(
@@ -122,7 +133,20 @@ async def _run_python_lint(
 ) -> GateResult:
     """Run the repo's Python linter (ruff or flake8), scoped to *paths* if given."""
     linter = detect_python_linter(cwd)
-    base = resolve_tool(cwd, linter)
+    # WS-6b: pure-Python linters (flake8, and any future pylint/mypy/pyflakes) are
+    # version-sensitive — running them under AutoDev's host py3.13 (the bare
+    # ``resolve_tool`` fallback) crashed flake8 and false-failed the gate
+    # (django-10914, pylint-5859), so they route through the TARGET repo's
+    # interpreter (``resolve_python_tool`` → ``python -m <linter>``). A
+    # self-contained binary (``ruff``) has no interpreter-mismatch problem and
+    # keeps the plain ``resolve_tool`` cascade. This is a DENY-LIST
+    # (``_SELF_CONTAINED_LINTERS``), not an allow-list, so pure-Python is the safe
+    # default and a new linter value cannot silently reintroduce the host crash.
+    base = (
+        resolve_tool(cwd, linter)
+        if linter in _SELF_CONTAINED_LINTERS
+        else resolve_python_tool(cwd, linter)
+    )
 
     if paths is None:
         # Whole-tree lint (back-compat: a bare repo yields ``["ruff", "check", "."]``).

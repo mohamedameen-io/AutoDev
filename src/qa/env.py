@@ -12,6 +12,7 @@ cheap; no subprocesses are spawned here.
 from __future__ import annotations
 
 import shutil
+import sys
 import tomllib
 from pathlib import Path
 
@@ -73,6 +74,77 @@ def resolve_tool(cwd: Path, tool: str) -> list[str]:
         return ["uv", "run", *dev_group, tool]
     if (cwd / "poetry.lock").exists() and shutil.which("poetry"):
         return ["poetry", "run", tool]
+    return [tool]
+
+
+def resolve_target_python(cwd: Path) -> list[str]:
+    """Return the argv prefix of the *target* repo's Python interpreter.
+
+    WS2-21 / WS-6b: running a QA gate against the target repo with AutoDev's OWN
+    ``sys.executable`` is a version-mismatch trap — AutoDev runs on (say) 3.13
+    while the target pins 3.9, so 3.9-valid syntax (or a version-sensitive
+    pure-Python tool such as ``flake8``) FALSE-FAILS on otherwise-clean code.
+    Resolve the *target's* interpreter instead.
+
+    Cascade (first match wins):
+
+    * ``<cwd>/.venv/bin/python3`` / ``<cwd>/.venv/bin/python`` — the repo's own
+      virtualenv interpreter (direct, no PATH guesswork).
+    * :func:`resolve_tool` for ``python3`` then ``python`` — this also surfaces
+      uv/poetry-managed interpreters (``uv run python3 -m …``) and any
+      ``.venv/bin/python*`` it finds. ``resolve_tool`` returns the *bare*
+      ``[tool]`` as its last-resort fallback; that is NOT a target-specific
+      resolution (it would shell out to whatever ``python``/``python3`` is on
+      PATH, defeating the point), so we ignore the bare form and keep cascading.
+    * ``sys.executable`` — only when nothing target-specific resolves (a repo
+      with no venv / no lockfile manager): AutoDev's interpreter is the best
+      available, matching the legacy behaviour for that case.
+    """
+    for direct in (".venv/bin/python3", ".venv/bin/python"):
+        candidate = cwd / direct
+        if candidate.exists():
+            return [str(candidate)]
+    for tool in ("python3", "python"):
+        argv = resolve_tool(cwd, tool)
+        # Skip the bare ``[tool]`` last-resort — only accept a managed/venv form.
+        if argv != [tool]:
+            return argv
+    return [sys.executable]
+
+
+def resolve_python_tool(cwd: Path, tool: str) -> list[str]:
+    """Return the argv prefix to invoke a *pure-Python* QA *tool* inside *cwd*,
+    preferring the TARGET repo's own interpreter over AutoDev's host.
+
+    WS-6b: a version-sensitive pure-Python tool (notably ``flake8``, also
+    ``pytest``) crashes / false-fails when run under AutoDev's host interpreter
+    (py3.13) against a repo pinned to an older Python. :func:`resolve_tool`
+    already prefers the target's ``.venv/bin/<tool>`` / ``uv run`` /
+    ``poetry run``; its only host-bound outcome is the bare ``[tool]`` last
+    resort. When we hit that last resort but the target repo DOES expose its own
+    interpreter (a ``.venv`` python), run the tool as a module under that
+    interpreter (``<target-python> -m <tool>``) so it executes on the target's
+    Python, not the host's.
+
+    Cascade (first match wins):
+
+    * :func:`resolve_tool` result when it is target-specific (anything other
+      than the bare ``[tool]``) — e.g. ``.venv/bin/<tool>``, ``uv run <tool>``.
+    * ``[*resolve_target_python(cwd), "-m", tool]`` when a target ``.venv``
+      interpreter exists (see :func:`resolve_target_python`).
+    * the bare ``[tool]`` — no target env resolvable → unchanged host behaviour
+      (matches the legacy fallback / graceful skip).
+
+    NOTE: intended for pure-Python tools only. A self-contained binary such as
+    ``ruff`` (version-agnostic) has no interpreter-mismatch problem and must NOT
+    be routed through ``-m`` — call :func:`resolve_tool` for those.
+    """
+    argv = resolve_tool(cwd, tool)
+    if argv != [tool]:
+        return argv
+    target_python = resolve_target_python(cwd)
+    if target_python != [sys.executable]:
+        return [*target_python, "-m", tool]
     return [tool]
 
 
@@ -162,5 +234,7 @@ __all__ = [
     "detect_js_package_manager",
     "detect_python_linter",
     "resolve_js_tool",
+    "resolve_python_tool",
+    "resolve_target_python",
     "resolve_tool",
 ]

@@ -29,7 +29,7 @@ from pathlib import Path
 
 from plugins.registry import GateResult
 from qa.detect import detect_language
-from qa.env import resolve_tool
+from qa.env import resolve_python_tool
 
 
 # The orchestrator normally overrides this via ``cfg.test_timeout_s``; the
@@ -284,8 +284,14 @@ async def _run_pytest(
     timeout_s: float,
     paths: list[Path] | None,
 ) -> GateResult:
-    """Run pytest via the repo's tooling, scoped to changed tests if *paths* given."""
-    base = resolve_tool(cwd, "pytest")
+    """Run pytest via the repo's tooling, scoped to changed tests if *paths* given.
+
+    WS-6b: pytest is a version-sensitive pure-Python tool — run it under the
+    TARGET repo's interpreter (``resolve_python_tool``) rather than AutoDev's
+    host py3.13, which would import the target package under the wrong Python.
+    Repos with no target venv keep the bare host ``pytest`` (unchanged).
+    """
+    base = resolve_python_tool(cwd, "pytest")
 
     if paths is None:
         targets: list[str] = []

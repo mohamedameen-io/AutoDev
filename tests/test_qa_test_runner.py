@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,6 +18,15 @@ def _make_proc(returncode: int, stdout: bytes = b"", stderr: bytes = b"") -> Mag
     proc.returncode = returncode
     proc.communicate = AsyncMock(return_value=(stdout, stderr))
     return proc
+
+
+def _make_target_venv_python(cwd: Path, name: str = "python3") -> Path:
+    """Create an executable target ``.venv/bin/<name>`` interpreter and return it."""
+    interp = cwd / ".venv" / "bin" / name
+    interp.parent.mkdir(parents=True, exist_ok=True)
+    interp.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(interp, 0o755)
+    return interp
 
 
 @pytest.mark.asyncio
@@ -157,6 +168,48 @@ async def test_run_tests_paths_no_python(tmp_path: Path) -> None:
     assert result.passed
     assert "no python changes" in result.details
     mock_exec.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# WS-6b: pytest must run under the TARGET repo interpreter, not AutoDev's host
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_tests_python_uses_target_venv_interpreter(tmp_path: Path) -> None:
+    """ENGAGEMENT: with a target ``.venv`` python present (but no
+    ``.venv/bin/pytest``), pytest runs UNDER the target interpreter
+    (``python -m pytest``), not the bare host pytest under AutoDev's py3.13."""
+    interp = _make_target_venv_python(tmp_path, "python3")
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")  # source present
+
+    proc = _make_proc(0, stdout=b"5 passed")
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
+        result = await run_tests(tmp_path, language="python")
+
+    assert result.passed
+    args = list(mock_exec.call_args.args)
+    assert args[0] == str(interp), (
+        "pytest must run under the target repo's venv interpreter, "
+        f"not AutoDev's host; invoked={args[0]!r}"
+    )
+    assert args[0] != sys.executable
+    assert "-m" in args and "pytest" in args
+
+
+@pytest.mark.asyncio
+async def test_run_tests_python_no_venv_falls_back_to_bare_pytest(tmp_path: Path) -> None:
+    """FALLBACK: no target venv → the bare host pytest (unchanged legacy behaviour)."""
+    proc = _make_proc(0, stdout=b"5 passed")
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
+        result = await run_tests(tmp_path, language="python")
+
+    assert result.passed
+    assert mock_exec.call_args.args[0] == "pytest"
 
 
 # ---------------------------------------------------------------------------

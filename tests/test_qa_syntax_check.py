@@ -3,12 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from qa.syntax_check import run_syntax_check
+
+
+def _make_proc(returncode: int, stdout: bytes = b"", stderr: bytes = b"") -> MagicMock:
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    return proc
+
+
+def _make_target_venv_python(cwd: Path, name: str = "python3") -> Path:
+    """Create an executable target ``.venv/bin/<name>`` interpreter and return it."""
+    interp = cwd / ".venv" / "bin" / name
+    interp.parent.mkdir(parents=True, exist_ok=True)
+    interp.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(interp, 0o755)
+    return interp
 
 
 # ---------------------------------------------------------------------------
@@ -197,3 +215,46 @@ async def test_syntax_check_nodejs_timeout(tmp_path: Path) -> None:
         result = await run_syntax_check(tmp_path, language="nodejs")
     assert not result.passed
     assert "timed out" in result.details
+
+
+# ---------------------------------------------------------------------------
+# WS-6b: py_compile must run under the TARGET repo interpreter, not the host
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_syntax_check_uses_target_venv_interpreter(tmp_path: Path) -> None:
+    """ENGAGEMENT: with a target ``.venv`` python present, ``py_compile`` runs
+    under the TARGET interpreter, NOT AutoDev's host ``sys.executable``."""
+    interp = _make_target_venv_python(tmp_path, "python3")
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+    proc = _make_proc(0)
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
+        result = await run_syntax_check(tmp_path, language="python")
+
+    assert result.passed
+    args = list(mock_exec.call_args.args)
+    assert args[0] == str(interp), (
+        "syntax_check must compile with the target repo's venv interpreter, "
+        f"not AutoDev's host; invoked={args[0]!r}"
+    )
+    assert args[0] != sys.executable
+    assert "py_compile" in args
+
+
+@pytest.mark.asyncio
+async def test_syntax_check_no_venv_uses_sys_executable(tmp_path: Path) -> None:
+    """FALLBACK: no target venv → AutoDev's ``sys.executable`` (unchanged legacy)."""
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+    proc = _make_proc(0)
+    with patch(
+        "asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ) as mock_exec:
+        result = await run_syntax_check(tmp_path, language="python")
+
+    assert result.passed
+    assert mock_exec.call_args.args[0] == sys.executable
