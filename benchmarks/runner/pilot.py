@@ -450,13 +450,24 @@ class PilotReport:
         # which multi-line stdout/stderr would corrupt). Data-driven — NOT
         # hardcoded to "only ERROR status instances" — so it can never silently
         # drift out of sync with however status is actually computed elsewhere.
+        #
+        # ``score_detail`` is gated on a non-PASS status: the real SbcliScorer
+        # sets a non-empty detail on EVERY verdict — including "resolved" for a
+        # PASS — so surfacing it unconditionally would list every healthy pass
+        # under "Failure detail" and defeat the section on a green run. A PASS's
+        # score_detail is still preserved in to_dict()/JSON; it is only omitted
+        # from THIS human-summary section. The nested helper keeps the filter and
+        # the render clause in lock-step (one definition, no drift).
+        def _surfaces_score_detail(o: "PilotInstanceOutcome") -> bool:
+            return bool(o.score_detail) and o.status != PASS
+
         lines.append("## Failure detail (excerpt — full tails in pilot-report.json)")
         lines.append("")
         reportable = [
             o
             for o in self.instances
             if o.detail
-            or o.score_detail
+            or _surfaces_score_detail(o)
             or o.fail_stdout_tail
             or o.fail_stderr_tail
             or o.install_stdout_tail
@@ -471,7 +482,7 @@ class PilotReport:
             if o.detail:
                 lines.append(f"- detail: {o.detail}")
                 lines.append("")
-            if o.score_detail:
+            if _surfaces_score_detail(o):
                 lines.append(f"- score_detail: {o.score_detail}")
                 lines.append("")
             if o.fail_stdout_tail:
@@ -552,9 +563,13 @@ def _instance_cost_usd(ledger_path: Path | None) -> float:
     ledger itself).
 
     Best-effort and defensive: ``ledger_path=None`` (no outcome — e.g. a raised
-    quota abort or a prepare failure), a missing file, or a malformed/partial
-    line never raises — each simply contributes ``0.0``, so a telemetry gap can
-    never crash the pilot or manufacture spend that was not actually recorded.
+    quota abort or a prepare failure), a missing file, an unparseable line, OR a
+    line that is valid JSON but NOT an object (``null``, a bare scalar, an array
+    — exactly what a truncated / interleaved concurrent write produces) never
+    raises — each simply contributes ``0.0``, so a telemetry gap can never crash
+    the pilot (this runs unguarded inside ``run_pilot``'s per-instance loop, so a
+    raise here would abort the whole pilot and write no report) or manufacture
+    spend that was not actually recorded.
     """
     if ledger_path is None:
         return 0.0
@@ -573,6 +588,11 @@ def _instance_cost_usd(ledger_path: Path | None) -> float:
         try:
             row = json.loads(stripped)
         except json.JSONDecodeError:
+            continue
+        # Valid JSON but not an object (null / scalar / array) has no ``.get`` —
+        # skip it rather than letting an AttributeError escape (the whole point
+        # of this helper is that it NEVER raises).
+        if not isinstance(row, dict):
             continue
         try:
             total += float(row.get("cost_usd", 0.0) or 0.0)

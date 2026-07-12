@@ -476,6 +476,79 @@ def test_run_pilot_threads_score_detail_from_scorer_into_outcome_and_json(
     assert "score_detail: sb-cli eval did not complete (infra)" in summary
 
 
+def test_human_summary_does_not_surface_score_detail_for_passing_instance():
+    """I-2 regression: the REAL SbcliScorer sets a non-empty ``detail`` on EVERY
+    verdict -- including ``detail="resolved"`` for a PASS (see sbcli.py). If that
+    is threaded onto ``score_detail`` and surfaced unconditionally, every healthy
+    pass gets listed under "## Failure detail" as ``- score_detail: resolved``,
+    defeating the section on a green run.
+
+    RED before the fix: the pre-fix ``or o.score_detail`` filter clause + the
+    unconditional ``if o.score_detail`` render pulled the PASS into the section.
+    GREEN after gating the surfacing on a non-PASS status.
+
+    Non-vacuous: a FAIL carrying ``score_detail="unresolved"`` DOES appear in the
+    section, proving the guard keys on STATUS, not on score_detail being empty.
+    The PASS's score_detail is still kept in the JSON (to_dict); only the
+    human-summary surfacing is suppressed."""
+    passing = PilotInstanceOutcome(
+        instance_id="pass-1",
+        status=PASS,
+        wall_time_s=2.0,
+        quota_wait_time_s=0.0,
+        attempts=1,
+        blind=False,
+        quota_exhausted=False,
+        detail=None,
+        score_detail="resolved",  # exactly what the real SbcliScorer sets on PASS
+    )
+    failing = PilotInstanceOutcome(
+        instance_id="fail-1",
+        status=FAIL,
+        wall_time_s=3.0,
+        quota_wait_time_s=0.0,
+        attempts=1,
+        blind=False,
+        quota_exhausted=False,
+        detail=None,
+        score_detail="unresolved",
+    )
+    report = PilotReport(
+        run_id="rid-score-pass",
+        autodev_version="1.0.0",
+        timestamp="2026-01-01T00:00:00+00:00",
+        instances=[passing, failing],
+        passed=1,
+        failed=1,
+        errored=0,
+        blind_count=0,
+        clean_count=2,
+        total_wall_time_s=5.0,
+        total_quota_wait_time_s=0.0,
+        gate_verdict="green",
+        gate_status="ok",
+        gate_reasons=[],
+        baseline_established=True,
+        baseline_path=None,
+        recommend_lock=False,
+    )
+
+    summary = report.human_summary()
+    assert "## Failure detail" in summary
+    detail_section = summary.split("## Failure detail", 1)[1]
+    # the PASS is entirely absent from the failure-detail section ...
+    assert "pass-1" not in detail_section
+    assert "score_detail: resolved" not in detail_section
+    # ... while the FAIL's score_detail IS surfaced (non-vacuous control).
+    assert "fail-1" in detail_section
+    assert "score_detail: unresolved" in detail_section
+
+    # The PASS's score_detail is still preserved in the machine-readable JSON.
+    doc = report.to_dict()
+    by_id = {i["instance_id"]: i for i in doc["instances"]}
+    assert by_id["pass-1"]["score_detail"] == "resolved"
+
+
 def test_run_pilot_reads_cost_usd_from_run_summary_sibling_of_ledger_path(
     tmp_path: Path,
 ):
@@ -580,7 +653,16 @@ def test_run_pilot_cost_usd_is_zero_when_outcome_is_none(tmp_path: Path):
 def test_instance_cost_usd_helper_sums_and_defaults_safely(tmp_path: Path):
     """Direct unit coverage of _instance_cost_usd: a None ledger_path and a
     missing run-summary.jsonl both default to 0.0; a well-formed file sums
-    cost_usd across every line; a malformed line is skipped, never fatal."""
+    cost_usd across every line; a malformed line is skipped, never fatal; AND
+    (I-1 regression) a line that is VALID JSON but not an object -- ``null``, a
+    bare scalar, an array (exactly what a truncated/interleaved concurrent write
+    produces) -- is skipped, contributes 0.0, and NEVER raises (a raise here
+    would escape the unguarded run_pilot loop and abort the whole pilot).
+
+    RED before the fix: ``json.loads("null")`` returns ``None`` and
+    ``None.get("cost_usd")`` raises ``AttributeError`` -- which the old
+    ``except (TypeError, ValueError)`` did NOT catch, so this test raised
+    instead of returning a float."""
     from benchmarks.runner.pilot import _instance_cost_usd
 
     assert _instance_cost_usd(None) == 0.0
@@ -595,14 +677,27 @@ def test_instance_cost_usd_helper_sums_and_defaults_safely(tmp_path: Path):
         "\n".join(
             [
                 '{"phase": "plan", "cost_usd": 0.25}',
-                "not json at all",  # malformed line -- must not raise
+                "not json at all",  # unparseable line -- must not raise
+                "null",  # valid JSON, NOT an object -- must not raise (I-1)
+                "42",  # valid JSON bare scalar -- must not raise (I-1)
+                '["cost_usd", 0.75]',  # valid JSON array -- must not raise (I-1)
                 '{"phase": "execute", "cost_usd": 0.75}',
             ]
         )
         + "\n",
         encoding="utf-8",
     )
+    # only the two real object rows contribute; every non-object line is 0.0.
     assert _instance_cost_usd(autodev_dir / "plan-ledger.jsonl") == 1.0
+
+    # And a file whose ONLY content is valid-JSON-non-object lines is a clean
+    # 0.0, not a crash (the pure I-1 case with no valid rows to mask a raise).
+    only_non_objects = tmp_path / "non-object-only" / ".autodev"
+    only_non_objects.mkdir(parents=True)
+    (only_non_objects / "run-summary.jsonl").write_text(
+        "null\n42\n[1, 2, 3]\n", encoding="utf-8"
+    )
+    assert _instance_cost_usd(only_non_objects / "plan-ledger.jsonl") == 0.0
 
 
 # ---------------------------------------------------------------------------
