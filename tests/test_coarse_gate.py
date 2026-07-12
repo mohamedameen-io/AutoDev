@@ -410,3 +410,124 @@ def test_gate_instances_from_score_report_maps_status_and_telemetry() -> None:
     assert by_id["b"].blind is True
     assert by_id["c"].quota_wait_time_s == 300.0
     assert by_id["c"].blind is False  # not in blind map -> default
+
+
+# ---------------------------------------------------------------------------
+# WS-7: known network-artifact instances are excluded from the gate cohort —
+# out of the resolve-rate denominator + go/no-go — and surfaced (mirrors the
+# blind-instance listing at coarse_gate.py:344). psf__requests-1963 /
+# psf__requests-2148 need live httpbin.org and are unpassable offline.
+# ---------------------------------------------------------------------------
+
+
+def test_network_artifact_instances_excluded_from_cohort_and_denominator(
+    tmp_path: Path,
+) -> None:
+    """A cohort of 12 PASS + 8 FAIL (resolve 0.60, completed 20) with 2 EXTRA
+    network-artifact FAILs must count completed=20 / resolve=0.60 — the artifacts
+    are OUT of the denominator — and surface the 2 excluded ids in a dedicated
+    ``network_artifact_instances`` list (like ``blind_instances``).
+
+    RED pre-fix: without exclusion the 2 artifact FAILs inflate completed to 22
+    and drop the resolve-rate to 12/22 = 0.545."""
+    healthy = _mk(12, 8, 0)  # 20 completed, resolve 0.60
+    artifacts = [
+        GateInstance(
+            instance_id="psf__requests-1963", status=FAIL, network_artifact=True
+        ),
+        GateInstance(
+            instance_id="psf__requests-2148", status=FAIL, network_artifact=True
+        ),
+    ]
+
+    report = _evaluate(healthy + artifacts, tmp_path)
+
+    # denominator + resolve-rate are computed on the cohort ONLY (artifacts out).
+    assert report.completed == 20
+    assert report.resolve_rate == pytest.approx(0.60)
+    assert report.passed == 12
+    assert report.failed == 8  # NOT 10 — the 2 artifact FAILs are excluded
+    # surfaced as an explicit excluded list (mirror of blind_instances).
+    assert set(report.network_artifact_instances) == {
+        "psf__requests-1963",
+        "psf__requests-2148",
+    }
+    # the artifacts are NOT in the scored per-instance cohort ...
+    per_ids = {r["instance_id"] for r in report.per_instance}
+    assert "psf__requests-1963" not in per_ids
+    assert "psf__requests-2148" not in per_ids
+    # ... and are NOT written into the established baseline (they would poison
+    # every future comparison's denominator).
+    doc = json.loads(_baseline_file(tmp_path).read_text(encoding="utf-8"))
+    baseline_ids = {r["instance_id"] for r in doc["results"]}
+    assert "psf__requests-1963" not in baseline_ids
+    assert "psf__requests-2148" not in baseline_ids
+    assert doc["summary"]["completed"] == 20
+
+
+def test_network_artifact_exclusion_can_flip_insufficient_completed(
+    tmp_path: Path,
+) -> None:
+    """The exclusion is genuinely load-bearing on the go/no-go: a slice of 11
+    real completed + 2 network-artifact completed is 13 raw, but only 11 in the
+    cohort — BELOW the min-completed floor (12) — so the gate is RED
+    ``insufficient-completed``. Counting the artifacts would vacuously clear the
+    floor (13 >= 12) and mask an under-powered slice.
+
+    RED pre-fix: with the artifacts counted, completed=13 and this run is GREEN."""
+    real = _mk(7, 4, 0)  # 11 completed, resolve ~0.636
+    artifacts = [
+        GateInstance(
+            instance_id="psf__requests-1963", status=PASS, network_artifact=True
+        ),
+        GateInstance(
+            instance_id="psf__requests-2148", status=FAIL, network_artifact=True
+        ),
+    ]
+
+    report = _evaluate(real + artifacts, tmp_path)
+
+    assert report.completed == 11
+    assert report.verdict == RED
+    assert report.status == STATUS_INSUFFICIENT_COMPLETED
+    assert set(report.network_artifact_instances) == {
+        "psf__requests-1963",
+        "psf__requests-2148",
+    }
+    # a degenerate (under-powered) cohort must not become a baseline.
+    assert not _baseline_file(tmp_path).exists()
+    assert report.baseline_established is False
+
+
+def test_normal_slice_has_no_network_artifacts_and_stays_counted(
+    tmp_path: Path,
+) -> None:
+    """Non-vacuous back-compat: a slice with NO known network-artifact ids reports
+    an empty ``network_artifact_instances`` and keeps every completed verdict in
+    the denominator (the exclusion never touches ordinary instances)."""
+    report = _evaluate(_mk(12, 8, 0), tmp_path)
+    assert report.network_artifact_instances == []
+    assert report.completed == 20
+    assert report.resolve_rate == pytest.approx(0.60)
+
+
+def test_gate_instances_from_score_report_flags_known_network_artifacts() -> None:
+    """The builder flags KNOWN network-artifact ids on the GateInstance — exactly
+    how it sets ``blind`` from the blind map — so a real pilot run's gate cohort
+    excludes them without the caller wiring anything. A normal id is left False."""
+    from benchmarks.gate.coarse_gate import KNOWN_NETWORK_ARTIFACT_INSTANCES
+
+    assert {"psf__requests-1963", "psf__requests-2148"} <= KNOWN_NETWORK_ARTIFACT_INSTANCES
+
+    sr = ScoreReport(
+        instances=[
+            InstanceScore("psf__requests-1963", FAIL),
+            InstanceScore("psf__requests-2148", FAIL),
+            InstanceScore("pallets__flask-4992", PASS),
+        ]
+    )
+    built = gate_instances_from_score_report(sr)
+    by_id = {g.instance_id: g for g in built}
+    assert by_id["psf__requests-1963"].network_artifact is True
+    assert by_id["psf__requests-2148"].network_artifact is True
+    assert by_id["pallets__flask-4992"].network_artifact is False

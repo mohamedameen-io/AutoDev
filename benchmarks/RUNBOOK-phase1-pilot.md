@@ -134,15 +134,43 @@ per-instance `quota_wait_time_s` are how you read real throughput.
 Open `results/<run>/pilot-summary.md`. The key numbers:
 
 - **`clean_count`** — instances that reached a real PASS/FAIL verdict *with
-  self-repair on* (deps installed, not blind). This is the count that matters.
+  self-repair on* (deps installed, not blind, **and not a known network
+  artifact** — see below). This is the count that matters.
 - **`blind_count`** — instances that solved blind (arm64 deps failed →
   `test_runner` off). High blind count = weak signal. To see *why* an instance
   went blind, read its `install_stdout_tail` / `install_stderr_tail` in
   `pilot-report.json` (also rendered under "install stdout" / "install stderr"
   in `pilot-summary.md`'s **Failure detail** section), or the full untruncated
   capture in `.autodev-bench/install-failure.log` under that instance's workdir.
+- **`network_artifact_count`** — instances excluded from capability accounting
+  as **known benchmark-host artifacts** (see below). Listed by id on the
+  `- excluded: known network artifact …` line of `pilot-summary.md`.
 - **wall-time / quota-wait totals** — extrapolate to **sustainable
   instances/day** on the subscription.
+
+### Known benchmark artifacts (excluded from capability)
+
+Two SWE-bench-Lite instances are **unpassable on an offline eval host regardless
+of fix quality**, because their required `FAIL_TO_PASS` tests make live network
+calls to `httpbin.org`:
+
+- **`psf__requests-1963`** — 6 of 7 F2P tests hit live `httpbin.org`.
+- **`psf__requests-2148`** — 9 of 10 F2P tests hit live `httpbin.org`.
+
+These are **benchmark-host artifacts, not AutoDev solve defects** (AutoDev in fact
+produced APPROVED fixes for both). They are excluded from capability accounting
+exactly like `blind` instances: **out of `clean_count` and the go/no-go count**
+(pilot), and **out of the resolve-rate denominator + the gate cohort/baseline**
+(coarse gate) — so a scoring FAIL that only reflects "no network on the eval host"
+never masquerades as a real capability FAIL and depresses the gate. The exclusion
+is **visible, not silent**: the ids are listed in `pilot-summary.md` and in the
+gate report's `network_artifact_instances`.
+
+The set (`KNOWN_NETWORK_ARTIFACT_INSTANCES` in `benchmarks/gate/coarse_gate.py`) is
+deliberately **conservative** — exactly these two, evidence-cited to the offline
+run. It **must be re-confirmed once the sb-cli cloud grader is restored** (WS-1):
+if the cloud grader provides `httpbin`, these become normal, countable instances
+again and should be removed from the set.
 
 Criteria:
 

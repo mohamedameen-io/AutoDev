@@ -67,6 +67,34 @@ COARSE_RESOLVE_DROP_THRESHOLD = 0.25
 DEFAULT_MIN_COMPLETED = 12
 DEFAULT_MAX_ERROR_RATE = 0.30
 
+# Known SWE-bench-Lite instances that are **unpassable on an OFFLINE eval host
+# regardless of fix quality** because their required FAIL_TO_PASS tests make live
+# network calls to ``httpbin.org``:
+#
+#   * ``psf__requests-1963`` — 6 of 7 F2P tests hit live httpbin.org
+#   * ``psf__requests-2148`` — 9 of 10 F2P tests hit live httpbin.org
+#
+# (Their ``test_requests.py`` bodies call a ``httpbin(...)`` helper defaulting to
+# ``http://httpbin.org/``; evidence in the slice-4 forensic dossiers A2/A9. AutoDev
+# in fact produced APPROVED fixes for both — this is a BENCHMARK-HOST artifact, NOT
+# an AutoDev solve defect.) They are excluded from capability accounting exactly
+# like ``blind`` is: OUT of the resolve-rate denominator + the go/no-go cohort, so a
+# scoring FAIL that only reflects "no network on the eval host" cannot masquerade as
+# a real capability FAIL and depress the gate.
+#
+# CAVEATS (deliberately conservative + to-be-re-confirmed):
+#   * ONLY these two — no wildcards, no whole-repo exclusion; every OTHER instance
+#     (including other ``psf/requests`` instances) stays fully counted.
+#   * Evidence-cited to the offline slice-4 run. This must be RE-CONFIRMED once the
+#     sb-cli cloud grader is restored (WS-1) — the cloud grader may provide httpbin,
+#     in which case these become normal, countable instances again.
+KNOWN_NETWORK_ARTIFACT_INSTANCES: frozenset[str] = frozenset(
+    {
+        "psf__requests-1963",
+        "psf__requests-2148",
+    }
+)
+
 # The broken-control env var (set to "1" -> gate RED unconditionally).
 FORCE_NULL_SOLVER_ENV = "AUTODEV_BENCH_FORCE_NULL_SOLVER"
 
@@ -99,6 +127,10 @@ class GateInstance:
     ERROR is infra/quota, never a capability FAIL). ``quota_wait_time_s`` is how
     long the quota guard parked this instance; ``blind`` records whether it
     solved with ``test_runner`` off (arm64 deps failed to install).
+    ``network_artifact`` records whether this is a known benchmark-host artifact
+    (see :data:`KNOWN_NETWORK_ARTIFACT_INSTANCES`) that is excluded from the
+    resolve-rate denominator + go/no-go — set by
+    :func:`gate_instances_from_score_report`, exactly as ``blind`` is set.
     """
 
     instance_id: str
@@ -106,6 +138,7 @@ class GateInstance:
     wall_time_s: float = 0.0
     quota_wait_time_s: float = 0.0
     blind: bool = False
+    network_artifact: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,6 +178,7 @@ class GateReport:
     baseline_path: str
     per_instance: list[dict]
     blind_instances: list[str]
+    network_artifact_instances: list[str]
     baseline_resolve_rate: float | None = None
     resolve_rate_drop: float | None = None
     comparison: dict | None = None
@@ -339,9 +373,23 @@ def evaluate_coarse_gate(
        (``regressed``); otherwise GREEN (``healthy``).
     """
     env_map = os.environ if env is None else env
-    counts = _count(instances)
-    per_instance = [_instance_dict(i) for i in instances]
-    blind_instances = [i.instance_id for i in instances if i.blind]
+    # WS-7: known network-artifact instances (live-httpbin.org F2P tests,
+    # unpassable offline — see :data:`KNOWN_NETWORK_ARTIFACT_INSTANCES`) are
+    # excluded from the SCORED COHORT entirely: out of the resolve-rate
+    # denominator, the anti-vacuity completed/error counts, the baseline
+    # comparison, AND the written baseline (so they never poison a future
+    # comparison). They are surfaced separately in ``network_artifact_instances``
+    # (mirroring the ``blind_instances`` listing) — VISIBLE, never silently
+    # dropped. This goes one step beyond ``blind``: a blind instance still carries
+    # a real (if weak) verdict and stays IN the cohort, whereas a network artifact
+    # carries no fair offline verdict at all and leaves it.
+    network_artifact_instances = [
+        i.instance_id for i in instances if i.network_artifact
+    ]
+    cohort = [i for i in instances if not i.network_artifact]
+    counts = _count(cohort)
+    per_instance = [_instance_dict(i) for i in cohort]
+    blind_instances = [i.instance_id for i in cohort if i.blind]
     base_path = baseline_path_for(baselines_root, autodev_version)
 
     def _report(
@@ -366,12 +414,13 @@ def evaluate_coarse_gate(
             resolve_rate=counts.resolve_rate,
             error_rate=counts.error_rate,
             blind_count=len(blind_instances),
-            total_wall_time_s=sum(i.wall_time_s for i in instances),
-            total_quota_wait_time_s=sum(i.quota_wait_time_s for i in instances),
+            total_wall_time_s=sum(i.wall_time_s for i in cohort),
+            total_quota_wait_time_s=sum(i.quota_wait_time_s for i in cohort),
             baseline_established=baseline_established,
             baseline_path=str(base_path),
             per_instance=per_instance,
             blind_instances=blind_instances,
+            network_artifact_instances=network_artifact_instances,
             baseline_resolve_rate=baseline_resolve_rate,
             resolve_rate_drop=resolve_rate_drop,
             comparison=comparison,
@@ -393,9 +442,12 @@ def evaluate_coarse_gate(
     if vacuity_reasons:
         return _report(RED, vacuity_reasons[0], vacuity_reasons)
 
-    # 3. No baseline -> establish it (the slice is trustworthy here) + GREEN.
+    # 3. No baseline -> establish it (the slice is trustworthy here) + GREEN. The
+    #    baseline is written over the COHORT (network artifacts excluded) so it can
+    #    never seed a future comparison with a verdict the offline host can't fairly
+    #    produce.
     if not base_path.is_file():
-        write_baseline(baselines_root, autodev_version, instances)
+        write_baseline(baselines_root, autodev_version, cohort)
         return _report(
             GREEN,
             STATUS_BASELINE_ESTABLISHED,
@@ -426,7 +478,7 @@ def evaluate_coarse_gate(
         )
 
     comparison = score_benchmark_results(
-        _score_doc(instances),
+        _score_doc(cohort),
         _score_doc(baseline_instances),
         pass_rate_drop_threshold=config.resolve_drop_threshold,
     )
@@ -490,6 +542,11 @@ def gate_instances_from_score_report(
     ``GuardResult``; blind from ``InstanceReport.degraded_blind``) into the
     :class:`GateInstance` list the gate consumes. Telemetry is matched by
     ``instance_id``; anything missing defaults to zero / ``False``.
+
+    ``network_artifact`` is set from :data:`KNOWN_NETWORK_ARTIFACT_INSTANCES`
+    membership (WS-7) — the same construction-boundary at which ``blind`` is
+    applied from the blind map — so the gate cohort excludes the two known
+    live-httpbin.org instances without the caller wiring anything.
     """
     wt = wall_times or {}
     qw = quota_waits or {}
@@ -501,6 +558,7 @@ def gate_instances_from_score_report(
             wall_time_s=float(wt.get(s.instance_id, 0.0)),
             quota_wait_time_s=float(qw.get(s.instance_id, 0.0)),
             blind=bool(bl.get(s.instance_id, False)),
+            network_artifact=s.instance_id in KNOWN_NETWORK_ARTIFACT_INSTANCES,
         )
         for s in report.instances
     ]
@@ -537,6 +595,7 @@ __all__ = [
     "DEFAULT_MIN_COMPLETED",
     "FORCE_NULL_SOLVER_ENV",
     "GREEN",
+    "KNOWN_NETWORK_ARTIFACT_INSTANCES",
     "RED",
     "SLICE_NAME",
     "STATUS_BASELINE_ESTABLISHED",

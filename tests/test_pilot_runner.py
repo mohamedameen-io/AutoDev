@@ -977,6 +977,158 @@ def test_run_pilot_install_tails_default_empty_when_adapter_report_lacks_them(
     assert only.install_stderr_tail == ""
 
 
+# ---------------------------------------------------------------------------
+# 7b. WS-7: known network-artifact instances are excluded from capability
+#     accounting (clean_count / go-no-go) — VISIBLE, not silently dropped.
+#     psf__requests-1963 (6/7 F2P) and psf__requests-2148 (9/10 F2P) require
+#     live httpbin.org, unpassable offline regardless of fix quality. A
+#     network-artifact scoring FAIL must NOT depress capability as a "clean" FAIL.
+# ---------------------------------------------------------------------------
+
+
+def test_pilot_outcome_network_artifact_is_not_clean():
+    """The ``clean`` property excludes a known network-artifact instance exactly
+    as it excludes ``blind``: a network-artifact FAIL is NOT clean (it carries no
+    fair offline verdict); a NORMAL FAIL IS clean (exclusion scoped to the known
+    set only); a network-artifact PASS is also excluded (an offline httpbin PASS
+    is not a fair capability PASS either).
+
+    RED pre-fix: ``PilotInstanceOutcome`` has no ``network_artifact`` field and
+    ``clean`` ignores it, so the network-artifact FAIL reads clean=True."""
+
+    def _mk_outcome(iid: str, status: str, network_artifact: bool) -> PilotInstanceOutcome:
+        return PilotInstanceOutcome(
+            instance_id=iid,
+            status=status,
+            wall_time_s=1.0,
+            quota_wait_time_s=0.0,
+            attempts=1,
+            blind=False,
+            quota_exhausted=False,
+            network_artifact=network_artifact,
+        )
+
+    assert _mk_outcome("psf__requests-1963", FAIL, True).clean is False
+    assert _mk_outcome("normal-fail", FAIL, False).clean is True  # back-compat
+    assert _mk_outcome("psf__requests-2148", PASS, True).clean is False
+    # a blind FAIL is still excluded too — the two exclusions compose, neither
+    # masks the other.
+    blind_normal = PilotInstanceOutcome(
+        instance_id="b",
+        status=FAIL,
+        wall_time_s=1.0,
+        quota_wait_time_s=0.0,
+        attempts=1,
+        blind=True,
+        quota_exhausted=False,
+        network_artifact=False,
+    )
+    assert blind_normal.clean is False
+
+
+def test_run_pilot_network_artifact_fail_excluded_from_clean_and_surfaced(
+    tmp_path: Path,
+):
+    """End-to-end: a KNOWN network-artifact instance scored FAIL is out of
+    ``clean_count`` (capability) yet VISIBLE — counted in ``network_artifact_count``
+    and listed by id in the human summary under an explicit 'excluded' category —
+    while a NORMAL FAIL in the same run still counts clean.
+
+    RED pre-fix: ``network_artifact_count`` does not exist AND the artifact FAIL
+    is folded into ``clean_count`` (15, not 14), wrongly depressing capability."""
+    import json
+
+    from benchmarks.runner.pilot import KNOWN_NETWORK_ARTIFACT_INSTANCES
+
+    artifact_id = "psf__requests-1963"
+    assert artifact_id in KNOWN_NETWORK_ARTIFACT_INSTANCES  # fixture sanity
+
+    ids = [artifact_id, "normal-fail-1"] + [f"inst-{i}" for i in range(13)]
+    verdicts = {
+        iid: (FAIL if iid in (artifact_id, "normal-fail-1") else PASS) for iid in ids
+    }
+    preds = [
+        {"instance_id": iid, "model_name_or_path": "autodev", "model_patch": "p"}
+        for iid in ids
+    ]
+    guards = [_guard_complete(iid, wall_time_s=1.0) for iid in ids]
+    adapter = _FakeAdapter(
+        reports=[_Report(iid, degraded_blind=False) for iid in ids]
+    )
+    scorer = _FakeScorer(verdicts)
+    instances = [
+        {
+            "instance_id": iid,
+            "problem_statement": "x",
+            "repo": "psf/requests" if iid == artifact_id else "pallets/flask",
+        }
+        for iid in ids
+    ]
+
+    report = run_pilot(
+        adapter,
+        scorer,
+        instances=instances,
+        invoker=lambda *a, **k: None,
+        workdir_root=tmp_path / "wd",
+        run_id="rid-net-artifact",
+        autodev_version="9.9.9-net-artifact",
+        baselines_root=tmp_path / "baselines",
+        guarded_solve=_fake_guarded_solve_factory(preds, guards),
+    )
+
+    by_id = {o.instance_id: o for o in report.instances}
+    # the artifact is flagged and is NOT clean, despite a real FAIL verdict.
+    assert by_id[artifact_id].network_artifact is True
+    assert by_id[artifact_id].status == FAIL
+    assert by_id[artifact_id].clean is False
+    # the NORMAL fail stays clean (exclusion scoped to the known set only).
+    assert by_id["normal-fail-1"].network_artifact is False
+    assert by_id["normal-fail-1"].clean is True
+    # visible count, and the artifact is OUT of clean_count (13 PASS + 1 normal
+    # FAIL = 14, NOT 15).
+    assert report.network_artifact_count == 1
+    assert report.clean_count == 14
+
+    # VISIBLE, not silent: surfaced by id in the human summary under an explicit
+    # network-artifact / excluded category (a dedicated line, not just the
+    # per-instance table row).
+    summary = report.human_summary()
+    net_lines = [
+        ln for ln in summary.splitlines() if "network artifact" in ln.lower()
+    ]
+    assert net_lines, "no network-artifact line in the human summary"
+    assert any(artifact_id in ln for ln in net_lines)
+    assert any("1" in ln for ln in net_lines)
+
+    # the count round-trips into the JSON summary + the per-instance flag survives.
+    json_path, _ = write_pilot_report(report, tmp_path / "out")
+    doc = json.loads(json_path.read_text(encoding="utf-8"))
+    assert doc["summary"]["network_artifact_count"] == 1
+    inst_doc = {i["instance_id"]: i for i in doc["instances"]}
+    assert inst_doc[artifact_id]["network_artifact"] is True
+    assert inst_doc["normal-fail-1"]["network_artifact"] is False
+
+
+def test_known_network_artifact_set_is_conservative_and_evidence_scoped():
+    """The known set is CONSERVATIVE — exactly the two evidence-cited requests
+    instances (6/7 and 9/10 F2P hit live httpbin.org), and nothing pure-python /
+    unrelated. Guards against an over-broad set silently excluding real capability
+    verdicts from the denominator."""
+    from benchmarks.runner.pilot import KNOWN_NETWORK_ARTIFACT_INSTANCES
+
+    assert KNOWN_NETWORK_ARTIFACT_INSTANCES == frozenset(
+        {"psf__requests-1963", "psf__requests-2148"}
+    )
+    for not_artifact in (
+        "psf__requests-2317",
+        "pallets__flask-4992",
+        "django__django-10914",
+        "sympy__sympy-11400",
+    ):
+        assert not_artifact not in KNOWN_NETWORK_ARTIFACT_INSTANCES
+
+
 def test_human_summary_surfaces_install_tails_for_blind_instance():
     """WS7 #3 (red-before-green): a blind instance whose ONLY diagnostic is the
     arm64 install failure — ``install_stdout_tail``/``install_stderr_tail``

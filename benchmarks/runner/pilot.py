@@ -51,6 +51,7 @@ from typing import Any, Callable, Iterable, Sequence
 from benchmarks.adapters.base import BenchmarkAdapter, Instance
 from benchmarks.gate.coarse_gate import (
     DEFAULT_BASELINES_ROOT,
+    KNOWN_NETWORK_ARTIFACT_INSTANCES,
     CoarseGateConfig,
     GateReport,
     current_autodev_version,
@@ -320,6 +321,13 @@ class PilotInstanceOutcome:
     solved workdir's ``run-summary.jsonl`` (the sibling of the terminal
     ``SolveOutcome.ledger_path`` — see :func:`_instance_cost_usd`); ``0.0`` when
     no outcome/ledger exists or nothing was recorded (best-effort, never raises).
+
+    ``network_artifact`` (WS-7) marks a known benchmark-host artifact (see
+    :data:`~benchmarks.gate.coarse_gate.KNOWN_NETWORK_ARTIFACT_INSTANCES`) whose
+    required tests hit live ``httpbin.org`` and so cannot be fairly scored on an
+    offline eval host. It is excluded from the ``clean`` capability signal exactly
+    as ``blind`` is — but surfaced (``network_artifact_count`` + the human summary),
+    never silently dropped.
     """
 
     instance_id: str
@@ -336,11 +344,19 @@ class PilotInstanceOutcome:
     install_stderr_tail: str = ""
     score_detail: str | None = None
     cost_usd: float = 0.0
+    network_artifact: bool = False
 
     @property
     def clean(self) -> bool:
-        """A real capability verdict reached with self-repair on (not blind)."""
-        return self.status in (PASS, FAIL) and not self.blind
+        """A real capability verdict reached with self-repair on — NOT blind, and
+        NOT a known network artifact (WS-7). A network-artifact FAIL reflects "no
+        network on the offline eval host", never a real capability miss, so it must
+        not depress the clean signal / go-no-go count."""
+        return (
+            self.status in (PASS, FAIL)
+            and not self.blind
+            and not self.network_artifact
+        )
 
 
 @dataclass
@@ -367,6 +383,7 @@ class PilotReport:
     baseline_established: bool
     baseline_path: str | None
     recommend_lock: bool
+    network_artifact_count: int = 0
     quota_wait_events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -380,6 +397,7 @@ class PilotReport:
                 "failed": self.failed,
                 "errored": self.errored,
                 "blind_count": self.blind_count,
+                "network_artifact_count": self.network_artifact_count,
                 "clean_count": self.clean_count,
                 "total_wall_time_s": round(self.total_wall_time_s, 3),
                 "total_quota_wait_time_s": round(self.total_quota_wait_time_s, 3),
@@ -414,6 +432,20 @@ class PilotReport:
         lines.append(
             f"- blind (deps failed, self-repair off): {self.blind_count}; "
             f"clean (verdict + self-repair): {self.clean_count}"
+        )
+        # WS-7: surface the known network-artifact exclusions EXPLICITLY (id-listed),
+        # never a silent drop — these are out of clean_count / go-no-go because their
+        # required tests hit live httpbin.org and can't be fairly scored offline.
+        net_artifact_ids = [
+            o.instance_id for o in self.instances if o.network_artifact
+        ]
+        net_artifact_suffix = (
+            f" [{', '.join(net_artifact_ids)}]" if net_artifact_ids else ""
+        )
+        lines.append(
+            "- excluded: known network artifact (live httpbin.org, unpassable "
+            "offline; out of capability accounting): "
+            f"{self.network_artifact_count}{net_artifact_suffix}"
         )
         lines.append(
             f"- wall-time: {self.total_wall_time_s:.0f}s; "
@@ -688,6 +720,7 @@ def run_pilot(
                 cost_usd=_instance_cost_usd(
                     g.outcome.ledger_path if g.outcome is not None else None
                 ),
+                network_artifact=g.instance_id in KNOWN_NETWORK_ARTIFACT_INSTANCES,
             )
         )
 
@@ -710,6 +743,7 @@ def run_pilot(
     errored = sum(1 for o in outcomes if o.status == ERROR)
     failed = len(outcomes) - passed - errored
     blind_count = sum(1 for o in outcomes if o.blind)
+    network_artifact_count = sum(1 for o in outcomes if o.network_artifact)
     clean_count = sum(1 for o in outcomes if o.clean)
 
     return PilotReport(
@@ -721,6 +755,7 @@ def run_pilot(
         failed=failed,
         errored=errored,
         blind_count=blind_count,
+        network_artifact_count=network_artifact_count,
         clean_count=clean_count,
         total_wall_time_s=sum(o.wall_time_s for o in outcomes),
         total_quota_wait_time_s=sum(o.quota_wait_time_s for o in outcomes),
@@ -877,6 +912,7 @@ __all__ = [
     "GO_NOGO_MIN_CLEAN",
     "HEAVY_DEP_REPO_HINTS",
     "HEAVY_LITE_REPOS",
+    "KNOWN_NETWORK_ARTIFACT_INSTANCES",
     "PilotInstanceOutcome",
     "PilotReport",
     "main",
