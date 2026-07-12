@@ -409,20 +409,23 @@ async def test_no_tests_found_persists_diagnosis_in_evidence(
 # ---------------------------------------------------------------------------
 
 
-def _test_engineer_reports_missing_change() -> AgentResult:
+def _test_engineer_reports_missing_change(variant: str = "v1") -> AgentResult:
     """A test_engineer result in the django-10914 shape.
 
     ``success=True`` with zero counts and a "no tests" cue → the classifier
     diagnoses ``no_tests_found``. The ``BUGS FOUND:`` section carries the
-    missing-change signal the forensic quoted verbatim.
+    missing-change signal the forensic quoted verbatim. ``variant`` perturbs the
+    surrounding prose (not the anchor phrase) so the loop detector — which
+    hashes adapter output — does not trip across retries and preempt the retry
+    ladder's own terminal reason.
     """
     return ok(
         "RESULTS: passed=0 failed=0 total=0\n"
-        "No tests found that exercise this change.\n"
+        f"No tests found that exercise this change ({variant}).\n"
         "COVERAGE: N/A\n"
         "BUGS FOUND: global_settings.py:307 still defines "
         "FILE_UPLOAD_PERMISSIONS = None; the source change is missing "
-        "from this diff.\n"
+        f"from this diff. (probe {variant})\n"
     )
 
 
@@ -439,18 +442,32 @@ async def test_no_tests_found_with_missing_change_is_not_soft_passed(
     """
     import json
 
-    missing_change = _test_engineer_reports_missing_change()
-
     # Ample stubs so the retry ladder exhausts on the persistent missing-change
-    # signal rather than running out of stubbed responses.
+    # signal rather than running out of stubbed responses. Every role's output
+    # varies per attempt so the per-(task, role) loop detector doesn't trip
+    # first (we want the WS-4 routing, not the repetition guardrail, to be the
+    # terminator — its blocked_reason is what the distinguishability contract
+    # below pins).
     adapter = StubAdapter(
         {
             "developer": [_coder_ok_with_diff(f"v{i}") for i in range(8)],
-            "reviewer": _reviewer_approved(),
-            "test_engineer": [missing_change for _ in range(8)],
+            "reviewer": [ok(f"APPROVED\n- clean (v{i})") for i in range(8)],
+            "test_engineer": [
+                _test_engineer_reports_missing_change(f"v{i}") for i in range(8)
+            ],
         }
     )
     orch = await _make_orch_with_plan(tmp_path, adapter)
+    # Make the WS-4 routing itself the deterministic terminator so its reason is
+    # the terminal blocked_reason (M-4). Two orthogonal mechanisms would
+    # otherwise preempt it: (1) the blocker resolver's recovery cycles, and
+    # (2) the escalation ladder's REFINE/PIVOT rungs (discard_count >= 3), which
+    # delegate to repeatedly-stubbed critic roles and trip the repetition
+    # guardrail. Disabling the resolver + capping retries at 2 keeps discard_count
+    # <= 2 (ladder stays on "continue") so attempt 2 escalates via the legacy
+    # retry-exhaustion path carrying the missing-change reason.
+    orch.cfg.resolver.enabled = False
+    orch.cfg.qa_retry_limit = 2
     tasks = await orch.execute()
 
     assert len(tasks) == 1
@@ -465,6 +482,13 @@ async def test_no_tests_found_with_missing_change_is_not_soft_passed(
     # and it RETRIED the gate rather than silently accepting the first result.
     assert final.status == "blocked" or final.escalated
     assert adapter.count("test_engineer") >= 2
+    # Distinguishability contract (M-4): the terminal reason names the
+    # missing-source-change cause, not a generic test failure.
+    blocked_reason = (final.blocked_reason or "").lower()
+    assert "source change" in blocked_reason and "missing" in blocked_reason, (
+        f"expected the terminal reason to name the missing source change, "
+        f"got: {final.blocked_reason!r}"
+    )
 
     # The evidence preserves the genuine diagnosis + the BUGS FOUND content and
     # was NOT stamped as a soft-pass.
@@ -508,4 +532,42 @@ async def test_no_tests_found_bugs_found_none_still_soft_passes(
     )
     assert final.blocked_reason is None
     # A legitimate no-test-surface run does not retry.
+    assert adapter.count("test_engineer") == 1
+
+
+@pytest.mark.asyncio
+async def test_no_tests_found_benign_no_source_change_still_soft_passes(
+    tmp_path: Path,
+) -> None:
+    """I-1 regression: benign "no source change was necessary" still soft-passes.
+
+    Even with a non-empty developer diff + ``no_tests_found``, a ``BUGS FOUND:``
+    body that merely states no source change was NEEDED (a legitimate no-op /
+    docs task) must NOT fire the missing-change guard — the task soft-passes to
+    ``complete`` as before. Guards against the opposite-direction regression: a
+    state-framed marker over-matching benign prose and routing a legitimate task
+    into retry→block.
+    """
+    benign = ok(
+        "RESULTS: passed=0 failed=0 total=0\n"
+        "No tests found in scope for this change.\n"
+        "BUGS FOUND: N/A. No source change was necessary for this docs task.\n"
+    )
+
+    adapter = StubAdapter(
+        {
+            "developer": _coder_ok_with_diff(),
+            "reviewer": _reviewer_approved(),
+            "test_engineer": benign,
+        }
+    )
+    orch = await _make_orch_with_plan(tmp_path, adapter)
+    tasks = await orch.execute()
+
+    final = tasks[0]
+    assert final.status == "complete", (
+        f"expected complete, got {final.status} "
+        f"(blocked_reason={final.blocked_reason})"
+    )
+    assert final.blocked_reason is None
     assert adapter.count("test_engineer") == 1

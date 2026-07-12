@@ -312,3 +312,21 @@ def test_reports_missing_change_false_for_unrelated_bug() -> None:
     """A real bug that is NOT about a missing change must not over-trigger."""
     text = "BUGS FOUND: divide-by-zero when denominator is 0"
     assert reports_missing_change(text) is False
+
+
+def test_reports_missing_change_false_for_benign_no_source_change_prose() -> None:
+    """I-1 regression: benign "no source change was necessary" must NOT trip.
+
+    A docs / no-op task whose test_engineer reports there were no source changes
+    to make is a LEGITIMATE no-test-surface case. A state-framed phrasing like
+    "no source change" must NOT be read as a missing-EXPECTED-change signal —
+    that would be the opposite-direction regression WS-4 exists to avoid.
+    """
+    body = "BUGS FOUND: N/A. No source change was necessary for this docs task."
+    assert reports_missing_change(body) is False
+
+
+def test_reports_missing_change_false_for_source_unchanged_prose() -> None:
+    """I-1 regression: benign "source is unchanged" narration must NOT trip."""
+    body = "BUGS FOUND: Note: the public API and source is unchanged from baseline."
+    assert reports_missing_change(body) is False

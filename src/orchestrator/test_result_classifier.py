@@ -212,33 +212,38 @@ _REPORT_SECTION_HEADERS: tuple[str, ...] = (
 )
 
 # Conservative "the expected change did not land" phrasings, matched
-# case-insensitively as substrings of the ``BUGS FOUND:`` body. Deliberately
-# narrow: each marker asserts an ABSENT/UNAPPLIED change, so an unrelated source
-# bug the agent happens to report (a real ``BUGS FOUND:`` that is NOT about a
-# missing change) does not trip the missing-change gate. The django-10914 quote
-# — "the source change is missing from this diff" — is the anchor case.
+# case-insensitively as substrings of the ``BUGS FOUND:`` body. Two design rules
+# keep every entry pulling its own weight and prevent false positives in BOTH
+# directions:
+#
+#   * DEFECT-framed only. Each marker asserts an EXPECTED change is
+#     absent/unapplied. STATE-framed phrasings ("no source change",
+#     "source is unchanged", "source was not modified") were deliberately
+#     EXCLUDED: they over-match benign prose (e.g. a docs task reporting
+#     "no source change was necessary"), which would route a LEGITIMATE
+#     no-test-surface task into retry→block — the exact opposite-direction
+#     regression WS-4 must avoid. The trailing-"was not" prefixes ("source
+#     change was not", "expected change was not") were dropped for the same
+#     reason ("... was not necessary/needed" is benign) — their real signal is
+#     already covered by "change was not applied" / "change is not applied".
+#   * No substring-subsumed duplicates (e.g. "source change is missing" and
+#     "expected change is missing" both collapse into "change is missing").
+#
+# The django-10914 quote ("... the source change is missing from this diff") is
+# the anchor case — matched by "change is missing" AND "missing from this diff".
 _MISSING_CHANGE_MARKERS: tuple[str, ...] = (
-    "source change is missing",
-    "source change was not",
     "change is missing",
-    "change was not applied",
-    "change is not applied",
-    "change is absent",
-    "change is not present",
     "missing from this diff",
     "missing from the diff",
+    "change is absent",
+    "change is not present",
+    "change was not applied",
+    "change is not applied",
     "not present in this diff",
     "not present in the diff",
-    "expected change is missing",
-    "expected change is absent",
-    "expected change was not",
-    "expected fix is missing",
     "fix is missing",
-    "fix was not applied",
     "fix is not present",
-    "no source change",
-    "source was not modified",
-    "source is unchanged",
+    "fix was not applied",
 )
 
 
@@ -260,7 +265,10 @@ def parse_bugs_found(text: str) -> str | None:
     """
     if not text:
         return None
-    marker = re.search(r"BUGS\s+FOUND\s*:", text, re.IGNORECASE)
+    # Line-anchored (mirrors the truncation regex below) so an inline
+    # "bugs found:" buried in an earlier FAILURES message can't anchor the
+    # section body at the wrong offset — the header sits on its own line.
+    marker = re.search(r"(?im)^\s*BUGS\s+FOUND\s*:", text)
     if marker is None:
         return None
     body = text[marker.end() :]
