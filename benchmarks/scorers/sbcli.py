@@ -65,24 +65,35 @@ API_KEY_ENV = "SWEBENCH_API_KEY"
 DEFAULT_CLI = "sb-cli"
 DEFAULT_SUBSET = "swe-bench_lite"
 DEFAULT_SPLIT = "test"
-# OPERATOR NOTE (WS-1, best-effort — not diagnosed further here, no invocation
-# behaviour changed by this note): every historical run against this exact
-# (DEFAULT_SUBSET, DEFAULT_SPLIT) pair — 7/7 runs, including the Phase-1 pilot
-# and the slice4 forensic re-grade's gold control — fast-failed in ~103s with
-# completed_instances=0 for EVERY submitted instance, never reaching the
-# hidden-test phase. That is too fast and too uniform across unrelated repos
-# to be per-instance solve/patch quality; it reads as an invocation/config
-# problem upstream of grading. Unconfirmed candidates an operator should check
-# next (roughly cheapest-to-rule-out first): (1) the installed ``sb-cli``
-# package version vs. what the swebench.com service currently expects;
-# (2) whether "swe-bench_lite" / "test" are still the LIVE subset/split ids
-# for that service (vs. a renamed, retired, or re-versioned split);
-# (3) ``SWEBENCH_API_KEY`` entitlement/quota on this subset specifically (a
-# general auth failure would more plausibly reject the submission itself
-# rather than accept it and then fast-fail at ~103s); (4) a swebench.com-side
-# outage/incident spanning the runs to date. The ERROR-not-FAIL reclassification
-# below is what makes the benchmark signal safe regardless of which of these
-# turns out to be the cause.
+# OPERATOR NOTE (WS-1(1b), DIAGNOSED 2026-07-13 — no invocation behaviour is
+# changed by this note): the non-completion is a PERSISTENT, external
+# SWE-bench-"M" hosted-eval BACKEND failure for this (DEFAULT_SUBSET,
+# DEFAULT_SPLIT) pair — NOT an AutoDev/client/config defect. Across 8 runs
+# spanning 2026-07-09..13 (the Phase-1 pilot, the slice4 forensic re-grade and
+# its gold control, and a dedicated live gold probe on 07-13) EVERY submitted
+# instance — canonical GOLD included — lands in ``failed_ids`` with
+# ``completed_instances=0``. The live probe's own words: "Evaluating
+# predictions ✓ (~90s) → Successful runs: 0 / Failed runs: 10". Every
+# client-side cause is eliminated with evidence: patch quality (gold fails
+# too); patch malformation (``git apply --check`` CLEAN at the canonical base);
+# prediction format (exact triple, non-empty patches); subset/split id (the API
+# resolves the correct 300-instance set — the other ~290 sit in
+# ``incomplete_ids``); instance-ids (ours appear in ``submitted_ids``); auth
+# (``sb-cli get-quotas`` / ``list-runs`` return authenticated data);
+# entitlement/quota (``get-quotas`` shows swe-bench_lite/test with runs
+# remaining); and CLI version (fails IDENTICALLY on the prod 0.1.4 path AND the
+# latest 0.1.5). So the earlier candidates (1) sb-cli version, (2) subset/split
+# id, and (3) SWEBENCH_API_KEY entitlement are all RULED OUT; candidate (4) — a
+# swebench.com-side backend inability to run lite/test — is CONFIRMED and
+# persistent. ``failed_ids`` is the server's own "eval run failed to execute"
+# bucket (sb-cli 0.1.5 labels it "Failed runs"), which is exactly why the
+# verdict mapping below routes it to ERROR, never FAIL — keeping the benchmark
+# signal honest regardless of the cause. CONSEQUENCE: a hosted PASS is
+# impossible until SWE-bench restores the lite/test backend, OR a local/
+# self-hosted ``swebench``-harness eval path is added (needs x86/Docker; the
+# arm64 solve host cannot run the per-instance eval images, which is why hosted
+# sb-cli is used for scoring). Evidence: ~/bench-forensics/slice4/
+# (sbcli-goldctl/, sbcli-probe-20260713/, dossiers/X5-regrade-sbcli.json).
 # sb-cli submit with --gen_report 1 blocks until the cloud evaluation finishes,
 # so this is a generous ceiling, not a typical wait.
 DEFAULT_SUBMIT_TIMEOUT = 1800
